@@ -1,0 +1,17 @@
+# Git worktrees of rustyharness: their history lives in the rustyharness repo.
+/.wt-*/
+# Rust build output.
+target/
+# Raw model wire dumps and harness run state: large, regenerable, and they
+# hold full prompts and workspace content. Run summaries are committed instead.
+/devkit/*/dumps/
+/devkit/*/state/
+*.pid
+.DS_Store
+# Full test logs of break-it runs: large and regenerable; breakit-results.json is committed.
+/devkit/breakit/out-*/*.log
+/devkit/wild/state/
+/devkit/wild/workspaces/
+# Per-run workspace copies (rebuilt from fixture + journal) and raw local wire dumps.
+/devkit/*/work/
+/devkit/*/dumps-local/

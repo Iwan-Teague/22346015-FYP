@@ -1,0 +1,7 @@
+[package]
+name = "famcount"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+bench-gen = { path = "../../rustybenchmark/crates/bench-gen" }
+[workspace]

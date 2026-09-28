@@ -1,0 +1,19 @@
+[package]
+name = "bench-stats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Aggregation: reads graded journal lines and computes the published figures —
+# capability_score, per-category means, pass-rate, and cluster-bootstrap CIs —
+# exactly as decided in docs/07-statistics.md (Q28 pass predicate, Q29 estimation).
+
+[dependencies]
+bench-core = { path = "../bench-core" }
+bench-invariants = { path = "../bench-invariants" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

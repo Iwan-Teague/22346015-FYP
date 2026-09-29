@@ -1,0 +1,11 @@
+[package]
+name = "split-mut-window"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+# Standalone: a materialised task crate must not be adopted by any surrounding
+# cargo workspace (e.g. the harness's own). Every task Cargo.toml carries this.
+[workspace]

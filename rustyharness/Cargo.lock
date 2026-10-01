@@ -144,6 +144,7 @@ dependencies = [
  "harness-manifest",
  "harness-model",
  "harness-policy",
+ "harness-sandbox",
  "harness-tools",
  "serde_json",
  "thiserror",
@@ -167,6 +168,7 @@ dependencies = [
  "harness-journal",
  "harness-manifest",
  "harness-policy",
+ "harness-sandbox",
  "serde_json",
  "thiserror",
 ]

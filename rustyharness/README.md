@@ -25,7 +25,9 @@ this is not built yet: see Status below, and the owner decisions in
 (slice H1g), the exit test passed again on a local model with both protocols,
 slice H1h makes the native protocol send past actions back as the model's own
 tool calls (a model copied the old text form), and the owner's sign-off on the
-design's open questions remains before H2. What works today:
+design's open questions remains before H2. H2 is being built on an integration
+branch: edits (H2b), the macOS sandbox (H2a, H2c) and commands in it (H2d).
+What works today:
 
 - **A read-only agent loop** against a model served on loopback
   (`http://127.0.0.1`, `[::1]` or `localhost`; OpenAI-compatible, e.g. llama.cpp),
@@ -52,8 +54,18 @@ design's open questions remains before H2. What works today:
   whatever the agent says: a run that starts ends `Indeterminate { NothingChecked }`
   (`UnreadableEvidence` if its journal fails or a resume's catch-up diverges),
   exit 5; a refused run is `CouldNotRun`.
-- **No sandbox, no execution.** No backend has passed conformance, so no execute
-  capability can be granted and `rustyharness sandbox` refuses (H2).
+- **Commands, in a sandbox, on macOS (H2d, on the integration branch).**
+  `harness.exec.run` runs one program the task file allows: `argv` is a list
+  whose first item is a program's NAME from the task's `exec` section, which
+  pins it to one absolute path (no `PATH` lookup, no shell unless the task
+  allowlists one). It runs in the Seatbelt sandbox that passed the conformance
+  suite on this host (deny-default, no network, the workspace and a per-run
+  scratch directory as its only writable roots, a built environment, and
+  time, CPU, memory, process-count and output limits), and the harness
+  re-measures the workspace after it. A command asks like an edit unless the
+  `--policy` file allows the runner. Where no backend passes (Linux and Windows
+  today), a task that executes is refused before anything starts (exit 3);
+  `rustyharness sandbox` shows the witness or the reason (design rows H2d).
 - **Local disks only.** `run` and `resume` refuse a `state_root` that is not on
   a filesystem positively identified as local; on Windows every one is refused
   until spike S-W1, so runs work on Linux and macOS. `replay` does not check yet
@@ -73,9 +85,9 @@ crates/
   harness-policy      effective classes, decisions, the trifecta, locality   (pure)
   harness-model-core  messages, action protocols, profiles, context builder  (pure)
   harness-model       the loopback HTTP client, replay and scripted backends
-  harness-tools       the ToolProvider seam and the built-in read tools
+  harness-tools       the ToolProvider seam, the built-in read and edit tools, the command runner
   harness-journal     the append-only, hash-chained run journal
-  harness-sandbox     fail-closed confinement; locality and environment probes
+  harness-sandbox     fail-closed confinement (Seatbelt on macOS); locality and environment probes
   harness-run         the run driver: loop, audit replay, resume
   harness-cli         the `rustyharness` binary
 adapters/             fixtures only: an example v1 manifest (providers ship their own)
@@ -88,7 +100,7 @@ scripts/ci/gates.sh   the member gate entrypoint (fmt, purity, deny, clippy, tes
 ```bash
 cargo test --workspace
 cargo run -p harness-cli -- manifest check adapters/example/manifest.json
-cargo run -p harness-cli -- sandbox            # refuses: no confinement yet
+cargo run -p harness-cli -- sandbox            # macOS: the witness; elsewhere: why it refuses
 ```
 
 A run needs the binary (`cargo build --release -p harness-cli` puts it at
@@ -115,6 +127,23 @@ rustyharness run --task task.json --profile profile.json \
   --endpoint http://127.0.0.1:8080/v1
 rustyharness replay --run <run id> --task task.json --profile profile.json \
   --state-root state --anchor <chain head>
+```
+
+A task that runs commands names each program it allows, by name and by its
+real path, and what the programs need (read-only roots, variables, limits:
+per process 2048 MiB of address space, 600 s of CPU and 1024 MiB files, 128
+processes and 1024 KiB of each output stream by default). Each command's
+build output and caches go to the run's scratch directory
+(`CARGO_TARGET_DIR`, `CARGO_HOME`), outside the workspace:
+
+```json
+{"task": "Make cargo test pass.",
+ "grants": ["harness.fs.read", "harness.fs.list", "harness.edit.replace", "harness.exec.run"],
+ "exec": {"programs": [{"name": "cargo", "path": "/Users/me/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin/cargo"}],
+          "read_only": ["/Users/me/.rustup/toolchains/1.88.0-aarch64-apple-darwin",
+                        "/Library/Developer/CommandLineTools", "/private/etc/ssl"],
+          "env": {"DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "CARGO_NET_OFFLINE": "true"},
+          "limits": {"memory_mib": 2048, "processes": 128}}}
 ```
 
 `run` prints the run id on stderr (`run <id> attempt 1: stopped …`) and, on

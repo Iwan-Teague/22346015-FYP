@@ -108,6 +108,7 @@ fn spec() -> TaskSpec {
         task: TaskText::new(TASK.into()),
         grants: GRANTS.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
+        exec: None,
     }
 }
 
@@ -129,6 +130,7 @@ fn go_with(state: &Path, ws: &Path, policy: &UserPolicy, backend: &dyn ModelBack
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
     .unwrap()
 }
@@ -589,6 +591,7 @@ fn resume_edits(
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
 }
 

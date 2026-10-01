@@ -117,6 +117,17 @@ pub mod code {
     /// The edit was written but could not be verified afterwards (§4.9
     /// step 4; H2b): the file may have changed.
     pub const UNVERIFIED: u16 = 16;
+    /// `argv[0]` is not a program on the task's exec allowlist (H2d; policy
+    /// refuses it first, so this is defence in depth).
+    pub const EXEC_NOT_ALLOWED: u16 = 17;
+    /// The sandbox refused the command's setup or could not start: nothing
+    /// ran (H2d).
+    pub const EXEC_SPAWN: u16 = 18;
+    /// The program could not be started inside the sandbox (H2d).
+    pub const EXEC_FAILED: u16 = 19;
+    /// The command held more processes than its cap, so its sandbox was
+    /// swept (FT-5, H2d).
+    pub const EXEC_PROCESS_LIMIT: u16 = 20;
 }
 
 const READ: &str = "harness.fs.read";
@@ -163,6 +174,7 @@ impl ReadTools {
 }
 
 /// A finished tool call, before capping.
+#[derive(Debug)]
 pub(crate) struct Out {
     pub(crate) status: ToolStatus,
     pub(crate) text: String,
@@ -233,6 +245,7 @@ pub(crate) fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
         truncated: false,
         read: None,
         edit: None,
+        exec: None,
     }
 }
 
@@ -256,6 +269,7 @@ pub(crate) fn finish(cap: &str, out: Out) -> ToolResult {
         digest,
         read: out.read,
         edit: None,
+        exec: None,
     }
 }
 

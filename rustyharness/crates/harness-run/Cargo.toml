@@ -19,6 +19,9 @@ harness-manifest = { path = "../harness-manifest" }
 harness-model = { path = "../harness-model" }
 harness-policy = { path = "../harness-policy" }
 harness-tools = { path = "../harness-tools" }
+# The command runner's confinement (H2d): the run obtains a Conformed
+# witness through the Confinement seam before it plans an exec grant.
+harness-sandbox = { path = "../harness-sandbox" }
 serde_json.workspace = true
 thiserror.workspace = true
 

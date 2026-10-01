@@ -17,6 +17,9 @@ harness-core = { path = "../harness-core" }
 harness-journal = { path = "../harness-journal" }
 harness-manifest = { path = "../harness-manifest" }
 harness-policy = { path = "../harness-policy" }
+# The command runner (H2d) starts every command through the sandbox's
+# Confinement seam, with its Conformed witness (design §1.2 edge).
+harness-sandbox = { path = "../harness-sandbox" }
 serde_json.workspace = true
 thiserror.workspace = true
 

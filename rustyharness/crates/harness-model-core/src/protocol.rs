@@ -252,8 +252,15 @@ pub fn parse_reply(
 }
 
 /// The protocol part of the system block (§3.3), rendered from harness
-/// data only: the protocol rules (static) and the active tools' ids,
-/// harness-authored descriptions and schemas.
+/// data only: the protocol rules (static) and the active tools, by the
+/// names the model uses for them, with their harness-authored
+/// descriptions. The text protocol lists each tool's id and its argument
+/// schema: that list is the only place the model learns them. The native
+/// protocol lists each tool by its wire name, the name the model calls it
+/// by, without the schema (design row H1i): the request's `tools`
+/// parameter carries names, descriptions and schemas, and listing the
+/// dotted ids beside the wire names gave the model two names for one tool
+/// (and every schema twice).
 pub fn protocol_system_text(protocol: Protocol, tools: &[ToolSpec]) -> HarnessText {
     let mut s = String::from(match protocol {
         Protocol::Text => {
@@ -264,12 +271,19 @@ pub fn protocol_system_text(protocol: Protocol, tools: &[ToolSpec]) -> HarnessTe
         }
     });
     for t in tools {
-        s.push_str(&format!(
-            "- {}: {} args schema: {}\n",
-            t.id,
-            t.description.as_str(),
-            t.parameters
-        ));
+        match protocol {
+            Protocol::Text => s.push_str(&format!(
+                "- {}: {} args schema: {}\n",
+                t.id,
+                t.description.as_str(),
+                t.parameters
+            )),
+            Protocol::Native => s.push_str(&format!(
+                "- {}: {}\n",
+                wire_name(&t.id),
+                t.description.as_str()
+            )),
+        }
     }
     HarnessText::rendered(s)
 }
@@ -321,6 +335,7 @@ mod tests {
             request_bytes: 0,
             reply_bytes: 0,
             retried: vec![],
+            server_stats: None,
         }
     }
 

@@ -1,5 +1,5 @@
-//! rustyharness policy for read classes and the built-in workspace edits
-//! (design `docs/01-design-v0.1.md` §4.2, §5.1, §5.2, §5.3, §5.4; this
+//! rustyharness policy for read classes, the built-in workspace edits and
+//! the confined command runner (design `docs/01-design-v0.1.md` §4.2, §5.1, §5.2, §5.3, §5.4; this
 //! slice of §9 H1/H2).
 //!
 //! Pure: no I/O, no clock, no global state. Everything a decision reads is
@@ -17,7 +17,12 @@
 //!   allow rule, otherwise an ask (rule [`EDIT_DEFAULT_RULE`]), a deny with
 //!   no approver present. §5.2's default allow for them assumes a sandbox
 //!   and snapshots that make an edit undoable; this build edits the
-//!   workspace in place with neither, so it asks.
+//!   workspace in place with neither, so it asks. The one execute-class
+//!   capability is the built-in command runner [`EXEC_ID`] (H2d): planned
+//!   only with a workspace and a conformed sandbox witness (INV-6), its
+//!   `argv[0]` must name a program on the task's exec allowlist and its
+//!   `cwd` stay in the workspace (INV-13), and it asks by default (rule
+//!   [`EXEC_DEFAULT_RULE`]) unless a user allow rule allows it.
 //! - [`Session::decide`]: the §5.1 order — deny rules (first match wins,
 //!   cannot be overridden), then ask rules, then allow rules, then DENY by
 //!   default. Every decision carries the id of the rule that produced it.
@@ -292,11 +297,33 @@ pub enum DenyReason {
     Args(ArgsError),
     /// A built-in file tool's path argument leaves the workspace.
     Path(PathRefused),
+    /// A command-runner call refused before it runs (H2d, INV-13).
+    Exec(ExecRefused),
     /// An ask with nobody to answer it (§5.2: every Ask becomes Deny).
     NoApprover,
     /// No allow rule matched (the §5.1 default).
     NoRuleMatched,
 }
+
+/// Why a `harness.exec.run` call is refused before anything runs (§4.8,
+/// INV-13). The program is resolved by NAME against the task's exec
+/// allowlist; the model never chooses a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecRefused {
+    /// `argv` is empty: there is no program.
+    EmptyArgv,
+    /// `argv[0]` is not a program name on the task's exec allowlist (a
+    /// path, a shell that was not allowlisted, anything else).
+    NotAllowlisted,
+    /// More than [`EXEC_MAX_ARGS`] items.
+    TooManyArgs,
+    /// An item holds a NUL byte, which no OS argv can carry.
+    Nul,
+}
+
+/// The most `argv` items one `harness.exec.run` call may pass (the 64 KiB
+/// action cap binds on their total size first).
+pub const EXEC_MAX_ARGS: usize = 256;
 
 /// What may happen to one call (§5.1). Not a verdict (§1.4, INV-28).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +447,15 @@ pub struct SessionSpec {
     pub approver_present: bool,
     /// The session was granted personal data (§5.2).
     pub personal_data_granted: bool,
+    /// The run holds a `Conformed` sandbox witness (§6.1): the caller
+    /// obtained one from `harness_sandbox::require()` before planning. An
+    /// execute-class capability is planned and decided only with one
+    /// (INV-6). The policy crate cannot name the witness's type (the edge
+    /// runs sandbox → policy), so the caller states it.
+    pub conformed: bool,
+    /// The program names on the task's exec allowlist (§4.8, H2d): a
+    /// command runs only when its `argv[0]` is one of them (INV-13).
+    pub exec_programs: Vec<String>,
 }
 
 /// Why a session was refused at planning. Nothing has run.
@@ -452,6 +488,10 @@ pub enum SessionRefused {
     /// A built-in file tool granted without a workspace.
     #[error("capability {0} needs a workspace and the task grants none")]
     NoWorkspace(String),
+    /// An execute-class capability granted with no `Conformed` sandbox
+    /// witness (INV-6: no unconfined fallback).
+    #[error("capability {0} needs a conformed sandbox and this host has none; refused")]
+    NoConfinement(String),
     /// A class or feature this build's policy does not decide.
     #[error("capability {capability}: {what} is not decided by this build's policy; refused")]
     OutOfScope {
@@ -506,6 +546,11 @@ struct Active {
     /// must stay in the workspace, and it is allowed only by a user allow
     /// rule or an approval (see [`Session::decide`]).
     edit: bool,
+    /// The built-in command runner (`harness.exec.run`, §4.8, H2d): its
+    /// `cwd` must stay in the workspace, its `argv[0]` must be on the exec
+    /// allowlist, and it is allowed only by a user allow rule or an
+    /// approval, and only with a conformed sandbox.
+    exec: bool,
 }
 
 /// A planned session: the active set with each capability's effective
@@ -516,6 +561,8 @@ pub struct Session {
     quarantined: BTreeSet<CapId>,
     approver_present: bool,
     personal_granted: bool,
+    conformed: bool,
+    exec_programs: BTreeSet<String>,
 }
 
 const FS_PREFIX: &str = "harness.fs.";
@@ -558,6 +605,28 @@ fn is_builtin_edit(c: &Capability) -> bool {
         && c.blast_radius() == BlastRadius::Own
         && c.egress() == Egress::None
         && c.content() == Content::Own
+        && c.confirmation() == Confirmation::None
+}
+
+/// The built-in command runner (§4.8; H2d).
+pub const EXEC_ID: &str = "harness.exec.run";
+
+/// The rule id of the command runner's default decision in this build
+/// (H2d): an ask, like the edits (the workspace is changed in place, with no
+/// snapshot to undo a command).
+pub const EXEC_DEFAULT_RULE: &str = "ask.exec.default";
+
+/// Whether `c` is the built-in command runner with exactly the labels §4.8
+/// gives it (execute / operational / own / none), `content: third_party`
+/// and no declared confirmation.
+fn is_builtin_exec(c: &Capability) -> bool {
+    c.id().as_str() == EXEC_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Execute
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::ThirdParty
         && c.confirmation() == Confirmation::None
 }
 
@@ -635,13 +704,24 @@ impl Session {
                 capability: id.to_string(),
                 what,
             };
-            if (id.as_str().starts_with(FS_PREFIX) || EDIT_IDS.contains(&id.as_str()))
+            if (id.as_str().starts_with(FS_PREFIX)
+                || EDIT_IDS.contains(&id.as_str())
+                || id.as_str() == EXEC_ID)
                 && spec.workspace.is_none()
             {
                 return Err(SessionRefused::NoWorkspace(id.to_string()));
             }
-            if cl.effect != Effect::Read && !is_submit_sentinel(c) && !is_builtin_edit(c) {
+            if cl.effect != Effect::Read
+                && !is_submit_sentinel(c)
+                && !is_builtin_edit(c)
+                && !is_builtin_exec(c)
+            {
                 return Err(out("a non-read effect class"));
+            }
+            // INV-6: no execution without a conformed sandbox, refused at
+            // planning, before anything starts (§4.5).
+            if cl.requires_conformed && !spec.conformed {
+                return Err(SessionRefused::NoConfinement(id.to_string()));
             }
             if cl.egress != Egress::None {
                 return Err(out("egress (the allowlist proxy is H4)"));
@@ -662,6 +742,7 @@ impl Session {
                         && c.id().as_str().starts_with(FS_PREFIX),
                     submit: is_submit_sentinel(c),
                     edit: is_builtin_edit(c),
+                    exec: is_builtin_exec(c),
                 },
             );
         }
@@ -670,6 +751,8 @@ impl Session {
             quarantined: BTreeSet::new(),
             approver_present: spec.approver_present,
             personal_granted: spec.personal_data_granted,
+            conformed: spec.conformed,
+            exec_programs: spec.exec_programs.iter().cloned().collect(),
         })
     }
 
@@ -706,7 +789,7 @@ impl Session {
             return deny(DenyReason::Quarantined, "deny.quarantined");
         }
         let cl = a.class;
-        if cl.effect != Effect::Read && !a.submit && !a.edit {
+        if cl.effect != Effect::Read && !a.submit && !a.edit && !a.exec {
             return deny(
                 DenyReason::ClassOutOfScope(cl.effect),
                 "deny.class-out-of-scope",
@@ -718,7 +801,8 @@ impl Session {
         if cl.egress != Egress::None {
             return deny(DenyReason::EgressUnavailable, "deny.egress-unavailable");
         }
-        if cl.requires_conformed {
+        // INV-6: execute-class only with a conformed sandbox witness.
+        if cl.requires_conformed && !self.conformed {
             return deny(DenyReason::NoConformed, "deny.no-conformed");
         }
         if cl.sensitivity == Sensitivity::Personal && !self.personal_granted {
@@ -743,6 +827,23 @@ impl Session {
                 if let Err(e) = checked {
                     return deny(DenyReason::Path(e), "deny.path-outside-workspace");
                 }
+            }
+        }
+        if a.exec {
+            if let Some(p) = call.args.get("cwd") {
+                let checked = p.as_str().map_or(Err(PathRefused::Empty), workspace_path);
+                if let Err(e) = checked {
+                    return deny(DenyReason::Path(e), "deny.path-outside-workspace");
+                }
+            }
+            if let Err(e) = self.exec_argv(&call.args) {
+                let name = match e {
+                    ExecRefused::NotAllowlisted | ExecRefused::EmptyArgv => {
+                        "deny.exec-not-allowlisted"
+                    }
+                    ExecRefused::TooManyArgs | ExecRefused::Nul => "deny.exec-argv",
+                };
+                return deny(DenyReason::Exec(e), name);
             }
         }
 
@@ -800,9 +901,56 @@ impl Session {
                 rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
             };
         }
+        // The command runner (H2d): execute-class asks by default. The
+        // sandbox is the control and the allowlist names the programs, but
+        // a build script is arbitrary code whatever the argv says (§4.8), so
+        // running one is the user's call unless a user allow rule (checked
+        // above) says so. No approver: the ask is a deny (§5.2).
+        if a.exec {
+            if !self.approver_present {
+                return deny(DenyReason::NoApprover, "deny.no-approver");
+            }
+            return PolicyDecision::Ask {
+                tier: Confirmation::UserConfirm,
+                rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+            };
+        }
 
         // ---- 4. Default: deny. ----
         deny(DenyReason::NoRuleMatched, "deny.default")
+    }
+
+    /// The `argv` rule of the command runner (INV-13): a non-empty list of
+    /// at most [`EXEC_MAX_ARGS`] strings without NUL whose first item is a
+    /// program NAME on the task's exec allowlist. The schema has already
+    /// made `argv` a list of strings.
+    fn exec_argv(&self, args: &Value) -> Result<(), ExecRefused> {
+        let items = args
+            .get("argv")
+            .and_then(Value::as_array)
+            .ok_or(ExecRefused::EmptyArgv)?;
+        let first = items
+            .first()
+            .and_then(Value::as_str)
+            .ok_or(ExecRefused::EmptyArgv)?;
+        if items.len() > EXEC_MAX_ARGS {
+            return Err(ExecRefused::TooManyArgs);
+        }
+        if items
+            .iter()
+            .any(|v| v.as_str().is_none_or(|s| s.contains('\0')))
+        {
+            return Err(ExecRefused::Nul);
+        }
+        if !self.exec_programs.contains(first) {
+            return Err(ExecRefused::NotAllowlisted);
+        }
+        Ok(())
+    }
+
+    /// Whether the session holds a conformed sandbox witness (§6.1).
+    pub fn conformed(&self) -> bool {
+        self.conformed
     }
 
     /// Mint an [`Authorized`] call, only when [`Session::decide`] allows it.

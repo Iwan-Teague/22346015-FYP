@@ -33,6 +33,8 @@ fn spec(grants: &[&str]) -> SessionSpec {
         workspace: ws(),
         approver_present: false,
         personal_data_granted: false,
+        conformed: false,
+        exec_programs: Vec::new(),
     }
 }
 
@@ -246,6 +248,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             fs_tool: false,
             submit: false,
             edit: false,
+            exec: false,
         },
     );
     Session {
@@ -253,6 +256,8 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
         quarantined: BTreeSet::new(),
         approver_present: true,
         personal_granted: true,
+        conformed: false,
+        exec_programs: BTreeSet::new(),
     }
 }
 
@@ -1219,4 +1224,252 @@ fn h2b_the_approval_request_escapes_and_bounds_the_arguments() {
         shown.contains("more characters not shown; sha256 of the call"),
         "{shown}"
     );
+}
+
+// ---- H2d: the built-in command runner ------------------------------------------
+
+const EXEC_GRANTS: [&str; 3] = ["harness.fs.read", "harness.edit.replace", EXEC_ID];
+
+fn exec_spec(approver: bool, programs: &[&str]) -> SessionSpec {
+    let mut sp = spec(&EXEC_GRANTS);
+    sp.approver_present = approver;
+    sp.conformed = true;
+    sp.exec_programs = programs.iter().map(|p| (*p).to_owned()).collect();
+    sp
+}
+
+fn exec_session(approver: bool, programs: &[&str], policy: &UserPolicy) -> Session {
+    Session::plan(&exec_spec(approver, programs), &builtin_registry(), policy).unwrap()
+}
+
+fn run(argv: &[&str]) -> Call {
+    call(EXEC_ID, json!({ "argv": argv }))
+}
+
+fn exec_allowed() -> UserPolicy {
+    UserPolicy::new(&[], &[], &[EXEC_ID]).unwrap()
+}
+
+// INV-6 at planning: an execute-class grant needs the witness and a
+// workspace; without the witness the session is refused before anything
+// starts, never planned "read-only with exec switched off".
+#[test]
+fn h2d_exec_is_planned_only_with_a_workspace_and_a_conformed_sandbox() {
+    let mut sp = exec_spec(true, &["cargo"]);
+    sp.conformed = false;
+    assert_eq!(
+        Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::NoConfinement(EXEC_ID.to_owned())
+    );
+    let mut sp = exec_spec(true, &["cargo"]);
+    sp.workspace = None;
+    assert!(matches!(
+        Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::NoWorkspace(_)
+    ));
+    let s = exec_session(true, &["cargo"], &UserPolicy::default());
+    let class = s.class(EXEC_ID).unwrap();
+    assert_eq!(class.effect, Effect::Execute);
+    assert!(class.requires_conformed);
+    assert!(s.conformed());
+    // A session without the grant plans without the witness, as before.
+    let mut sp = spec(&["harness.fs.read"]);
+    sp.conformed = false;
+    assert!(Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).is_ok());
+}
+
+// Execute-class asks by default (H2d); with no approver the ask is a deny.
+#[test]
+fn h2d_a_command_asks_by_default_and_is_denied_without_an_approver() {
+    let with = exec_session(true, &["cargo"], &UserPolicy::default());
+    let without = exec_session(false, &["cargo"], &UserPolicy::default());
+    let c = run(&["cargo", "test"]);
+    assert_eq!(
+        with.decide(&c),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+        }
+    );
+    assert_eq!(
+        without.decide(&c),
+        PolicyDecision::Deny {
+            reason: DenyReason::NoApprover,
+            rule: RuleId::Builtin("deny.no-approver"),
+        }
+    );
+    assert!(with.authorize(c.clone()).is_err());
+    assert!(without.authorize(c).is_err());
+    // A user allow rule is how an unattended run executes; a user deny wins
+    // and a user ask asks under its own rule.
+    let s = exec_session(false, &["cargo"], &exec_allowed());
+    assert!(s.authorize(run(&["cargo", "test", "--offline"])).is_ok());
+    let deny = UserPolicy::new(&[EXEC_ID], &[], &[]).unwrap();
+    assert!(is_deny(
+        &exec_session(true, &["cargo"], &deny).decide(&run(&["cargo", "test"])),
+        &DenyReason::UserDenied
+    ));
+    let ask = UserPolicy::new(&[], &[EXEC_ID], &[]).unwrap();
+    assert_eq!(
+        exec_session(true, &["cargo"], &ask).decide(&run(&["cargo", "test"])),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::User {
+                list: RuleList::Ask,
+                index: 0
+            },
+        }
+    );
+}
+
+// INV-13: argv is resolved by NAME against the task's allowlist, before
+// any allow rule. A shell, a path or anything else not on the list is
+// denied; a shell the task allowlists explicitly is allowed like any
+// program (its header stamps `shell_enabled`, harness-run).
+#[test]
+fn inv_13_argv_is_resolved_by_name_and_sh_c_is_refused_without_a_shell() {
+    let s = exec_session(true, &["cargo"], &exec_allowed());
+    let exec_deny = |c: &Call| match s.decide(c) {
+        PolicyDecision::Deny {
+            reason: DenyReason::Exec(e),
+            ..
+        } => Some(e),
+        _ => None,
+    };
+    assert_eq!(
+        exec_deny(&run(&["sh", "-c", "cargo test"])),
+        Some(ExecRefused::NotAllowlisted)
+    );
+    for argv in [
+        vec!["/bin/sh", "-c", "x"],
+        vec!["bash", "-c", "x"],
+        vec!["/usr/bin/cargo", "test"],
+        vec!["./cargo"],
+        vec!["cargo test"],
+        vec!["Cargo"],
+        vec![""],
+    ] {
+        assert_eq!(
+            exec_deny(&run(&argv)),
+            Some(ExecRefused::NotAllowlisted),
+            "{argv:?}"
+        );
+    }
+    assert_eq!(exec_deny(&run(&[])), Some(ExecRefused::EmptyArgv));
+    assert_eq!(exec_deny(&run(&["cargo", "a\0b"])), Some(ExecRefused::Nul));
+    let many: Vec<&str> = std::iter::once("cargo")
+        .chain(std::iter::repeat_n("x", EXEC_MAX_ARGS))
+        .collect();
+    assert_eq!(exec_deny(&run(&many)), Some(ExecRefused::TooManyArgs));
+    assert!(matches!(
+        s.decide(&run(&["cargo", "test"])),
+        PolicyDecision::Allow { .. }
+    ));
+    // The rule ids name the refusal.
+    assert_eq!(
+        s.decide(&run(&["sh", "-c", "x"])).rule(),
+        RuleId::Builtin("deny.exec-not-allowlisted")
+    );
+    assert_eq!(
+        s.decide(&run(&["cargo", "a\0b"])).rule(),
+        RuleId::Builtin("deny.exec-argv")
+    );
+    // Explicitly allowlisted, a shell is a program like any other: the
+    // sandbox, not the argv validator, is the control (§4.8).
+    let with_sh = exec_session(true, &["cargo", "sh"], &exec_allowed());
+    assert!(matches!(
+        with_sh.decide(&run(&["sh", "-c", "cargo test"])),
+        PolicyDecision::Allow { .. }
+    ));
+    // Off-schema arguments are the schema's denial.
+    for bad in [
+        json!({"argv": "cargo test"}),
+        json!({"argv": ["cargo", 1]}),
+        json!({"cwd": "."}),
+        json!({"argv": ["cargo"], "env": {}}),
+    ] {
+        assert!(
+            matches!(
+                s.decide(&call(EXEC_ID, bad.clone())),
+                PolicyDecision::Deny {
+                    reason: DenyReason::Args(_),
+                    ..
+                }
+            ),
+            "{bad}"
+        );
+    }
+}
+
+// The working directory takes the workspace path rule, like a file tool's
+// path, before any allow rule.
+#[test]
+fn h2d_the_working_directory_must_stay_in_the_workspace() {
+    let s = exec_session(true, &["cargo"], &exec_allowed());
+    for cwd in ["../x", "/tmp", "a/../../b", "C:\\x", ""] {
+        assert!(
+            matches!(
+                s.decide(&call(EXEC_ID, json!({"argv": ["cargo"], "cwd": cwd}))),
+                PolicyDecision::Deny {
+                    reason: DenyReason::Path(_),
+                    ..
+                }
+            ),
+            "{cwd:?}"
+        );
+    }
+    assert!(matches!(
+        s.decide(&call(
+            EXEC_ID,
+            json!({"argv": ["cargo"], "cwd": "crates/a"})
+        )),
+        PolicyDecision::Allow { .. }
+    ));
+}
+
+// Defence in depth: a session that holds the runner but no witness (built
+// directly, bypassing planning) still denies every command.
+#[test]
+fn h2d_decide_denies_a_command_without_the_witness() {
+    let reg = builtin_registry();
+    let found = match reg.resolve(EXEC_ID) {
+        Resolved::One { capability, .. } => Some(capability),
+        _ => None,
+    };
+    let capability = found.expect("the runner is built in");
+    let mut s = raw_session(capability, Some(0));
+    if let Some(a) = s.active.get_mut(capability.id()) {
+        a.exec = true;
+    }
+    s.exec_programs.insert("cargo".into());
+    assert!(is_deny(
+        &s.decide(&run(&["cargo", "test"])),
+        &DenyReason::NoConformed
+    ));
+    s.conformed = true;
+    assert!(matches!(
+        s.decide(&run(&["cargo", "test"])),
+        PolicyDecision::Allow { .. }
+    ));
+}
+
+// Only the built-in runner, with exactly its labels, is the runner: an
+// external execute-class capability stays out of scope.
+#[test]
+fn h2d_an_external_execute_capability_stays_out_of_scope() {
+    let m = fixture(vec![cap_json(
+        "run",
+        [
+            "execute",
+            "operational",
+            "own",
+            "none",
+            "third_party",
+            "none",
+        ],
+    )]);
+    let mut sp = spec(&["fixture.run"]);
+    sp.conformed = true;
+    let err = plan_over(&[m], &sp, &UserPolicy::default()).unwrap_err();
+    assert!(matches!(err, SessionRefused::OutOfScope { .. }), "{err:?}");
 }

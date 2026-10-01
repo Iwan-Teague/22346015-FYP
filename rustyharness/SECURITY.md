@@ -5,11 +5,14 @@ confinement fails closed, tool and model output is untrusted data, irreversible
 actions need a human yes, and results are decided by evidence. A way around any of
 these is a security bug.
 
-**Status:** H1, the read-only agent (design `docs/01-design-v0.1.md` §9). The
-`rustyharness` binary drives a model on loopback through read-only workspace tools
-and writes a hash-chained journal. Nothing the agent asks for executes: no sandbox
-backend has passed conformance, so no execute capability can be granted, and no
-provider outside the built-in one can be admitted.
+**Status:** H1, the read-only agent (design `docs/01-design-v0.1.md` §9), with
+H2 on an integration branch. The `rustyharness` binary drives a model on
+loopback through built-in workspace tools and writes a hash-chained journal. On
+that branch the agent can edit (H2b) and run allowlisted programs (H2d,
+`harness.exec.run`) only inside a sandbox backend that passed the conformance
+suite on the host (macOS Seatbelt, H2a/H2c); where none passes, a task that
+executes is refused before anything starts. No provider outside the built-in
+one can be admitted.
 
 In scope for reports today, a way to:
 
@@ -24,6 +27,16 @@ In scope for reports today, a way to:
   edit run without such a yes (a reused, forged or other-step approval), write
   outside the workspace, follow a symlink, edit a file changed since the run
   read it, or apply a completed edit again on resume (design rows H2b);
+- make a command run (on the H2d branch) other than: a program the task's exec
+  allowlist names, resolved by name to its pinned path (a shell only when the
+  task allowlists one; `sh -c` otherwise refused, INV-13), inside a conformed
+  sandbox (no unconfined fallback, INV-6), after policy allowed it or an
+  approver said yes to that exact call; get a command network access, a write
+  outside the workspace and the run's scratch directory, a read of the home
+  directory beyond the granted toolchain roots, the harness's environment, or
+  a process that outlives the call without the run stopping (the design's H2d
+  rows name the interim: a cleanup the harness cannot confirm stops the run);
+  make a resume or an audit run a completed command again;
 - read outside the workspace, beyond the residuals the design names (hard links,
   mount points inside the workspace and the check-then-open window, the
   design's H1e-2 "Read tools" row);

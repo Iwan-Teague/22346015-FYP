@@ -186,10 +186,11 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "harness.fs.list",
             "harness.edit.replace",
             "harness.edit.write",
+            "harness.exec.run",
             "harness.task.submit"
         ]
     );
-    let submit = &m.capabilities()[5];
+    let submit = &m.capabilities()[6];
     assert_eq!(
         (submit.effect, submit.sensitivity, submit.content),
         (Effect::Write, Sensitivity::Public, Content::Own)
@@ -251,6 +252,42 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
         .input_schema()
         .validate_args(&json!({"path": "new.rs"}))
         .is_err());
+    // H2d: the command runner is execute / operational / own / none, its
+    // content third-party (compiler and test output quote the workspace),
+    // and its schema takes an argv list and an optional cwd, nothing else.
+    let exec = &m.capabilities()[5];
+    assert_eq!(
+        (
+            exec.effect,
+            exec.sensitivity,
+            exec.blast_radius,
+            exec.egress
+        ),
+        (
+            Effect::Execute,
+            Sensitivity::Operational,
+            BlastRadius::Own,
+            Egress::None
+        )
+    );
+    assert_eq!(
+        (exec.content, exec.confirmation),
+        (Content::ThirdParty, Confirmation::None)
+    );
+    for ok in [
+        json!({"argv": ["cargo", "test"]}),
+        json!({"argv": ["cargo", "test", "-q"], "cwd": "crate"}),
+    ] {
+        assert!(exec.input_schema().validate_args(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"argv": "cargo test"}),
+        json!({"argv": ["cargo", 1]}),
+        json!({"cwd": "."}),
+        json!({"argv": ["cargo"], "shell": true}),
+    ] {
+        assert!(exec.input_schema().validate_args(&bad).is_err(), "{bad}");
+    }
     for c in m.capabilities().iter().take(3) {
         assert_eq!(c.effect, Effect::Read, "{}", c.id);
         assert_eq!(c.sensitivity, Sensitivity::Operational, "{}", c.id);

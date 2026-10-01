@@ -3,10 +3,13 @@
 //! Both re-drive the SAME loop as a live run over what a journal recorded:
 //! the recorded model replies through `ReplayBackend` (which re-renders each
 //! request and refuses one whose digest differs), the recorded tool results
-//! in place of running the tools, and the recorded render nonces, so every
-//! request renders byte for byte. Everything else is recomputed: the
-//! context (its digest is journaled as `ContextBuilt`), the parse, loop
-//! detection, every policy decision, the meter.
+//! in place of running the tools, and the recorded observation nonces (each
+//! journaled once, with the request that first showed its observation, and
+//! re-fed by the observation's step: design row H1i), so every request
+//! renders byte for byte. Everything else is recomputed: the context (its
+//! digest is journaled as `ContextBuilt`), which observations and replies
+//! are withheld, the parse, loop detection, every policy decision, the
+//! meter.
 //!
 //! **Audit** ([`audit`]) writes what it recomputes into a fresh journal,
 //! `runs/<run-id>/replay-<k>/`, next to the attempts (never inside one),
@@ -99,7 +102,7 @@ use harness_journal::{
     Verified,
 };
 use harness_manifest::admission::{Registry, Resolved};
-use harness_model::context::CONTEXT_FORMAT;
+use harness_model::context::{Renderings, CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol};
 use harness_model::replay::{payload_bytes, ReplayBackend};
 use harness_model::{Completion, ModelBackend, ModelError, ModelIdentity, ModelRequest};
@@ -111,9 +114,10 @@ use serde_json::{Map, Value};
 
 use crate::approve::{nonce_bytes, Approver, ApproverKind, RecordedApproval};
 use crate::driver::{
-    attempt_check, builtin_manifest_sha256, commit, facts_block, header, is_edit, limits_fields,
-    new_meter, new_meter_resumed, plan, prepare, Approvals, HeaderInputs, Loop, NonceSource,
-    Prepared, ReadLog, RecordedEdit, RecordedResult, HEADER_INPUT_KEYS,
+    attempt_check, builtin_manifest_sha256, commit, exec_tools, facts_block, header, is_edit,
+    is_exec, limits_fields, new_meter, new_meter_resumed, parse_exec, plan, prepare, Approvals,
+    ExecHeader, HeaderInputs, Loop, NonceSource, Prepared, ReadLog, RecordedEdit, RecordedResult,
+    SandboxRecord, HEADER_INPUT_KEYS,
 };
 use crate::sample;
 
@@ -143,7 +147,8 @@ fn diverge(seq: u64, step: u64, why: &'static str) -> Divergence {
 /// The replay inputs recorded in a journal.
 struct Recorded {
     backend: ReplayBackend,
-    nonces: VecDeque<Nonce>,
+    /// Each observation's nonce, by the step of the observation (H1i).
+    nonces: BTreeMap<u64, Nonce>,
     feed: VecDeque<RecordedResult>,
     /// The approvers' recorded answers, in order (H2b).
     approvals: VecDeque<RecordedApproval>,
@@ -212,7 +217,7 @@ fn recorded(
 ) -> Result<Recorded, Divergence> {
     let backend = ReplayBackend::from_journal(v, blobs, profile.clone())
         .map_err(|_| diverge(0, 0, "the model records cannot be replayed"))?;
-    let mut nonces = VecDeque::new();
+    let mut nonces = BTreeMap::new();
     let mut feed = VecDeque::new();
     let mut approvals = VecDeque::new();
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
@@ -223,15 +228,20 @@ fn recorded(
     for r in &v.records {
         let bad = || diverge(r.seq, r.step, "a record is not the shape the loop writes");
         match r.kind {
-            EventKind::ModelRequested => {
-                let n = r
-                    .body
-                    .get("nonce")
-                    .and_then(Value::as_str)
-                    .and_then(Nonce::new)
-                    .ok_or_else(bad)?;
-                nonces.push_back(n);
-            }
+            // The nonce drawn for the observation a request showed first
+            // (H1i), re-fed at that observation's first render. Whether an
+            // observation was withheld is recomputed, not re-fed.
+            EventKind::ModelRequested => match (r.body.get("nonce"), r.body.get("nonce_step")) {
+                (None, None) => {}
+                (Some(n), Some(s)) => {
+                    let n = n.as_str().and_then(Nonce::new).ok_or_else(bad)?;
+                    let s = s.as_u64().ok_or_else(bad)?;
+                    if nonces.insert(s, n).is_some() {
+                        return Err(bad());
+                    }
+                }
+                _ => return Err(bad()),
+            },
             EventKind::ToolStarted => {
                 let cap = r
                     .body
@@ -312,6 +322,22 @@ fn recorded(
                 if r.body.contains_key("read_sha256") && status != Some(ToolStatus::Ok) {
                     return Err(bad());
                 }
+                // A command's record (H2d): only on the runner's result, in
+                // exactly the shape the loop writes, with the tree digest
+                // measured after it where there was one; nothing else
+                // carries either.
+                let exec = match r.body.get("exec") {
+                    None if r.body.contains_key("workspace_tree") => return Err(bad()),
+                    None => None,
+                    Some(_) if !is_exec(&cap) || status.is_none() => return Err(bad()),
+                    Some(v) => {
+                        let tree = match r.body.get("workspace_tree") {
+                            None => None,
+                            Some(_) => Some(digest_at(&r.body, "workspace_tree").ok_or_else(bad)?),
+                        };
+                        Some((parse_exec(v).ok_or_else(bad)?, tree))
+                    }
+                };
                 let environment = match (sampled, r.body.get("environment")) {
                     (true, Some(v)) => Some(sample::from_value(v).ok_or_else(bad)?),
                     (false, None) => None,
@@ -326,6 +352,7 @@ fn recorded(
                     read_sha256: digest_at(&r.body, "read_sha256"),
                     environment,
                     edit,
+                    exec,
                 });
             }
             EventKind::ApprovalGranted | EventKind::ApprovalDenied | EventKind::ApprovalExpired => {
@@ -350,6 +377,7 @@ fn recorded(
             read_sha256: None,
             environment: None,
             edit: Some(e),
+            exec: None,
         });
     }
     Ok(Recorded {
@@ -407,7 +435,18 @@ fn expected_inputs(
         "builtin_manifest".into(),
         Value::from(builtin_manifest_sha256().to_string()),
     );
-    m.insert("shell_enabled".into(), Value::Bool(false));
+    // The exec allowlist (H2d): whether a shell is on it, and the spec's
+    // digest; no `exec` key without one, as the header writes it.
+    m.insert(
+        "shell_enabled".into(),
+        Value::Bool(spec.exec.as_ref().is_some_and(|e| e.shell_enabled())),
+    );
+    if let Some(e) = &spec.exec {
+        let mut o = Map::new();
+        o.insert("spec".into(), Value::from(e.digest().to_string()));
+        o.insert("programs".into(), Value::from(e.programs.len() as u64));
+        m.insert("exec".into(), Value::Object(o));
+    }
     m.insert("context_format".into(), Value::from(CONTEXT_FORMAT));
     m.insert(
         "limits".into(),
@@ -445,13 +484,16 @@ fn header_mismatch(key: &str) -> &'static str {
         "policy" => "the policy given differs from the recorded header",
         "checks" => "the verification plan differs from the recorded header",
         "limits" => "the budget limits given differ from the recorded header",
-        "builtin_manifest" | "shell_enabled" => {
-            "another harness build wrote this journal (its built-in manifest or shell setting differs)"
+        "builtin_manifest" => {
+            "another harness build wrote this journal (its built-in manifest differs)"
         }
+        "shell_enabled" | "exec" => "the exec allowlist given differs from the recorded header",
         "context_format" => {
             "another harness build wrote this journal (its context format differs: since H1h the \
-             native protocol shows past actions as tool calls, so an older journal's contexts \
-             cannot be recomputed; audit it with the build that wrote it)"
+             native protocol shows past actions as tool calls, and since H1i each observation \
+             keeps its own delimiter nonce and the context is append-mostly, so an older \
+             journal's contexts and requests cannot be recomputed; audit it with the build that \
+             wrote it)"
         }
         _ => "a header input differs from the recorded header",
     }
@@ -894,8 +936,52 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
             None,
         ));
     };
-    let (session, tools) = plan(a.spec, a.registry, a.policy, a.profile, approver_present)
-        .map_err(AuditRefused::Plan)?;
+    // Whether the run held a sandbox witness is the run's (H2d), like the
+    // approver's presence: the audit plans with the recorded value and
+    // re-states the recorded sandbox in its own header; nothing runs here.
+    let exec_header = match (&a.spec.exec, head.body.get("sandbox")) {
+        (None, _) => None,
+        (Some(e), Some(sb)) => {
+            let rec = SandboxRecord::parse(sb);
+            let sha = digest_at(&head.body, "exec_programs_sha256");
+            let timeout = head.body.get("exec_timeout_ms").and_then(Value::as_u64);
+            match (rec, sha, timeout) {
+                (Some(sandbox), Some(programs_sha256), Some(timeout_ms)) => Some(ExecHeader {
+                    sandbox,
+                    shell_enabled: e.shell_enabled(),
+                    spec: e.digest(),
+                    programs: e.programs.len() as u64,
+                    programs_sha256,
+                    timeout_ms,
+                }),
+                _ => {
+                    return Ok(failed(
+                        diverge(
+                            0,
+                            0,
+                            "the header's sandbox or exec record is not one this build writes",
+                        ),
+                        None,
+                    ))
+                }
+            }
+        }
+        (Some(_), None) => {
+            return Ok(failed(
+                diverge(0, 0, "the header does not say which sandbox the run held"),
+                None,
+            ))
+        }
+    };
+    let (session, tools) = plan(
+        a.spec,
+        a.registry,
+        a.policy,
+        a.profile,
+        approver_present,
+        exec_header.is_some(),
+    )
+    .map_err(AuditRefused::Plan)?;
     let hdr = header(&HeaderInputs {
         spec: a.spec,
         registry: a.registry,
@@ -910,6 +996,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         environment,
         environment_recorded: true,
         approver_present,
+        exec: exec_header,
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)
@@ -940,6 +1027,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         step: 0,
         nonces: NonceSource {
             recorded: rec.nonces,
+            assigned: Renderings::new(),
         },
         feed: rec.feed,
         reads: ReadLog::default(),
@@ -1070,6 +1158,10 @@ pub struct Resume<'a> {
     /// the interrupted run had one (the header's `approver_present`), or the
     /// resume is refused: it decides every ask.
     pub approver: Option<&'a dyn Approver>,
+    /// Where commands are confined after the catch-up (H2d): a run with an
+    /// exec grant needs a witness again, obtained before anything is
+    /// written; the catch-up itself never runs a recorded command again.
+    pub confinement: Option<&'a dyn harness_sandbox::Confinement>,
 }
 
 /// The attempt a resume continues: the latest one holding evidence. Passed
@@ -1114,6 +1206,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         r.probe,
         r.config,
         r.approver.is_some(),
+        r.confinement,
     )?;
     let nope = RunRefused::NotResumable;
     let run_dir = layout::run_dir(&pre.state_root, r.run);
@@ -1175,11 +1268,13 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
     let Some(start) = recorded_facts(head) else {
         return Err(nope("the last attempt's header lacks the workspace facts"));
     };
+    // The last tree digest a kept record states: an edit's `EditApplied`,
+    // or a command's `ToolFinished` (H2d: measured after the command).
     let expected = kept
         .records
         .iter()
         .rev()
-        .filter(|x| x.kind == EventKind::EditApplied)
+        .filter(|x| matches!(x.kind, EventKind::EditApplied | EventKind::ToolFinished))
         .find_map(|x| digest_at(&x.body, "workspace_tree"))
         .unwrap_or(start.tree);
     if pre.facts.tree != expected {
@@ -1188,6 +1283,15 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
              applied without its result, or a change made outside the run); this build keeps no \
              snapshot to restore",
         ));
+    }
+    // The allowlisted programs must be the ones the run started with (H2d):
+    // their content was measured then and is measured again now.
+    if let Some((p, _)) = &pre.exec {
+        if digest_at(&head.body, "exec_programs_sha256") != Some(p.programs_digest()) {
+            return Err(nope(
+                "the allowlisted programs differ from the ones the run started with (their content digest changed)",
+            ));
+        }
     }
     let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
     let rec = recorded(&kept, &blobs, r.profile)
@@ -1218,7 +1322,12 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         environment: r.env.sample(),
         environment_recorded: false,
         approver_present: r.approver.is_some(),
+        exec: pre
+            .exec
+            .as_ref()
+            .map(|(p, w)| ExecHeader::live(p, w, r.config)),
     })?;
+    let exec = exec_tools(&pre, &run_dir, r.confinement, r.config)?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
         r.run.clone(),
@@ -1238,7 +1347,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         facts: facts_block(&start),
         profile: r.profile,
         backend: &chain,
-        providers: Prepared::providers(pre.read_tools, pre.edit_tools),
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec),
         meter: new_meter_resumed(
             r.config.limits.clone(),
             Box::new(SystemClock::default()),
@@ -1250,6 +1359,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         step: 0,
         nonces: NonceSource {
             recorded: rec.nonces,
+            assigned: Renderings::new(),
         },
         feed: rec.feed,
         reads: ReadLog::default(),

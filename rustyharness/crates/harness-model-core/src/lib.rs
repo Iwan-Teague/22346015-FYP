@@ -106,6 +106,12 @@ impl TaskText {
 /// [`Message::ToolResult`] or [`Message::ToolNotice`] with the same id), so
 /// the model sees its history in the form it is asked to reply in (design
 /// row H1h).
+///
+/// **Each observation carries its own delimiter nonce (design row H1i).**
+/// It is drawn when the observation is first rendered and reused every time
+/// it is shown again, so a past observation renders to the same bytes in
+/// every later request (the server's prompt cache can keep it), while a new
+/// one still gets a nonce nothing could predict when its output was made.
 #[derive(Debug)]
 pub enum Message {
     /// Harness rules, protocol spec, tool definitions.
@@ -120,6 +126,8 @@ pub enum Message {
         call: String,
         /// Its output.
         body: Untrusted<String>,
+        /// Its delimiter nonce (drawn at its first render, H1i).
+        nonce: RenderNonce,
     },
     /// Native protocol: a past action, shown as the model's own tool call.
     /// It is the harness's rendering of the action it parsed and acted on
@@ -145,6 +153,8 @@ pub enum Message {
         call: String,
         /// Its output.
         body: Untrusted<String>,
+        /// Its delimiter nonce (drawn at its first render, H1i).
+        nonce: RenderNonce,
     },
     /// Native protocol: the harness's own answer to a [`Message::ToolCall`]
     /// that produced no tool output (a policy denial, a provider failure).
@@ -211,20 +221,20 @@ impl ToolSpec {
     }
 }
 
-/// The per-turn delimiter nonce (§2.3). It lives in `harness-core` (as
-/// [`harness_core::Nonce`]) because it is one of the few values the journal
-/// may carry as trusted text (NF-C: `TrustedName` is sealed to core types).
+/// An observation's delimiter nonce (§2.3; one per observation since H1i).
+/// It lives in `harness-core` (as [`harness_core::Nonce`]) because it is
+/// one of the few values the journal may carry as trusted text (NF-C:
+/// `TrustedName` is sealed to core types).
 pub use harness_core::Nonce as RenderNonce;
 
-/// One model request.
+/// One model request. Its observations carry their own nonces (H1i); the
+/// request has none of its own.
 #[derive(Debug)]
 pub struct ModelRequest {
     /// The context, in order.
     pub messages: Vec<Message>,
     /// The active tools.
     pub tools: Vec<ToolSpec>,
-    /// This turn's delimiter nonce.
-    pub nonce: RenderNonce,
 }
 
 /// A tool call as the server returned it (native protocol). Untrusted.
@@ -284,6 +294,15 @@ pub struct Completion {
     /// HTTP statuses of failed attempts retried before this success (§3.2:
     /// each attempt is recorded).
     pub retried: Vec<u16>,
+    /// What the server reported about its prompt cache and its timings for
+    /// this reply (design row H1i), as compact JSON text: the numeric
+    /// entries of OpenAI-style `usage.prompt_tokens_details` (such as
+    /// `cached_tokens`) and of llama.cpp's `timings` (such as `cache_n`,
+    /// `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`), under those
+    /// names. Server claims: journaled as untrusted data, for the
+    /// prefill/generation split of RQ2, and never used for a decision.
+    /// `None` when the server reported neither.
+    pub server_stats: Option<Untrusted<String>>,
 }
 
 /// Why a transport attempt did not produce a reply.

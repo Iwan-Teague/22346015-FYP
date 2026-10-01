@@ -82,6 +82,7 @@ fn spec(task: &str) -> TaskSpec {
         task: TaskText::new(task.into()),
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
+        exec: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn go(state: &Path, ws: &Path, replies: Vec<Result<Completion, ModelError>>) -> 
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
     .unwrap()
 }
@@ -451,6 +453,7 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
         env: &FIXED_ENV,
         config: &config,
         approver: None,
+        confinement: None,
     })
     .unwrap();
     assert_eq!(r.cause, StopCause::Budget(harness_core::BudgetDim::Wall));
@@ -562,6 +565,7 @@ fn resume_under(
         env: &FIXED_ENV,
         config,
         approver: None,
+        confinement: None,
     })
 }
 
@@ -1407,6 +1411,7 @@ fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
     .unwrap_err();
     assert!(matches!(e, RunRefused::Start(_)), "{e:?}");

@@ -62,6 +62,7 @@ impl ToolProvider for Spy {
             digest: sha256(b"file text"),
             read: None,
             edit: None,
+            exec: None,
         })
     }
 }
@@ -85,6 +86,8 @@ fn session() -> Session {
             workspace: Some(WorkspaceDecl::default()),
             approver_present: false,
             personal_data_granted: false,
+            conformed: false,
+            exec_programs: Vec::new(),
         },
         &reg,
         &UserPolicy::default(),

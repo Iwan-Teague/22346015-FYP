@@ -198,6 +198,7 @@ fn cli(args: &[&str], local: bool, marker: &Path) -> Output {
                 out: RefCell::new(&mut out),
                 err: RefCell::new(&mut err),
                 approver: harness_cli::ApproverSource::None,
+                confinement: &harness_sandbox::SystemConfinement,
             };
             harness_cli::main_with(&cx, args)
         };
@@ -640,6 +641,7 @@ fn an_approver_given_to_the_cli_approves_an_edit() {
             out: RefCell::new(&mut out),
             err: RefCell::new(&mut err),
             approver: harness_cli::ApproverSource::Given(&Yes),
+            confinement: &harness_sandbox::SystemConfinement,
         };
         harness_cli::main_with(&cx, &run_args(&fx, &ep))
     };
@@ -648,6 +650,175 @@ fn an_approver_given_to_the_cli_approves_an_edit() {
         std::fs::read_to_string(fx.ws.join("a.txt")).unwrap(),
         "the reply is in here\n"
     );
+}
+
+// ---- H2d: commands through the CLI ---------------------------------------------------
+
+/// The exec task: run one perl command that writes a file, then submit.
+/// The task file pins perl by path, declares one variable and two limits.
+fn exec_fixture(name: &str) -> (Fx, PathBuf) {
+    let fx = fixture(name);
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"Write ran.txt.","grants":["harness.fs.read","harness.exec.run"],
+  "exec":{"programs":[{"name":"perl","path":"/usr/bin/perl"}],"env":{"RH_TASK":"1"},
+          "limits":{"memory_mib":1024,"processes":64}}}"#,
+    )
+    .unwrap();
+    let allow = fx.base.join("allow-exec.json");
+    std::fs::write(&allow, r#"{"allow":["harness.exec.run"]}"#).unwrap();
+    (fx, allow)
+}
+
+fn exec_replies() -> Vec<String> {
+    vec![
+        act(
+            "harness.exec.run",
+            r#"{"argv":["perl","-e","open(my $f, q{>}, q{ran.txt}) or die; print $f $ENV{RH_TASK}"]}"#,
+        ),
+        act("harness.task.submit", r#"{"note":"ran"}"#),
+    ]
+}
+
+/// INV-6 through the CLI: a task that executes, on a host whose
+/// confinement refuses, exits 3 with an Indeterminate report and writes
+/// nothing; the model server is checked but never asked for a step.
+#[test]
+fn a_task_that_executes_without_confinement_exits_3_and_writes_nothing() {
+    let (fx, allow) = exec_fixture("exec-refused");
+    // A program that pins on every OS (never run: the refusal comes
+    // first), so Windows reaches the refusal path too.
+    let tools = fx.base.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("tool"), b"#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tools.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let tools = std::fs::canonicalize(&tools).unwrap();
+    let task = serde_json::json!({
+        "task": "Write ran.txt.",
+        "grants": ["harness.fs.read", "harness.exec.run"],
+        "exec": {
+            "programs": [{"name": "perl", "path": tools.join("tool")}],
+            "read_only": [tools],
+        },
+    });
+    std::fs::write(&fx.task, task.to_string()).unwrap();
+    let m = mock(exec_replies());
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+    let refuse = harness_sandbox::NoConfinement(harness_sandbox::Unavailable {
+        backend: None,
+        reason: harness_sandbox::UnavailableReason::NoBackendForOs,
+    });
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = {
+        let cx = harness_cli::Cx {
+            probe: &Local,
+            gate_ok_file: Some(fx.marker.clone()),
+            out: RefCell::new(&mut out),
+            err: RefCell::new(&mut err),
+            approver: harness_cli::ApproverSource::None,
+            confinement: &refuse,
+        };
+        harness_cli::main_with(&cx, &args)
+    };
+    let o = Output {
+        code: i32::from(code),
+        stdout: out,
+        stderr: err,
+    };
+    assert_eq!(o.code(), Some(3), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        report(&o)["outcome"]["Indeterminate"]["why"],
+        "UnsupportedOs"
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no confinement backend"));
+    assert!(!fx.state.join("runs").exists());
+    assert!(!fx.ws.join("ran.txt").exists());
+    assert!(!fx.marker.exists());
+}
+
+/// A malformed exec section is unreadable input (exit 4), like any other.
+#[test]
+fn a_malformed_exec_section_is_unreadable_input() {
+    let (fx, _) = exec_fixture("exec-malformed");
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"x","grants":["harness.exec.run"],"exec":{"programz":[]}}"#,
+    )
+    .unwrap();
+    let o = cli(&run_args(&fx, "http://127.0.0.1:9/v1"), true, &fx.marker);
+    assert_eq!(o.code(), Some(4), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(report(&o)["outcome"]["Indeterminate"]["why"], "CouldNotRun");
+}
+
+/// §5.2 for commands, through the real binary (its confinement is the
+/// production `SystemConfinement`): an unattended run executes only when
+/// its policy file allows the runner; without one the command is denied
+/// and nothing ran. With it, the command ran confined, with the task's
+/// variable, and the anchored replay matches without running it again.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unattended_run_executes_only_when_its_policy_allows_the_runner() {
+    for with_policy in [true, false] {
+        let (fx, allow) = exec_fixture(&format!("exec-policy-{with_policy}"));
+        let m = mock(exec_replies());
+        let ep = format!("http://127.0.0.1:{}/v1", m.port);
+        let mut args = run_args(&fx, &ep);
+        if with_policy {
+            args.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+        }
+        let o = cli(&args, false, &fx.marker);
+        assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+        let id = run_id(&o);
+        let rules = decided_rules(&fx, &id);
+        if !with_policy {
+            assert_eq!(rules[0], "deny.no-approver");
+            assert!(!fx.ws.join("ran.txt").exists());
+            continue;
+        }
+        assert_eq!(rules[0], "user", "a user allow rule: {rules:?}");
+        assert_eq!(std::fs::read_to_string(fx.ws.join("ran.txt")).unwrap(), "1");
+        std::fs::remove_file(fx.ws.join("ran.txt")).unwrap();
+        let head = String::from_utf8(o.stdout.clone())
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("chain_head ")
+            .unwrap()
+            .to_owned();
+        let rp = cli(
+            &[
+                "replay",
+                "--run",
+                &id,
+                "--task",
+                fx.task.to_str().unwrap(),
+                "--state-root",
+                fx.state.to_str().unwrap(),
+                "--profile",
+                fx.profile.to_str().unwrap(),
+                "--anchor",
+                &head,
+                "--policy",
+                allow.to_str().unwrap(),
+            ],
+            true,
+            &fx.marker,
+        );
+        assert!(
+            String::from_utf8_lossy(&rp.stderr).contains(REPLAY_MATCHED),
+            "{}",
+            String::from_utf8_lossy(&rp.stderr)
+        );
+        assert!(!fx.ws.join("ran.txt").exists(), "the replay ran nothing");
+    }
 }
 
 #[test]

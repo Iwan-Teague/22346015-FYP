@@ -20,7 +20,7 @@ use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{parse_reply, FormatError};
 use harness_model::{
     FinishReason, HarnessText, Message, ModelBackend, ModelError, ModelRequest, RenderNonce,
-    TaskText, ToolSpec, Unavailable,
+    TaskText, ToolCallId, ToolSpec, Unavailable,
 };
 
 #[derive(Clone)]
@@ -582,4 +582,85 @@ fn the_startup_check_records_what_the_server_claims() {
     assert_eq!(claimed.model_id.as_deref(), Some("local-model"));
     assert_eq!(claimed.server.as_deref(), Some("llama.cpp b9999"));
     assert_eq!(claimed.template_sha256, None);
+}
+
+// ---- H1h: native tool history through the real client -----------------------------
+
+/// The bytes the server receives (design row H1h): each past action is an
+/// assistant message with `tool_calls` (harness-made id, wire name,
+/// canonical arguments), answered by the next message, a `role: "tool"`
+/// message with the same `tool_call_id` and the output inside the
+/// untrusted delimiters; `parallel_tool_calls: false` beside the tools when
+/// the profile says so. The id the server puts on its own call is not read
+/// (a completion's call has a name and arguments only), so nothing the
+/// server chose can become a history id.
+#[test]
+fn native_tool_history_goes_on_the_wire_as_tool_calls_and_tool_messages() {
+    let body = sse(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"server-chosen","type":"function","function":{"name":"harness_fs_read","arguments":"{\"path\":\"b\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]);
+    let m = mock(vec![Behave::Respond(chunked("text/event-stream", &body))]);
+    let profile = Profile::parse(
+        br#"{"profile_version":1,"id":"n","model":"local-model","context_window":8192,
+        "fill_ratio":0.6,"protocol":"native","tool_choice_required_ok":false,
+        "parallel_tool_calls_false_ok":true,"grammar":"none","max_active_tools":5,
+        "edit_format":"replace","recent_turns":4,
+        "sampling":{"temperature":0.2,"top_p":0.95,"max_tokens":1024}}"#,
+    )
+    .unwrap();
+    let c = OpenAiCompatible::new(
+        &format!("http://127.0.0.1:{}/v1", m.port),
+        profile,
+        None,
+        config(),
+    )
+    .unwrap();
+    let nonce = "00112233445566778899aabbccddeeff";
+    let req = ModelRequest {
+        messages: vec![
+            Message::System(HarnessText::from_static("rules")),
+            Message::Task(TaskText::new("read a, then b".into())),
+            Message::ToolCall {
+                id: ToolCallId::for_step(1),
+                tool: "harness.fs.read".into(),
+                arguments: Untrusted::new("{\"path\":\"a\"}".into(), Source::Model),
+                content: Untrusted::new(String::new(), Source::Model),
+            },
+            Message::ToolResult {
+                id: ToolCallId::for_step(1),
+                call: "harness.fs.read".into(),
+                body: Untrusted::new("alpha".into(), Source::Tool("harness.fs.read".into())),
+            },
+        ],
+        tools: tools(),
+        nonce: RenderNonce::new(nonce).unwrap(),
+    };
+    let completion = c.complete(&req, soon()).unwrap();
+    let call = completion.tool_calls[0].inspect("test");
+    assert_eq!(
+        (call.name.as_str(), call.arguments.as_str()),
+        ("harness_fs_read", "{\"path\":\"b\"}")
+    );
+    let parsed = parse_reply(&completion, Protocol::Native, &tools()).unwrap();
+    assert_eq!(parsed.action.tool, "harness.fs.read");
+
+    let raw = String::from_utf8(m.requests.lock().unwrap()[0].clone()).unwrap();
+    let (_, sent) = raw.split_once("\r\n\r\n").unwrap();
+    let v: serde_json::Value = serde_json::from_str(sent).unwrap();
+    assert_eq!(
+        v["messages"][2],
+        serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call00001", "type": "function",
+            "function": {"name": "harness_fs_read", "arguments": "{\"path\":\"a\"}"}}]})
+    );
+    assert_eq!(
+        v["messages"][3],
+        serde_json::json!({"role": "tool", "tool_call_id": "call00001", "content":
+            format!("<<untrusted {nonce}>>\nresult of harness.fs.read:\nalpha\n<</untrusted {nonce}>>")})
+    );
+    assert_eq!(v["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(v["parallel_tool_calls"], serde_json::Value::Bool(false));
+    assert_eq!(v["tools"][0]["function"]["name"], "harness_fs_read");
 }

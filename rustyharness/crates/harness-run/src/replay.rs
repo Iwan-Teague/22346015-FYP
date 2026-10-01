@@ -45,18 +45,28 @@
 //! (a crash or a kill) in a NEW attempt directory: the old journal is only
 //! read, never appended to, poisoned or not. Its header records the attempt
 //! it continues and that journal's chain head. The new attempt first
-//! replays every step of the old one except the last (catch-up: recorded
-//! replies and tool results re-fed; each model request the catch-up
-//! renders must have its recorded digest, but the other records it
-//! recomputes are NOT compared with the old attempt's: to check those,
-//! audit the old attempt, `replay --attempt <n>`; H1 phase-exit review
-//! F-3), then runs the last step again live, so a trailing intent with no
-//! result is decided again by policy, never executed blindly. A request
-//! that differs makes the resumed run `Indeterminate
+//! replays every COMPLETED step of the old one (catch-up: recorded
+//! replies, tool results, edits and approvals re-fed; each model request
+//! the catch-up renders must have its recorded digest, but the other
+//! records it recomputes are NOT compared with the old attempt's: to check
+//! those, audit the old attempt, `replay --attempt <n>`; H1 phase-exit
+//! review F-3). A step is completed when its call has a durable
+//! `ToolFinished` (H2b, the H1e-2b row's H2 condition): it is re-fed and
+//! never run again, so a completed edit is never repeated. Only a last step
+//! the crash cut (a trailing intent without a result, or no call yet) runs
+//! again live, so policy decides it again, never executing it blindly. A
+//! request that differs makes the resumed run `Indeterminate
 //! { UnreadableEvidence }`. The header inputs, the budget limits included,
-//! must equal the recorded ones, or the resume is refused. H1 sessions
-//! cannot change the workspace, so the snapshot of §2.10 is the recorded
-//! tree digest: a resume is refused when the workspace no longer has it.
+//! must equal the recorded ones, and the approver's presence too, or the
+//! resume is refused. The harness keeps no content snapshot to restore
+//! (materialisation, H2), so the snapshot of §2.10 is a tree digest: the
+//! workspace must hold the one the kept records end with (the last
+//! `EditApplied`'s, or the header's), and a resume is refused otherwise
+//! (an edit applied without its result, or a change made outside the run).
+//! The resumed header carries the run-start facts, so block 4 renders as
+//! it did. An attempt with no header (a start that failed) and a resumed
+//! attempt that stopped at its header are passed over and named (H1
+//! phase-exit review F-5).
 //! The wall time the interrupted attempt spent (its journal's last
 //! monotonic time, the writer's elapsed time) is charged to the resumed
 //! attempt's meter from the start, so a kill and resume buys no fresh wall
@@ -89,6 +99,7 @@ use harness_journal::{
     Verified,
 };
 use harness_manifest::admission::{Registry, Resolved};
+use harness_model::context::CONTEXT_FORMAT;
 use harness_model::profile::{Profile, Protocol};
 use harness_model::replay::{payload_bytes, ReplayBackend};
 use harness_model::{Completion, ModelBackend, ModelError, ModelIdentity, ModelRequest};
@@ -98,10 +109,11 @@ use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::{RefusalKind, ToolStatus};
 use serde_json::{Map, Value};
 
+use crate::approve::{nonce_bytes, Approver, ApproverKind, RecordedApproval};
 use crate::driver::{
-    attempt_check, builtin_manifest_sha256, commit, facts_block, header, limits_fields, new_meter,
-    new_meter_resumed, plan, prepare, HeaderInputs, Loop, NonceSource, ReadLog, RecordedResult,
-    HEADER_INPUT_KEYS,
+    attempt_check, builtin_manifest_sha256, commit, facts_block, header, is_edit, limits_fields,
+    new_meter, new_meter_resumed, plan, prepare, Approvals, HeaderInputs, Loop, NonceSource,
+    Prepared, ReadLog, RecordedEdit, RecordedResult, HEADER_INPUT_KEYS,
 };
 use crate::sample;
 
@@ -133,6 +145,41 @@ struct Recorded {
     backend: ReplayBackend,
     nonces: VecDeque<Nonce>,
     feed: VecDeque<RecordedResult>,
+    /// The approvers' recorded answers, in order (H2b).
+    approvals: VecDeque<RecordedApproval>,
+}
+
+/// A recorded approval answer, in exactly the shape the loop writes: the
+/// capability, argument digest and tier of every approval record, then the
+/// approver kind (granted, denied) and the nonce (granted).
+fn approval_of(r: &Record) -> Option<RecordedApproval> {
+    let b = &r.body;
+    let mut keys = vec!["capability", "args", "tier"];
+    match r.kind {
+        EventKind::ApprovalGranted => keys.extend(["approver", "nonce", "scope"]),
+        EventKind::ApprovalDenied => keys.push("approver"),
+        _ => {}
+    }
+    if b.len() != keys.len() || !keys.iter().all(|k| b.contains_key(*k)) {
+        return None;
+    }
+    digest_at(b, "args")?;
+    b.get("capability")?.as_str()?;
+    b.get("tier")?.as_str()?;
+    let kind = || ApproverKind::parse(b.get("approver")?.as_str()?);
+    Some(match r.kind {
+        EventKind::ApprovalGranted => {
+            if b.get("scope")?.as_str()? != "once" {
+                return None;
+            }
+            RecordedApproval::Granted {
+                kind: kind()?,
+                nonce: nonce_bytes(b.get("nonce")?.as_str()?)?,
+            }
+        }
+        EventKind::ApprovalDenied => RecordedApproval::Denied { kind: kind()? },
+        _ => RecordedApproval::Expired,
+    })
 }
 
 fn status_of(b: &Map<String, Value>) -> Option<Option<ToolStatus>> {
@@ -167,7 +214,12 @@ fn recorded(
         .map_err(|_| diverge(0, 0, "the model records cannot be replayed"))?;
     let mut nonces = VecDeque::new();
     let mut feed = VecDeque::new();
+    let mut approvals = VecDeque::new();
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
+    // `EditApplied` records waiting for their `ToolFinished` (H2b), by the
+    // intent they answer, with the record's own seq.
+    let mut edits: BTreeMap<u64, (u64, RecordedEdit)> = BTreeMap::new();
+    let last_seq = v.records.last().map_or(0, |r| r.seq);
     for r in &v.records {
         let bad = || diverge(r.seq, r.step, "a record is not the shape the loop writes");
         match r.kind {
@@ -188,6 +240,39 @@ fn recorded(
                     .ok_or_else(bad)?;
                 intents.insert(r.seq, cap.to_owned());
             }
+            EventKind::EditApplied => {
+                // The loop writes one for a verified edit, right before its
+                // result: an edit intent's, with the path as an untrusted
+                // payload, `before` only when the file existed, and the
+                // after and tree digests.
+                let seq = r
+                    .body
+                    .get("intent_seq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(bad)?;
+                let cap = intents.get(&seq).ok_or_else(bad)?;
+                let shape = r.body.keys().all(|k| {
+                    matches!(
+                        k.as_str(),
+                        "intent_seq" | "path" | "before" | "after" | "workspace_tree"
+                    )
+                });
+                if !is_edit(cap) || !shape || !r.body.contains_key("path") {
+                    return Err(bad());
+                }
+                let before = match r.body.get("before") {
+                    None => None,
+                    Some(_) => Some(digest_at(&r.body, "before").ok_or_else(bad)?),
+                };
+                let e = RecordedEdit {
+                    before,
+                    after: digest_at(&r.body, "after").ok_or_else(bad)?,
+                    tree: digest_at(&r.body, "workspace_tree").ok_or_else(bad)?,
+                };
+                if edits.insert(seq, (r.seq, e)).is_some() {
+                    return Err(bad());
+                }
+            }
             EventKind::ToolFinished => {
                 let seq = r
                     .body
@@ -195,10 +280,16 @@ fn recorded(
                     .and_then(Value::as_u64)
                     .ok_or_else(bad)?;
                 let cap = intents.get(&seq).ok_or_else(bad)?.clone();
+                let edit = edits.remove(&seq).map(|(_, e)| e);
                 if cap == SUBMIT_ID {
                     continue;
                 }
                 let status = status_of(&r.body).ok_or_else(bad)?;
+                // An ok edit has exactly its `EditApplied`, nothing else has
+                // one (H2b).
+                if edit.is_some() != (is_edit(&cap) && status == Some(ToolStatus::Ok)) {
+                    return Err(bad());
+                }
                 let (output, truncated, digest) = if status.is_some() {
                     let out = payload_bytes(r.body.get("output").ok_or_else(bad)?, blobs, r.seq)
                         .map_err(|_| bad())?;
@@ -234,15 +325,38 @@ fn recorded(
                     digest,
                     read_sha256: digest_at(&r.body, "read_sha256"),
                     environment,
+                    edit,
                 });
+            }
+            EventKind::ApprovalGranted | EventKind::ApprovalDenied | EventKind::ApprovalExpired => {
+                approvals.push_back(approval_of(r).ok_or_else(bad)?);
             }
             _ => {}
         }
+    }
+    // An `EditApplied` with no result can only be the journal's last record:
+    // a crash between the two. Re-fed as the edit it records (its result's
+    // own fields were never written, so nothing after it is compared).
+    for (seq, (at, e)) in edits {
+        if at != last_seq {
+            return Err(diverge(at, 0, "a record is not the shape the loop writes"));
+        }
+        feed.push_back(RecordedResult {
+            capability: intents.get(&seq).cloned().unwrap_or_default(),
+            status: Some(ToolStatus::Ok),
+            output: Vec::new(),
+            truncated: false,
+            digest: harness_core::sha256(b""),
+            read_sha256: None,
+            environment: None,
+            edit: Some(e),
+        });
     }
     Ok(Recorded {
         backend,
         nonces,
         feed,
+        approvals,
     })
 }
 
@@ -294,6 +408,7 @@ fn expected_inputs(
         Value::from(builtin_manifest_sha256().to_string()),
     );
     m.insert("shell_enabled".into(), Value::Bool(false));
+    m.insert("context_format".into(), Value::from(CONTEXT_FORMAT));
     m.insert(
         "limits".into(),
         Value::Object(
@@ -316,9 +431,11 @@ fn check_header(recorded: &Record, expected: &Map<String, Value>) -> Result<(), 
 }
 
 /// What a differing header input means (H1f-3 review F-5): most are the
-/// caller's inputs; `builtin_manifest` and `shell_enabled` belong to the
-/// harness build, so a journal written by another build (every journal
-/// from before H1f-3 included) cannot be audited or resumed by this one.
+/// caller's inputs; `builtin_manifest`, `shell_enabled` and
+/// `context_format` belong to the harness build, so a journal written by
+/// another build (every journal from before H1f-3 included, and, for the
+/// context format, every journal from before H1h) cannot be audited or
+/// resumed by this one, and says so.
 fn header_mismatch(key: &str) -> &'static str {
     match key {
         "task" => "the task given differs from the recorded header",
@@ -330,6 +447,11 @@ fn header_mismatch(key: &str) -> &'static str {
         "limits" => "the budget limits given differ from the recorded header",
         "builtin_manifest" | "shell_enabled" => {
             "another harness build wrote this journal (its built-in manifest or shell setting differs)"
+        }
+        "context_format" => {
+            "another harness build wrote this journal (its context format differs: since H1h the \
+             native protocol shows past actions as tool calls, so an older journal's contexts \
+             cannot be recomputed; audit it with the build that wrote it)"
         }
         _ => "a header input differs from the recorded header",
     }
@@ -579,6 +701,10 @@ pub struct Audit<'a> {
 pub struct AuditReport {
     /// The attempt replayed.
     pub attempt: u32,
+    /// Later attempts passed over because they hold no durable header (a
+    /// start that failed before it: H1 phase-exit review F-5), highest
+    /// first. Empty when an attempt was asked for by number.
+    pub skipped_attempts: Vec<u32>,
     /// Where the recomputed journal was written, when the replay ran.
     pub replay_dir: Option<PathBuf>,
     /// Records that matched (header and wall-budget records excluded).
@@ -627,6 +753,34 @@ const UNREADABLE: GateOutcome = GateOutcome::Indeterminate {
     why: IndeterminateKind::UnreadableEvidence,
 };
 
+/// The attempt numbers under `run_dir`, highest first.
+fn attempts_desc(run_dir: &Path) -> io::Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(run_dir)? {
+        let name = entry?.file_name();
+        if let Some(n) = name.to_str().and_then(layout::parse_attempt_name) {
+            out.push(n);
+        }
+    }
+    out.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(out)
+}
+
+/// Whether an attempt directory holds a header at all: its journal has a
+/// complete first line. A start that failed before its header was written
+/// (the new attempt directory's locality check, ENOSPC or EIO on the
+/// header) leaves no journal, an empty one, or a torn first line (H1
+/// phase-exit review F-5); such an attempt holds no evidence, so resume
+/// and the default audit pass over it. Anything with a complete line is
+/// evidence, and must verify.
+fn has_header(attempt_dir: &Path) -> io::Result<bool> {
+    match std::fs::read(attempt_dir.join(layout::JOURNAL_FILE)) {
+        Ok(bytes) => Ok(bytes.contains(&b'\n')),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 fn run_dir_of(state_root: &Path, run: &RunId) -> io::Result<PathBuf> {
     let root = std::fs::canonicalize(state_root)?;
     let dir = layout::run_dir(&root, run);
@@ -643,14 +797,27 @@ fn run_dir_of(state_root: &Path, run: &RunId) -> io::Result<PathBuf> {
 /// Replay a recorded attempt and compare (see the module docs).
 pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     let run_dir = run_dir_of(a.state_root, a.run).map_err(AuditRefused::NoRun)?;
-    let attempt = match a.attempt {
-        Some(n) => n,
-        None => layout::latest_attempt(&run_dir)
-            .map_err(AuditRefused::NoRun)?
-            .ok_or(AuditRefused::NoAttempt)?,
+    // By default the latest attempt with a durable header: a start that
+    // failed before its header is skipped, and named (H1 phase-exit review
+    // F-5). An attempt asked for by number is audited whatever it holds.
+    let (attempt, skipped_attempts) = match a.attempt {
+        Some(n) => (n, Vec::new()),
+        None => {
+            let mut skipped = Vec::new();
+            let mut found = None;
+            for n in attempts_desc(&run_dir).map_err(AuditRefused::NoRun)? {
+                if has_header(&layout::attempt_dir(&run_dir, n)).map_err(AuditRefused::NoRun)? {
+                    found = Some(n);
+                    break;
+                }
+                skipped.push(n);
+            }
+            (found.ok_or(AuditRefused::NoAttempt)?, skipped)
+        }
     };
     let failed = |d: Divergence, replay_dir| AuditReport {
         attempt,
+        skipped_attempts: skipped_attempts.clone(),
         replay_dir,
         matched: 0,
         wall_skipped: 0,
@@ -712,8 +879,23 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         Ok(r) => r,
         Err(d) => return Ok(failed(d, None)),
     };
-    let (session, tools) =
-        plan(a.spec, a.registry, a.policy, a.profile).map_err(AuditRefused::Plan)?;
+    // Whether anyone answered asks is the run's, like its approvers'
+    // answers (H2b): the audit plans with the recorded value and re-feeds
+    // the recorded answers. A forged value only makes the replay's asks and
+    // denials differ from the recorded ones (a divergence), unless the
+    // approval records are forged with it (anchor-only, like a tool result).
+    let Some(approver_present) = head.body.get("approver_present").and_then(Value::as_bool) else {
+        return Ok(failed(
+            diverge(
+                0,
+                0,
+                "the header does not say whether an approver was present",
+            ),
+            None,
+        ));
+    };
+    let (session, tools) = plan(a.spec, a.registry, a.policy, a.profile, approver_present)
+        .map_err(AuditRefused::Plan)?;
     let hdr = header(&HeaderInputs {
         spec: a.spec,
         registry: a.registry,
@@ -727,6 +909,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         // a past host cannot be re-measured, and the header is not compared.
         environment,
         environment_recorded: true,
+        approver_present,
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)
@@ -760,12 +943,18 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
+        tree: facts.tree,
+        workspace: None,
+        // Nobody is asked in an audit: the recorded answers are re-fed and
+        // re-minted with their recorded nonces (a reused one refuses).
+        approvals: Approvals::new(a.run, attempt, None, rec.approvals),
         // No provider runs in an audit: a recorded result is re-fed with its
         // recorded sample. A step with no recorded result (an intent a crash
         // cut) ends as a provider failure, whose sample says it was not
         // sampled rather than borrowing the header's (confirming NF-1).
         env: &NOT_SAMPLED,
         pressure: Vec::new(),
+        reads_seen: Default::default(),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -805,6 +994,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
             };
             AuditReport {
                 attempt,
+                skipped_attempts,
                 replay_dir: Some(replay_dir),
                 matched: c.matched,
                 wall_skipped: c.wall_skipped,
@@ -854,7 +1044,9 @@ pub struct Resume<'a> {
     pub state_root: &'a Path,
     /// The run to resume.
     pub run: &'a RunId,
-    /// The workspace (must still have the recorded tree digest).
+    /// The workspace. It must be exactly as the interrupted attempt's last
+    /// durable record left it (the tree digest after its last recorded
+    /// edit, or at its start), or the resume is refused.
     pub workspace: &'a Path,
     /// The task spec (must match the recorded header).
     pub spec: &'a TaskSpec,
@@ -874,6 +1066,40 @@ pub struct Resume<'a> {
     /// resume is refused otherwise, never adopting the journal's: H1
     /// phase-exit review F-1).
     pub config: &'a RunConfig,
+    /// Who answers an ask after the catch-up (§5.3). Present exactly when
+    /// the interrupted run had one (the header's `approver_present`), or the
+    /// resume is refused: it decides every ask.
+    pub approver: Option<&'a dyn Approver>,
+}
+
+/// The attempt a resume continues: the latest one holding evidence. Passed
+/// over, highest first: an attempt with no header (a start that failed:
+/// H1 phase-exit review F-5), and a resumed attempt that stopped before
+/// its first step (a header alone: nothing of the attempt it continued was
+/// re-recorded there, so resuming it would lose that attempt's steps).
+fn resumable_attempt(run_dir: &Path, run: &RunId) -> Result<(u32, Verified, Vec<u32>), RunRefused> {
+    let nope = RunRefused::NotResumable;
+    let mut skipped = Vec::new();
+    for n in attempts_desc(run_dir).map_err(RunRefused::RunDir)? {
+        let dir = layout::attempt_dir(run_dir, n);
+        if !has_header(&dir).map_err(RunRefused::RunDir)? {
+            skipped.push(n);
+            continue;
+        }
+        let v = JournalReader::open_expecting(&dir, run)
+            .map_err(|_| nope("the last attempt's journal does not verify"))?;
+        let only_header = v.records.len() == 1;
+        let resumed = v
+            .records
+            .first()
+            .is_some_and(|h| h.body.contains_key("resumed_from"));
+        if only_header && resumed {
+            skipped.push(n);
+            continue;
+        }
+        return Ok((n, v, skipped));
+    }
+    Err(nope("the run has no attempt with a durable header"))
 }
 
 /// Resume an interrupted run in a new attempt (see the module docs).
@@ -887,6 +1113,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         r.state_root,
         r.probe,
         r.config,
+        r.approver.is_some(),
     )?;
     let nope = RunRefused::NotResumable;
     let run_dir = layout::run_dir(&pre.state_root, r.run);
@@ -894,12 +1121,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
         _ => return Err(nope("no such run directory")),
     }
-    let n = layout::latest_attempt(&run_dir)
-        .map_err(RunRefused::RunDir)?
-        .ok_or(nope("the run has no attempt"))?;
+    let (n, v, skipped) = resumable_attempt(&run_dir, r.run)?;
     let attempt_dir = layout::attempt_dir(&run_dir, n);
-    let v = JournalReader::open_expecting(&attempt_dir, r.run)
-        .map_err(|_| nope("the last attempt's journal does not verify"))?;
     if v.records.iter().any(|x| x.kind == EventKind::RunStopped) {
         return Err(nope("the run already stopped; there is nothing to resume"));
     }
@@ -914,19 +1137,29 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         &expected_inputs(r.spec, r.registry, r.policy, r.profile, &r.config.limits),
     )
     .map_err(|d| nope(d.why))?;
-    if recorded_facts(head).map(|f| f.tree) != Some(pre.facts.tree) {
+    if head.body.get("approver_present").and_then(Value::as_bool) != Some(r.approver.is_some()) {
         return Err(nope(
-            "the workspace changed since the attempt, and an H1 run keeps no snapshot to restore",
+            "the approver differs from the recorded header: a run started with an approver \
+             resumes with one, and one started without resumes without",
         ));
     }
-    // Every step but the last is replayed; the last (possibly cut short)
-    // runs again live.
+    // The catch-up covers every step whose tool call finished (H2b, the
+    // H1e-2b row's H2 condition): a step with a durable `ToolFinished` is
+    // complete, so its result is re-fed, never run again, and a completed
+    // edit is never repeated. Every earlier step is complete too. Only the
+    // last step, when its call has no result (the crash cut it: a trailing
+    // intent, or no call yet), runs again live, and policy decides it
+    // again.
     let last = v.records.iter().map(|x| x.step).max().unwrap_or(0);
+    let last_done = v
+        .records
+        .iter()
+        .any(|x| x.step == last && x.kind == EventKind::ToolFinished);
     let kept = Verified {
         records: v
             .records
             .iter()
-            .filter(|x| x.step < last)
+            .filter(|x| x.step < last || (last_done && x.step == last))
             .cloned()
             .collect(),
         torn_tail: None,
@@ -934,6 +1167,28 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         run: v.run.clone(),
         attempt: v.attempt,
     };
+    // The workspace must be as the kept records leave it: the tree digest
+    // after the last recorded edit, or the attempt's own at its start. The
+    // harness keeps no content snapshot to restore (materialisation, H2),
+    // so an edit applied without a durable result, or a change made
+    // outside the run, refuses the resume instead of being built on.
+    let Some(start) = recorded_facts(head) else {
+        return Err(nope("the last attempt's header lacks the workspace facts"));
+    };
+    let expected = kept
+        .records
+        .iter()
+        .rev()
+        .filter(|x| x.kind == EventKind::EditApplied)
+        .find_map(|x| digest_at(&x.body, "workspace_tree"))
+        .unwrap_or(start.tree);
+    if pre.facts.tree != expected {
+        return Err(nope(
+            "the workspace differs from the interrupted attempt's last durable record (an edit \
+             applied without its result, or a change made outside the run); this build keeps no \
+             snapshot to restore",
+        ));
+    }
     let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
     let rec = recorded(&kept, &blobs, r.profile)
         .map_err(|_| nope("the last attempt's records cannot be replayed"))?;
@@ -947,17 +1202,22 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let carried_ms = carried_in.saturating_add(v.records.last().map_or(0, |x| x.t_mono_ms));
+    // The facts of block 4 are the run's, measured at its start and
+    // carried from attempt to attempt, so the catch-up renders every
+    // recorded request byte for byte; the workspace as it is now was
+    // checked against the journal above.
     let hdr = header(&HeaderInputs {
         spec: r.spec,
         registry: r.registry,
         policy: r.policy,
         profile: r.profile,
         identity: &r.backend.identity(),
-        facts: pre.facts,
+        facts: start,
         limits: &r.config.limits,
-        resumed_from: Some((n, v.head, carried_ms)),
+        resumed_from: Some((n, v.head, carried_ms, skipped)),
         environment: r.env.sample(),
         environment_recorded: false,
+        approver_present: r.approver.is_some(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -975,10 +1235,10 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         registry: r.registry,
         tools: pre.tools,
         task: &r.spec.task,
-        facts: facts_block(&pre.facts),
+        facts: facts_block(&start),
         profile: r.profile,
         backend: &chain,
-        providers: vec![Box::new(pre.read_tools)],
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools),
         meter: new_meter_resumed(
             r.config.limits.clone(),
             Box::new(SystemClock::default()),
@@ -993,8 +1253,14 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
+        // The catch-up re-feeds each recorded edit's tree digest; the
+        // listing measured now already holds every one of them.
+        tree: start.tree,
+        workspace: Some(pre.tree),
+        approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals),
         env: r.env,
         pressure: Vec::new(),
+        reads_seen: Default::default(),
     };
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);

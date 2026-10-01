@@ -20,7 +20,7 @@ use harness_policy::{Authorized, Call, UserPolicy};
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 
 use crate::driver::{
-    commit, new_meter, new_nonce, new_run_id, plan, End, Loop, NonceSource, ReadLog,
+    commit, new_meter, new_nonce, new_run_id, plan, Approvals, End, Loop, NonceSource, ReadLog,
 };
 use crate::{RunConfig, TaskSpec};
 
@@ -61,7 +61,7 @@ impl ToolProvider for Spy {
     fn invoke(
         &mut self,
         call: Journaled<Authorized<Call>>,
-        _ctx: &InvokeCtx,
+        _ctx: &InvokeCtx<'_>,
     ) -> Result<ToolResult, ToolError> {
         self.invoked.set(self.invoked.get() + 1);
         let Some(status) = self.status else {
@@ -78,6 +78,7 @@ impl ToolProvider for Spy {
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
             read: None,
+            edit: None,
         })
     }
 }
@@ -154,7 +155,7 @@ fn drive_full(
         workspace_public: false,
     };
     let policy = UserPolicy::default();
-    let (session, tools) = plan(&spec, &reg, &policy, &profile).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false).unwrap();
     let backend = ScriptedBackend::new(profile.clone(), replies);
     let invoked = Rc::new(Cell::new(0));
     let mut cfg = RunConfig::defaults(1_000_000);
@@ -198,8 +199,12 @@ fn drive_full(
         nonces: NonceSource::default(),
         feed: std::collections::VecDeque::new(),
         reads: ReadLog::default(),
+        tree: harness_core::sha256(b"tree"),
+        workspace: None,
+        approvals: Approvals::new(&RunId::new(9, [1; 10]), 1, None, Default::default()),
         env,
         pressure: Vec::new(),
+        reads_seen: Default::default(),
     };
     let end = lp.drive(&mut w);
     let pressure = lp.pressure.clone();
@@ -839,4 +844,102 @@ fn a_timeout_or_crash_records_the_host_and_flags_pressure() {
         // The sample never changes the outcome.
         assert_eq!(o.released, NOTHING_CHECKED, "{what}");
     }
+}
+
+// H2b: an edit that was written but not verified (code UNVERIFIED) may have
+// changed the workspace in a way the harness cannot state: the result is
+// journaled, then the run stops (PolicyAbort), fail closed, and the model
+// is never asked again. Driven through a spy that reports that status for
+// the edit (the real engine cannot produce it without another writer).
+#[test]
+fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
+    let reg = registry();
+    let profile = Profile::conservative_default("m");
+    let spec = TaskSpec {
+        task: TaskText::new("Edit a.txt.".into()),
+        grants: vec!["harness.edit.replace".into()],
+        workspace_public: false,
+    };
+    let policy = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false).unwrap();
+    let backend = ScriptedBackend::new(
+        profile.clone(),
+        vec![
+            action(
+                "harness.edit.replace",
+                "{\"path\":\"a.txt\",\"old\":\"a\",\"new\":\"b\"}",
+            ),
+            submit(),
+        ],
+    );
+    let invoked = Rc::new(Cell::new(0));
+    let cfg = RunConfig::defaults(1_000_000);
+    let file = FaultFile::new(FaultPlan::default());
+    let buf = file.buf.clone();
+    let blobs = MemBlobs::default();
+    let mut w = JournalWriter::start(
+        file,
+        blobs.clone(),
+        Tick(Cell::new(0)),
+        RunId::new(9, [1; 10]),
+        1,
+        Header::new(Ident::of("0.0.1").unwrap()),
+    )
+    .unwrap();
+    let env = EnvSample::unmeasured(Unmeasured::NoSafeApi);
+    let mut lp = Loop {
+        session,
+        registry: &reg,
+        tools,
+        task: &spec.task,
+        facts: Vec::new(),
+        profile: &profile,
+        backend: &backend,
+        providers: vec![Box::new(Spy {
+            ns: ProviderName::new("harness").unwrap(),
+            invoked: invoked.clone(),
+            status: Some(ToolStatus::Error {
+                code: harness_tools::builtin::code::UNVERIFIED,
+            }),
+        })],
+        meter: new_meter(
+            cfg.limits.clone(),
+            Box::new(Advancing {
+                now: Cell::new(Duration::ZERO),
+                step: Duration::ZERO,
+            }),
+        ),
+        detector: harness_core::LoopDetector::new(),
+        turns: Vec::new(),
+        config: &cfg,
+        step: 0,
+        nonces: NonceSource::default(),
+        feed: std::collections::VecDeque::new(),
+        reads: ReadLog::default(),
+        tree: harness_core::sha256(b"tree"),
+        workspace: None,
+        approvals: Approvals::new(&RunId::new(9, [1; 10]), 1, None, Default::default()),
+        env: &env,
+        pressure: Vec::new(),
+        reads_seen: Default::default(),
+    };
+    let end = lp.drive(&mut w);
+    assert_eq!(end.cause, StopCause::PolicyAbort);
+    assert_eq!(end.step, 1, "the model is not asked again");
+    assert_eq!(invoked.get(), 1);
+    let released = commit(w, &end, None).outcome;
+    assert_eq!(released, NOTHING_CHECKED);
+    let journal = buf.borrow().clone();
+    let v = verify(&journal, &blobs).unwrap();
+    let last_finished = v
+        .records
+        .iter()
+        .rev()
+        .find(|r| r.kind == EventKind::ToolFinished)
+        .unwrap();
+    assert_eq!(
+        last_finished.body.get("code").and_then(|c| c.as_u64()),
+        Some(u64::from(harness_tools::builtin::code::UNVERIFIED))
+    );
+    assert!(!v.records.iter().any(|r| r.kind == EventKind::EditApplied));
 }

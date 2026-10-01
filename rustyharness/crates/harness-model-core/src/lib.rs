@@ -45,6 +45,37 @@ impl HarnessText {
         Self(Cow::Owned(s))
     }
 
+    /// A policy denial for arguments outside a tool's schema, naming the
+    /// argument and the bounds the tool's own schema gives it: "the argument
+    /// `lines` must be an integer from 1 to 100". Everything rendered comes
+    /// from `spec` (an admitted capability's reviewed schema): `property` is
+    /// only looked up among the schema's properties, and the name shown is
+    /// the schema's own key, never the call's text. `None` when the schema
+    /// has no such property, or gives it no bound, so the caller keeps its
+    /// static text (judge finding (c) of the dev-suite review, H2b).
+    pub fn argument_bounds(spec: &ToolSpec, property: &str) -> Option<Self> {
+        let (name, node) = spec
+            .parameters
+            .get("properties")?
+            .as_object()?
+            .iter()
+            .find(|(k, _)| k.as_str() == property)?;
+        let int = |k: &str| node.get(k).and_then(serde_json::Value::as_i64);
+        let bound = match node.get("type").and_then(serde_json::Value::as_str)? {
+            "integer" => match (int("minimum"), int("maximum")) {
+                (Some(lo), Some(hi)) => format!("an integer from {lo} to {hi}"),
+                (Some(lo), None) => format!("an integer of at least {lo}"),
+                (None, Some(hi)) => format!("an integer of at most {hi}"),
+                (None, None) => return None,
+            },
+            "string" => format!("a string of at most {} characters", int("maxLength")?),
+            _ => return None,
+        };
+        Some(Self::rendered(format!(
+            "Policy denied the call: the argument {name} must be {bound}. The tool's schema lists every argument and its bounds."
+        )))
+    }
+
     /// The text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -68,6 +99,13 @@ impl TaskText {
 }
 
 /// One message in the context (design §1.3, scaffold review F4).
+///
+/// The first four are what the text protocol shows back to the model. The
+/// native protocol shows a past action as the model's own tool call and its
+/// result as the tool's answer ([`Message::ToolCall`], then
+/// [`Message::ToolResult`] or [`Message::ToolNotice`] with the same id), so
+/// the model sees its history in the form it is asked to reply in (design
+/// row H1h).
 #[derive(Debug)]
 pub enum Message {
     /// Harness rules, protocol spec, tool definitions.
@@ -83,6 +121,68 @@ pub enum Message {
         /// Its output.
         body: Untrusted<String>,
     },
+    /// Native protocol: a past action, shown as the model's own tool call.
+    /// It is the harness's rendering of the action it parsed and acted on
+    /// (the active tool and the parsed arguments), never the raw reply, so
+    /// a reply that was not exactly one well-formed call has no
+    /// `ToolCall`.
+    ToolCall {
+        /// Harness-made id; the next message answers it.
+        id: ToolCallId,
+        /// The capability id (its wire name is derived when rendering).
+        tool: String,
+        /// The parsed arguments as canonical JSON text: model-chosen values.
+        arguments: Untrusted<String>,
+        /// The text of the reply beside the call (its reasoning).
+        content: Untrusted<String>,
+    },
+    /// Native protocol: the tool output answering the [`Message::ToolCall`]
+    /// with the same id, fed back as data in the tool role.
+    ToolResult {
+        /// The id of the call it answers.
+        id: ToolCallId,
+        /// The capability id that produced it.
+        call: String,
+        /// Its output.
+        body: Untrusted<String>,
+    },
+    /// Native protocol: the harness's own answer to a [`Message::ToolCall`]
+    /// that produced no tool output (a policy denial, a provider failure).
+    ToolNotice {
+        /// The id of the call it answers.
+        id: ToolCallId,
+        /// The harness text.
+        text: HarnessText,
+    },
+}
+
+/// The id of a past tool call in the native protocol's history (design row
+/// H1h). Harness-made from the loop step, which runs at most one action, so
+/// no model or server text ever enters an id (the ids a server puts in its
+/// replies are never read), and a replay that rebuilds the same turns
+/// rebuilds the same ids and the same context digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ToolCallId(u64);
+
+impl ToolCallId {
+    /// The id of the call made at loop step `step`.
+    pub fn for_step(step: u64) -> Self {
+        Self(step)
+    }
+
+    /// The loop step.
+    pub fn step(self) -> u64 {
+        self.0
+    }
+
+    /// The wire form: `call` and the step zero-padded to five digits
+    /// (`call00007`). That is nine ASCII letters and digits, a shape strict
+    /// servers accept (some chat templates require exactly nine
+    /// alphanumerics; UNVERIFIED beyond the servers the harness was run
+    /// against), and it stays unique past step 99 999, only longer.
+    pub fn wire(self) -> String {
+        format!("call{:05}", self.0)
+    }
 }
 
 /// A tool as offered to the model: its manifest id, a harness-authored
@@ -295,5 +395,50 @@ impl fmt::Display for EndpointClass {
             EndpointClass::Replay => "replay",
             EndpointClass::Scripted => "scripted",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn read_tool() -> ToolSpec {
+        ToolSpec {
+            id: "harness.fs.read".into(),
+            description: HarnessText::from_static("read"),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {"type": "string", "maxLength": 4096},
+                    "start": {"type": "integer", "minimum": 1},
+                    "lines": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "flag": {"type": "boolean"}
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    // Judge finding (c): a denial names the violated argument's bounds from
+    // the tool's own schema; anything the schema does not bound, or does
+    // not have, gets no rendering (the caller keeps its static text).
+    #[test]
+    fn an_argument_denial_names_the_schemas_bounds() {
+        let t = read_tool();
+        let text = |p: &str| HarnessText::argument_bounds(&t, p).map(|h| h.as_str().to_owned());
+        assert_eq!(
+            text("lines").unwrap(),
+            "Policy denied the call: the argument lines must be an integer from 1 to 100. \
+             The tool's schema lists every argument and its bounds."
+        );
+        assert!(text("start").unwrap().contains("an integer of at least 1"));
+        assert!(text("path")
+            .unwrap()
+            .contains("a string of at most 4096 characters"));
+        for none in ["flag", "nosuch", "", "lines/0", "LINES"] {
+            assert_eq!(text(none), None, "{none:?}");
+        }
     }
 }

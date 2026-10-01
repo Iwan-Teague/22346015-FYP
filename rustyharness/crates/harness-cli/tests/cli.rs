@@ -197,6 +197,7 @@ fn cli(args: &[&str], local: bool, marker: &Path) -> Output {
                 gate_ok_file: Some(marker.to_path_buf()),
                 out: RefCell::new(&mut out),
                 err: RefCell::new(&mut err),
+                approver: harness_cli::ApproverSource::None,
             };
             harness_cli::main_with(&cx, args)
         };
@@ -459,7 +460,8 @@ fn a_crashed_run_resumes_through_the_cli_in_a_new_attempt() {
         act("harness.fs.read", r#"{"path":"a.txt"}"#),
         act("harness.fs.list", r#"{"path":"."}"#),
         act("harness.task.submit", r#"{"note":"done"}"#),
-        // After the crash: step 2 again live, then submit.
+        // After the crash: step 2's call finished, so the catch-up re-feeds
+        // it (H2b) and step 3 runs live, then a submit.
         act("harness.fs.list", r#"{"path":"."}"#),
         act("harness.task.submit", r#"{"note":"done"}"#),
     ]);
@@ -499,6 +501,153 @@ fn a_crashed_run_resumes_through_the_cli_in_a_new_attempt() {
         .join("attempt-2/journal.jsonl")
         .is_file());
     let _ = &fx.base;
+}
+
+// ---- H2b: edits through the CLI ------------------------------------------------------
+
+/// The edit task: read a.txt, replace one word, submit.
+fn edit_fixture(name: &str) -> (Fx, PathBuf) {
+    let fx = fixture(name);
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"Change 'answer' to 'reply' in a.txt.","grants":["harness.fs.read","harness.edit.replace"]}"#,
+    )
+    .unwrap();
+    let allow = fx.base.join("allow-edits.json");
+    std::fs::write(
+        &allow,
+        r#"{"allow":["harness.edit.replace","harness.edit.write"]}"#,
+    )
+    .unwrap();
+    (fx, allow)
+}
+
+fn edit_replies() -> Vec<String> {
+    vec![
+        act("harness.fs.read", r#"{"path":"a.txt"}"#),
+        act(
+            "harness.edit.replace",
+            r#"{"path":"a.txt","old":"answer","new":"reply"}"#,
+        ),
+        act("harness.task.submit", r#"{"note":"changed"}"#),
+    ]
+}
+
+fn decided_rules(fx: &Fx, id: &str) -> Vec<String> {
+    let jp = fx
+        .state
+        .join("runs")
+        .join(id)
+        .join("attempt-1/journal.jsonl");
+    std::fs::read_to_string(jp)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["kind"] == "PolicyDecided")
+        .map(|v| v["body"]["rule"].as_str().unwrap_or("user").to_owned())
+        .collect()
+}
+
+/// §5.2 through the binary: an unattended run (stdin is no terminal, so
+/// nobody answers) edits only when its policy file allows the edit tools;
+/// without one the edit is denied and the file is untouched. Both replay.
+#[test]
+fn an_unattended_run_edits_only_when_its_policy_allows_edits() {
+    for with_policy in [true, false] {
+        let (fx, allow) = edit_fixture(&format!("edit-policy-{with_policy}"));
+        let m = mock(edit_replies());
+        let ep = format!("http://127.0.0.1:{}/v1", m.port);
+        let mut args = run_args(&fx, &ep);
+        if with_policy {
+            args.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+        }
+        let o = cli(&args, !REAL_PROBE_MEASURES, &fx.marker);
+        assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+        let text = std::fs::read_to_string(fx.ws.join("a.txt")).unwrap();
+        let id = run_id(&o);
+        let rules = decided_rules(&fx, &id);
+        if with_policy {
+            assert_eq!(text, "the reply is in here\n");
+            assert_eq!(rules[1], "user", "a user allow rule: {rules:?}");
+        } else {
+            assert_eq!(text, "the answer is in here\n");
+            assert_eq!(rules[1], "deny.no-approver");
+        }
+        // The replay re-feeds the edit and never applies it again.
+        std::fs::write(fx.ws.join("a.txt"), "the answer is in here\n").unwrap();
+        let head = String::from_utf8(o.stdout.clone())
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("chain_head ")
+            .unwrap()
+            .to_owned();
+        let mut rargs = vec![
+            "replay",
+            "--run",
+            &id,
+            "--task",
+            fx.task.to_str().unwrap(),
+            "--state-root",
+            fx.state.to_str().unwrap(),
+            "--profile",
+            fx.profile.to_str().unwrap(),
+            "--anchor",
+            &head,
+        ];
+        if with_policy {
+            rargs.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+        }
+        let rp = cli(&rargs, true, &fx.marker);
+        assert!(
+            String::from_utf8_lossy(&rp.stderr).contains(REPLAY_MATCHED),
+            "{}",
+            String::from_utf8_lossy(&rp.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.ws.join("a.txt")).unwrap(),
+            "the answer is in here\n"
+        );
+    }
+}
+
+/// An approver answering yes, given to the CLI library in process: the
+/// edit asks (no policy file), is approved, and runs once.
+#[test]
+fn an_approver_given_to_the_cli_approves_an_edit() {
+    struct Yes;
+    impl harness_run::Approver for Yes {
+        fn kind(&self) -> harness_run::ApproverKind {
+            harness_run::ApproverKind::Embedded
+        }
+        fn ask(
+            &self,
+            _req: &harness_policy::approval::ApprovalRequest,
+            _deadline: std::time::Instant,
+        ) -> harness_run::ApprovalAnswer {
+            harness_run::ApprovalAnswer::Yes
+        }
+    }
+    let (fx, _) = edit_fixture("edit-approved");
+    let m = mock(edit_replies());
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = {
+        let cx = harness_cli::Cx {
+            probe: &Local,
+            gate_ok_file: Some(fx.marker.clone()),
+            out: RefCell::new(&mut out),
+            err: RefCell::new(&mut err),
+            approver: harness_cli::ApproverSource::Given(&Yes),
+        };
+        harness_cli::main_with(&cx, &run_args(&fx, &ep))
+    };
+    assert_eq!(code, 5, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(
+        std::fs::read_to_string(fx.ws.join("a.txt")).unwrap(),
+        "the reply is in here\n"
+    );
 }
 
 #[test]

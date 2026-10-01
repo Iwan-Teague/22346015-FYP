@@ -18,8 +18,13 @@
 //! | 4 | unreadable input (task spec, policy, profile; a manifest for `manifest check`) |
 //! | 5 | `Indeterminate` (the kind is in the JSON): every H1 run, a refused run (e.g. the locality check), a journal failure, a replay divergence |
 //!
-//! Every H1 run is `Indeterminate { NothingChecked }` and exits 5 with no
-//! marker, whatever the agent did. Before the report line, one line
+//! Every run so far is `Indeterminate { NothingChecked }` (no task has
+//! checks before H3) and exits 5 with no marker, whatever the agent did,
+//! edits included. An edit asks unless the `--policy` file allows the edit
+//! tools; the binary's approver is the person at the terminal, only when
+//! stdin is a terminal, so an unattended run (a pipe, CI, `< /dev/null`)
+//! has nobody to ask and every ask is a deny (§5.2, §5.3; H2b). Before the
+//! report line, one line
 //! `chain_head <sha256>` names the journal's final chain head (§7.1
 //! "Anchoring"): keep it to detect a replaced journal later
 //! (`replay --anchor`).
@@ -60,9 +65,12 @@ use harness_manifest::{builtin, ManifestError, SemVer, ValidationContext};
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_model::profile::{CheckResult, Profile};
 use harness_model::TaskText;
+use harness_policy::approval::ApprovalRequest;
 use harness_policy::locality::LocalityProbe;
 use harness_policy::UserPolicy;
-use harness_run::{Audit, Resume, Run, RunConfig, RunRefused, TaskSpec};
+use harness_run::{
+    ApprovalAnswer, Approver, ApproverKind, Audit, Resume, Run, RunConfig, RunRefused, TaskSpec,
+};
 use harness_sandbox::environment::SystemEnv;
 use serde::Deserialize;
 
@@ -106,6 +114,83 @@ pub struct Cx<'a> {
     pub out: RefCell<&'a mut dyn Write>,
     /// Standard error.
     pub err: RefCell<&'a mut dyn Write>,
+    /// Who answers an ask in `run` and `resume` (§5.3). The shipped binary
+    /// passes [`ApproverSource::StdinIfTerminal`].
+    pub approver: ApproverSource<'a>,
+}
+
+/// Who answers an ask (§5.3, H2b).
+pub enum ApproverSource<'a> {
+    /// Nobody: every ask is a deny (§5.2).
+    None,
+    /// The person at the terminal, when stdin is a terminal
+    /// ([`TerminalApprover`]); nobody otherwise (a pipe, a file, CI), so an
+    /// unattended run never waits for an answer that cannot come.
+    StdinIfTerminal,
+    /// This approver (tests; an embedder driving the CLI library).
+    Given(&'a dyn Approver),
+}
+
+/// The terminal prompt (§5.3): shows the request on stderr (the approval
+/// request's own display: plain words, the arguments escaped for a
+/// terminal and bounded) and reads one line from stdin. `y` or `yes`
+/// approves this one call; any other line declines; no line by the
+/// deadline, or stdin closed, is no answer (a deny). Lines typed before
+/// the prompt appears are discarded, so a late answer to an earlier
+/// request can never approve this one.
+///
+/// Stdin is read by one background thread for the life of the process
+/// (a blocked read cannot be given a deadline otherwise); it only forwards
+/// lines, and nothing it reads reaches an argv, a prompt or the journal.
+pub struct TerminalApprover<'c, 'a> {
+    cx: &'c Cx<'a>,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl<'c, 'a> TerminalApprover<'c, 'a> {
+    /// A prompt on `cx`'s stderr, answered on this process's stdin.
+    pub fn new(cx: &'c Cx<'a>) -> Self {
+        let (tx, lines) = std::sync::mpsc::channel();
+        // If the thread cannot start, `tx` is dropped with it: every ask
+        // then finds the channel closed, which is no answer (a deny).
+        let _ = std::thread::Builder::new()
+            .name("approver-stdin".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::stdin().lock().lines() {
+                    let Ok(line) = line else { break };
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        Self { cx, lines }
+    }
+}
+
+impl Approver for TerminalApprover<'_, '_> {
+    fn kind(&self) -> ApproverKind {
+        ApproverKind::Terminal
+    }
+
+    fn ask(&self, req: &ApprovalRequest, deadline: Instant) -> ApprovalAnswer {
+        while self.lines.try_recv().is_ok() {}
+        self.cx.note(&format!(
+            "{req}\napprove this one call? [y/N] (no answer by the deadline is a no): "
+        ));
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match self.lines.recv_timeout(wait) {
+            Ok(line) => {
+                let a = line.trim().to_ascii_lowercase();
+                if a == "y" || a == "yes" {
+                    ApprovalAnswer::Yes
+                } else {
+                    ApprovalAnswer::No
+                }
+            }
+            Err(_) => ApprovalAnswer::NoAnswer,
+        }
+    }
 }
 
 impl Cx<'_> {
@@ -504,6 +589,22 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             format!("model server check failed: {e}"),
         ));
     }
+    // Who answers an ask (§5.3): with nobody, every ask is a deny (§5.2),
+    // so an unattended run edits only where its policy allows edits.
+    let terminal;
+    let approver: Option<&dyn Approver> = match cx.approver {
+        ApproverSource::None => None,
+        ApproverSource::Given(a) => Some(a),
+        ApproverSource::StdinIfTerminal => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                terminal = TerminalApprover::new(cx);
+                Some(&terminal)
+            } else {
+                None
+            }
+        }
+    };
     let report = match run_id {
         None => harness_run::run(Run {
             state_root: std::path::Path::new(state_root),
@@ -516,6 +617,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             probe,
             env: &SystemEnv,
             config: &config,
+            approver,
         }),
         Some(id) => harness_run::resume(Resume {
             state_root: std::path::Path::new(state_root),
@@ -529,6 +631,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             probe,
             env: &SystemEnv,
             config: &config,
+            approver,
         }),
     }
     .map_err(|e| from_refusal(cx, &e))?;

@@ -17,8 +17,7 @@
 # outcome crate).
 #
 # INV-23 (sections 2f and 5): every spawn in the harness is one of the
-# fixed queries in crates/harness-sandbox/src/capture.rs or the confined
-# spawn in crates/harness-sandbox/src/confine_spawn.rs (H2a), so no payload
+# fixed queries in crates/harness-sandbox/src/capture.rs, so no payload
 # reaches an argv; and the binary is built from nothing these scans do not
 # read or this gate has not reviewed.
 #
@@ -383,6 +382,11 @@ while IFS= read -r f; do
   scan "compile-time read" "(^|$nb)(include|include_str|include_bytes|env|option_env) ?!" "$tmpdir/norm-code" "$f"
   scan "macro_rules" "(^|$nb)macro_rules ?!" "$tmpdir/norm-code" "$f"
   scan "static item" "(^|[^A-Za-z0-9_'])static (mut )?[A-Za-z_]" "$tmpdir/norm-code" "$f"
+  # H1 phase-exit review F-6 (closed in H2b): no OS-seeded hashing. std's
+  # HashMap/HashSet default to RandomState, keyed from OS randomness, so
+  # their iteration order depends on the process; a pure decision must not.
+  # BTreeMap/BTreeSet are ordered.
+  scan "OS-seeded hashing" "(^|$nb)(HashMap|HashSet|RandomState)($nb|\$)" "$tmpdir/norm-code" "$f"
 done <"$tmpdir/pure-files"
 if [ -s "$tmpdir/hits" ]; then
     fail "pure sources name forbidden facilities:
@@ -483,14 +487,6 @@ fi
 #   - capture.rs is pinned by its SHA-256 (H1f-4 confirming review NF-2: a
 #     relative program name or an extra argument passed the literal check),
 #     so its programs, argv and bounds change only with this gate, by review.
-# H2a adds ONE second spawn module, the confined spawn (design §6.3),
-# crates/harness-sandbox/src/confine_spawn.rs, held to the same rules: the
-# words are allowed there, it must name `Command`, its absolute-path
-# literals may only be /usr/bin/sandbox-exec, /usr/bin/perl (the domain
-# stub inside the sandbox) and /bin/kill (the process-group kill), and it
-# is pinned by its SHA-256. What it starts is the confined program, whose
-# argv is exec.run's (§4.8); its own argv is fixed text plus the harness's
-# profile path, and argv, env and limits of the program travel over a pipe.
 # Section 5 below closes what these scans cannot read: dependencies,
 # targets outside src/, foreign code, cargo configuration. Integration tests
 # (crates/*/tests/) are separate test crates and may spawn freely. Fails
@@ -499,7 +495,6 @@ fi
 # need a review of this gate to allow.
 spawn_file=crates/harness-sandbox/src/capture.rs
 spawn_tests=crates/harness-sandbox/src/capture/tests.rs
-confine_file=crates/harness-sandbox/src/confine_spawn.rs
 find crates -type l >"$tmpdir/links" || fail "find failed (INV-23 symlinks)"
 if [ -s "$tmpdir/links" ]; then
     fail "INV-23: symlinks under crates/ (a source could hide behind one):
@@ -507,7 +502,7 @@ $(cat "$tmpdir/links")"
 fi
 find crates -path '*/src/*' -type f -name '*.rs' >"$tmpdir/argv-found" || fail "find failed (INV-23)"
 sort "$tmpdir/argv-found" >"$tmpdir/argv-files" || fail "sort failed (INV-23)"
-for must in "$spawn_file" "$spawn_tests" "$confine_file" crates/harness-sandbox/src/locality.rs; do
+for must in "$spawn_file" "$spawn_tests" crates/harness-sandbox/src/locality.rs; do
     grep -qxF "$must" "$tmpdir/argv-files" || fail "INV-23 scan would miss $must"
 done
 : >"$tmpdir/hits"
@@ -525,9 +520,9 @@ while IFS= read -r f; do
   scan "INV-23: #[path] module" '#\[ ?path ?=' "$tmpdir/argv-code" "$f"
   scan "INV-23: compile-time include" "(^|$nb)(include|include_str|include_bytes) ?!" "$tmpdir/argv-code" "$f"
   case $f in
-      "$spawn_file" | "$spawn_tests" | "$confine_file") continue ;;
+      "$spawn_file" | "$spawn_tests") continue ;;
   esac
-  scan "INV-23: a spawn outside $spawn_file and $confine_file" "(^|$nb)(Command|CommandExt|raw_arg)($nb|\$)" "$tmpdir/argv-code" "$f"
+  scan "INV-23: a spawn outside $spawn_file" "(^|$nb)(Command|CommandExt|raw_arg)($nb|\$)" "$tmpdir/argv-code" "$f"
 done <"$tmpdir/argv-files"
 strip_comments "$spawn_file" "$tmpdir/spawn-stripped"
 normalise "$tmpdir/spawn-stripped" "$tmpdir/spawn-code"
@@ -549,27 +544,8 @@ while IFS= read -r prog; do
         *) printf '%s: INV-23: program %s is not one §4.5 lists\n' "$spawn_file" "$prog" >>"$tmpdir/hits" ;;
     esac
 done <"$tmpdir/spawn-programs"
-# The confined spawn: names Command, and only its three programs.
-strip_comments "$confine_file" "$tmpdir/confine-stripped"
-normalise "$tmpdir/confine-stripped" "$tmpdir/confine-code"
-grep -qE "(^|$nb)Command($nb|\$)" "$tmpdir/confine-code" ||
-    fail "INV-23: $confine_file names no Command (read nothing?)"
-normalise "$confine_file" "$tmpdir/confine-raw"
-rc=0
-grep -aoE '"/[^"]*"' "$tmpdir/confine-raw" >"$tmpdir/confine-programs" || rc=$?
-case $rc in
-    0) ;;
-    1) fail "INV-23: $confine_file names no program (read nothing?)" ;;
-    *) fail "grep error (rc=$rc) listing programs in $confine_file" ;;
-esac
-while IFS= read -r prog; do
-    case $prog in
-        '"/usr/bin/sandbox-exec"' | '"/usr/bin/perl"' | '"/bin/kill"') ;;
-        *) printf '%s: INV-23: program %s is not one the confined spawn may run\n' "$confine_file" "$prog" >>"$tmpdir/hits" ;;
-    esac
-done <"$tmpdir/confine-programs"
 if [ -s "$tmpdir/hits" ]; then
-    fail "INV-23: spawns are confined to the closed query set in $spawn_file and the confined spawn in $confine_file:
+    fail "INV-23: spawns are confined to the closed query set in $spawn_file:
 $(cat "$tmpdir/hits")"
 fi
 # The one spawn site, pinned. Update only with a review of the change.
@@ -584,17 +560,6 @@ fi
 read -r capture_got _ <"$tmpdir/capture-sha" || fail "could not read the digest of $spawn_file"
 [ "$capture_got" = "$capture_sha256" ] ||
     fail "INV-23: $spawn_file is not the reviewed version (sha256 $capture_got, pinned $capture_sha256): the one spawn site changes only with this gate; review the change, then update capture_sha256 in scripts/ci/purity.sh"
-
-# The confined spawn, pinned. Update only with a review of the change.
-confine_spawn_sha256=5eb586cce2fe4a5cc4d636f991f841ef16095fdba01692112fa101763ec9e6bf
-if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum <"$confine_file" >"$tmpdir/confine-sha" || fail "sha256sum failed on $confine_file"
-else
-    shasum -a 256 <"$confine_file" >"$tmpdir/confine-sha" || fail "shasum failed on $confine_file"
-fi
-read -r confine_got _ <"$tmpdir/confine-sha" || fail "could not read the digest of $confine_file"
-[ "$confine_got" = "$confine_spawn_sha256" ] ||
-    fail "INV-23: $confine_file is not the reviewed version (sha256 $confine_got, pinned $confine_spawn_sha256): the confined spawn changes only with this gate; review the change, then update confine_spawn_sha256 in scripts/ci/purity.sh"
 
 # --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------
 # Every compile_fail doctest names its expected error code; gates.sh runs the

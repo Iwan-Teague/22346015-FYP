@@ -172,7 +172,7 @@ fn fixture_manifest_validates() {
 // ---- built-in manifest ------------------------------------------------------
 
 #[test]
-fn builtin_manifest_declares_exactly_the_h1_read_tools_and_the_sentinel() {
+fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() {
     let m = builtin::manifest(&ctx()).unwrap();
     assert_eq!(m.provider().as_str(), BUILTIN_NAMESPACE);
     assert_eq!(m.origin(), Origin::Compiled);
@@ -184,14 +184,73 @@ fn builtin_manifest_declares_exactly_the_h1_read_tools_and_the_sentinel() {
             "harness.fs.read",
             "harness.fs.search",
             "harness.fs.list",
+            "harness.edit.replace",
+            "harness.edit.write",
             "harness.task.submit"
         ]
     );
-    let submit = &m.capabilities()[3];
+    let submit = &m.capabilities()[5];
     assert_eq!(
         (submit.effect, submit.sensitivity, submit.content),
         (Effect::Write, Sensitivity::Public, Content::Own)
     );
+    // The dev-suite judge's finding (a): the tools say where paths start
+    // (a model listed "/" first in 3 of 5 runs), and the list and search
+    // tools name "." as the root.
+    for c in &m.capabilities()[..5] {
+        assert!(
+            c.summary()
+                .contains("Paths are relative to the workspace root"),
+            "{}",
+            c.id
+        );
+    }
+    for c in &m.capabilities()[1..3] {
+        assert!(c.summary().contains(r#""." is the root"#), "{}", c.id);
+    }
+    // H2b: the edit tools carry §4.8's labels (write / operational / own /
+    // none), content own, no declared confirmation, and §4.9's schemas.
+    for c in &m.capabilities()[3..5] {
+        assert_eq!(
+            (c.effect, c.sensitivity, c.blast_radius, c.egress),
+            (
+                Effect::Write,
+                Sensitivity::Operational,
+                BlastRadius::Own,
+                Egress::None
+            ),
+            "{}",
+            c.id
+        );
+        assert_eq!(
+            (c.content, c.confirmation),
+            (Content::Own, Confirmation::None)
+        );
+        assert!(c.secrets.is_empty() && c.mcp_name.is_none() && c.schema_sha256.is_none());
+    }
+    let replace = &m.capabilities()[3];
+    for ok in [
+        json!({"path": "src/lib.rs", "old": "a", "new": "b"}),
+        json!({"path": "src/lib.rs", "old": "a", "new": "", "count": 2}),
+    ] {
+        assert!(replace.input_schema().validate_args(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"path": "src/lib.rs", "old": "a"}),
+        json!({"path": "src/lib.rs", "old": "a", "new": "b", "count": 0}),
+        json!({"path": "src/lib.rs", "old": "a", "new": "b", "mode": "x"}),
+    ] {
+        assert!(replace.input_schema().validate_args(&bad).is_err(), "{bad}");
+    }
+    let write = &m.capabilities()[4];
+    assert!(write
+        .input_schema()
+        .validate_args(&json!({"path": "new.rs", "content": ""}))
+        .is_ok());
+    assert!(write
+        .input_schema()
+        .validate_args(&json!({"path": "new.rs"}))
+        .is_err());
     for c in m.capabilities().iter().take(3) {
         assert_eq!(c.effect, Effect::Read, "{}", c.id);
         assert_eq!(c.sensitivity, Sensitivity::Operational, "{}", c.id);

@@ -23,7 +23,9 @@ this is not built yet: see Status below, and the owner decisions in
 **H1, the read-only agent, is built** (design
 [§9](docs/01-design-v0.1.md#9-phasing)); its phase-exit review's fixes are in
 (slice H1g), the exit test passed again on a local model with both protocols,
-and the owner's sign-off on the design's open questions remains before H2. What works today:
+slice H1h makes the native protocol send past actions back as the model's own
+tool calls (a model copied the old text form), and the owner's sign-off on the
+design's open questions remains before H2. What works today:
 
 - **A read-only agent loop** against a model served on loopback
   (`http://127.0.0.1`, `[::1]` or `localhost`; OpenAI-compatible, e.g. llama.cpp),
@@ -35,7 +37,17 @@ and the owner's sign-off on the design's open questions remains before H2. What 
   and tool results, recomputes every context digest and policy decision, and
   names the first divergence; only `--anchor` (the chain head `run` printed)
   detects a replaced or consistently re-chained journal (design §7.1 and the
-  H1e-2b, H1f-3 and H1g rows). `resume` continues an interrupted run in a new attempt.
+  H1e-2b, H1f-3 and H1g rows). A journal written by another harness build is
+  refused by name (rows H1f-3, H1h). `resume` continues an interrupted run in a new attempt.
+- **Edits, with a person's permission (H2b, in progress on a branch).** Two
+  edit tools, `harness.edit.replace` (an exact, unique text) and
+  `harness.edit.write` (a new file, or a whole file of at most 400 lines),
+  anchored on the run's reads, applied atomically and verified, and journaled
+  with their before and after digests. The workspace is edited in place with no
+  sandbox or snapshot yet, so an edit asks: the terminal prompts when stdin is
+  a terminal, and with nobody to ask it is denied, unless the `--policy` file
+  lists the edit tools under `allow` (how an unattended run edits). `resume`
+  never applies a completed edit again (design rows H2b).
 - **No run can pass yet.** Checks arrive in H3, so no run ends `Passed`,
   whatever the agent says: a run that starts ends `Indeterminate { NothingChecked }`
   (`UnreadableEvidence` if its journal fails or a resume's catch-up diverges),

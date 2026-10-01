@@ -99,6 +99,7 @@ fn go(state: &Path, ws: &Path, replies: Vec<Result<Completion, ModelError>>) -> 
         probe: &Local,
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
+        approver: None,
     })
     .unwrap()
 }
@@ -449,6 +450,7 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
         probe: &Local,
         env: &FIXED_ENV,
         config: &config,
+        approver: None,
     })
     .unwrap();
     assert_eq!(r.cause, StopCause::Budget(harness_core::BudgetDim::Wall));
@@ -501,6 +503,24 @@ fn crash_after(path: &Path, keep_below: u64) {
     fs::write(path, out).unwrap();
 }
 
+/// Cut a committed journal inside step `step`, just before its first record
+/// of kind `kind` (a crash mid-step: e.g. before `ToolFinished`, leaving
+/// the step's intent without its result).
+fn crash_in(path: &Path, step: u64, kind: &str) {
+    let text = fs::read_to_string(path).unwrap();
+    let mut out = String::new();
+    for line in text.lines() {
+        let v: Value = serde_json::from_str(line).unwrap();
+        let s = v["step"].as_u64().unwrap();
+        if s > step || (s == step && v["kind"] == kind) || v["kind"] == "RunStopped" {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(path, out).unwrap();
+}
+
 fn resume_with(
     state: &Path,
     ws: &Path,
@@ -541,6 +561,7 @@ fn resume_under(
         probe: &Local,
         env: &FIXED_ENV,
         config,
+        approver: None,
     })
 }
 
@@ -548,8 +569,9 @@ fn resume_under(
 fn resume_continues_in_a_new_attempt_and_re_runs_the_cut_step_live() {
     let (state, ws) = scratch("resume");
     let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
-    // Crash in step 2: its records survive but step 3 and RunStopped do not.
-    crash_after(&journal_path(&r, 1), 3);
+    // Crash in step 2 before its result: its intent survives without a
+    // `ToolFinished`, and step 3 and RunStopped do not.
+    crash_in(&journal_path(&r, 1), 2, "ToolFinished");
     let before = fs::read(journal_path(&r, 1)).unwrap();
     let old = JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).unwrap();
     // Step 1 is replayed from the journal; step 2 runs again live, then 3.
@@ -586,6 +608,34 @@ fn resume_continues_in_a_new_attempt_and_re_runs_the_cut_step_live() {
     assert_eq!(a.divergence, None, "{a:?}");
 }
 
+/// H2b (the H1e-2b row's H2 condition): a step whose call has a durable
+/// `ToolFinished` is complete, so resume re-feeds it and never runs it
+/// again; only the next step runs live.
+#[test]
+fn resume_re_feeds_a_completed_last_step_and_runs_only_the_next_live() {
+    let (state, ws) = scratch("resume-completed");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    // Crash after step 2 finished: its result is durable, step 3 is gone.
+    crash_after(&journal_path(&r, 1), 3);
+    let old = JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).unwrap();
+    let res = resume_with(&state, &ws, &r.run, TASK, vec![submit()]).unwrap();
+    assert_eq!(res.attempt, 2);
+    assert_eq!(res.steps, 3, "steps 1 and 2 replayed, step 3 live");
+    assert_eq!(res.cause, StopCause::Submitted);
+    let new = JournalReader::open(&layout::attempt_dir(&r.run_dir, 2)).unwrap();
+    let body = |v: &harness_journal::Verified, s: u64| -> Vec<(EventKind, Value)> {
+        v.records
+            .iter()
+            .filter(|x| x.step == s)
+            .map(|x| (x.kind, Value::Object(x.body.clone())))
+            .collect()
+    };
+    assert_eq!(body(&new, 1), body(&old, 1));
+    assert_eq!(body(&new, 2), body(&old, 2), "step 2 re-fed, not re-run");
+    let a = audit_with(&state, &r.run, Some(2), TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+}
+
 #[test]
 fn resume_refuses_a_stopped_run_a_changed_workspace_and_changed_inputs() {
     let (state, ws) = scratch("resume-refusals");
@@ -603,7 +653,7 @@ fn resume_refuses_a_stopped_run_a_changed_workspace_and_changed_inputs() {
     fs::write(ws.join("a.txt"), "changed\n").unwrap();
     let e = resume_with(&state, &ws, &r.run, TASK, vec![]).unwrap_err();
     assert!(
-        matches!(e, RunRefused::NotResumable(w) if w.contains("workspace changed")),
+        matches!(e, RunRefused::NotResumable(w) if w.contains("workspace differs")),
         "{e:?}"
     );
     assert!(
@@ -1310,5 +1360,82 @@ fn inv_20_a_tampered_tool_result_diverges_at_the_first_context_built_from_it() {
         (d.step, recs[d.seq as usize]["kind"].clone()),
         (2, Value::from("ContextBuilt")),
         "{d:?}"
+    );
+}
+
+// ---- H1 phase-exit review F-5 (closed in H2b) -----------------------------------------
+
+/// A probe that admits the state root and refuses every attempt directory
+/// (the review's witness W4: the new attempt's locality check fails, e.g.
+/// a macOS query past its deadline on a loaded host).
+struct RefuseAttempts;
+impl LocalityProbe for RefuseAttempts {
+    fn query(&self, path: &str) -> FsQuery {
+        if path.contains("attempt-") {
+            FsQuery::MacOs {
+                mnt_local: false,
+                fs_type_name: "smbfs".into(),
+            }
+        } else {
+            Local.query(path)
+        }
+    }
+}
+
+/// W4: a resume whose new attempt fails its start leaves an empty
+/// `attempt-2`. It holds no header, so it is evidence of nothing: the
+/// default audit passes over it (and names it) to attempt 1, and a later
+/// resume, once the condition clears, continues attempt 1 in attempt 3,
+/// naming attempt 2 in its header.
+#[test]
+fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
+    let (state, ws) = scratch("w4");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    crash_after(&journal_path(&r, 1), 3);
+    let profile = Profile::conservative_default("m");
+    let backend = ScriptedBackend::new(profile.clone(), vec![]);
+    let e = resume(Resume {
+        state_root: &state,
+        run: &r.run,
+        workspace: &ws,
+        spec: &spec(TASK),
+        registry: &registry(),
+        policy: &UserPolicy::default(),
+        profile: &profile,
+        backend: &backend,
+        probe: &RefuseAttempts,
+        env: &FIXED_ENV,
+        config: &RunConfig::defaults(1_000_000),
+        approver: None,
+    })
+    .unwrap_err();
+    assert!(matches!(e, RunRefused::Start(_)), "{e:?}");
+    let left = layout::attempt_dir(&r.run_dir, 2);
+    assert!(left.is_dir() && !left.join(layout::JOURNAL_FILE).exists());
+
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.attempt, 1, "{a:?}");
+    assert_eq!(a.skipped_attempts, vec![2]);
+    assert_eq!(a.divergence, None, "{a:?}");
+
+    let again = resume_with(&state, &ws, &r.run, TASK, vec![submit()]).unwrap();
+    assert_eq!(again.attempt, 3);
+    assert_eq!(again.cause, StopCause::Submitted);
+    let h = JournalReader::open(&layout::attempt_dir(&r.run_dir, 3)).unwrap();
+    assert_eq!(h.records[0].body["resumed_from"]["attempt"], 1);
+    assert_eq!(
+        h.records[0].body["resumed_from"]["skipped_attempts"],
+        serde_json::json!([2])
+    );
+    // An attempt with a header that does not verify is never passed over.
+    let bad = layout::attempt_dir(&r.run_dir, 3).join(layout::JOURNAL_FILE);
+    let t = fs::read_to_string(&bad)
+        .unwrap()
+        .replacen("a.txt", "b.txt", 1);
+    fs::write(&bad, t).unwrap();
+    let e = resume_with(&state, &ws, &r.run, TASK, vec![]).unwrap_err();
+    assert!(
+        matches!(e, RunRefused::NotResumable(w) if w.contains("does not verify")),
+        "{e:?}"
     );
 }

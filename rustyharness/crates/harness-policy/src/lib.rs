@@ -1,5 +1,6 @@
-//! rustyharness policy, READ CLASSES ONLY (design `docs/01-design-v0.1.md`
-//! §4.2, §5.1, §5.2, §5.4; this slice of §9 H1).
+//! rustyharness policy for read classes and the built-in workspace edits
+//! (design `docs/01-design-v0.1.md` §4.2, §5.1, §5.2, §5.3, §5.4; this
+//! slice of §9 H1/H2).
 //!
 //! Pure: no I/O, no clock, no global state. Everything a decision reads is
 //! in its arguments, so audit replay can recompute it (§2.9).
@@ -9,16 +10,30 @@
 //! - [`Session::plan`]: session-level refusals before anything runs:
 //!   unknown or duplicate grants, `restricted` (INV-27), the trifecta
 //!   (INV-9, pure half), and every class this slice does not decide. The
-//!   one write-class capability it does decide is the built-in submit
+//!   write-class capabilities it does decide are the built-in submit
 //!   sentinel [`SUBMIT_ID`] (§2.5), allowed by the named rule
-//!   `allow.task-submit` after every deny rule and schema check.
+//!   `allow.task-submit` after every deny rule and schema check, and the
+//!   built-in workspace edits [`EDIT_IDS`] (H2b): allowed only by a user
+//!   allow rule, otherwise an ask (rule [`EDIT_DEFAULT_RULE`]), a deny with
+//!   no approver present. §5.2's default allow for them assumes a sandbox
+//!   and snapshots that make an edit undoable; this build edits the
+//!   workspace in place with neither, so it asks.
 //! - [`Session::decide`]: the §5.1 order — deny rules (first match wins,
 //!   cannot be overridden), then ask rules, then allow rules, then DENY by
 //!   default. Every decision carries the id of the rule that produced it.
-//! - [`Session::authorize`]: the only mint of [`Authorized`]; only `Allow`
-//!   mints. An `Ask` cannot be turned into an `Authorized` in this build
-//!   (approval tokens are H2), and with no approver present an `Ask` is a
-//!   `Deny` (§5.2).
+//! - [`Session::authorize`]: a mint of [`Authorized`]; only `Allow`
+//!   mints. An `Ask` alone never mints: with no approver present an `Ask`
+//!   is a `Deny` (§5.2), and with one it stays an `Ask` until the approver
+//!   says yes and a valid, bound, unconsumed approval token is redeemed
+//!   (§5.3, INV-5).
+//! - [`approval`]: the §5.3 approval tokens. An
+//!   [`ApprovalAuthority`] mints HMAC-bound, 15-minute, single-use (or
+//!   run-scoped-identical) tokens under a per-run key that exists only in
+//!   harness memory; a token that is forged, expired, rebound, cross-run
+//!   or replayed is refused (INV-16).
+//! - [`Session::authorize_approved`]: the ONLY other mint of
+//!   [`Authorized`]: an `Ask` decision plus a redeemed token that binds
+//!   exactly this call. Nothing else turns an `Ask` into a call.
 //! - [`path`]: what a built-in read may touch (the workspace, lexically).
 //! - [`locality`]: the `state_root` filesystem-locality check's interface
 //!   and its refusing default (the per-OS probes live in `harness-sandbox`).
@@ -47,6 +62,7 @@ use harness_manifest::{
 };
 use serde_json::Value;
 
+pub mod approval;
 pub mod locality;
 pub mod path;
 
@@ -327,9 +343,11 @@ pub struct Call {
     pub args: Value,
 }
 
-/// A call that policy allowed. Fields are private and the only constructor
-/// is [`Session::authorize`], so a provider that accepts only
-/// `Authorized<Call>` cannot be driven by an unchecked call (§4.5).
+/// A call that policy allowed. Fields are private and the only
+/// constructors are [`Session::authorize`] and, for a call policy asked
+/// about, [`Session::authorize_approved`] with a redeemed approval token
+/// (§5.3), so a provider that accepts only `Authorized<Call>` cannot be
+/// driven by an unchecked call (§4.5).
 ///
 /// ```compile_fail,E0451
 /// let forged = harness_policy::Authorized {
@@ -347,17 +365,23 @@ pub struct Authorized<C> {
 /// intent: the compact JSON of `{"args": …, "capability": …}` with sorted
 /// keys (serde_json's map is ordered). The journal calls this on the very
 /// `Authorized<Call>` it then returns as `Journaled`, so the intent names
-/// exactly the call that may run (H1c review F-7).
+/// exactly the call that may run (H1c review F-7). The same digest binds
+/// approval tokens to the call they approve (§5.3).
 impl harness_core::CallDigest for Authorized<Call> {
     fn call_digest(&self) -> harness_core::Digest {
-        let mut m = serde_json::Map::new();
-        m.insert("args".into(), self.call.args.clone());
-        m.insert(
-            "capability".into(),
-            Value::from(self.call.capability.clone()),
-        );
-        harness_core::sha256(Value::Object(m).to_string().as_bytes())
+        canonical_call_digest(&self.call)
     }
+}
+
+/// SHA-256 of a call's canonical form (the sorted-key compact JSON of
+/// `{"args": …, "capability": …}`): the one digest shared by the journal's
+/// call intent ([`harness_core::CallDigest`]) and approval-token binding
+/// (§5.3), so a token can never bind a call under a different spelling.
+pub(crate) fn canonical_call_digest(call: &Call) -> harness_core::Digest {
+    let mut m = serde_json::Map::new();
+    m.insert("args".into(), call.args.clone());
+    m.insert("capability".into(), Value::from(call.capability.clone()));
+    harness_core::sha256(Value::Object(m).to_string().as_bytes())
 }
 
 impl<C> Authorized<C> {
@@ -476,9 +500,12 @@ struct Active {
     user_allow: Option<usize>,
     /// A built-in file tool: its `path` argument must stay in the workspace.
     fs_tool: bool,
-    /// The built-in submit sentinel (§2.5), the one write-class capability
-    /// this slice decides.
+    /// The built-in submit sentinel (§2.5).
     submit: bool,
+    /// A built-in workspace edit (`harness.edit.*`, §4.8, H2b): its `path`
+    /// must stay in the workspace, and it is allowed only by a user allow
+    /// rule or an approval (see [`Session::decide`]).
+    edit: bool,
 }
 
 /// A planned session: the active set with each capability's effective
@@ -506,6 +533,28 @@ fn is_submit_sentinel(c: &Capability) -> bool {
         && c.id().provider() == BUILTIN_NAMESPACE
         && c.effect() == Effect::Write
         && c.sensitivity() == Sensitivity::Public
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::Own
+        && c.confirmation() == Confirmation::None
+}
+
+/// The built-in workspace edit tools (§4.8, §4.9; H2b).
+pub const EDIT_IDS: [&str; 2] = ["harness.edit.replace", "harness.edit.write"];
+
+/// The rule id of the built-in edits' default decision in this build (§5.2,
+/// H2b): an ask, since the workspace is edited in place.
+pub const EDIT_DEFAULT_RULE: &str = "ask.edit.in-place";
+
+/// Whether `c` is a built-in workspace edit with exactly the labels §4.8
+/// gives it (write / operational / own / none, content own, no declared
+/// confirmation). Anything else under those ids would not be the harness's
+/// edit tool, and its write class is then out of scope like any other.
+fn is_builtin_edit(c: &Capability) -> bool {
+    EDIT_IDS.contains(&c.id().as_str())
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Write
+        && c.sensitivity() == Sensitivity::Operational
         && c.blast_radius() == BlastRadius::Own
         && c.egress() == Egress::None
         && c.content() == Content::Own
@@ -586,10 +635,12 @@ impl Session {
                 capability: id.to_string(),
                 what,
             };
-            if id.as_str().starts_with(FS_PREFIX) && spec.workspace.is_none() {
+            if (id.as_str().starts_with(FS_PREFIX) || EDIT_IDS.contains(&id.as_str()))
+                && spec.workspace.is_none()
+            {
                 return Err(SessionRefused::NoWorkspace(id.to_string()));
             }
-            if cl.effect != Effect::Read && !is_submit_sentinel(c) {
+            if cl.effect != Effect::Read && !is_submit_sentinel(c) && !is_builtin_edit(c) {
                 return Err(out("a non-read effect class"));
             }
             if cl.egress != Egress::None {
@@ -610,6 +661,7 @@ impl Session {
                     fs_tool: c.id().provider() == BUILTIN_NAMESPACE
                         && c.id().as_str().starts_with(FS_PREFIX),
                     submit: is_submit_sentinel(c),
+                    edit: is_builtin_edit(c),
                 },
             );
         }
@@ -654,7 +706,7 @@ impl Session {
             return deny(DenyReason::Quarantined, "deny.quarantined");
         }
         let cl = a.class;
-        if cl.effect != Effect::Read && !a.submit {
+        if cl.effect != Effect::Read && !a.submit && !a.edit {
             return deny(
                 DenyReason::ClassOutOfScope(cl.effect),
                 "deny.class-out-of-scope",
@@ -684,7 +736,7 @@ impl Session {
         if let Err(e) = a.schema.validate_args(&call.args) {
             return deny(DenyReason::Args(e), "deny.args-schema");
         }
-        if a.fs_tool {
+        if a.fs_tool || a.edit {
             if let Some(p) = call.args.get("path") {
                 // The schema says string; anything else was refused above.
                 let checked = p.as_str().map_or(Err(PathRefused::Empty), workspace_path);
@@ -731,6 +783,23 @@ impl Session {
                 rule: RuleId::Builtin("allow.task-submit"),
             };
         }
+        // Built-in workspace edits (H2b). §5.2 allows them by default
+        // because "the sandbox plus snapshots make them undoable"; this
+        // build has neither (it edits the task's workspace in place), so
+        // they take the provider-declared write row instead: ask unless a
+        // user allow rule (checked above) allows them, and with no approver
+        // the ask is a deny (§5.2). The decision is an Ask at
+        // `user_confirm` although the declared confirmation is `none`: the
+        // tier comes from this rule, not from the class.
+        if a.edit {
+            if !self.approver_present {
+                return deny(DenyReason::NoApprover, "deny.no-approver");
+            }
+            return PolicyDecision::Ask {
+                tier: Confirmation::UserConfirm,
+                rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+            };
+        }
 
         // ---- 4. Default: deny. ----
         deny(DenyReason::NoRuleMatched, "deny.default")
@@ -741,6 +810,38 @@ impl Session {
     pub fn authorize(&self, call: Call) -> Result<Authorized<Call>, PolicyDecision> {
         match self.decide(&call) {
             PolicyDecision::Allow { rule } => Ok(Authorized { call, rule }),
+            other => Err(other),
+        }
+    }
+
+    /// Mint an [`Authorized`] call from an `Ask` plus a REDEEMED approval
+    /// token (§5.3): the only path besides [`Session::authorize`], and
+    /// nothing else turns an `Ask` into a call. The decision must be
+    /// `Ask`, and the [`approval::Redeemed`] proof must bind exactly this
+    /// call — same capability, same canonical argument digest
+    /// ([`canonical_call_digest`]), same tier as asked. The proof is
+    /// consumed by value, so a single-use approval cannot be spent twice.
+    ///
+    /// Anything else fails closed: an `Ask` whose token does not bind this
+    /// call stays an `Ask` (never a mint), and `Allow`/`Deny` decisions
+    /// pass through untouched — an approval can never authorize a call
+    /// policy did not ask about.
+    pub fn authorize_approved(
+        &self,
+        call: Call,
+        redeemed: approval::Redeemed,
+    ) -> Result<Authorized<Call>, PolicyDecision> {
+        match self.decide(&call) {
+            PolicyDecision::Ask { tier, rule } => {
+                if redeemed.tier() == tier
+                    && redeemed.capability().as_str() == call.capability
+                    && redeemed.args_sha256() == canonical_call_digest(&call)
+                {
+                    Ok(Authorized { call, rule })
+                } else {
+                    Err(PolicyDecision::Ask { tier, rule })
+                }
+            }
             other => Err(other),
         }
     }

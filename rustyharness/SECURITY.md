@@ -17,9 +17,13 @@ In scope for reports today, a way to:
   parsed for an action, INV-29);
 - invoke a capability the task did not grant or user policy denies, get a
   provider other than the built-in one admitted, or cause any workspace write
-  through the agent (H1 is read-only; the one write-class capability is the
-  submit sentinel `harness.task.submit`, granted to every session, which only
-  ends the loop, §2.5);
+  through the agent other than a granted edit tool's (on the H2b branch:
+  `harness.edit.replace` and `harness.edit.write`, which run only when user
+  policy allows them or an approver said yes to that exact call at that step;
+  the submit sentinel `harness.task.submit` only ends the loop, §2.5); make an
+  edit run without such a yes (a reused, forged or other-step approval), write
+  outside the workspace, follow a symlink, edit a file changed since the run
+  read it, or apply a completed edit again on resume (design rows H2b);
 - read outside the workspace, beyond the residuals the design names (hard links,
   mount points inside the workspace and the check-then-open window, the
   design's H1e-2 "Read tools" row);

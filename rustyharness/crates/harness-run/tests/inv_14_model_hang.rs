@@ -147,6 +147,7 @@ fn go(state: &Path, ws: &Path, server: &Hold, config: &RunConfig) -> (RunReport,
         probe: &Local,
         env: &FIXED_ENV,
         config,
+        approver: None,
     })
     .unwrap();
     (r, t.elapsed())

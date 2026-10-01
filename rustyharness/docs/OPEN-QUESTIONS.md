@@ -31,14 +31,15 @@ so the history stays readable. What is still open is listed first.
    writes `runs/<run-id>/replay-<k>/` under `state_root` without the locality check
    `run` applies (INV-35), so on Windows it writes where `run` refuses. Checking would
    make replay refuse on Windows until S-W1 too (design row H1f-1).
-3. **The H1 phase-exit review** (§9): each H1 slice has its own recorded review
-   (the H1a-H1e commits, and the H1f rows of the design); the phase as a whole has
-   not been reviewed. Two items for it: INV-14's falsifying test ("hanging tool →
-   `Budget(Wall)` within budget + kill grace") has no H1 counterpart, because
-   in-process read tools are not interruptible (a named §11 residual that H2's
-   killable helper closes), so the review decides whether H1 exits with it named;
-   and `replay`'s "every record recomputed and matched" message, which should say
-   that replies, tool results and samples are re-fed.
+3. **The H1 phase exit** (§9): the phase-exit review found H1 NEEDS-FIXES and
+   decided its two items: H1 exits with INV-14's hanging-tool test named (it is an
+   H2 key test), and `replay`'s message now says that replies, tool results and
+   samples are re-fed. Slice H1g made its code and doc fixes (design rows H1g and
+   H1g-2), and the findings the review let H1 carry into H2 are named, with where
+   each closes, in design row H1g-3.
+   The H1 exit test was re-run on a local model server, both protocols, and
+   passed (review F-10; design row H1g-4). Still to do before H2: item 1 above
+   (F-11).
 4. **(owner) Sharing confinement code with rustybenchmark** (reopened 2026-09-24;
    was answered item 5). The owner's position: the benchmark's grading sandbox stays
    its own, and the harness never depends on the benchmark. Open: share confinement

@@ -273,6 +273,10 @@ const NOTHING_CHECKED: GateOutcome = GateOutcome::Indeterminate {
     why: IndeterminateKind::NothingChecked,
 };
 
+/// What `replay` says of an attempt it matched, stop included (H1
+/// phase-exit review, named item 2).
+const REPLAY_MATCHED: &str = "records matched. Re-fed from the journal, not re-run: the model replies, the tool results and the environment samples. Recomputed and compared: every context, parse, loop-detector and policy decision, and the stop.";
+
 // ---- the tests ---------------------------------------------------------------------
 
 /// The real binary refused `state_root` as not local: before anything was
@@ -415,7 +419,29 @@ fn a_whole_run_is_nothing_checked_exit_5_no_marker_and_prints_its_chain_head() {
     let r = report(&clean);
     assert_eq!(r["gate"], "audit.h1");
     assert_eq!(r["outcome"]["Indeterminate"]["why"], "NothingChecked");
-    assert!(String::from_utf8_lossy(&clean.stderr).contains("recomputed and matched"));
+    // H1 phase-exit review, named item 2: the replay says what it re-fed
+    // and what it recomputed, never "every record recomputed".
+    let err = String::from_utf8_lossy(&clean.stderr);
+    assert!(err.contains(REPLAY_MATCHED), "{err}");
+    assert!(
+        err.contains("The anchor matched the journal's chain head."),
+        "{err}"
+    );
+    assert!(!err.contains("recomputed and matched"), "{err}");
+    assert!(
+        r["findings"][0]["observed"].as_str().unwrap().ends_with(
+            " records matched (replies, tool results and samples re-fed; contexts, parses and decisions recomputed); anchor matched"
+        ),
+        "{r}"
+    );
+    let unanchored = replay(&[]);
+    assert_eq!(unanchored.code(), Some(5));
+    let err = String::from_utf8_lossy(&unanchored.stderr);
+    assert!(err.contains(REPLAY_MATCHED), "{err}");
+    assert!(
+        err.contains("Without --anchor, a journal rewritten consistently is not detected (the chain is unkeyed)."),
+        "{err}"
+    );
     let wrong = replay(&["--anchor", &"0".repeat(64)]);
     assert_eq!(wrong.code(), Some(5));
     assert_eq!(
@@ -622,7 +648,171 @@ fn replay_of_a_forged_wall_stop_is_unreadable_evidence_with_a_named_finding() {
         rep["findings"][0]["observed"],
         "wall stop not recomputable; only --anchor proves no truncation"
     );
-    assert!(!String::from_utf8_lossy(&r.stderr).contains("every record recomputed and matched"));
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("the stop was NOT recomputed"), "{err}");
+    assert!(!err.contains(REPLAY_MATCHED), "{err}");
+}
+
+/// Write `records` as a journal the way a forger who re-chains would: seq
+/// renumbered, every result's `intent_seq` pointed at its (renumbered)
+/// intent, every hash recomputed.
+fn write_chained(path: &Path, records: &[serde_json::Value]) {
+    use harness_journal::canon::{RecordFields, GENESIS};
+    let mut prev = GENESIS;
+    let mut out = Vec::new();
+    let mut last_intent = 0u64;
+    for (i, v) in records.iter().enumerate() {
+        let seq = i as u64;
+        let mut body = v["body"].as_object().unwrap().clone();
+        if v["kind"] == "ToolStarted" {
+            last_intent = seq;
+        }
+        if body.contains_key("intent_seq") {
+            body.insert("intent_seq".into(), serde_json::Value::from(last_intent));
+        }
+        let (bytes, hash) = RecordFields {
+            seq,
+            prev,
+            t_mono_ms: v["t_mono_ms"].as_u64().unwrap(),
+            t_wall: v["t_wall"].as_str().unwrap().to_owned(),
+            run: harness_core::RunId::parse(v["run"].as_str().unwrap()).unwrap(),
+            attempt: u32::try_from(v["attempt"].as_u64().unwrap()).unwrap(),
+            step: v["step"].as_u64().unwrap(),
+            kind: harness_journal::EventKind::parse(v["kind"].as_str().unwrap()).unwrap(),
+            body,
+        }
+        .encode();
+        out.extend(bytes);
+        out.push(b'\n');
+        prev = hash;
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// `replay` of `id` through the real binary, with `extra` options.
+fn replay_bin(fx: &Fx, id: &str, extra: &[&str]) -> Output {
+    let mut a = vec![
+        "replay",
+        "--run",
+        id,
+        "--task",
+        fx.task.to_str().unwrap(),
+        "--state-root",
+        fx.state.to_str().unwrap(),
+        "--profile",
+        fx.profile.to_str().unwrap(),
+    ];
+    a.extend_from_slice(extra);
+    cli(&a, false, &fx.marker)
+}
+
+/// A three-step run (read, list, submit) in process; its run id, journal
+/// path and chain head.
+fn three_steps(fx: &Fx) -> (String, PathBuf, String) {
+    let m = mock(vec![
+        act("harness.fs.read", r#"{"path":"a.txt"}"#),
+        act("harness.fs.list", r#"{"path":"."}"#),
+        act("harness.task.submit", r#"{"note":"done"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(fx, &ep), true, &fx.marker);
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let head = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("chain_head ").map(str::to_owned))
+        .unwrap();
+    let id = run_id(&o);
+    let jp = fx
+        .state
+        .join("runs")
+        .join(&id)
+        .join("attempt-1/journal.jsonl");
+    (id, jp, head)
+}
+
+/// The real binary's replay of a forged journal: exit 5, unreadable
+/// evidence, a named divergence whose reason contains `why`, and never the
+/// words of a match.
+fn assert_replay_diverged(o: &Output, why: &str, marker: &Path) {
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "{err}");
+    let rep = report(o);
+    assert_eq!(rep["outcome"]["Indeterminate"]["why"], "UnreadableEvidence");
+    assert_eq!(rep["findings"][0]["code"], "harness.replay.divergence");
+    assert!(
+        rep["findings"][0]["observed"]
+            .as_str()
+            .unwrap()
+            .contains(why),
+        "{rep}"
+    );
+    assert!(err.contains("DIVERGED"), "{err}");
+    assert!(!err.contains("records matched"), "{err}");
+    assert!(!marker.exists());
+}
+
+/// H1 phase-exit review F-1 through the real binary (CLI-W1): a journal cut
+/// after step 1, its header's step limit lowered to 1, the 80% condition
+/// and the steps-budget stop the loop recomputes under that limit added,
+/// re-chained. `replay` gives the audit the binary's own limits, so it is
+/// a divergence at the header, without an anchor and with the forged
+/// journal's own head as one; it once printed "every record recomputed and
+/// matched (9 records)".
+#[test]
+fn replay_of_a_journal_forged_through_its_header_limits_is_unreadable_evidence() {
+    let fx = fixture("forged-limits");
+    let (id, jp, _) = three_steps(&fx);
+    let genuine: Vec<serde_json::Value> = std::fs::read_to_string(&jp)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let step1: Vec<serde_json::Value> =
+        genuine.iter().filter(|v| v["step"] == 1).cloned().collect();
+    let mut header = genuine[0].clone();
+    header["body"]["limits"]["steps"] = serde_json::Value::from(1u64);
+    let mut condition = step1[0].clone();
+    condition["kind"] = serde_json::Value::from("BudgetCharged");
+    condition["body"] = serde_json::json!({"condition": "enter", "key": "steps"});
+    let mut stop = step1.last().unwrap().clone();
+    stop["step"] = serde_json::Value::from(2u64);
+    stop["kind"] = serde_json::Value::from("RunStopped");
+    stop["body"] = serde_json::json!({
+        "cause": "budget", "dimension": "steps", "outcome": "indeterminate:nothing_checked"
+    });
+    let mut forged = vec![header, condition];
+    forged.extend(step1);
+    forged.push(stop);
+    write_chained(&jp, &forged);
+    let v = harness_journal::JournalReader::open(jp.parent().unwrap()).unwrap();
+    assert!(v.is_complete(), "the forged journal verifies");
+
+    let forged_head = v.head.to_string();
+    for extra in [&[][..], &["--anchor", forged_head.as_str()][..]] {
+        let o = replay_bin(&fx, &id, extra);
+        assert_replay_diverged(&o, "budget limits", &fx.marker);
+    }
+}
+
+/// H1 phase-exit review F-2 through the real binary (CLI-W2): bytes
+/// appended after `RunStopped` with no newline (a line reader's last
+/// record) are refused by the reader, so `replay --anchor <the genuine
+/// head>` is unreadable evidence; it once printed "every record recomputed
+/// and matched (16 records)".
+#[test]
+fn replay_of_a_journal_with_bytes_after_run_stopped_is_unreadable_even_anchored() {
+    let fx = fixture("after-stop");
+    let (id, jp, head) = three_steps(&fx);
+    let mut bytes = std::fs::read(&jp).unwrap();
+    let planted = r#"{"attempt":1,"body":{"cause":"submitted","outcome":"passed"},"kind":"RunStopped","note":"planted"}"#;
+    bytes.extend_from_slice(planted.as_bytes());
+    std::fs::write(&jp, &bytes).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&jp).unwrap().lines().last(),
+        Some(planted)
+    );
+    let o = replay_bin(&fx, &id, &["--anchor", &head]);
+    assert_replay_diverged(&o, "does not verify", &fx.marker);
 }
 
 /// INV-1 / INV-22 through the CLI: `manifest check` is the v1 admission

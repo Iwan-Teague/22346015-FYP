@@ -17,7 +17,9 @@
 //! directory, against the loopback server: `run` must end with the task
 //! submitted, the answer found in the workspace, exit 5 and a
 //! `NothingChecked` report shown on stderr and in the report line; then
-//! `replay` must recompute every record of that run and match.
+//! `replay` must match every record of that run, the stop included (the
+//! replies, tool results and samples re-fed; every context, parse,
+//! loop-detector and policy decision and the stop recomputed).
 
 #![allow(
     clippy::unwrap_used,
@@ -173,7 +175,8 @@ fn exit_test(protocol: &str) {
         .unwrap();
     assert!(note.contains(CODENAME), "submitted note: {note:?}");
 
-    // Replay: every record recomputed and matched.
+    // Replay: every record matched, the stop recomputed (H1 phase-exit
+    // review, named item 2: re-fed inputs are named as such).
     let r = run(&[
         "replay",
         "--run",
@@ -192,7 +195,11 @@ fn exit_test(protocol: &str) {
         last_line(&r)["outcome"]["Indeterminate"]["why"],
         "NothingChecked"
     );
-    assert!(rs.contains("every record recomputed and matched"), "{rs}");
+    assert!(
+        rs.contains("records matched. Re-fed from the journal, not re-run")
+            && rs.contains("policy decision, and the stop."),
+        "{rs}"
+    );
 }
 
 #[test]

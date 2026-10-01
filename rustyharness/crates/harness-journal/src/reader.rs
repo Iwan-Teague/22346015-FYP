@@ -5,7 +5,11 @@
 //! reads the files and calls it. It refuses the whole journal at the FIRST
 //! broken record and names it. A torn final line (no trailing newline: a
 //! crash mid-append) is not a break: it is reported, and the verified prefix
-//! is what a resume starts from (§2.10).
+//! is what a resume starts from (§2.10). Bytes after `RunStopped` are a
+//! break whether or not they end in a newline: `commit` fsyncs
+//! `RunStopped` and consumes the writer, so no crash leaves anything after
+//! it, and a torn "tail" there is an edit the chain head (and so the
+//! anchor) would not cover (H1 phase-exit review F-2).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,7 +75,8 @@ pub struct Record {
 pub struct Verified {
     /// The records, in order.
     pub records: Vec<Record>,
-    /// Byte offset of a torn final line, if the file does not end in `\n`.
+    /// Byte offset of a torn final line, if the file does not end in `\n`
+    /// (never after `RunStopped`: that is refused as `AfterRunStopped`).
     pub torn_tail: Option<usize>,
     /// Hash of the last verified record.
     pub head: Digest,
@@ -150,7 +155,7 @@ pub enum BreakKind {
     WrongRun,
     /// `t_mono_ms` went backwards.
     TimeBackwards,
-    /// A record after `RunStopped`.
+    /// A record, or any bytes (a torn line included), after `RunStopped`.
     AfterRunStopped,
     /// An untrusted payload object is malformed.
     UntrustedMalformed,
@@ -208,6 +213,15 @@ pub fn verify(bytes: &[u8], blobs: &dyn BlobSource) -> Result<Verified, Broken> 
         prev = rec.hash;
         last_mono = rec.t_mono_ms;
         records.push(rec);
+    }
+    // No crash leaves bytes after a durable `RunStopped` (see the module
+    // docs), so a torn tail there is refused like a record there.
+    if torn_tail.is_some()
+        && records
+            .last()
+            .is_some_and(|r| r.kind == EventKind::RunStopped)
+    {
+        return Err(broken(records.len(), BreakKind::AfterRunStopped));
     }
     let (run, attempt) = run.ok_or(broken(0, BreakKind::Empty))?;
     Ok(Verified {

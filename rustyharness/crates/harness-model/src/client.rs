@@ -100,7 +100,9 @@ pub struct RetryPolicy {
     pub base_ms: u64,
     /// Largest backoff, milliseconds.
     pub cap_ms: u64,
-    /// Jitter seed (the run driver passes a random one).
+    /// Jitter seed. The default is 0, and the CLI passes the default, so in
+    /// H1 every client backs off on the same schedule (a caller wanting
+    /// clients to spread out passes a seed per client).
     pub jitter_seed: u64,
 }
 

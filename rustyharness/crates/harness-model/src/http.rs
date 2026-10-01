@@ -13,8 +13,14 @@
 //!
 //! **Bounds, all fail-closed:**
 //! - connect timeout, per-read idle timeout, and a total deadline checked
-//!   before every connect, write and read (each read waits at most
-//!   `min(read_timeout, time left)`);
+//!   before the connect, once before the request is written, and before
+//!   every read (each read waits at most `min(read_timeout, time left)`).
+//!   The write timeout is set once, to `min(read_timeout, time left)` at
+//!   that point, and a request larger than the socket buffer takes several
+//!   sends, each allowed that long, so a server that reads the request
+//!   slowly can hold the write past the deadline (a server that stops
+//!   reading fails the first send that times out). The loopback server is
+//!   the user's own process (trust base, design §11);
 //! - response head ≤ `max_head_bytes`, body ≤ `max_body_bytes` (a server
 //!   that streams forever hits the deadline or the size cap);
 //! - `Transfer-Encoding` other than exactly `chunked`, both

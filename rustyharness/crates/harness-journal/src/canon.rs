@@ -36,9 +36,8 @@ pub const INLINE_MAX: usize = 4096;
 /// manifest, versions, budget dimensions). Anything a model, tool, file or
 /// task produced (paths, URLs, arguments, names chosen at run time) goes
 /// into an [`crate::UntrustedBlob`], even when it happens to fit this
-/// grammar. The grammar keeps paths and URLs out by construction; the rest
-/// of the rule is enforced by review until H1e gives `Ident` typed
-/// constructors from `RunId`/`CapId` (design doc, Changes since v0.2).
+/// grammar. The grammar keeps paths and URLs out by construction; the
+/// typed constructors below keep runtime text out (closed in H1e-1).
 ///
 /// **Typed provenance (H1c review F-6, closed in H1e-1).** There is no
 /// public constructor from a runtime `&str`. An `Ident` comes from:

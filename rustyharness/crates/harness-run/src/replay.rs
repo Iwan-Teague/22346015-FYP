@@ -16,17 +16,28 @@
 //! and the audit's outcome is `Indeterminate { UnreadableEvidence }`. A
 //! journal that does not verify, belongs to another run or attempt, or
 //! does not match a caller-supplied chain head (the anchor) is the same.
+//! The header inputs, the budget limits among them, are the CALLER's and
+//! must equal the recorded ones: the replay recomputes every budget stop
+//! from the limits, so limits read from the journal would let a re-chained
+//! edit choose the stop it then "recomputes" (H1 phase-exit review F-1).
 //! Two recorded facts are not recomputable and are handled explicitly:
 //! - **wall time.** A `BudgetCharged` record for the `wall` dimension is
 //!   left out of the comparison on both sides, and the replay's meter has
-//!   no wall limit. A run stopped by the wall budget can only be checked
-//!   up to its last record: every recorded record must match, but the stop
-//!   itself is NOT recomputed (`AuditReport::stop_recomputed` is false).
-//!   Since a journal cut at any step boundary and ended with a forged wall
-//!   stop, re-chained, looks exactly the same (H1e-2b review F-1), such an
-//!   audit is `Indeterminate { UnreadableEvidence }` unless the caller's
-//!   anchor matched the journal's chain head; only the anchor proves that
-//!   nothing was removed.
+//!   no wall limit. What is left out must be exactly what the loop writes
+//!   for the wall dimension: at most one record per attempt, the entry
+//!   `{condition: enter, key: wall}` (wall time never decreases within an
+//!   attempt, so the loop never writes a wall exit; H1g confirming review
+//!   NF-1); anything else is a divergence, and how many were left out is
+//!   reported
+//!   (`AuditReport::wall_skipped`). A run stopped by the wall budget can
+//!   only be checked up to its last record: every recorded record must
+//!   match, but the stop itself is NOT recomputed
+//!   (`AuditReport::stop_recomputed` is false). Since a journal cut at any
+//!   step boundary and ended with a forged wall stop, re-chained, looks
+//!   exactly the same (H1e-2b review F-1), such an audit is
+//!   `Indeterminate { UnreadableEvidence }` unless the caller's anchor
+//!   matched the journal's chain head; only the anchor proves that nothing
+//!   was removed.
 //! - **the workspace.** Audit mode re-feeds tool output; it never reads the
 //!   workspace. The workspace facts come from the recorded header.
 //!
@@ -35,17 +46,33 @@
 //! read, never appended to, poisoned or not. Its header records the attempt
 //! it continues and that journal's chain head. The new attempt first
 //! replays every step of the old one except the last (catch-up: recorded
-//! replies and tool results, checked exactly like an audit), then runs the
-//! last step again live, so a trailing intent with no result is decided
-//! again by policy, never executed blindly. A catch-up that diverges makes
-//! the resumed run `Indeterminate { UnreadableEvidence }`. H1 sessions
+//! replies and tool results re-fed; each model request the catch-up
+//! renders must have its recorded digest, but the other records it
+//! recomputes are NOT compared with the old attempt's: to check those,
+//! audit the old attempt, `replay --attempt <n>`; H1 phase-exit review
+//! F-3), then runs the last step again live, so a trailing intent with no
+//! result is decided again by policy, never executed blindly. A request
+//! that differs makes the resumed run `Indeterminate
+//! { UnreadableEvidence }`. The header inputs, the budget limits included,
+//! must equal the recorded ones, or the resume is refused. H1 sessions
 //! cannot change the workspace, so the snapshot of §2.10 is the recorded
 //! tree digest: a resume is refused when the workspace no longer has it.
 //! The wall time the interrupted attempt spent (its journal's last
 //! monotonic time, the writer's elapsed time) is charged to the resumed
 //! attempt's meter from the start, so a kill and resume buys no fresh wall
-//! budget; steps and tokens are re-charged by the catch-up.
+//! budget up to the interrupted attempt's last durable record; the time
+//! after it, up to one model call (300 s by default), is not charged, so
+//! each kill and resume can regain that much (H1 phase-exit review F-13).
+//! Steps and tokens are re-charged by the catch-up. That wall time
+//! is taken from the interrupted attempt's journal (the header's
+//! `resumed_from.wall_carried_ms` and the last record's `t_mono_ms`). An
+//! interrupted attempt has no printed chain head, and resume takes no
+//! anchor, so a consistent edit made to it before the resume is not
+//! detected; after it, the resumed header's `resumed_from.chain_head` pins
+//! what was resumed from, and an anchored audit of the resumed attempt
+//! covers that (H1g confirming review NF-2).
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -72,7 +99,7 @@ use harness_tools::{RefusalKind, ToolStatus};
 use serde_json::{Map, Value};
 
 use crate::driver::{
-    attempt_check, builtin_manifest_sha256, commit, facts_block, header, new_meter,
+    attempt_check, builtin_manifest_sha256, commit, facts_block, header, limits_fields, new_meter,
     new_meter_resumed, plan, prepare, HeaderInputs, Loop, NonceSource, ReadLog, RecordedResult,
     HEADER_INPUT_KEYS,
 };
@@ -221,12 +248,13 @@ fn recorded(
 
 /// The header values an audit or a resume recomputes from its own inputs
 /// (task grants, workspace declaration, protocol, profile, policy, number
-/// of checks), as the header writes them.
+/// of checks, budget limits), as the header writes them.
 fn expected_inputs(
     spec: &TaskSpec,
     registry: &Registry,
     policy: &UserPolicy,
     profile: &Profile,
+    limits: &MeterLimits,
 ) -> Map<String, Value> {
     let mut grants: Vec<Value> = Vec::new();
     let mut names: Vec<&str> = spec.grants.iter().map(String::as_str).collect();
@@ -266,6 +294,15 @@ fn expected_inputs(
         Value::from(builtin_manifest_sha256().to_string()),
     );
     m.insert("shell_enabled".into(), Value::Bool(false));
+    m.insert(
+        "limits".into(),
+        Value::Object(
+            limits_fields(limits)
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), Value::from(v)))
+                .collect(),
+        ),
+    );
     m
 }
 
@@ -290,6 +327,7 @@ fn header_mismatch(key: &str) -> &'static str {
         "protocol" | "profile" => "the profile given differs from the recorded header",
         "policy" => "the policy given differs from the recorded header",
         "checks" => "the verification plan differs from the recorded header",
+        "limits" => "the budget limits given differ from the recorded header",
         "builtin_manifest" | "shell_enabled" => {
             "another harness build wrote this journal (its built-in manifest or shell setting differs)"
         }
@@ -305,41 +343,115 @@ fn recorded_facts(h: &Record) -> Option<WorkspaceFacts> {
     })
 }
 
-fn recorded_limits(h: &Record) -> Option<MeterLimits> {
-    let l = h.body.get("limits")?;
-    let n = |k: &str| l.get(k).and_then(Value::as_u64);
-    Some(MeterLimits {
-        steps: u32::try_from(n("steps")?).ok()?,
-        tokens: n("tokens")?,
-        wall: Duration::from_millis(n("wall_ms")?),
-        cost_micros: n("cost_micros")?,
-        format_errors: u32::try_from(n("format_errors")?).ok()?,
-        repair_rounds: u32::try_from(n("repair_rounds")?).ok()?,
-    })
+/// A wall-budget condition record: when the clock crossed 80% of the wall
+/// budget is not recomputable, so the comparison leaves these out.
+fn is_wall_condition(r: &Record) -> bool {
+    r.kind == EventKind::BudgetCharged && r.body.get("key").and_then(Value::as_str) == Some("wall")
 }
 
-/// A record the comparison looks at: everything but the clock-dependent
-/// wall-budget condition.
-fn comparable(r: &Record) -> bool {
-    !(r.kind == EventKind::BudgetCharged
-        && r.body.get("key").and_then(Value::as_str) == Some("wall"))
+/// Check the recorded wall-budget condition records before they are left
+/// out of the comparison (H1 phase-exit review F-1): each must be exactly
+/// what the loop writes (`StandingConditions::observe`). For the wall
+/// dimension that is at most one record per attempt, the entry
+/// `{condition: enter, key: wall}`: the meter's wall time never decreases
+/// within an attempt and its limit is fixed, so the 80% condition turns
+/// true at most once and never turns false again, and the loop never
+/// writes a wall exit (H1g confirming review NF-1). A second record, an
+/// exit, or any other body is a record the loop did not write. Returns
+/// how many were left out (0 or 1).
+pub(crate) fn check_wall_conditions(recorded: &[Record]) -> Result<usize, Divergence> {
+    let mut n = 0;
+    for r in recorded.iter().filter(|r| is_wall_condition(r)) {
+        let b = &r.body;
+        let loop_wrote =
+            n == 0 && b.len() == 2 && b.get("condition").and_then(Value::as_str) == Some("enter");
+        if !loop_wrote {
+            return Err(diverge(
+                r.seq,
+                r.step,
+                "a wall-budget record is not one the loop writes",
+            ));
+        }
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// How a recorded attempt compared with its replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Compared {
-    /// Records that matched (header excluded).
+    /// Records that matched (header and wall-budget records excluded).
     matched: usize,
+    /// Wall-budget condition records left out of the comparison, each
+    /// checked to be a record the loop writes.
+    wall_skipped: usize,
     /// Whether the recorded stop itself was recomputed: false for a
     /// wall-budget stop (the clock is not replayable) and for an attempt
     /// that never committed.
     stop_recomputed: bool,
 }
 
-/// Compare the recorded attempt with its replay, header excluded.
+/// Compare the recorded attempt with its replay, header excluded: the
+/// first divergence in record order, whether it is a record the replay
+/// recomputed differently or a wall-budget record the loop does not write.
 fn compare(recorded: &[Record], replayed: &[Record]) -> Result<Compared, Divergence> {
-    let rec: Vec<&Record> = recorded.iter().skip(1).filter(|r| comparable(r)).collect();
-    let rep: Vec<&Record> = replayed.iter().skip(1).filter(|r| comparable(r)).collect();
+    match (
+        check_wall_conditions(recorded),
+        compare_recomputed(recorded, replayed),
+    ) {
+        (Ok(wall_skipped), Ok(c)) => Ok(Compared { wall_skipped, ..c }),
+        (Err(w), Err(d)) => Err(if w.seq < d.seq { w } else { d }),
+        (Err(w), Ok(_)) => Err(w),
+        (Ok(_), Err(d)) => Err(d),
+    }
+}
+
+/// The seqs of a journal's wall-budget condition records, in order.
+fn wall_seqs(records: &[Record]) -> Vec<u64> {
+    records
+        .iter()
+        .filter(|r| is_wall_condition(r))
+        .map(|r| r.seq)
+        .collect()
+}
+
+/// A body as the comparison sees it. A result's `intent_seq` (the seq of
+/// the intent it answers) is counted among the records compared, without
+/// the wall-budget records before it: the replay writes none, so each one
+/// the recorded journal holds shifts every later seq by one, and a run
+/// that crossed 80% of its wall budget before a later tool result would
+/// otherwise never match (found fixing H1 phase-exit review F-1). One
+/// that points at a wall-budget record points at no intent: it never
+/// matches.
+fn compared_body<'r>(r: &'r Record, walls: &[u64]) -> Cow<'r, Map<String, Value>> {
+    match r.body.get("intent_seq").and_then(Value::as_u64) {
+        Some(n) => {
+            let counted = match walls.binary_search(&n) {
+                Ok(_) => Value::Null,
+                Err(before) => Value::from(n.saturating_sub(before as u64)),
+            };
+            let mut b = r.body.clone();
+            b.insert("intent_seq".into(), counted);
+            Cow::Owned(b)
+        }
+        None => Cow::Borrowed(&r.body),
+    }
+}
+
+/// Compare every recorded record the replay recomputes (all but the header
+/// and the wall-budget records) with the replay's.
+fn compare_recomputed(recorded: &[Record], replayed: &[Record]) -> Result<Compared, Divergence> {
+    let (rec_walls, rep_walls) = (wall_seqs(recorded), wall_seqs(replayed));
+    let rec: Vec<&Record> = recorded
+        .iter()
+        .skip(1)
+        .filter(|r| !is_wall_condition(r))
+        .collect();
+    let rep: Vec<&Record> = replayed
+        .iter()
+        .skip(1)
+        .filter(|r| !is_wall_condition(r))
+        .collect();
     let (rec_body, rec_stop) = match rec.split_last() {
         Some((last, body)) if last.kind == EventKind::RunStopped => (body, Some(*last)),
         _ => (rec.as_slice(), None),
@@ -359,7 +471,7 @@ fn compare(recorded: &[Record], replayed: &[Record]) -> Result<Compared, Diverge
                 "the replay wrote a different record here",
             ));
         }
-        if p.body != r.body {
+        if compared_body(p, &rep_walls) != compared_body(r, &rec_walls) {
             return Err(diverge(
                 r.seq,
                 r.step,
@@ -371,6 +483,7 @@ fn compare(recorded: &[Record], replayed: &[Record]) -> Result<Compared, Diverge
         // An attempt that never committed: its recorded prefix matched.
         return Ok(Compared {
             matched: rec_body.len(),
+            wall_skipped: 0,
             stop_recomputed: false,
         });
     };
@@ -385,6 +498,7 @@ fn compare(recorded: &[Record], replayed: &[Record]) -> Result<Compared, Diverge
         // (H1e-2b review F-1).
         return Ok(Compared {
             matched: rec_body.len(),
+            wall_skipped: 0,
             stop_recomputed: false,
         });
     }
@@ -407,6 +521,7 @@ fn compare(recorded: &[Record], replayed: &[Record]) -> Result<Compared, Diverge
     }
     Ok(Compared {
         matched: rec_body.len() + 1,
+        wall_skipped: 0,
         stop_recomputed: true,
     })
 }
@@ -451,6 +566,12 @@ pub struct Audit<'a> {
     pub policy: &'a UserPolicy,
     /// The model profile.
     pub profile: &'a Profile,
+    /// The budget limits the run was given (the CLI's are
+    /// `RunConfig::defaults(1_000_000).limits`). They must equal the
+    /// recorded ones, which are otherwise a divergence at the header: the
+    /// replay recomputes every budget stop from them (H1 phase-exit review
+    /// F-1).
+    pub limits: &'a MeterLimits,
 }
 
 /// What an audit found.
@@ -460,8 +581,14 @@ pub struct AuditReport {
     pub attempt: u32,
     /// Where the recomputed journal was written, when the replay ran.
     pub replay_dir: Option<PathBuf>,
-    /// Records that matched (header excluded).
+    /// Records that matched (header and wall-budget records excluded).
     pub matched: usize,
+    /// Wall-budget condition records (`BudgetCharged`, key `wall`) left out
+    /// of the comparison, since when the clock crossed 80% is not
+    /// recomputable. 0 or 1: at most one was admitted, and only the
+    /// entry `{condition: enter, key: wall}`, the one record the loop
+    /// writes for the wall dimension (H1g confirming review NF-1).
+    pub wall_skipped: usize,
     /// Whether the recorded stop was recomputed by the replay. False for a
     /// wall-budget stop (the clock is not replayable) and for an attempt
     /// that never committed. A journal cut short and ended with a forged
@@ -526,6 +653,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         attempt,
         replay_dir,
         matched: 0,
+        wall_skipped: 0,
         stop_recomputed: false,
         anchored: false,
         divergence: Some(d),
@@ -562,20 +690,19 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     };
     if let Err(d) = check_header(
         head,
-        &expected_inputs(a.spec, a.registry, a.policy, a.profile),
+        &expected_inputs(a.spec, a.registry, a.policy, a.profile, a.limits),
     ) {
         return Ok(failed(d, None));
     }
-    let (Some(facts), Some(limits), Some(environment)) = (
+    let (Some(facts), Some(environment)) = (
         recorded_facts(head),
-        recorded_limits(head),
         head.body.get("environment").and_then(sample::from_value),
     ) else {
         return Ok(failed(
             diverge(
                 0,
                 0,
-                "the header lacks the workspace facts, the limits or the environment sample",
+                "the header lacks the workspace facts or the environment sample",
             ),
             None,
         ));
@@ -594,7 +721,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         profile: a.profile,
         identity: &rec.backend.identity(),
         facts,
-        limits: &limits,
+        limits: a.limits,
         resumed_from: None,
         // The replay journal repeats the recorded sample, marked as such:
         // a past host cannot be re-measured, and the header is not compared.
@@ -608,7 +735,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     // its meter has no wall limit, so a replay never stops on the clock.
     let limits = MeterLimits {
         wall: Duration::MAX,
-        ..limits
+        ..a.limits.clone()
     };
     let config = RunConfig {
         limits: limits.clone(),
@@ -680,6 +807,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
                 attempt,
                 replay_dir: Some(replay_dir),
                 matched: c.matched,
+                wall_skipped: c.wall_skipped,
                 stop_recomputed: c.stop_recomputed,
                 anchored,
                 divergence: None,
@@ -742,7 +870,9 @@ pub struct Resume<'a> {
     pub probe: &'a dyn LocalityProbe,
     /// The environment probe (§7.1).
     pub env: &'a dyn EnvProbe,
-    /// Budgets and timeouts (the recorded limits apply; timeouts from here).
+    /// Budgets and timeouts. The limits must equal the recorded ones (the
+    /// resume is refused otherwise, never adopting the journal's: H1
+    /// phase-exit review F-1).
     pub config: &'a RunConfig,
 }
 
@@ -777,9 +907,11 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         .records
         .first()
         .ok_or(nope("the last attempt has no header"))?;
+    // The limits included: a resume runs under the caller's limits, which
+    // must be the recorded ones (H1 phase-exit review F-1).
     check_header(
         head,
-        &expected_inputs(r.spec, r.registry, r.policy, r.profile),
+        &expected_inputs(r.spec, r.registry, r.policy, r.profile, &r.config.limits),
     )
     .map_err(|d| nope(d.why))?;
     if recorded_facts(head).map(|f| f.tree) != Some(pre.facts.tree) {
@@ -787,7 +919,6 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             "the workspace changed since the attempt, and an H1 run keeps no snapshot to restore",
         ));
     }
-    let limits = recorded_limits(head).ok_or(nope("the recorded header lacks the limits"))?;
     // Every step but the last is replayed; the last (possibly cut short)
     // runs again live.
     let last = v.records.iter().map(|x| x.step).max().unwrap_or(0);
@@ -823,7 +954,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         profile: r.profile,
         identity: &r.backend.identity(),
         facts: pre.facts,
-        limits: &limits,
+        limits: &r.config.limits,
         resumed_from: Some((n, v.head, carried_ms)),
         environment: r.env.sample(),
         environment_recorded: false,
@@ -839,10 +970,6 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         live: r.backend,
         diverged: Cell::new(false),
     };
-    let config = RunConfig {
-        limits: limits.clone(),
-        ..r.config.clone()
-    };
     let mut lp = Loop {
         session: pre.session,
         registry: r.registry,
@@ -853,13 +980,13 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         backend: &chain,
         providers: vec![Box::new(pre.read_tools)],
         meter: new_meter_resumed(
-            limits,
+            r.config.limits.clone(),
             Box::new(SystemClock::default()),
             Duration::from_millis(carried_ms),
         ),
         detector: LoopDetector::new(),
         turns: Vec::new(),
-        config: &config,
+        config: r.config,
         step: 0,
         nonces: NonceSource {
             recorded: rec.nonces,

@@ -1,8 +1,8 @@
 //! The `profile check` smoke eval (design §3.4): a fixed set of cases sent
 //! through any [`ModelBackend`], each asking for one known tool call.
 //! Scoring and the stamp are [`crate::profile::score`] (pure). The CLI verb
-//! `rustyharness profile check` that runs this against a live server and
-//! writes the stamp into the profile file is H1e.
+//! `rustyharness profile check` (H1e-2b) runs this against a live server
+//! and prints the stamp to add to the profile; it does not write the file.
 //!
 //! Measured here: tool-call validity and format-error rate. Edit-format
 //! compliance needs the edit tools (H2) and is reported as unchecked.

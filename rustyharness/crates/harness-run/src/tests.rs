@@ -700,6 +700,45 @@ fn the_80_percent_budget_condition_is_journaled_once_on_entry() {
     );
 }
 
+/// H1g confirming review NF-1: wall time never decreases within an
+/// attempt and its limit is fixed, so the wall dimension's 80% condition
+/// turns true at most once and never turns false again. A run that
+/// crosses 80% of its wall budget and then goes on, over several more
+/// steps, to submit writes exactly one wall record, an entry, and no exit
+/// (not even at commit); that is all the audit's shape check admits.
+#[test]
+fn the_wall_condition_is_journaled_once_as_an_entry_and_never_exits() {
+    let mut replies: Vec<_> = (0..20).map(|i| read(&format!("f{i}"))).collect();
+    replies.push(submit());
+    // Every clock read advances 1 s; 21 steps take a little over 60 s, so
+    // a 66 s budget is crossed at 80% a few steps before the submit.
+    let o = drive_with(
+        replies,
+        FaultPlan::default(),
+        |c| c.limits.wall = Duration::from_secs(66),
+        Duration::from_secs(1),
+    );
+    let v = verify(&o.journal, &o.blobs).unwrap();
+    let walls: Vec<(u64, String)> = v
+        .records
+        .iter()
+        .filter(|r| r.kind == EventKind::BudgetCharged)
+        .filter(|r| r.body.get("key").and_then(serde_json::Value::as_str) == Some("wall"))
+        .map(|r| (r.step, r.body["condition"].as_str().unwrap().to_owned()))
+        .collect();
+    assert_eq!(o.end.cause, StopCause::Submitted);
+    assert_eq!(walls.len(), 1, "{walls:?}");
+    assert_eq!(walls[0].1, "enter");
+    assert!(
+        walls[0].0 + 2 <= o.end.step,
+        "crossed at least two steps before the last, so later steps observed it: {walls:?}"
+    );
+    assert!(matches!(
+        crate::replay::check_wall_conditions(&v.records),
+        Ok(1)
+    ));
+}
+
 #[test]
 fn the_read_log_refuses_an_edit_to_a_file_never_read_or_changed_since() {
     let mut log = ReadLog::default();

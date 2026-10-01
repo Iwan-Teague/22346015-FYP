@@ -1,6 +1,6 @@
-//! The tool-provider seam (design §4.5, §2.2 steps 7-8). Signature only:
-//! built-in tools, the MCP adapter and the loop that drives them are later
-//! slices (H1e, H4).
+//! The tool-provider seam (design §4.5, §2.2 steps 7-8). The built-in read
+//! tools implement it ([`crate::builtin`]) and the loop in `harness-run`
+//! drives it (both H1e-2); the MCP adapter is H4.
 //!
 //! `ToolProvider::invoke` accepts exactly one argument type for the call,
 //! `Journaled<Authorized<Call>>`:
@@ -36,11 +36,11 @@
 //! }
 //! ```
 //!
-//! **Sync for now.** Design §4.5 sketches `async fn invoke`. The async
-//! runtime arrives with the I/O slices (H1d/H1e, rmcp in H4), and an `async
-//! fn` in a public trait needs a decision on `Send` bounds; that decision is
-//! left to H1e. The argument type, which is what F-01 is about, is fixed
-//! here.
+//! **Synchronous in H1.** Design §4.5 sketches `async fn invoke`, and an
+//! `async fn` in a public trait needs a decision on `Send` bounds. H1e
+//! decided: `ToolProvider`, like `ModelBackend`, stays synchronous for H1,
+//! and the question returns with rmcp (H4). The argument type, which is
+//! what F-01 is about, is fixed here.
 
 use std::time::Instant;
 

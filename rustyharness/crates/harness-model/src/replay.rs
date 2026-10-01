@@ -16,12 +16,12 @@
 //! [`ModelError::ReplayDiverged`] naming the exchange: the first
 //! divergence, never a best-effort answer.
 //!
-//! **What is NOT here (H1e).** Recomputing every context digest and policy
+//! **What is NOT here.** Recomputing every context digest and policy
 //! decision of a whole run, comparing them with the journal, and reporting
 //! `Indeterminate { UnreadableEvidence }` at the first divergent step is the
-//! audit DRIVER; it needs the H1e loop (context builder, policy session,
-//! journaled tool results). This module gives it the backend, the recorded
-//! outputs, the recorded nonces, and the request-digest check.
+//! audit DRIVER, `harness_run::audit` (H1e-2b), which re-drives the loop.
+//! This module gives it the backend, the recorded outputs, the recorded
+//! nonces, and the request-digest check.
 
 use std::cell::Cell;
 use std::time::Instant;

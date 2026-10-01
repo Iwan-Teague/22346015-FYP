@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use gate_outcome::{GateOutcome, IndeterminateKind};
 use harness_core::environment::{EnvSample, Unmeasured};
-use harness_core::{RunId, StopCause};
+use harness_core::{MeterLimits, RunId, StopCause};
 use harness_journal::canon::{RecordFields, GENESIS};
 use harness_journal::{layout, EventKind, JournalReader};
 use harness_manifest::admission::{Registry, Tier};
@@ -103,6 +103,12 @@ fn go(state: &Path, ws: &Path, replies: Vec<Result<Completion, ModelError>>) -> 
     .unwrap()
 }
 
+/// The limits every run and resume in this file is given (`go`,
+/// `resume_with`), which an audit must be given too (review F-1).
+fn limits() -> MeterLimits {
+    RunConfig::defaults(1_000_000).limits
+}
+
 fn audit_with(
     state: &Path,
     run: &RunId,
@@ -119,6 +125,7 @@ fn audit_with(
         registry: &registry(),
         policy,
         profile: &Profile::conservative_default("m"),
+        limits: &limits(),
     })
     .unwrap()
 }
@@ -305,6 +312,7 @@ fn inv_20_an_anchor_catches_a_replaced_journal() {
             registry: &registry(),
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
+            limits: &limits(),
         })
         .unwrap()
     };
@@ -372,6 +380,16 @@ fn audit_anchored(
     run: &RunId,
     anchor: Option<harness_core::Digest>,
 ) -> harness_run::AuditReport {
+    audit_given(state, run, anchor, &limits())
+}
+
+/// [`audit_anchored`] with the limits the audit is given.
+fn audit_given(
+    state: &Path,
+    run: &RunId,
+    anchor: Option<harness_core::Digest>,
+    limits: &MeterLimits,
+) -> harness_run::AuditReport {
     audit(Audit {
         state_root: state,
         run,
@@ -381,6 +399,7 @@ fn audit_anchored(
         registry: &registry(),
         policy: &UserPolicy::default(),
         profile: &Profile::conservative_default("m"),
+        limits,
     })
     .unwrap()
 }
@@ -433,13 +452,14 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
     })
     .unwrap();
     assert_eq!(r.cause, StopCause::Budget(harness_core::BudgetDim::Wall));
-    let a = audit_anchored(&state, &r.run, None);
+    // The audit is given the limits this run was given (review F-1).
+    let a = audit_given(&state, &r.run, None, &config.limits);
     assert!(!a.stop_recomputed);
     assert_eq!(
         a.outcome, UNREADABLE,
         "without an anchor a wall stop is not verified"
     );
-    let a = audit_anchored(&state, &r.run, r.chain_head);
+    let a = audit_given(&state, &r.run, r.chain_head, &config.limits);
     assert!(a.anchored && !a.stop_recomputed);
     assert_eq!(a.divergence, None);
     assert_eq!(
@@ -488,6 +508,25 @@ fn resume_with(
     task: &str,
     replies: Vec<Result<Completion, ModelError>>,
 ) -> Result<RunReport, RunRefused> {
+    resume_under(
+        state,
+        ws,
+        run,
+        task,
+        &RunConfig::defaults(1_000_000),
+        replies,
+    )
+}
+
+/// [`resume_with`] under the given budgets and timeouts.
+fn resume_under(
+    state: &Path,
+    ws: &Path,
+    run: &RunId,
+    task: &str,
+    config: &RunConfig,
+    replies: Vec<Result<Completion, ModelError>>,
+) -> Result<RunReport, RunRefused> {
     let profile = Profile::conservative_default("m");
     let backend = ScriptedBackend::new(profile.clone(), replies);
     resume(Resume {
@@ -501,7 +540,7 @@ fn resume_with(
         backend: &backend,
         probe: &Local,
         env: &FIXED_ENV,
-        config: &RunConfig::defaults(1_000_000),
+        config,
     })
 }
 
@@ -891,4 +930,385 @@ fn a_journal_from_another_harness_build_is_named_as_such() {
     let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("another harness build"));
+}
+
+// ---- H1 phase-exit review (H1g): F-1, F-2, INV-20 ------------------------------------
+
+const NOTHING_CHECKED: GateOutcome = GateOutcome::Indeterminate {
+    why: IndeterminateKind::NothingChecked,
+};
+
+/// Every record of the journal at `path`, parsed.
+fn lines(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// Write `records` as a journal the way a forger who re-chains would: seq
+/// renumbered, every result's `intent_seq` pointed at its (renumbered)
+/// intent, every hash recomputed.
+fn write_chained(path: &Path, records: &[Value]) {
+    write_records(path, records, true);
+}
+
+/// [`write_chained`]; `repoint` false leaves every `intent_seq` as given.
+fn write_records(path: &Path, records: &[Value], repoint: bool) {
+    let mut prev = GENESIS;
+    let mut out = Vec::new();
+    let mut last_intent = 0u64;
+    for (i, v) in records.iter().enumerate() {
+        let mut v = v.clone();
+        let seq = i as u64;
+        v["seq"] = Value::from(seq);
+        if v["kind"] == "ToolStarted" {
+            last_intent = seq;
+        }
+        if repoint && v["body"].get("intent_seq").is_some() {
+            v["body"]["intent_seq"] = Value::from(last_intent);
+        }
+        let (bytes, hash) = fields(&v, prev, None).encode();
+        out.extend(bytes);
+        out.push(b'\n');
+        prev = hash;
+    }
+    fs::write(path, out).unwrap();
+}
+
+/// Review F-1 (W1): a journal cut after step 1, its header's step limit
+/// lowered to 1, the 80% condition the loop writes at step 1 under that
+/// limit added and the stop the loop recomputes at step 2 appended, all
+/// re-chained. The audit is given the limits the run was given and they
+/// are not the recorded ones: a divergence at the header, without an
+/// anchor and even with the forged journal's own head as the anchor. With
+/// the genuine anchor the cut is caught first.
+#[test]
+fn f_1_a_truncation_forged_through_the_header_limits_is_never_verified() {
+    let (state, ws) = scratch("h1g-w1-limits");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let genuine_head = r.chain_head.unwrap();
+    // Control (W0): untouched, it audits clean without an anchor.
+    let a = audit_anchored(&state, &r.run, None);
+    assert!(a.divergence.is_none() && a.stop_recomputed, "{a:?}");
+    assert_eq!(a.outcome, NOTHING_CHECKED);
+
+    let path = journal_path(&r, 1);
+    let genuine = lines(&path);
+    let step1: Vec<Value> = genuine.iter().filter(|v| v["step"] == 1).cloned().collect();
+    let mut header = genuine[0].clone();
+    header["body"]["limits"]["steps"] = Value::from(1u64);
+    let mut condition = step1[0].clone();
+    condition["kind"] = Value::from("BudgetCharged");
+    condition["body"] = serde_json::json!({"condition": "enter", "key": "steps"});
+    let mut stop = step1.last().unwrap().clone();
+    stop["step"] = Value::from(2u64);
+    stop["kind"] = Value::from("RunStopped");
+    stop["body"] = serde_json::json!({
+        "cause": "budget", "dimension": "steps", "outcome": "indeterminate:nothing_checked"
+    });
+    let mut forged = vec![header, condition];
+    forged.extend(step1);
+    forged.push(stop);
+    write_chained(&path, &forged);
+    let v = JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).unwrap();
+    assert!(
+        v.is_complete(),
+        "the forged journal verifies and is committed"
+    );
+    assert_eq!(
+        v.records
+            .iter()
+            .filter(|x| x.kind == EventKind::ToolStarted)
+            .count(),
+        1,
+        "the read of b.txt and the submit are gone"
+    );
+
+    for anchor in [None, Some(v.head)] {
+        let a = audit_anchored(&state, &r.run, anchor);
+        assert_eq!(a.outcome, UNREADABLE, "anchor {anchor:?}");
+        let d = a.divergence.unwrap();
+        assert_eq!((d.seq, d.step), (0, 0), "{d:?}");
+        assert!(d.why.contains("budget limits"), "{d:?}");
+    }
+    let a = audit_anchored(&state, &r.run, Some(genuine_head));
+    assert_eq!(a.outcome, UNREADABLE);
+    assert!(a.divergence.unwrap().why.contains("anchor"));
+}
+
+/// Review F-1: the limits are the caller's. An audit given other limits
+/// than the run's diverges at the header, naming them, whatever the
+/// anchor. A resume given other limits (here a longer wall budget) is
+/// refused before anything is written, never adopting the recorded ones;
+/// given the recorded ones, it resumes.
+#[test]
+fn f_1_an_audit_or_a_resume_given_other_limits_refuses() {
+    let (state, ws) = scratch("h1g-limits");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let mut other = limits();
+    other.steps -= 1;
+    let a = audit_given(&state, &r.run, r.chain_head, &other);
+    assert_eq!(a.outcome, UNREADABLE);
+    let d = a.divergence.unwrap();
+    assert_eq!(d.seq, 0);
+    assert!(d.why.contains("budget limits"), "{d:?}");
+
+    crash_after(&journal_path(&r, 1), 3);
+    let mut config = RunConfig::defaults(1_000_000);
+    config.limits.wall *= 2;
+    let e = resume_under(
+        &state,
+        &ws,
+        &r.run,
+        TASK,
+        &config,
+        vec![read("b.txt"), submit()],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, RunRefused::NotResumable(w) if w.contains("budget limits")),
+        "{e:?}"
+    );
+    assert!(
+        !layout::attempt_dir(&r.run_dir, 2).exists(),
+        "nothing was written"
+    );
+    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    assert_eq!((res.attempt, res.cause), (2, StopCause::Submitted));
+}
+
+/// Review F-1 (W6): a `BudgetCharged` record keyed `wall` is left out of
+/// the comparison, but only when it is a record the loop writes. One the
+/// loop never writes (an exit carrying anything else, here a "verdict"),
+/// inserted just before `RunStopped` and re-chained, is a divergence at
+/// that record without an anchor; with the genuine anchor the edit is
+/// caught first.
+#[test]
+fn f_1_a_wall_record_the_loop_does_not_write_is_a_divergence() {
+    let (state, ws) = scratch("h1g-w6-wall");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let path = journal_path(&r, 1);
+    let mut recs = lines(&path);
+    let at = recs.iter().position(|v| v["kind"] == "RunStopped").unwrap();
+    let mut injected = recs[at - 1].clone();
+    injected["kind"] = Value::from("BudgetCharged");
+    injected["body"] = serde_json::json!({
+        "condition": "exit",
+        "key": "wall",
+        "verdict": "harness verified the answer; outcome passed"
+    });
+    recs.insert(at, injected);
+    write_chained(&path, &recs);
+    let a = audit_anchored(&state, &r.run, None);
+    assert_eq!(a.outcome, UNREADABLE);
+    let d = a.divergence.unwrap();
+    assert_eq!(d.seq, at as u64, "{d:?}");
+    assert!(d.why.contains("not one the loop writes"), "{d:?}");
+    let a = audit_anchored(&state, &r.run, r.chain_head);
+    assert_eq!(a.outcome, UNREADABLE);
+    assert!(a.divergence.unwrap().why.contains("anchor"));
+}
+
+/// Review F-1: what "exactly the shape the loop writes" admits. Records
+/// are inserted at step 2's start (before a later tool result), re-chained.
+/// One entry `{condition: enter, key: wall}` is skipped and counted, and it
+/// shifts nothing (a result's `intent_seq` is compared by position among
+/// the records compared, so a run that crossed 80% of its wall budget
+/// before a later tool result still matches). Anything else is a
+/// divergence at the offending record, including an exit and a second
+/// entry: wall time never decreases within an attempt, so the loop writes
+/// at most one wall record, an entry, and never an exit (H1g confirming
+/// review NF-1; its witness B3, entry/exit/entry/exit with a free
+/// `affected`, is the last case).
+#[test]
+fn f_1_wall_records_in_the_loops_shape_are_skipped_and_counted_and_no_others() {
+    let enter = serde_json::json!({"condition": "enter", "key": "wall"});
+    let exit = serde_json::json!({"affected": 3, "condition": "exit", "key": "wall"});
+    let cases: Vec<(&str, Vec<Value>, Option<usize>)> = vec![
+        ("an entry", vec![enter.clone()], None),
+        (
+            "an entry, then its exit",
+            vec![enter.clone(), exit.clone()],
+            Some(1),
+        ),
+        ("two entries", vec![enter.clone(), enter.clone()], Some(1)),
+        ("an exit with no entry", vec![exit.clone()], Some(0)),
+        (
+            "an exit counting no observation",
+            vec![
+                enter.clone(),
+                serde_json::json!({"affected": 0, "condition": "exit", "key": "wall"}),
+            ],
+            Some(1),
+        ),
+        (
+            "an entry with another field",
+            vec![serde_json::json!({"condition": "enter", "key": "wall", "outcome": "passed"})],
+            Some(0),
+        ),
+        (
+            "an unknown condition",
+            vec![serde_json::json!({"condition": "passed", "key": "wall"})],
+            Some(0),
+        ),
+        (
+            "review NF-1 witness B3: entry, exit, entry, exit",
+            vec![
+                enter.clone(),
+                serde_json::json!({"affected": 999, "condition": "exit", "key": "wall"}),
+                enter.clone(),
+                serde_json::json!({"affected": 1, "condition": "exit", "key": "wall"}),
+            ],
+            Some(1),
+        ),
+    ];
+    for (i, (what, bodies, refused)) in cases.into_iter().enumerate() {
+        let (state, ws) = scratch(&format!("h1g-wall-shape-{i}"));
+        let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+        let clean = audit_anchored(&state, &r.run, None);
+        assert!(
+            clean.divergence.is_none() && clean.wall_skipped == 0,
+            "{what}"
+        );
+        let path = journal_path(&r, 1);
+        let mut recs = lines(&path);
+        let at = recs.iter().position(|v| v["step"] == 2).unwrap();
+        for (k, body) in bodies.iter().enumerate() {
+            let mut w = recs[at].clone();
+            w["kind"] = Value::from("BudgetCharged");
+            w["body"] = body.clone();
+            recs.insert(at + k, w);
+        }
+        write_chained(&path, &recs);
+        let a = audit_anchored(&state, &r.run, None);
+        match refused {
+            None => {
+                assert_eq!(a.divergence, None, "{what}");
+                assert!(a.stop_recomputed, "{what}");
+                assert_eq!(a.wall_skipped, bodies.len(), "{what}");
+                assert_eq!(a.matched, clean.matched, "{what}: not counted as matched");
+                assert_eq!(a.outcome, NOTHING_CHECKED, "{what}");
+            }
+            Some(k) => {
+                assert_eq!(a.outcome, UNREADABLE, "{what}");
+                let d = a.divergence.unwrap();
+                assert_eq!(d.seq, (at + k) as u64, "{what}: {d:?}");
+                assert!(d.why.contains("not one the loop writes"), "{what}: {d:?}");
+            }
+        }
+    }
+}
+
+/// A result's `intent_seq` is compared by its position among the records
+/// compared, so a wall-budget record shifts nothing; one pointing AT a
+/// wall-budget record points at no intent and never matches. Here a
+/// wall-budget entry is inserted just before the submit's intent (a place
+/// the loop never writes one, but of its shape, so skipped), then the
+/// submit's `SubmitRequested` is pointed at it instead of the intent.
+#[test]
+fn f_1_a_result_pointing_at_a_wall_record_is_a_divergence() {
+    let (state, ws) = scratch("h1g-wall-pointer");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let path = journal_path(&r, 1);
+    let mut recs = lines(&path);
+    let intent = recs
+        .iter()
+        .rposition(|v| v["kind"] == "ToolStarted")
+        .unwrap();
+    let mut w = recs[intent].clone();
+    w["kind"] = Value::from("BudgetCharged");
+    w["body"] = serde_json::json!({"condition": "enter", "key": "wall"});
+    recs.insert(intent, w);
+    write_chained(&path, &recs);
+    // Control: of the loop's shape and every result pointing at its
+    // intent, it is skipped and counted.
+    let a = audit_anchored(&state, &r.run, None);
+    assert_eq!(a.divergence, None, "{a:?}");
+    assert_eq!(a.wall_skipped, 1);
+    let mut recs = lines(&path);
+    let s = recs
+        .iter()
+        .position(|v| v["kind"] == "SubmitRequested")
+        .unwrap();
+    assert_eq!(recs[s]["body"]["intent_seq"], (intent + 1) as u64);
+    recs[s]["body"]["intent_seq"] = Value::from(intent as u64);
+    write_records(&path, &recs, false);
+    let a = audit_anchored(&state, &r.run, None);
+    assert_eq!(a.outcome, UNREADABLE);
+    let d = a.divergence.unwrap();
+    assert_eq!(d.seq, s as u64, "{d:?}");
+    assert!(d.why.contains("different body"), "{d:?}");
+}
+
+/// Review F-2 (W2): bytes appended after `RunStopped` with no newline are
+/// not a crash's torn tail (no crash writes after a durable `RunStopped`),
+/// the chain head does not cover them, and a line reader takes them for
+/// the journal's last record. The reader refuses them, so the audit is
+/// unreadable evidence with the genuine anchor as without one.
+#[test]
+fn f_2_bytes_after_run_stopped_are_refused_even_with_the_genuine_anchor() {
+    let (state, ws) = scratch("h1g-w2-after-stop");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let head = r.chain_head.unwrap();
+    let path = journal_path(&r, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    let planted = r#"{"attempt":1,"body":{"cause":"submitted","outcome":"passed"},"kind":"RunStopped","note":"planted"}"#;
+    bytes.extend_from_slice(planted.as_bytes());
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap().lines().last().unwrap(),
+        planted,
+        "a line reader's last record"
+    );
+    let e = JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).unwrap_err();
+    assert!(
+        matches!(&e, harness_journal::reader::ReadError::Broken(b) if b.why == harness_journal::BreakKind::AfterRunStopped),
+        "{e:?}"
+    );
+    for anchor in [Some(head), None] {
+        let a = audit_anchored(&state, &r.run, anchor);
+        assert_eq!(a.outcome, UNREADABLE, "anchor {anchor:?}");
+        assert!(a.divergence.unwrap().why.contains("does not verify"));
+    }
+}
+
+/// INV-20 (review F-8, W7): "tamper a recorded tool result → divergence".
+/// A recorded result is an input to the replay, re-fed like a model reply,
+/// so an edit to one (payload digest recomputed, re-chained) leaves its
+/// own step's records matching and diverges at the first context built
+/// from it: the next step's `ContextBuilt`. (The last result before the
+/// stop feeds no later context: an anchor-only residual, row H1e-2b.)
+#[test]
+fn inv_20_a_tampered_tool_result_diverges_at_the_first_context_built_from_it() {
+    let (state, ws) = scratch("h1g-w7-tool-result");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let path = journal_path(&r, 1);
+    let mut recs = lines(&path);
+    let i = recs
+        .iter()
+        .position(|v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some())
+        .unwrap();
+    assert_eq!(recs[i]["step"], 1);
+    let out = recs[i]["body"]["output"]["inline"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let edited = out.replace("alpha", "omega");
+    assert_ne!(out, edited);
+    let raw = harness_journal::canon::unescape(&edited).unwrap();
+    recs[i]["body"]["output"]["inline"] = Value::from(edited);
+    recs[i]["body"]["output"]["sha256"] =
+        Value::from(harness_core::sha256(raw.as_bytes()).to_string());
+    write_chained(&path, &recs);
+    assert!(JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).is_ok());
+    let a = audit_with(&state, &r.run, Some(1), TASK, &UserPolicy::default());
+    assert_eq!(a.outcome, UNREADABLE);
+    let d = a.divergence.unwrap();
+    assert_eq!(
+        (d.step, recs[d.seq as usize]["kind"].clone()),
+        (2, Value::from("ContextBuilt")),
+        "{d:?}"
+    );
 }

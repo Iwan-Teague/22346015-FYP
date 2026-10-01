@@ -58,7 +58,8 @@ so the history stays readable. What is still open is listed first.
    policy (D7, §4, §4.6).
 2. **Tool calling with small local models** — both native tool calls and a text
    protocol, chosen per model profile (D6, §3.3); grammar-constrained decoding waits
-   on spike S-P1 and safety never depends on it.
+   on spike S-P1 and safety never depends on it. The native protocol sends past
+   actions back as tool-call and tool messages, never as text (design row H1h).
 3. **Edit format** — exact search/replace (unique match) or whole-file write, applied
    in process with a stale-read check and post-apply verification; never `git apply`
    (D9, §4.9; H2).

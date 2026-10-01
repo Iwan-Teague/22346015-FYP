@@ -52,3 +52,6 @@ pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Re
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod context_tests;

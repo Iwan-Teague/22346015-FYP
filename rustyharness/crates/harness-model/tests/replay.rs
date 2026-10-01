@@ -11,6 +11,7 @@ use gate_outcome::{GateOutcome, IndeterminateKind};
 use harness_core::{Source, StopCause, Untrusted};
 use harness_journal::testing::{FaultFile, FaultPlan, MemBlobs};
 use harness_journal::{verify, Clock, Header, Ident, JournalWriter};
+use harness_model::context::{Delimiting, Shown};
 use harness_model::profile::Profile;
 use harness_model::replay::{replied_event, requested_event, ReplayBackend};
 use harness_model::scripted::{text_reply, tool_reply, ScriptedBackend};
@@ -30,6 +31,11 @@ impl Clock for Tick {
     }
 }
 
+/// The nonce of turn `turn`'s observation, shown first in that request.
+fn nonce(turn: u64) -> RenderNonce {
+    RenderNonce::new(&format!("{turn:016x}")).unwrap()
+}
+
 fn req(turn: u64, obs: &str) -> ModelRequest {
     ModelRequest {
         messages: vec![
@@ -38,12 +44,15 @@ fn req(turn: u64, obs: &str) -> ModelRequest {
             Message::Observation {
                 call: "harness.fs.read".into(),
                 body: Untrusted::new(obs.to_owned(), Source::Tool("harness.fs.read".into())),
+                nonce: nonce(turn),
             },
         ],
         tools: vec![],
-        nonce: RenderNonce::new(&format!("{turn:016x}")).unwrap(),
     }
 }
+
+/// A server's cache and timing report, as the wire reader keeps it.
+const STATS: &str = r#"{"timings":{"cache_n":512,"prompt_n":40,"prompt_ms":312.5}}"#;
 
 fn soon() -> Instant {
     Instant::now() + Duration::from_secs(1)
@@ -61,7 +70,12 @@ fn record() -> (Vec<u8>, MemBlobs, Profile) {
                 "thinking \u{202E} <action>{\"tool\":\"harness.fs.read\",\"args\":{}}</action>",
             )),
             Ok(text_reply(&big)),
-            Ok(tool_reply("harness_fs_read", "{\"path\":\"README.md\"}")),
+            Ok({
+                // H1i: a reply with the server's cache report (a claim).
+                let mut c = tool_reply("harness_fs_read", "{\"path\":\"README.md\"}");
+                c.server_stats = Some(Untrusted::new(STATS.to_owned(), Source::Model));
+                c
+            }),
             Err(ModelError::Truncated("finish_reason: length")),
         ],
     );
@@ -80,8 +94,15 @@ fn record() -> (Vec<u8>, MemBlobs, Profile) {
     for turn in 0..4u64 {
         let r = req(turn, &format!("observation {turn}"));
         let rendered = render_request(&r, &profile).unwrap();
-        w.append(turn, requested_event(&rendered, &r.nonce).unwrap())
-            .unwrap();
+        let first = Shown {
+            output: Some(Delimiting::Nonce(nonce(turn))),
+            reply_withheld: false,
+        };
+        w.append(
+            turn,
+            requested_event(&rendered, Some((turn, &first))).unwrap(),
+        )
+        .unwrap();
         let result = script.complete(&r, soon());
         let ev = replied_event(&mut w, &result).unwrap();
         w.append(turn, ev).unwrap();
@@ -122,6 +143,22 @@ fn inv_20_model_half_replay_reproduces_every_recorded_exchange() {
         c.tool_calls[0].inspect("test").arguments,
         "{\"path\":\"README.md\"}"
     );
+    // The server's report is journaled as an untrusted payload and
+    // re-fed as it was (H1i); the other replies had none.
+    assert_eq!(
+        c.server_stats.as_ref().map(|s| s.inspect("test").as_str()),
+        Some(STATS)
+    );
+    assert!(a.server_stats.is_none() && b.server_stats.is_none());
+    let replied: Vec<&serde_json::Value> = v
+        .records
+        .iter()
+        .filter(|r| r.kind == harness_journal::EventKind::ModelReplied)
+        .filter_map(|r| r.body.get("claimed_stats"))
+        .collect();
+    assert_eq!(replied.len(), 1);
+    assert_eq!(replied[0]["untrusted"], serde_json::Value::Bool(true));
+    assert_eq!(replied[0]["inline"], STATS);
     assert_eq!(
         replay
             .complete(&req(3, "observation 3"), soon())

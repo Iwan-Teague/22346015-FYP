@@ -3,13 +3,10 @@
 //! Both re-drive the SAME loop as a live run over what a journal recorded:
 //! the recorded model replies through `ReplayBackend` (which re-renders each
 //! request and refuses one whose digest differs), the recorded tool results
-//! in place of running the tools, and the recorded observation nonces (each
-//! journaled once, with the request that first showed its observation, and
-//! re-fed by the observation's step: design row H1i), so every request
-//! renders byte for byte. Everything else is recomputed: the context (its
-//! digest is journaled as `ContextBuilt`), which observations and replies
-//! are withheld, the parse, loop detection, every policy decision, the
-//! meter.
+//! in place of running the tools, and the recorded render nonces, so every
+//! request renders byte for byte. Everything else is recomputed: the
+//! context (its digest is journaled as `ContextBuilt`), the parse, loop
+//! detection, every policy decision, the meter.
 //!
 //! **Audit** ([`audit`]) writes what it recomputes into a fresh journal,
 //! `runs/<run-id>/replay-<k>/`, next to the attempts (never inside one),
@@ -92,7 +89,6 @@ use harness_journal::{
     Verified,
 };
 use harness_manifest::admission::{Registry, Resolved};
-use harness_model::context::{Renderings, CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol};
 use harness_model::replay::{payload_bytes, ReplayBackend};
 use harness_model::{Completion, ModelBackend, ModelError, ModelIdentity, ModelRequest};
@@ -135,8 +131,7 @@ fn diverge(seq: u64, step: u64, why: &'static str) -> Divergence {
 /// The replay inputs recorded in a journal.
 struct Recorded {
     backend: ReplayBackend,
-    /// Each observation's nonce, by the step of the observation (H1i).
-    nonces: BTreeMap<u64, Nonce>,
+    nonces: VecDeque<Nonce>,
     feed: VecDeque<RecordedResult>,
 }
 
@@ -170,26 +165,21 @@ fn recorded(
 ) -> Result<Recorded, Divergence> {
     let backend = ReplayBackend::from_journal(v, blobs, profile.clone())
         .map_err(|_| diverge(0, 0, "the model records cannot be replayed"))?;
-    let mut nonces = BTreeMap::new();
+    let mut nonces = VecDeque::new();
     let mut feed = VecDeque::new();
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
     for r in &v.records {
         let bad = || diverge(r.seq, r.step, "a record is not the shape the loop writes");
         match r.kind {
-            // The nonce drawn for the observation a request showed first
-            // (H1i), re-fed at that observation's first render. Whether an
-            // observation was withheld is recomputed, not re-fed.
-            EventKind::ModelRequested => match (r.body.get("nonce"), r.body.get("nonce_step")) {
-                (None, None) => {}
-                (Some(n), Some(s)) => {
-                    let n = n.as_str().and_then(Nonce::new).ok_or_else(bad)?;
-                    let s = s.as_u64().ok_or_else(bad)?;
-                    if nonces.insert(s, n).is_some() {
-                        return Err(bad());
-                    }
-                }
-                _ => return Err(bad()),
-            },
+            EventKind::ModelRequested => {
+                let n = r
+                    .body
+                    .get("nonce")
+                    .and_then(Value::as_str)
+                    .and_then(Nonce::new)
+                    .ok_or_else(bad)?;
+                nonces.push_back(n);
+            }
             EventKind::ToolStarted => {
                 let cap = r
                     .body
@@ -304,7 +294,6 @@ fn expected_inputs(
         Value::from(builtin_manifest_sha256().to_string()),
     );
     m.insert("shell_enabled".into(), Value::Bool(false));
-    m.insert("context_format".into(), Value::from(CONTEXT_FORMAT));
     m.insert(
         "limits".into(),
         Value::Object(
@@ -327,11 +316,9 @@ fn check_header(recorded: &Record, expected: &Map<String, Value>) -> Result<(), 
 }
 
 /// What a differing header input means (H1f-3 review F-5): most are the
-/// caller's inputs; `builtin_manifest`, `shell_enabled` and
-/// `context_format` belong to the harness build, so a journal written by
-/// another build (every journal from before H1f-3 included, and, for the
-/// context format, every journal from before H1h) cannot be audited or
-/// resumed by this one, and says so.
+/// caller's inputs; `builtin_manifest` and `shell_enabled` belong to the
+/// harness build, so a journal written by another build (every journal
+/// from before H1f-3 included) cannot be audited or resumed by this one.
 fn header_mismatch(key: &str) -> &'static str {
     match key {
         "task" => "the task given differs from the recorded header",
@@ -343,13 +330,6 @@ fn header_mismatch(key: &str) -> &'static str {
         "limits" => "the budget limits given differ from the recorded header",
         "builtin_manifest" | "shell_enabled" => {
             "another harness build wrote this journal (its built-in manifest or shell setting differs)"
-        }
-        "context_format" => {
-            "another harness build wrote this journal (its context format differs: since H1h the \
-             native protocol shows past actions as tool calls, and since H1i each observation \
-             keeps its own delimiter nonce and the context is append-mostly, so an older \
-             journal's contexts and requests cannot be recomputed; audit it with the build that \
-             wrote it)"
         }
         _ => "a header input differs from the recorded header",
     }
@@ -777,7 +757,6 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         step: 0,
         nonces: NonceSource {
             recorded: rec.nonces,
-            assigned: Renderings::new(),
         },
         feed: rec.feed,
         reads: ReadLog::default(),
@@ -1011,7 +990,6 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         step: 0,
         nonces: NonceSource {
             recorded: rec.nonces,
-            assigned: Renderings::new(),
         },
         feed: rec.feed,
         reads: ReadLog::default(),

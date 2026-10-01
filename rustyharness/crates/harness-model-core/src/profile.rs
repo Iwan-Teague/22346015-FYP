@@ -9,15 +9,7 @@
 //!   build has none (N-7: "a hosted run without a price table refuses to
 //!   start" belongs with the `hosted` feature);
 //! - `tool_choice_required_ok: true` with the text protocol is refused as
-//!   meaningless, and so is `parallel_tool_calls_false_ok: true`.
-//!
-//! **Optional fields within version 1.** `parallel_tool_calls_false_ok`
-//! (design row H1h) and `stream_include_usage_ok` (row H1i) are optional
-//! and off by default, like `kv_quant_note`: every profile written before
-//! them still parses, and still has the same content digest (each joins the
-//! digest only when it is on), so its `profile check` stamp stays valid. An
-//! older harness refuses a profile that sets one (unknown fields are
-//! refused), so no build silently ignores it.
+//!   meaningless.
 //!
 //! An unknown model gets [`Profile::conservative_default`]. A profile runs
 //! whether or not `profile check` stamped it; `profile_validated` is
@@ -107,10 +99,6 @@ struct ProfileWire {
     fill_ratio: f64,
     protocol: Protocol,
     tool_choice_required_ok: bool,
-    #[serde(default)]
-    parallel_tool_calls_false_ok: bool,
-    #[serde(default)]
-    stream_include_usage_ok: bool,
     grammar: Grammar,
     max_active_tools: u32,
     edit_format: EditFormat,
@@ -134,8 +122,6 @@ pub struct Profile {
     fill_ratio: f64,
     protocol: Protocol,
     tool_choice_required_ok: bool,
-    parallel_tool_calls_false_ok: bool,
-    stream_include_usage_ok: bool,
     max_active_tools: u32,
     edit_format: EditFormat,
     recent_turns: u32,
@@ -244,9 +230,6 @@ impl Profile {
         if w.tool_choice_required_ok && w.protocol == Protocol::Text {
             return Err(f("tool_choice_required_ok"));
         }
-        if w.parallel_tool_calls_false_ok && w.protocol == Protocol::Text {
-            return Err(f("parallel_tool_calls_false_ok"));
-        }
         Ok(Self {
             id: w.id,
             model: w.model,
@@ -254,8 +237,6 @@ impl Profile {
             fill_ratio: w.fill_ratio,
             protocol: w.protocol,
             tool_choice_required_ok: w.tool_choice_required_ok,
-            parallel_tool_calls_false_ok: w.parallel_tool_calls_false_ok,
-            stream_include_usage_ok: w.stream_include_usage_ok,
             max_active_tools: w.max_active_tools,
             edit_format: w.edit_format,
             recent_turns: w.recent_turns,
@@ -276,8 +257,6 @@ impl Profile {
             fill_ratio: 0.6,
             protocol: Protocol::Text,
             tool_choice_required_ok: false,
-            parallel_tool_calls_false_ok: false,
-            stream_include_usage_ok: false,
             max_active_tools: 5,
             edit_format: EditFormat::Replace,
             recent_turns: 4,
@@ -316,23 +295,6 @@ impl Profile {
     /// Whether `tool_choice: "required"` may be sent.
     pub fn tool_choice_required_ok(&self) -> bool {
         self.tool_choice_required_ok
-    }
-    /// Whether `parallel_tool_calls: false` is sent with the tools (native
-    /// protocol; design row H1h). A server that honours it makes at most
-    /// one call per reply; one that accepts and ignores it (Z.ai's
-    /// glm-5.3-flash, measured 2026-09-28) leaves the harness's
-    /// one-action rule to its format error and repair message.
-    pub fn parallel_tool_calls_false_ok(&self) -> bool {
-        self.parallel_tool_calls_false_ok
-    }
-    /// Whether the request asks for usage in the stream,
-    /// `stream_options: {"include_usage": true}` (design row H1i). llama.cpp
-    /// (build 10470 measured) sends a streamed reply's token usage only
-    /// when asked; its final chunk carries `timings` either way. Off by
-    /// default: a server that refuses unknown parameters would refuse every
-    /// request. Z.ai accepts it (measured 2026-09-28) and sends usage anyway.
-    pub fn stream_include_usage_ok(&self) -> bool {
-        self.stream_include_usage_ok
     }
     /// Cap on the active tool set.
     pub fn max_active_tools(&self) -> u32 {
@@ -400,21 +362,6 @@ impl Profile {
         }
         if let (Some(n), Some(o)) = (&self.kv_quant_note, v.as_object_mut()) {
             o.insert("kv_quant_note".into(), serde_json::Value::from(n.clone()));
-        }
-        // Only when on (H1h), so every profile without it keeps its digest
-        // and its stamp.
-        if let (true, Some(o)) = (self.parallel_tool_calls_false_ok, v.as_object_mut()) {
-            o.insert(
-                "parallel_tool_calls_false_ok".into(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        // The same for H1i's flag.
-        if let (true, Some(o)) = (self.stream_include_usage_ok, v.as_object_mut()) {
-            o.insert(
-                "stream_include_usage_ok".into(),
-                serde_json::Value::Bool(true),
-            );
         }
         sha256(v.to_string().as_bytes())
     }
@@ -577,20 +524,6 @@ mod tests {
             Profile::parse(native_tc.as_bytes()),
             Err(ProfileError::Field("tool_choice_required_ok"))
         );
-        let text_ptc = with("parallel_tool_calls_false_ok", "true");
-        assert_eq!(
-            Profile::parse(text_ptc.as_bytes()),
-            Err(ProfileError::Field("parallel_tool_calls_false_ok"))
-        );
-        for v in ["null", "\"yes\"", "1"] {
-            assert!(
-                matches!(
-                    Profile::parse(with("parallel_tool_calls_false_ok", v).as_bytes()),
-                    Err(ProfileError::Shape(_))
-                ),
-                "{v}"
-            );
-        }
         for (k, v) in [("grammar", "\"gbnf_lazy\""), ("price", r#"{"input":1}"#)] {
             assert!(
                 matches!(
@@ -643,92 +576,6 @@ mod tests {
                 .unwrap()
                 .validated()
         );
-    }
-
-    // H1h: the optional flag. Off by default; a profile without it (every
-    // profile written before it) keeps the content digest it had at the
-    // H1g exit build (`05e91dc`), so its stamp stays valid; on, it is part
-    // of the content.
-    #[test]
-    fn parallel_tool_calls_false_ok_is_optional_and_off_by_default() {
-        const GOOD_CONTENT: &str =
-            "b8bf6a5e7b6c3f107548dc8cb096d84b2900f8e0846e474845521be5f8fcfb6f";
-        const DEFAULT_CONTENT: &str =
-            "d6b9b8ef0476910c516913f9edd2adfb5c8d91798e629f2403906c69141ba6cb";
-        let p = Profile::parse(GOOD.as_bytes()).unwrap();
-        assert!(!p.parallel_tool_calls_false_ok());
-        assert_eq!(p.content_sha256().to_string(), GOOD_CONTENT);
-        let d = Profile::conservative_default("m");
-        assert!(!d.parallel_tool_calls_false_ok());
-        assert_eq!(d.content_sha256().to_string(), DEFAULT_CONTENT);
-
-        let native = with("protocol", "\"native\"");
-        let off = Profile::parse(native.as_bytes()).unwrap();
-        let explicit_off = {
-            let mut o: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&native).unwrap();
-            o.insert("parallel_tool_calls_false_ok".into(), false.into());
-            Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap()
-        };
-        let on = {
-            let mut o: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&native).unwrap();
-            o.insert("parallel_tool_calls_false_ok".into(), true.into());
-            Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap()
-        };
-        assert!(on.parallel_tool_calls_false_ok());
-        assert_eq!(off.content_sha256(), explicit_off.content_sha256());
-        assert_ne!(off.content_sha256(), on.content_sha256());
-        // A stamp made without the flag does not validate the profile with it.
-        let st = off.stamp_for(&sha256(b"report"));
-        let mut o: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&native).unwrap();
-        o.insert("parallel_tool_calls_false_ok".into(), true.into());
-        o.insert(
-            "validated".into(),
-            serde_json::from_str(&stamp_json(&st)).unwrap(),
-        );
-        let stamped = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
-        assert!(!stamped.validated());
-    }
-
-    // H1i: `stream_include_usage_ok`, optional and off by default like the
-    // H1h flag: every existing profile keeps the digest pinned above (the
-    // same constants), explicit `false` equals absent, `true` is content;
-    // either protocol may set it.
-    #[test]
-    fn stream_include_usage_ok_is_optional_and_off_by_default() {
-        let p = Profile::parse(GOOD.as_bytes()).unwrap();
-        assert!(!p.stream_include_usage_ok());
-        assert!(!Profile::conservative_default("m").stream_include_usage_ok());
-        assert_eq!(
-            p.content_sha256().to_string(),
-            "b8bf6a5e7b6c3f107548dc8cb096d84b2900f8e0846e474845521be5f8fcfb6f"
-        );
-        let off = Profile::parse(with("stream_include_usage_ok", "false").as_bytes()).unwrap();
-        assert_eq!(off.content_sha256(), p.content_sha256());
-        for protocol in ["\"text\"", "\"native\""] {
-            let mut o: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&with("protocol", protocol)).unwrap();
-            o.insert("stream_include_usage_ok".into(), true.into());
-            let on = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
-            assert!(on.stream_include_usage_ok());
-            assert_ne!(
-                on.content_sha256(),
-                Profile::parse(with("protocol", protocol).as_bytes())
-                    .unwrap()
-                    .content_sha256()
-            );
-        }
-        for v in ["null", "\"yes\"", "1"] {
-            assert!(
-                matches!(
-                    Profile::parse(with("stream_include_usage_ok", v).as_bytes()),
-                    Err(ProfileError::Shape(_))
-                ),
-                "{v}"
-            );
-        }
     }
 
     #[test]

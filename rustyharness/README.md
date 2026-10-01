@@ -23,9 +23,7 @@ this is not built yet: see Status below, and the owner decisions in
 **H1, the read-only agent, is built** (design
 [§9](docs/01-design-v0.1.md#9-phasing)); its phase-exit review's fixes are in
 (slice H1g), the exit test passed again on a local model with both protocols,
-slice H1h makes the native protocol send past actions back as the model's own
-tool calls (a model copied the old text form), and the owner's sign-off on the
-design's open questions remains before H2. What works today:
+and the owner's sign-off on the design's open questions remains before H2. What works today:
 
 - **A read-only agent loop** against a model served on loopback
   (`http://127.0.0.1`, `[::1]` or `localhost`; OpenAI-compatible, e.g. llama.cpp),
@@ -37,8 +35,7 @@ design's open questions remains before H2. What works today:
   and tool results, recomputes every context digest and policy decision, and
   names the first divergence; only `--anchor` (the chain head `run` printed)
   detects a replaced or consistently re-chained journal (design §7.1 and the
-  H1e-2b, H1f-3 and H1g rows). A journal written by another harness build is
-  refused by name (rows H1f-3, H1h). `resume` continues an interrupted run in a new attempt.
+  H1e-2b, H1f-3 and H1g rows). `resume` continues an interrupted run in a new attempt.
 - **No run can pass yet.** Checks arrive in H3, so no run ends `Passed`,
   whatever the agent says: a run that starts ends `Indeterminate { NothingChecked }`
   (`UnreadableEvidence` if its journal fails or a resume's catch-up diverges),

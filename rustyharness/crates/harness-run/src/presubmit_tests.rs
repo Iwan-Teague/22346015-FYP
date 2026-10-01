@@ -29,10 +29,13 @@ use harness_tools::{
 use serde_json::{json, Value};
 
 use crate::approve::{ApprovalAnswer, Approver, ApproverKind};
-use crate::driver::{
-    commit, new_meter, plan, Approvals, BudgetNotices, End, Loop, NonceSource, ReadLog,
-    RecordedResult,
-};
+use crate::driver::approvals::Approvals;
+use crate::driver::plan::{loop_facts, plan};
+use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
+use crate::driver::stop::{commit, End};
+use crate::driver::tools::RecordedResult;
+use crate::driver::{new_meter, ReadLog};
+
 use crate::presubmit::{PresubmitReport, PresubmitResult, PresubmitSpec, PresubmitState};
 use crate::{RunConfig, TaskSpec};
 
@@ -361,12 +364,12 @@ fn drive(s: Setup<'_>) -> Done {
     )
     .unwrap();
     let env = EnvSample::unmeasured(Unmeasured::NoSafeApi);
-    let mut lp = Loop {
+    let mut lp = Loop::new(LoopInit {
         session,
         registry: &reg,
         tools,
         task: &s.spec.task,
-        facts: crate::driver::loop_facts(
+        facts: loop_facts(
             &harness_tools::builtin::WorkspaceFacts {
                 tree: sha256(b"tree"),
                 files: 1,
@@ -400,7 +403,7 @@ fn drive(s: Setup<'_>) -> Done {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
-    };
+    });
     let end = lp.drive(&mut w);
     let report = lp.presubmit.as_ref().map(PresubmitState::report);
     let (tree, pressure) = (lp.tree, lp.pressure.clone());
@@ -988,7 +991,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
     )
     .unwrap();
     let env = EnvSample::unmeasured(Unmeasured::NoSafeApi);
-    let mut lp = Loop {
+    let mut lp = Loop::new(LoopInit {
         session,
         registry: &reg,
         tools,
@@ -1022,7 +1025,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&spec.presubmit),
-    };
+    });
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::SubmittedChecksFailed);
     let released = commit(w, &end, None);

@@ -68,6 +68,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use harness_core::diff::{self, DEFAULT_CONTEXT, DEFAULT_MAX_LINES};
+use harness_core::display::{sanitize_for_terminal, DisplayMode};
 use harness_core::{sha256, Digest};
 use harness_journal::Journaled;
 use harness_manifest::ProviderName;
@@ -444,15 +446,7 @@ impl EditEngine {
     /// re-read digest equals the expected splice.
     pub fn replace(&self, req: &ReplaceReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
-        if req.count == 0 {
-            return Err(EditError::BadCount);
-        }
-        if req.old.is_empty() {
-            return Err(EditError::EmptyOld);
-        }
-        if req.old == req.new {
-            return Err(EditError::NoOp);
-        }
+        check_replace_args(req)?;
         let (path, meta) = resolve_path(&self.root, &wp)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound);
@@ -462,40 +456,13 @@ impl EditEngine {
         }
         let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
-        reads.check(wp.as_str(), before)?;
+        reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
-        let offsets = find_offsets(text, &req.old);
-        if offsets.is_empty() {
-            return Err(zero_matches(text, &req.old));
-        }
-        if offsets.len() != req.count {
-            return Err(EditError::MatchCount {
-                expected: req.count,
-                found: offsets.len(),
-                lines: offsets.iter().map(|&o| line_of(text, o)).collect(),
-            });
-        }
-        // The replacement takes the file's dominant line endings.
-        let new = if crlf_dominant(text) {
-            lf_to_crlf(&req.new)
-        } else {
-            req.new.clone()
-        };
-        let spliced = splice(&bytes, &offsets, req.old.len(), new.as_bytes());
-        if spliced == bytes {
-            // Cannot happen with `old != new` unless line-ending
-            // conversion maps `new` back onto `old`; still refused as
-            // the silent no-op it is.
-            return Err(EditError::NoChange { sha256: before });
-        }
-        // An edit that would leave a file the harness cannot read back is
-        // refused before anything is written (H2e: before, it was written
-        // and then failed its verification, which stops the run).
-        check_cap(&spliced)?;
+        let (spliced, lines) = plan_replace(req, text, &bytes)?;
         let expected = sha256(&spliced);
         atomic_write(&path, &spliced, Some(meta.permissions()))?;
         let mut applied = self.verify(&wp, Some(before), expected, line_count(&spliced))?;
-        applied.lines = offsets.iter().map(|&o| line_of(text, o)).collect();
+        applied.lines = lines;
         Ok(applied)
     }
 
@@ -517,19 +484,7 @@ impl EditEngine {
                 max: MULTI_MAX_EDITS,
             });
         }
-        let item = |index: usize, error: EditError| EditError::Item {
-            index,
-            total,
-            error: Box::new(error),
-        };
-        for (i, e) in req.edits.iter().enumerate() {
-            if e.old.is_empty() {
-                return Err(item(i + 1, EditError::EmptyOld));
-            }
-            if e.old == e.new {
-                return Err(item(i + 1, EditError::NoOp));
-            }
-        }
+        check_multi_edits(req)?;
         let (path, meta) = resolve_path(&self.root, &wp)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound);
@@ -539,53 +494,9 @@ impl EditEngine {
         }
         let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
-        reads.check(wp.as_str(), before)?;
+        reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
-        // Every replacement takes the file's dominant line endings, as the
-        // file was before the call.
-        let crlf = crlf_dominant(text);
-        let mut cur = text.to_owned();
-        let mut lines = Vec::with_capacity(total);
-        for (i, e) in req.edits.iter().enumerate() {
-            let offsets = find_offsets(&cur, &e.old);
-            if offsets.is_empty() {
-                return Err(item(i + 1, zero_matches(&cur, &e.old)));
-            }
-            if offsets.len() != 1 {
-                return Err(item(
-                    i + 1,
-                    EditError::MatchCount {
-                        expected: 1,
-                        found: offsets.len(),
-                        lines: offsets.iter().map(|&o| line_of(&cur, o)).collect(),
-                    },
-                ));
-            }
-            lines.extend(offsets.iter().map(|&o| line_of(&cur, o)));
-            let new = if crlf {
-                lf_to_crlf(&e.new)
-            } else {
-                e.new.clone()
-            };
-            // A match starts and ends on character boundaries, so the
-            // splice of UTF-8 into UTF-8 is UTF-8.
-            let spliced = splice(cur.as_bytes(), &offsets, e.old.len(), new.as_bytes());
-            cur = String::from_utf8(spliced).map_err(|_| EditError::NotUtf8)?;
-            if cur.len() as u64 > EDIT_MAX_BYTES {
-                return Err(item(
-                    i + 1,
-                    EditError::TooLarge {
-                        len: cur.len() as u64,
-                        cap: EDIT_MAX_BYTES,
-                    },
-                ));
-            }
-        }
-        let spliced = cur.into_bytes();
-        if spliced == bytes {
-            // The replacements undo each other.
-            return Err(EditError::NoChange { sha256: before });
-        }
+        let (spliced, lines) = plan_multi(req, text, &bytes)?;
         let expected = sha256(&spliced);
         atomic_write(&path, &spliced, Some(meta.permissions()))?;
         let mut applied = self.verify(&wp, Some(before), expected, line_count(&spliced))?;
@@ -641,30 +552,12 @@ impl EditEngine {
                 }
                 let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
                 let before = sha256(&bytes);
-                reads.check(wp.as_str(), before)?;
+                reads.check(wp.as_str(), before).map_err(EditError::from)?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
-                let lines = text.lines().count();
-                if lines > WRITE_OVERWRITE_MAX_LINES {
-                    return Err(EditError::TooManyLines {
-                        lines,
-                        cap: WRITE_OVERWRITE_MAX_LINES,
-                    });
-                }
-                // The body takes the file's dominant line endings; a
-                // body that only differs in line endings is still a
-                // no-op once converted.
-                let out = if crlf_dominant(text) {
-                    lf_to_crlf(&req.content)
-                } else {
-                    req.content.clone()
-                };
-                let out_bytes = out.as_bytes();
-                if out_bytes == bytes.as_slice() {
-                    return Err(EditError::NoOp);
-                }
-                let expected = sha256(out_bytes);
-                atomic_write(&path, out_bytes, Some(meta.permissions()))?;
-                self.verify(&wp, Some(before), expected, line_count(out_bytes))
+                let out_bytes = plan_write_overwrite(req, text, &bytes)?;
+                let expected = sha256(&out_bytes);
+                atomic_write(&path, &out_bytes, Some(meta.permissions()))?;
+                self.verify(&wp, Some(before), expected, line_count(&out_bytes))
             }
         }
     }
@@ -785,6 +678,293 @@ fn remove_dirs(root: &Path, made: &[String]) {
     for rel in made.iter().rev() {
         let _ = fs::remove_dir(root.join(rel));
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-memory planning (P-16): the pure half of every edit, shared by the
+// apply path and `EditTools::preview`, so a preview can only show what an
+// apply would write.
+// ---------------------------------------------------------------------------
+
+/// The argument-sanity checks apply and preview both run before the file
+/// is resolved: `count` at least 1, non-empty `old`, `old` differing
+/// from `new`.
+fn check_replace_args(req: &ReplaceReq) -> Result<(), EditError> {
+    if req.count == 0 {
+        return Err(EditError::BadCount);
+    }
+    if req.old.is_empty() {
+        return Err(EditError::EmptyOld);
+    }
+    if req.old == req.new {
+        return Err(EditError::NoOp);
+    }
+    Ok(())
+}
+
+/// The per-item checks apply and preview both run for a multi edit
+/// before the file is resolved: every `old` non-empty and differing
+/// from its `new`, the first failure named ([`EditError::Item`]).
+fn check_multi_edits(req: &MultiReq) -> Result<(), EditError> {
+    let total = req.edits.len();
+    let item = |index: usize, error: EditError| EditError::Item {
+        index,
+        total,
+        error: Box::new(error),
+    };
+    for (i, e) in req.edits.iter().enumerate() {
+        if e.old.is_empty() {
+            return Err(item(i + 1, EditError::EmptyOld));
+        }
+        if e.old == e.new {
+            return Err(item(i + 1, EditError::NoOp));
+        }
+    }
+    Ok(())
+}
+
+/// The in-memory half of an exact replace ([`EditEngine::replace`] and
+/// [`EditTools::preview`]): match checks, line-ending conversion and the
+/// splice, no I/O. Returns the spliced bytes and the 1-based line of each
+/// match in `text` (the file before the edit).
+fn plan_replace(
+    req: &ReplaceReq,
+    text: &str,
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<usize>), EditError> {
+    let offsets = find_offsets(text, &req.old);
+    if offsets.is_empty() {
+        return Err(zero_matches(text, &req.old));
+    }
+    let lines: Vec<usize> = offsets.iter().map(|&o| line_of(text, o)).collect();
+    if offsets.len() != req.count {
+        return Err(EditError::MatchCount {
+            expected: req.count,
+            found: offsets.len(),
+            lines,
+        });
+    }
+    // The replacement takes the file's dominant line endings.
+    let new = if crlf_dominant(text) {
+        lf_to_crlf(&req.new)
+    } else {
+        req.new.clone()
+    };
+    let spliced = splice(bytes, &offsets, req.old.len(), new.as_bytes());
+    if spliced == bytes {
+        // Cannot happen with `old != new` unless line-ending
+        // conversion maps `new` back onto `old`; still refused as
+        // the silent no-op it is.
+        return Err(EditError::NoChange {
+            sha256: sha256(&spliced),
+        });
+    }
+    // An edit that would leave a file the harness cannot read back is
+    // refused before anything is written (H2e).
+    check_cap(&spliced)?;
+    Ok((spliced, lines))
+}
+
+/// The in-memory half of a multi edit ([`EditEngine::multi`] and
+/// [`EditTools::preview`]): every replacement in order against the text
+/// as the ones before it left it, all or none, no I/O. Returns the
+/// spliced bytes and the 1-based line of each match, in the text each
+/// replacement was matched in. The `old`-emptiness and no-op checks are
+/// the caller's ([`check_multi_edits`]): they run before the file is
+/// even resolved.
+fn plan_multi(
+    req: &MultiReq,
+    text: &str,
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<usize>), EditError> {
+    let total = req.edits.len();
+    let item = |index: usize, error: EditError| EditError::Item {
+        index,
+        total,
+        error: Box::new(error),
+    };
+    // Every replacement takes the file's dominant line endings, as the
+    // file was before the call.
+    let crlf = crlf_dominant(text);
+    let mut cur = text.to_owned();
+    let mut lines = Vec::with_capacity(total);
+    for (i, e) in req.edits.iter().enumerate() {
+        let offsets = find_offsets(&cur, &e.old);
+        if offsets.is_empty() {
+            return Err(item(i + 1, zero_matches(&cur, &e.old)));
+        }
+        if offsets.len() != 1 {
+            return Err(item(
+                i + 1,
+                EditError::MatchCount {
+                    expected: 1,
+                    found: offsets.len(),
+                    lines: offsets.iter().map(|&o| line_of(&cur, o)).collect(),
+                },
+            ));
+        }
+        lines.extend(offsets.iter().map(|&o| line_of(&cur, o)));
+        let new = if crlf {
+            lf_to_crlf(&e.new)
+        } else {
+            e.new.clone()
+        };
+        // A match starts and ends on character boundaries, so the
+        // splice of UTF-8 into UTF-8 is UTF-8.
+        let spliced = splice(cur.as_bytes(), &offsets, e.old.len(), new.as_bytes());
+        cur = String::from_utf8(spliced).map_err(|_| EditError::NotUtf8)?;
+        if cur.len() as u64 > EDIT_MAX_BYTES {
+            return Err(item(
+                i + 1,
+                EditError::TooLarge {
+                    len: cur.len() as u64,
+                    cap: EDIT_MAX_BYTES,
+                },
+            ));
+        }
+    }
+    let spliced = cur.into_bytes();
+    if spliced == bytes {
+        // The replacements undo each other.
+        return Err(EditError::NoChange {
+            sha256: sha256(&spliced),
+        });
+    }
+    Ok((spliced, lines))
+}
+
+/// The in-memory half of a whole-file overwrite (the overwriting regime
+/// of [`EditEngine::write`] and [`EditTools::preview`]): the line cap,
+/// the file's dominant line endings and the no-op check, no I/O.
+/// Returns the bytes the file would hold.
+fn plan_write_overwrite(req: &WriteReq, text: &str, bytes: &[u8]) -> Result<Vec<u8>, EditError> {
+    let lines = text.lines().count();
+    if lines > WRITE_OVERWRITE_MAX_LINES {
+        return Err(EditError::TooManyLines {
+            lines,
+            cap: WRITE_OVERWRITE_MAX_LINES,
+        });
+    }
+    // The body takes the file's dominant line endings; a body that only
+    // differs in line endings is still a no-op once converted.
+    let out = if crlf_dominant(text) {
+        lf_to_crlf(&req.content)
+    } else {
+        req.content.clone()
+    };
+    if out.as_bytes() == bytes {
+        return Err(EditError::NoOp);
+    }
+    Ok(out.into_bytes())
+}
+
+/// Whether a new file's directories COULD be made, without making them:
+/// the preview's read-only mirror of [`create_parents`] (H2f) — each
+/// existing component must be a real directory (a symlink is refused,
+/// as everywhere), and at most [`WRITE_MAX_NEW_DIRS`] may be missing.
+fn check_new_parents(root: &Path, wp: &WorkspacePath) -> Result<(), EditError> {
+    let comps: Vec<&str> = wp.components().collect();
+    let parents = comps.len().saturating_sub(1);
+    let mut missing = 0usize;
+    let mut cur = root.to_path_buf();
+    for c in comps.iter().take(parents) {
+        cur.push(c);
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return Err(EditError::Symlink),
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(EditError::NotADirectory),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing += 1;
+                if missing > WRITE_MAX_NEW_DIRS {
+                    return Err(EditError::TooManyDirs);
+                }
+            }
+            Err(e) => return Err(EditError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `harness.edit.replace` call's arguments; the [`Out`] is the
+/// BAD_ARGS result the tool call would return.
+fn parse_replace_args(args: &Value) -> Result<ReplaceReq, Out> {
+    let (Some(path), Some(old), Some(new)) = (
+        args.get("path").and_then(Value::as_str),
+        args.get("old").and_then(Value::as_str),
+        args.get("new").and_then(Value::as_str),
+    ) else {
+        return Err(err(code::BAD_ARGS, "path, old and new must be strings"));
+    };
+    let count = match args.get("count") {
+        None => 1,
+        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) => n,
+            None => return Err(err(code::BAD_ARGS, "count must be a positive integer")),
+        },
+    };
+    Ok(ReplaceReq {
+        path: path.to_owned(),
+        old: old.to_owned(),
+        new: new.to_owned(),
+        count,
+    })
+}
+
+/// Parse a `harness.edit.multi` call's arguments; the [`Out`] is the
+/// BAD_ARGS result the tool call would return.
+fn parse_multi_args(args: &Value) -> Result<MultiReq, Out> {
+    let (Some(path), Some(list)) = (
+        args.get("path").and_then(Value::as_str),
+        args.get("edits").and_then(Value::as_array),
+    ) else {
+        return Err(err(
+            code::BAD_ARGS,
+            "path must be a string and edits a list of {old, new} strings",
+        ));
+    };
+    let mut edits = Vec::with_capacity(list.len());
+    for e in list {
+        let (Some(old), Some(new)) = (
+            e.get("old").and_then(Value::as_str),
+            e.get("new").and_then(Value::as_str),
+        ) else {
+            return Err(err(
+                code::BAD_ARGS,
+                "path must be a string and edits a list of {old, new} strings",
+            ));
+        };
+        edits.push(Replacement {
+            old: old.to_owned(),
+            new: new.to_owned(),
+        });
+    }
+    Ok(MultiReq {
+        path: path.to_owned(),
+        edits,
+    })
+}
+
+/// Parse a `harness.edit.write` call's arguments; the [`Out`] is the
+/// BAD_ARGS result the tool call would return.
+fn parse_write_args(args: &Value) -> Result<WriteReq, Out> {
+    let (Some(path), Some(content)) = (
+        args.get("path").and_then(Value::as_str),
+        args.get("content").and_then(Value::as_str),
+    ) else {
+        return Err(err(code::BAD_ARGS, "path and content must be strings"));
+    };
+    Ok(WriteReq {
+        path: path.to_owned(),
+        content: content.to_owned(),
+    })
+}
+
+/// The message of a parse [`Out`], without the tool's `error: ` prefix.
+fn bad_args_text(out: &Out) -> String {
+    out.text
+        .strip_prefix("error: ")
+        .unwrap_or(&out.text)
+        .to_owned()
 }
 
 /// How many lines `bytes` has, as `str::lines` counts them (a final line
@@ -1031,33 +1211,9 @@ impl EditTools {
     }
 
     fn replace(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
-        let (Some(path), Some(old), Some(new)) = (
-            args.get("path").and_then(Value::as_str),
-            args.get("old").and_then(Value::as_str),
-            args.get("new").and_then(Value::as_str),
-        ) else {
-            return (
-                err(code::BAD_ARGS, "path, old and new must be strings"),
-                None,
-            );
-        };
-        let count = match args.get("count") {
-            None => 1,
-            Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
-                Some(n) => n,
-                None => {
-                    return (
-                        err(code::BAD_ARGS, "count must be a positive integer"),
-                        None,
-                    )
-                }
-            },
-        };
-        let req = ReplaceReq {
-            path: path.to_owned(),
-            old: old.to_owned(),
-            new: new.to_owned(),
-            count,
+        let req = match parse_replace_args(args) {
+            Ok(req) => req,
+            Err(out) => return (out, None),
         };
         match self.engine.replace(&req, reads) {
             Ok(a) => {
@@ -1081,37 +1237,9 @@ impl EditTools {
     }
 
     fn multi(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
-        let bad = || {
-            (
-                err(
-                    code::BAD_ARGS,
-                    "path must be a string and edits a list of {old, new} strings",
-                ),
-                None,
-            )
-        };
-        let (Some(path), Some(list)) = (
-            args.get("path").and_then(Value::as_str),
-            args.get("edits").and_then(Value::as_array),
-        ) else {
-            return bad();
-        };
-        let mut edits = Vec::with_capacity(list.len());
-        for e in list {
-            let (Some(old), Some(new)) = (
-                e.get("old").and_then(Value::as_str),
-                e.get("new").and_then(Value::as_str),
-            ) else {
-                return bad();
-            };
-            edits.push(Replacement {
-                old: old.to_owned(),
-                new: new.to_owned(),
-            });
-        }
-        let req = MultiReq {
-            path: path.to_owned(),
-            edits,
+        let req = match parse_multi_args(args) {
+            Ok(req) => req,
+            Err(out) => return (out, None),
         };
         match self.engine.multi(&req, reads) {
             Ok(a) => {
@@ -1135,18 +1263,9 @@ impl EditTools {
     }
 
     fn write(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
-        let (Some(path), Some(content)) = (
-            args.get("path").and_then(Value::as_str),
-            args.get("content").and_then(Value::as_str),
-        ) else {
-            return (
-                err(code::BAD_ARGS, "path and content must be strings"),
-                None,
-            );
-        };
-        let req = WriteReq {
-            path: path.to_owned(),
-            content: content.to_owned(),
+        let req = match parse_write_args(args) {
+            Ok(req) => req,
+            Err(out) => return (out, None),
         };
         match self.engine.write(&req, reads) {
             Ok(a) => {
@@ -1181,6 +1300,156 @@ impl EditTools {
             Err(e) => (edit_err(&e), None),
         }
     }
+
+    /// The diff a call would produce (P-16): the edit is planned in
+    /// memory exactly as the apply path plans it — the same argument
+    /// parse, the same confinement walk, the same stale-read check
+    /// ([`ReadLog`]), the same planners — and rendered as a bounded
+    /// unified diff of the whole file, sanitised for a terminal like
+    /// every harness block. Nothing is written, nothing is journalled,
+    /// no directory is created; a refusal is the apply path's own
+    /// pre-write refusal ([`PreviewRefused`]).
+    ///
+    /// Deterministic: no clock (a preview is not a provider invoke), no
+    /// randomness — the same call, file and read log give the same text.
+    pub fn preview(&self, call: &Call, reads: &ReadLog) -> Result<String, PreviewRefused> {
+        match call.capability.as_str() {
+            REPLACE => {
+                let req = parse_replace_args(&call.args)
+                    .map_err(|out| PreviewRefused::BadArgs(bad_args_text(&out)))?;
+                self.preview_replace(&req, reads)
+            }
+            MULTI => {
+                let req = parse_multi_args(&call.args)
+                    .map_err(|out| PreviewRefused::BadArgs(bad_args_text(&out)))?;
+                self.preview_multi(&req, reads)
+            }
+            WRITE => {
+                let req = parse_write_args(&call.args)
+                    .map_err(|out| PreviewRefused::BadArgs(bad_args_text(&out)))?;
+                self.preview_write(&req, reads)
+            }
+            other => Err(PreviewRefused::NotEdit(other.to_owned())),
+        }
+    }
+
+    fn preview_replace(&self, req: &ReplaceReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
+        let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        check_replace_args(req)?;
+        let (path, meta) = resolve_path(&self.engine.root, &wp).map_err(EditError::from)?;
+        let Some(meta) = meta else {
+            return Err(EditError::NotFound.into());
+        };
+        if !meta.is_file() {
+            return Err(EditError::NotAFile.into());
+        }
+        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        let before = sha256(&bytes);
+        reads.check(wp.as_str(), before).map_err(EditError::from)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
+        let (spliced, _) = plan_replace(req, text, &bytes)?;
+        let new_text = String::from_utf8(spliced).map_err(|_| EditError::NotUtf8)?;
+        Ok(render_diff(wp.as_str(), false, text, &new_text))
+    }
+
+    fn preview_multi(&self, req: &MultiReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
+        let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        let total = req.edits.len();
+        if total == 0 || total > MULTI_MAX_EDITS {
+            return Err(EditError::EditCount {
+                count: total,
+                max: MULTI_MAX_EDITS,
+            }
+            .into());
+        }
+        check_multi_edits(req)?;
+        let (path, meta) = resolve_path(&self.engine.root, &wp).map_err(EditError::from)?;
+        let Some(meta) = meta else {
+            return Err(EditError::NotFound.into());
+        };
+        if !meta.is_file() {
+            return Err(EditError::NotAFile.into());
+        }
+        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        let before = sha256(&bytes);
+        reads.check(wp.as_str(), before).map_err(EditError::from)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
+        let (spliced, _) = plan_multi(req, text, &bytes)?;
+        let new_text = String::from_utf8(spliced).map_err(|_| EditError::NotUtf8)?;
+        Ok(render_diff(wp.as_str(), false, text, &new_text))
+    }
+
+    fn preview_write(&self, req: &WriteReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
+        let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        let (path, meta) = match resolve_path(&self.engine.root, &wp) {
+            Ok(x) => x,
+            // A directory on the way is missing (H2f): apply would make
+            // it; the preview only checks that it could, making nothing.
+            Err(ResolveErr::NotFound) => {
+                check_cap(req.content.as_bytes())?;
+                check_new_parents(&self.engine.root, &wp)?;
+                return Ok(render_diff(wp.as_str(), true, "", &req.content));
+            }
+            Err(e) => return Err(EditError::from(e).into()),
+        };
+        match meta {
+            // Create: nothing at the path, so nothing to be stale about
+            // ("CREATING: must not exist", §4.8, holds by construction).
+            // Apply would make the directories; the preview only checks
+            // that it could, making nothing.
+            None => {
+                check_cap(req.content.as_bytes())?;
+                check_new_parents(&self.engine.root, &wp)?;
+                Ok(render_diff(wp.as_str(), true, "", &req.content))
+            }
+            Some(meta) => {
+                if !meta.is_file() {
+                    return Err(EditError::NotAFile.into());
+                }
+                let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+                let before = sha256(&bytes);
+                reads.check(wp.as_str(), before).map_err(EditError::from)?;
+                let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
+                let out = plan_write_overwrite(req, text, &bytes)?;
+                let new_text = String::from_utf8(out).map_err(|_| EditError::NotUtf8)?;
+                Ok(render_diff(wp.as_str(), false, text, &new_text))
+            }
+        }
+    }
+}
+
+/// Why a preview was refused (P-16). Never mutates the workspace: every
+/// variant is reported before anything would have been written, and the
+/// [`EditError`] cases are exactly the apply path's pre-write refusals.
+#[derive(Debug, thiserror::Error)]
+pub enum PreviewRefused {
+    /// The call is not one of the edit capabilities this previews.
+    #[error("not an edit capability: {0}")]
+    NotEdit(String),
+    /// The arguments fail the same parse the tool call would.
+    #[error("bad arguments: {0}")]
+    BadArgs(String),
+    /// The edit is refused, exactly as apply would refuse it.
+    #[error(transparent)]
+    Edit(#[from] EditError),
+}
+
+/// The preview text for a planned edit: file headers, then the bounded
+/// unified diff ([`harness_core::diff::unified`] at its defaults:
+/// context 3, at most 200 lines, a `[N lines cut]` marker past that),
+/// sanitised for a terminal as a block (P-04) — control bytes, hidden
+/// characters and oversize output all rendered harmlessly. A create
+/// diffs against the empty file and is headed `--- /dev/null`.
+fn render_diff(path: &str, is_create: bool, old: &str, new: &str) -> String {
+    let mut s = String::new();
+    if is_create {
+        s.push_str("--- /dev/null\n");
+    } else {
+        s.push_str(&format!("--- a/{path}\n"));
+    }
+    s.push_str(&format!("+++ b/{path}\n"));
+    s.push_str(&diff::unified(old, new, DEFAULT_CONTEXT, DEFAULT_MAX_LINES));
+    sanitize_for_terminal(&s, DisplayMode::Block)
 }
 
 fn record(a: &Applied) -> EditRecord {
@@ -1519,5 +1788,188 @@ mod tests {
         assert_eq!(log.get("f"), Some(d));
         assert_eq!(log.check("f", d), Ok(()));
         assert_eq!(log.check("f", sha256(b"y")), Err(StaleRead::Changed));
+    }
+
+    // --- P-16: the preview ---
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rh-preview-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    // The preview's diff is what applying the call really produces: the
+    // same call, run for real in a scratch workspace, leaves exactly the
+    // file the diff shows.
+    #[test]
+    fn preview_replace_matches_applied_result() {
+        let ws = scratch("replace-matches-apply");
+        let tools = EditTools::new(&ws).expect("tools");
+        let file = ws.join("notes.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").expect("seed");
+        let mut reads = ReadLog::default();
+        reads.record("notes.txt", sha256(b"alpha\nbeta\ngamma\n"));
+        let call = Call {
+            capability: REPLACE.to_owned(),
+            args: serde_json::json!({ "path": "notes.txt", "old": "beta", "new": "BETA" }),
+        };
+        let shown = tools.preview(&call, &reads).expect("preview");
+        let applied = EditEngine::new(&ws)
+            .expect("engine")
+            .replace(
+                &ReplaceReq {
+                    path: "notes.txt".into(),
+                    old: "beta".into(),
+                    new: "BETA".into(),
+                    count: 1,
+                },
+                &reads,
+            )
+            .expect("apply");
+        assert_eq!(
+            applied.after,
+            sha256(&std::fs::read(&file).expect("read back"))
+        );
+        assert_eq!(
+            shown,
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn preview_does_not_modify_file() {
+        let ws = scratch("no-modify");
+        let tools = EditTools::new(&ws).expect("tools");
+        let file = ws.join("notes.txt");
+        std::fs::write(&file, "keep\nthis\n").expect("seed");
+        let before = std::fs::read(&file).expect("read");
+        let mut reads = ReadLog::default();
+        reads.record("notes.txt", sha256(&before));
+        let call = Call {
+            capability: REPLACE.to_owned(),
+            args: serde_json::json!({ "path": "notes.txt", "old": "keep", "new": "changed" }),
+        };
+        let shown = tools.preview(&call, &reads).expect("preview");
+        assert!(shown.contains("+changed"), "{shown}");
+        assert_eq!(
+            std::fs::read(&file).expect("read"),
+            before,
+            "the file is untouched"
+        );
+        // No temp file left behind either: the directory holds the file
+        // and nothing else.
+        assert_eq!(std::fs::read_dir(&ws).expect("dir").count(), 1);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn preview_refuses_stale_read_like_apply() {
+        let ws = scratch("stale");
+        let tools = EditTools::new(&ws).expect("tools");
+        let engine = EditEngine::new(&ws).expect("engine");
+        std::fs::write(ws.join("notes.txt"), "one\ntwo\n").expect("seed");
+        let req = ReplaceReq {
+            path: "notes.txt".into(),
+            old: "one".into(),
+            new: "ONE".into(),
+            count: 1,
+        };
+        let call = Call {
+            capability: REPLACE.to_owned(),
+            args: serde_json::json!({ "path": "notes.txt", "old": "one", "new": "ONE" }),
+        };
+        // Never read: both paths refuse, with the same error.
+        assert!(matches!(
+            engine.replace(&req, &ReadLog::default()),
+            Err(EditError::Stale(StaleRead::NeverRead))
+        ));
+        assert!(matches!(
+            tools.preview(&call, &ReadLog::default()),
+            Err(PreviewRefused::Edit(EditError::Stale(StaleRead::NeverRead)))
+        ));
+        // A digest that does not match the file: the same on both paths.
+        let mut stale = ReadLog::default();
+        stale.record("notes.txt", sha256(b"old content"));
+        assert!(matches!(
+            engine.replace(&req, &stale),
+            Err(EditError::Stale(StaleRead::Changed))
+        ));
+        assert!(matches!(
+            tools.preview(&call, &stale),
+            Err(PreviewRefused::Edit(EditError::Stale(StaleRead::Changed)))
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // A create previews against /dev/null and makes nothing; the
+    // create-time refusals are the apply path's own.
+    #[test]
+    fn preview_write_create_heads_dev_null_and_refuses_like_apply() {
+        let ws = scratch("write-create");
+        let tools = EditTools::new(&ws).expect("tools");
+        let call = Call {
+            capability: WRITE.to_owned(),
+            args: serde_json::json!({ "path": "new/dir/file.txt", "content": "h1\nh2\n" }),
+        };
+        let shown = tools.preview(&call, &ReadLog::default()).expect("preview");
+        assert_eq!(
+            shown,
+            "--- /dev/null\n+++ b/new/dir/file.txt\n@@ -0,0 +1,2 @@\n+h1\n+h2\n"
+        );
+        assert!(!ws.join("new").exists(), "a preview creates nothing");
+        // More new directories than one write makes: refused, unmade.
+        let call = Call {
+            capability: WRITE.to_owned(),
+            args: serde_json::json!({ "path": "a/b/c/d/e/f/g/h/i/deep.txt", "content": "x\n" }),
+        };
+        assert!(matches!(
+            tools.preview(&call, &ReadLog::default()),
+            Err(PreviewRefused::Edit(EditError::TooManyDirs))
+        ));
+        // A file where a directory belongs: resolve itself fails with
+        // ENOTDIR before any create regime, and preview reports exactly
+        // what apply reports.
+        std::fs::write(ws.join("blocker"), "x").expect("seed");
+        let call = Call {
+            capability: WRITE.to_owned(),
+            args: serde_json::json!({ "path": "blocker/file.txt", "content": "x\n" }),
+        };
+        let res = tools.preview(&call, &ReadLog::default());
+        let apply = EditEngine::new(&ws)
+            .expect("engine")
+            .write(
+                &WriteReq {
+                    path: "blocker/file.txt".into(),
+                    content: "x\n".into(),
+                },
+                &ReadLog::default(),
+            )
+            .err();
+        match (&res, &apply) {
+            (Err(PreviewRefused::Edit(EditError::Io(e))), Some(EditError::Io(a))) => {
+                assert_eq!(e.kind(), a.kind(), "preview and apply agree");
+                assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory);
+            }
+            _ => panic!("wrong results: preview {res:?}, apply {apply:?}"),
+        }
+        assert!(!ws.join("blocker").exists() || ws.join("blocker").is_file());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn preview_refuses_a_non_edit_call() {
+        let ws = scratch("not-edit");
+        let tools = EditTools::new(&ws).expect("tools");
+        let call = Call {
+            capability: "harness.fs.read".to_owned(),
+            args: serde_json::json!({}),
+        };
+        assert!(matches!(
+            tools.preview(&call, &ReadLog::default()),
+            Err(PreviewRefused::NotEdit(cap)) if cap == "harness.fs.read"
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

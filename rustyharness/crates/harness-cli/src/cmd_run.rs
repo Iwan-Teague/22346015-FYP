@@ -32,17 +32,71 @@ fn from_refusal(cx: &Cx<'_>, e: &RunRefused) -> Outcome {
     o
 }
 
-pub(crate) fn run_or_resume(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Outcome {
-    match try_run(cx, o, verb) {
+pub(crate) fn run_or_resume(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    verb: Verb,
+    cfg: &Option<crate::config::UserConfig>,
+) -> Outcome {
+    match try_run(cx, o, verb, cfg) {
         Ok(x) | Err(x) => x,
     }
 }
 
-fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome, Outcome> {
-    let inp = inputs(cx, o)?;
-    let workspace = required(cx, o, "workspace")?;
-    let state_root = required(cx, o, "state-root")?;
-    let endpoint = required(cx, o, "endpoint")?;
+fn try_run(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    verb: Verb,
+    cfg: &Option<crate::config::UserConfig>,
+) -> Result<Outcome, Outcome> {
+    // `--output stream-json` (P-15): the only output mode. A usage error
+    // here stops before anything runs.
+    let stream = match o.get("output") {
+        None => false,
+        Some(&"stream-json") => true,
+        Some(other) => {
+            note!(
+                cx,
+                "--output must be stream-json, not {other:?}\n{}",
+                crate::args::USAGE
+            );
+            return Err(refused(exit::USAGE, "--output must be stream-json".into()));
+        }
+    };
+    let inp = inputs(cx, o, cfg)?;
+    // The workspace (P-07): the flag, else the current directory. A cwd
+    // that cannot be determined is fail-closed (Indeterminate), not a
+    // silent other directory.
+    let workspace: std::borrow::Cow<'_, str> = match crate::config::value(o, cfg, "workspace") {
+        Some(w) => std::borrow::Cow::Borrowed(w),
+        None => match std::env::current_dir() {
+            Ok(d) => std::borrow::Cow::Owned(d.to_string_lossy().into_owned()),
+            Err(e) => {
+                let why = format!("cannot determine the current directory for --workspace: {e}");
+                note!(cx, "{why}");
+                return Err(refused(exit::INDETERMINATE, why));
+            }
+        },
+    };
+    let state_root = match crate::config::state_root(o, cfg) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            note!(
+                cx,
+                "--state-root is required here (no default state root on this platform)\n{}",
+                crate::args::USAGE
+            );
+            return Err(refused(exit::USAGE, "--state-root missing".into()));
+        }
+        Err(e) => {
+            note!(cx, "{e}");
+            return Err(refused(exit::UNREADABLE_INPUT, e));
+        }
+    };
+    let endpoint = crate::config::value(o, cfg, "endpoint").ok_or_else(|| {
+        note!(cx, "--endpoint is required\n{}", crate::args::USAGE);
+        refused(exit::USAGE, "--endpoint missing".into())
+    })?;
     let run_id = match verb {
         Verb::Resume => Some(RunId::parse(required(cx, o, "run")?).ok_or_else(|| {
             note!(cx, "--run is not a run id");
@@ -60,7 +114,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     let config = &inp.config;
     // The state root's locality first (§2.8): a run that cannot start does
     // not contact the model server. The run checks it again itself.
-    let root = std::fs::canonicalize(state_root)
+    let root = std::fs::canonicalize(state_root.as_ref())
         .map_err(|e| from_refusal(cx, &RunRefused::StateRoot(e)))?;
     harness_policy::locality::check(probe, &root.to_string_lossy())
         .map_err(|e| from_refusal(cx, &RunRefused::Locality(e)))?;
@@ -74,10 +128,17 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     // Who answers an ask (§5.3): with nobody, every ask is a deny (§5.2),
     // so an unattended run edits only where its policy allows edits.
     let terminal;
+    // A config `approver: "none"` says nobody is at the terminal (P-07):
+    // every ask is a deny, even at a real terminal. `--approver` does not
+    // exist, and an approver given by the test binary always wins.
+    let wants_terminal = match cfg {
+        Some(c) => c.approver == crate::config::ApproverSetting::Terminal,
+        None => true,
+    };
     let approver: Option<&dyn Approver> = match cx.approver {
         ApproverSource::None => None,
         ApproverSource::Given(a) => Some(a),
-        ApproverSource::StdinIfTerminal => {
+        ApproverSource::StdinIfTerminal if wants_terminal => {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() {
                 terminal = TerminalApprover::new(cx);
@@ -86,11 +147,12 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
                 None
             }
         }
+        ApproverSource::StdinIfTerminal => None,
     };
     let report = match run_id {
         None => harness_run::run(Run {
-            state_root: std::path::Path::new(state_root),
-            workspace: std::path::Path::new(workspace),
+            state_root: std::path::Path::new(state_root.as_ref()),
+            workspace: std::path::Path::new(workspace.as_ref()),
             spec: &inp.spec,
             registry: &inp.registry,
             policy: &inp.policy,
@@ -103,9 +165,9 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             confinement: Some(cx.confinement),
         }),
         Some(id) => harness_run::resume(Resume {
-            state_root: std::path::Path::new(state_root),
+            state_root: std::path::Path::new(state_root.as_ref()),
             run: &id,
-            workspace: std::path::Path::new(workspace),
+            workspace: std::path::Path::new(workspace.as_ref()),
             spec: &inp.spec,
             registry: &inp.registry,
             policy: &inp.policy,
@@ -164,12 +226,41 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             words,
         ));
     }
+    if stream {
+        stream_json(cx, &report);
+    }
     Ok(Outcome {
         outcome: report.outcome,
         findings,
         chain_head: report.chain_head.map(|d| d.to_string()),
         exit_override: None,
     })
+}
+
+/// `--output stream-json` (P-15): the attempt journal as newline-delimited
+/// JSON on stdout — the schema line, one line per record (byte-for-byte the
+/// journal's canonical lines), then the `usage {...}` footer — all BEFORE
+/// the `chain_head` line and the report, which stay the last stdout lines.
+/// A journal that cannot be read does not change the run's report or exit
+/// code: it is noted on stderr and the stream is simply absent.
+fn stream_json(cx: &Cx<'_>, report: &harness_run::RunReport) {
+    let attempt_dir = harness_journal::layout::attempt_dir(&report.run_dir, report.attempt);
+    let v = match harness_journal::JournalReader::open_expecting(&attempt_dir, &report.run) {
+        Ok(v) => v,
+        Err(e) => {
+            note!(cx, "stream-json: cannot read the attempt journal: {e}");
+            return;
+        }
+    };
+    say!(cx, "{}", crate::cmd_events::SCHEMA_LINE);
+    for i in 0..v.records.len() {
+        if let Some(line) = v.line_bytes(i) {
+            say!(cx, "{}", String::from_utf8_lossy(&line));
+        }
+    }
+    let usage = crate::usage::Usage::from_journal(&v);
+    say!(cx, "usage {}", usage.to_json());
+    note!(cx, "{}", usage.in_words());
 }
 
 /// What a run's pre-submit checks did, said plainly (H3a): how many

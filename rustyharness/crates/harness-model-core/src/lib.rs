@@ -149,6 +149,15 @@ pub enum Message {
     System(HarnessText),
     /// The task.
     Task(TaskText),
+    /// A message from the user at the interface (P-05/P-10, session only).
+    /// Trusted intent shown verbatim in the user role: **never** wrapped in
+    /// the untrusted delimiters, and never compacted to an index line (only
+    /// an oldest prefix beyond its share of the window is dropped, counted
+    /// and noticed). Handled with the `Untrusted` mechanics all the same:
+    /// invisibles are stripped and a delimiter collision is refused when it
+    /// is rendered (`wire::render_request`), and only the session loop
+    /// builds one (`Source::User`).
+    User(Untrusted<String>),
     /// A prior reply of the model.
     Assistant(Untrusted<String>),
     /// A tool result, fed back as data.

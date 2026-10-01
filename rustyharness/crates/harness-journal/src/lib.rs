@@ -52,6 +52,7 @@ pub mod conditions;
 pub mod event;
 pub mod layout;
 pub mod reader;
+pub mod tail;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod testing;
 
@@ -68,6 +69,7 @@ pub use canon::{EventKind, Ident};
 pub use conditions::{Condition, ConditionKind};
 pub use event::{Event, Trusted, UntrustedBlob};
 pub use reader::{verify, BlobSource, BreakKind, Broken, JournalReader, Record, Verified};
+pub use tail::{JournalTail, Poll};
 pub use writer::{
     BlobSink, Clock, Header, JournalError, JournalFile, JournalWriter, Journaled, Released,
     StartError,

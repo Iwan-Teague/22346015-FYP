@@ -38,7 +38,9 @@ use harness_tools::builtin::WorkspaceTree;
 use harness_tools::{ExecCleanup, ExecEnd, ExecSpec, InvokeCtx, ToolError, ToolStatus};
 use serde_json::{json, Value};
 
-use crate::driver::{decided, exec_fields, journal, status_name, Loop};
+use crate::driver::step::{journal, Loop};
+use crate::driver::stop::decided;
+use crate::driver::tools::{exec_fields, status_name};
 use crate::sample;
 
 /// Most commands a task may declare.

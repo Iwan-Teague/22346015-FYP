@@ -240,6 +240,17 @@ pub fn run_scripted(
     fx: &Fixture,
     replies: Vec<Completion>,
 ) -> Result<RunReport, ScriptedRunRefused> {
+    run_scripted_policy(fx, &UserPolicy::default(), replies)
+}
+
+/// [`run_scripted`] under a caller-chosen user policy (P-08): the real
+/// `run` reads its matchers, and the journal carries the policy's digest,
+/// which [`assert_audit_clean_policy`] must be given back.
+pub fn run_scripted_policy(
+    fx: &Fixture,
+    policy: &UserPolicy,
+    replies: Vec<Completion>,
+) -> Result<RunReport, ScriptedRunRefused> {
     let registry = registry()?;
     let profile = Profile::conservative_default("m");
     let backend = ScriptedBackend::new(profile.clone(), replies.into_iter().map(Ok).collect());
@@ -248,7 +259,7 @@ pub fn run_scripted(
         workspace: fx.workspace(),
         spec: &fx.spec,
         registry: &registry,
-        policy: &UserPolicy::default(),
+        policy,
         profile: &profile,
         backend: &backend,
         probe: &Local,
@@ -267,6 +278,18 @@ pub fn run_scripted(
 /// [`run_scripted`] gave the run (review F-1), with the report's chain
 /// head as the anchor.
 pub fn assert_audit_clean(fx: &Fixture, report: &RunReport) -> Result<(), String> {
+    assert_audit_clean_policy(fx, &UserPolicy::default(), report)
+}
+
+/// [`assert_audit_clean`] under a caller-chosen user policy (P-08): the
+/// replay recomputes every matched decision with the SAME policy the run
+/// had — a different policy (a different digest) is refused before any
+/// decision is compared (§2.9, §7.1 header).
+pub fn assert_audit_clean_policy(
+    fx: &Fixture,
+    policy: &UserPolicy,
+    report: &RunReport,
+) -> Result<(), String> {
     let registry = registry().map_err(|e| format!("registry: {e}"))?;
     let a = audit(Audit {
         state_root: fx.state_root(),
@@ -275,7 +298,7 @@ pub fn assert_audit_clean(fx: &Fixture, report: &RunReport) -> Result<(), String
         anchor: report.chain_head,
         spec: &fx.spec,
         registry: &registry,
-        policy: &UserPolicy::default(),
+        policy,
         profile: &Profile::conservative_default("m"),
         limits: &RunConfig::defaults(TOKEN_BUDGET).limits,
     })

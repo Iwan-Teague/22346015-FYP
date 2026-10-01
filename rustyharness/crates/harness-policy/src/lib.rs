@@ -72,11 +72,13 @@ use serde_json::Value;
 pub mod approval;
 pub mod builtin;
 pub mod locality;
+pub mod matcher;
 pub mod path;
 
 pub use builtin::{
     EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
 };
+pub use matcher::Matcher;
 pub use path::{workspace_path, PathRefused, WorkspacePath};
 
 // ---------------------------------------------------------------------------
@@ -175,15 +177,45 @@ pub enum RuleList {
     Allow,
 }
 
-/// User policy from the harness config (trust base, §6.4). Three ordered
+/// One user rule: a [`Selector`] plus, since P-08, an optional argument
+/// [`Matcher`] (design §4.8). Without a matcher the rule is the v1 form and
+/// matches every call its selector covers; with one, only calls whose
+/// canonical arguments satisfy every condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// What capability (or provider) the rule names.
+    pub selector: Selector,
+    /// The `match` conditions, if any.
+    pub matcher: Option<Matcher>,
+}
+
+impl Rule {
+    /// The rule's canonical key: selector line plus matcher JSON, the same
+    /// spelling [`UserPolicy::digest`] writes, so two rules are the same
+    /// rule exactly when their keys are.
+    fn key(&self) -> String {
+        let mut k = selector_str(&self.selector);
+        if let Some(m) = &self.matcher {
+            k.push('\t');
+            k.push_str(&m.canonical());
+        }
+        k
+    }
+}
+
+/// A user policy from the harness config (trust base, §6.4). Three ordered
 /// lists; within the §5.1 order a user deny cannot be overridden, a user ask
 /// raises the effective confirmation to `user_confirm` (max-rule), and a
 /// user allow can never lower a floor (it is consulted after every ask rule).
-#[derive(Debug, Clone, Default)]
+/// Since P-08 a rule may carry a [`Matcher`]: a deny matcher denies only the
+/// calls it matches, an ask matcher asks only about them (and does not raise
+/// the session-wide floor), an allow matcher allows only them — but the
+/// order itself never moves (§5.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserPolicy {
-    deny: Vec<Selector>,
-    ask: Vec<Selector>,
-    allow: Vec<Selector>,
+    deny: Vec<Rule>,
+    ask: Vec<Rule>,
+    allow: Vec<Rule>,
 }
 
 /// A user policy that cannot be applied unambiguously.
@@ -192,25 +224,55 @@ pub enum PolicyConfigError {
     /// Not `provider.*` and not a capability id.
     #[error("policy selector {0:?} is neither a capability id nor provider.*")]
     BadSelector(String),
-    /// The same selector appears twice (in one list or across lists). The
-    /// §5.1 order would pick deny, but a config that says two things about
-    /// one selector is refused so its author finds out.
-    #[error("policy selector {0:?} appears more than once")]
+    /// The same rule (selector AND matcher) appears twice (in one list or
+    /// across lists). The §5.1 order would pick deny, but a config that says
+    /// two things about one rule is refused so its author finds out. Two
+    /// rules with the same selector and DIFFERENT matchers are fine: they
+    /// say different things about different calls (`allow cargo test` but
+    /// `ask git push`, P-08).
+    #[error("policy rule {0:?} appears more than once")]
     Ambiguous(String),
+    /// A policy file (v2, [`UserPolicy::from_json`]) whose shape is wrong:
+    /// not an object, a missing or mis-typed list, an unknown key, a rule
+    /// object without a `capability`, and the like.
+    #[error("policy file is invalid: {0}")]
+    BadRule(String),
+    /// A `match` object the matcher refuses: unknown key, an empty or
+    /// mis-typed condition, or a glob that is not a glob.
+    #[error("policy matcher is invalid: {0}")]
+    BadMatcher(String),
+    /// A rule's `examples` failed at load: the rule does not behave as its
+    /// author documented, or an example itself is malformed (§4.8: examples
+    /// are checked as unit tests when the config loads).
+    #[error("policy example failed: {0}")]
+    BadExample(String),
+}
+
+/// A rule's selector as a digest line (the v1 spelling, unchanged).
+fn selector_str(sel: &Selector) -> String {
+    match sel {
+        Selector::Capability(c) => c.as_str().to_owned(),
+        Selector::Provider(p) => format!("{}.*", p.as_str()),
+    }
 }
 
 impl UserPolicy {
     /// Build from selector strings; refuses malformed or repeated selectors.
+    /// Every rule has no matcher (the v1 form); [`UserPolicy::from_json`]
+    /// builds the v2 form with matchers.
     pub fn new(deny: &[&str], ask: &[&str], allow: &[&str]) -> Result<Self, PolicyConfigError> {
         let mut seen = BTreeSet::new();
-        let mut parse = |list: &[&str]| -> Result<Vec<Selector>, PolicyConfigError> {
+        let mut parse = |list: &[&str]| -> Result<Vec<Rule>, PolicyConfigError> {
             list.iter()
                 .map(|s| {
-                    let sel = Selector::parse(s)?;
-                    if !seen.insert(sel.clone()) {
+                    let rule = Rule {
+                        selector: Selector::parse(s)?,
+                        matcher: None,
+                    };
+                    if !seen.insert(rule.key()) {
                         return Err(PolicyConfigError::Ambiguous((*s).to_owned()));
                     }
-                    Ok(sel)
+                    Ok(rule)
                 })
                 .collect()
         };
@@ -221,10 +283,59 @@ impl UserPolicy {
         })
     }
 
+    /// Build from a policy file's parsed JSON (v2, P-08): `{"deny": …,
+    /// "ask": …, "allow": …}`, each list a list of rules (a list may be
+    /// absent, which is empty — the v1 files rely on that). A rule is a v1
+    /// selector string or an object `{"capability": …, "match": {…},
+    /// "examples": […]}` (`match` and `examples` optional). The v1 shape
+    /// parses identically and digests identically (superset, not a new
+    /// format). Unknown keys, malformed rules and failing `examples` are
+    /// refused: the file never loads half-understood (§4.8, fail-closed).
+    pub fn from_json(v: &Value) -> Result<Self, PolicyConfigError> {
+        let bad = |what: &str| PolicyConfigError::BadRule(what.to_owned());
+        let obj = v
+            .as_object()
+            .ok_or_else(|| bad("policy file is not a JSON object"))?;
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "deny" | "ask" | "allow") {
+                return Err(bad(&format!("unknown policy key {key:?}")));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut list = |name: &str| -> Result<Vec<Rule>, PolicyConfigError> {
+            // An absent list is empty (the v1 files rely on this); a list
+            // that is present must be a list of rules.
+            let Some(items) = obj.get(name) else {
+                return Ok(Vec::new());
+            };
+            let Some(items) = items.as_array() else {
+                return Err(bad(&format!("{name} must be a list of rules")));
+            };
+            items
+                .iter()
+                .map(|entry| {
+                    let rule = rule_from_json(entry, name)?;
+                    if !seen.insert(rule.key()) {
+                        return Err(PolicyConfigError::Ambiguous(rule.key()));
+                    }
+                    Ok(rule)
+                })
+                .collect()
+        };
+        Ok(Self {
+            deny: list("deny")?,
+            ask: list("ask")?,
+            allow: list("allow")?,
+        })
+    }
+
     /// SHA-256 of the policy's canonical form (each list in order, one
-    /// selector per line, `deny`/`ask`/`allow` sections): journaled in the
+    /// rule per line, `deny`/`ask`/`allow` sections): journaled in the
     /// header so an audit replay under a different policy is refused
-    /// before any decision is compared (§2.9, §7.1 header).
+    /// before any decision is compared (§2.9, §7.1 header). A rule with a
+    /// matcher appends its canonical matcher JSON after a TAB; a policy of
+    /// v1 rules digests byte-for-byte as before (P-08 keeps old journals
+    /// verifiable).
     pub fn digest(&self) -> harness_core::Digest {
         let mut s = String::new();
         for (name, list) in [
@@ -234,23 +345,155 @@ impl UserPolicy {
         ] {
             s.push_str(name);
             s.push('\n');
-            for sel in list {
-                match sel {
-                    Selector::Capability(c) => s.push_str(c.as_str()),
-                    Selector::Provider(p) => {
-                        s.push_str(p.as_str());
-                        s.push_str(".*");
-                    }
-                }
+            for rule in list {
+                s.push_str(&rule.key());
                 s.push('\n');
             }
         }
         harness_core::sha256(s.as_bytes())
     }
 
-    fn first_match(list: &[Selector], id: &CapId) -> Option<usize> {
-        list.iter().position(|s| s.matches(id))
+    /// The indices (in list order) of the rules of `list` whose selector
+    /// covers `id`, each with its matcher: the candidates a decision walks
+    /// in §5.1 order, matcher-tested per call.
+    fn candidates(list: &[Rule], id: &CapId) -> Vec<UserCandidate> {
+        list.iter()
+            .enumerate()
+            .filter(|(_, r)| r.selector.matches(id))
+            .map(|(index, r)| UserCandidate {
+                index,
+                matcher: r.matcher.clone(),
+            })
+            .collect()
     }
+}
+
+/// One user rule as a JSON object: `capability` required, `match` and
+/// `examples` optional, nothing else.
+fn rule_from_json(entry: &Value, list: &str) -> Result<Rule, PolicyConfigError> {
+    let bad = |what: String| PolicyConfigError::BadRule(format!("{list} rule: {what}"));
+    // v1: a bare selector string. v2: an object.
+    if let Some(s) = entry.as_str() {
+        return Ok(Rule {
+            selector: Selector::parse(s)?,
+            matcher: None,
+        });
+    }
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| bad("a rule must be a selector string or an object".to_owned()))?;
+    let mut selector = None;
+    let mut matcher = None;
+    let mut examples: Option<&Vec<Value>> = None;
+    for (key, val) in entry {
+        match key.as_str() {
+            "capability" => {
+                let Some(s) = val.as_str() else {
+                    return Err(bad("capability must be a string".to_owned()));
+                };
+                selector = Some(Selector::parse(s)?);
+            }
+            "match" => matcher = Matcher::parse(val)?,
+            "examples" => {
+                let Some(items) = val.as_array() else {
+                    return Err(bad("examples must be a list".to_owned()));
+                };
+                examples = Some(items);
+            }
+            other => return Err(bad(format!("unknown key {other:?}"))),
+        }
+    }
+    let selector = selector.ok_or_else(|| bad("a rule needs a capability".to_owned()))?;
+    let rule = Rule { selector, matcher };
+    if let Some(items) = examples {
+        check_examples(&rule, items)?;
+    }
+    Ok(rule)
+}
+
+/// A rule's `examples` (§4.8): `{"capability": …, "args": {…},
+/// "expect": "match"|"not_match"}`. Each is checked against the rule NOW,
+/// at load: a rule that does not do what its author documented refuses the
+/// whole file (Codex-style `match`/`not_match` unit tests, R1 §3.1).
+fn check_examples(rule: &Rule, items: &[Value]) -> Result<(), PolicyConfigError> {
+    for (i, item) in items.iter().enumerate() {
+        let bad = |what: String| PolicyConfigError::BadExample(format!("example {i}: {what}"));
+        let Some(obj) = item.as_object() else {
+            return Err(bad("an example must be an object".to_owned()));
+        };
+        let mut capability = None;
+        let mut args: Option<&Value> = None;
+        let mut expect = None;
+        for (key, val) in obj {
+            match key.as_str() {
+                "capability" => {
+                    let Some(s) = val.as_str() else {
+                        return Err(bad("capability must be a string".to_owned()));
+                    };
+                    capability =
+                        Some(CapId::new(s).map_err(|_| {
+                            bad(format!("capability {s:?} is not a capability id"))
+                        })?);
+                }
+                "args" => {
+                    if !val.is_object() {
+                        return Err(bad("args must be an object".to_owned()));
+                    }
+                    args = Some(val);
+                }
+                "expect" => {
+                    let Some(s) = val.as_str() else {
+                        return Err(bad("expect must be a string".to_owned()));
+                    };
+                    expect = Some(match s {
+                        "match" => true,
+                        "not_match" => false,
+                        other => {
+                            return Err(bad(format!(
+                                "expect is {other:?}, want \"match\" or \"not_match\""
+                            )))
+                        }
+                    });
+                }
+                other => return Err(bad(format!("unknown key {other:?}"))),
+            }
+        }
+        let Some(args) = args else {
+            return Err(bad("an example needs args".to_owned()));
+        };
+        let Some(expect) = expect else {
+            return Err(bad(
+                "an example needs expect: \"match\" or \"not_match\"".to_owned()
+            ));
+        };
+        // Under a provider selector an example must say which capability it
+        // is about; under a capability selector it may omit it. Either way
+        // the capability must be one the rule's selector covers.
+        let cap = match (&rule.selector, capability) {
+            (_, Some(c)) => c,
+            (Selector::Capability(c), None) => c.clone(),
+            (Selector::Provider(_), None) => {
+                return Err(bad(
+                    "under a provider.* selector an example needs an explicit capability"
+                        .to_owned(),
+                ))
+            }
+        };
+        if !rule.selector.matches(&cap) {
+            return Err(bad(format!(
+                "capability {} is not covered by the rule's selector",
+                cap.as_str()
+            )));
+        }
+        let matched = rule.matcher.as_ref().is_none_or(|m| m.matches(args));
+        if matched != expect {
+            let want = if expect { "match" } else { "not_match" };
+            return Err(bad(format!(
+                "args {args} was expected to {want} and did not"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -541,13 +784,34 @@ pub fn trifecta(
     }
 }
 
+/// One user-rule candidate for a capability: the rule's index in its list
+/// plus its matcher, if it carries one (P-08). Plan time resolves
+/// selectors; decide time matcher-tests the candidates against the call's
+/// canonical args, first match winning (§5.1).
+#[derive(Debug, Clone)]
+struct UserCandidate {
+    index: usize,
+    matcher: Option<Matcher>,
+}
+
+/// First candidate whose matcher (or lack of one) matches `args`: the
+/// §5.1 "first match wins" within a list. Matcher conditions on absent or
+/// mis-shaped arguments never hold, so an unmatched candidate falls
+/// through to the next one and finally to the built-in rules.
+fn first_matching(cands: &[UserCandidate], args: &Value) -> Option<usize> {
+    cands
+        .iter()
+        .find(|c| c.matcher.as_ref().is_none_or(|m| m.matches(args)))
+        .map(|c| c.index)
+}
+
 #[derive(Debug, Clone)]
 struct Active {
     class: EffectiveClass,
     schema: InputSchema,
-    user_deny: Option<usize>,
-    user_ask: Option<usize>,
-    user_allow: Option<usize>,
+    user_deny: Vec<UserCandidate>,
+    user_ask: Vec<UserCandidate>,
+    user_allow: Vec<UserCandidate>,
     /// A built-in file tool: its `path` argument must stay in the workspace.
     fs_tool: bool,
     /// The built-in submit sentinel (§2.5).
@@ -635,8 +899,12 @@ impl Session {
 
         let mut classes = Vec::with_capacity(resolved.len());
         for c in &resolved {
-            let user_ask = UserPolicy::first_match(&policy.ask, c.id());
-            let floor = if user_ask.is_some() {
+            let user_ask = UserPolicy::candidates(&policy.ask, c.id());
+            // Only an UNCONDITIONAL ask rule (no matcher) raises the
+            // capability's confirmation floor: a matcher ask asks about the
+            // calls it matches, at decide time, not about the capability
+            // (P-08: `ask git push` must not make `cargo test` ask).
+            let floor = if user_ask.iter().any(|c| c.matcher.is_none()) {
                 Confirmation::UserConfirm
             } else {
                 Confirmation::None
@@ -685,9 +953,9 @@ impl Session {
                 Active {
                     class,
                     schema: c.input_schema().clone(),
-                    user_deny: UserPolicy::first_match(&policy.deny, c.id()),
+                    user_deny: UserPolicy::candidates(&policy.deny, c.id()),
                     user_ask,
-                    user_allow: UserPolicy::first_match(&policy.allow, c.id()),
+                    user_allow: UserPolicy::candidates(&policy.allow, c.id()),
                     fs_tool: c.id().provider() == BUILTIN_NAMESPACE
                         && c.id().as_str().starts_with(builtin::FS_PREFIX),
                     submit: builtin::is_submit_sentinel(c),
@@ -760,7 +1028,7 @@ impl Session {
         if cl.sensitivity == Sensitivity::Personal && !self.personal_granted {
             return deny(DenyReason::PersonalNotGranted, "deny.personal-not-granted");
         }
-        if let Some(index) = a.user_deny {
+        if let Some(index) = first_matching(&a.user_deny, &call.args) {
             return PolicyDecision::Deny {
                 reason: DenyReason::UserDenied,
                 rule: RuleId::User {
@@ -817,25 +1085,29 @@ impl Session {
         }
 
         // ---- 2. Ask rules. ----
-        if cl.confirmation >= Confirmation::UserConfirm {
-            let rule = match a.user_ask {
-                Some(index) if cl.confirmation == Confirmation::UserConfirm => RuleId::User {
+        // An unconditional ask rule raised the floor at plan time; a
+        // matcher ask rule (P-08) asks only about the calls it matches.
+        // The user rule is credited only when the tier it produced is
+        // exactly `user_confirm` — its own tier or a matcher ask's tier —
+        // never above it: there the floor asks, not the user.
+        let ask_hit = first_matching(&a.user_ask, &call.args);
+        if cl.confirmation >= Confirmation::UserConfirm || ask_hit.is_some() {
+            let rule = match ask_hit {
+                Some(index) if cl.confirmation <= Confirmation::UserConfirm => RuleId::User {
                     list: RuleList::Ask,
                     index,
                 },
                 _ => RuleId::Builtin("ask.confirmation-floor"),
             };
+            let tier = cl.confirmation.max(Confirmation::UserConfirm);
             if !self.approver_present {
                 return deny(DenyReason::NoApprover, "deny.no-approver");
             }
-            return PolicyDecision::Ask {
-                tier: cl.confirmation,
-                rule,
-            };
+            return PolicyDecision::Ask { tier, rule };
         }
 
         // ---- 3. Allow rules. ----
-        if let Some(index) = a.user_allow {
+        if let Some(index) = first_matching(&a.user_allow, &call.args) {
             return PolicyDecision::Allow {
                 rule: RuleId::User {
                     list: RuleList::Allow,

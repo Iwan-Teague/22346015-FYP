@@ -19,9 +19,13 @@ use harness_model::{Completion, ModelError, ServerUsage, TaskText, Unavailable};
 use harness_policy::{Authorized, Call, UserPolicy};
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 
-use crate::driver::{
-    commit, new_meter, new_nonce, new_run_id, plan, Approvals, End, Loop, NonceSource, ReadLog,
-};
+use crate::driver::approvals::Approvals;
+use crate::driver::plan::plan;
+use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
+use crate::driver::stop::{commit, End};
+use crate::driver::tools::{exec_fields, parse_exec};
+use crate::driver::{new_meter, new_nonce, new_run_id, ReadLog};
+
 use crate::{RunConfig, TaskSpec};
 
 struct Tick(Cell<u64>);
@@ -175,7 +179,7 @@ fn drive_full(
         Header::new(Ident::of("0.0.1").unwrap()),
     )
     .unwrap();
-    let mut lp = Loop {
+    let mut lp = Loop::new(LoopInit {
         session,
         registry: &reg,
         tools,
@@ -209,9 +213,9 @@ fn drive_full(
         pressure: Vec::new(),
         reads_seen: Default::default(),
         todo: None,
-        notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
+        notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
-    };
+    });
     let end = lp.drive(&mut w);
     let pressure = lp.pressure.clone();
     let tokens = lp.meter.tokens_spent();
@@ -745,7 +749,7 @@ fn the_wall_condition_is_journaled_once_as_an_entry_and_never_exits() {
         "crossed at least two steps before the last, so later steps observed it: {walls:?}"
     );
     assert!(matches!(
-        crate::replay::check_wall_conditions(&v.records),
+        crate::replay::compare::check_wall_conditions(&v.records),
         Ok(1)
     ));
 }
@@ -895,7 +899,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
     )
     .unwrap();
     let env = EnvSample::unmeasured(Unmeasured::NoSafeApi);
-    let mut lp = Loop {
+    let mut lp = Loop::new(LoopInit {
         session,
         registry: &reg,
         tools,
@@ -931,9 +935,9 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         pressure: Vec::new(),
         reads_seen: Default::default(),
         todo: None,
-        notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
+        notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
-    };
+    });
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::PolicyAbort);
     assert_eq!(end.step, 1, "the model is not asked again");
@@ -961,7 +965,6 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
 // back as nothing, so an audit calls it a divergence.
 #[test]
 fn h2d_a_command_record_reads_back_exactly_and_nothing_else_does() {
-    use crate::driver::{exec_fields, parse_exec};
     use harness_journal::{Event, Trusted};
     use harness_tools::{ExecCleanup, ExecEnd, ExecRecord};
     let ends = [

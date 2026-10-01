@@ -2,7 +2,8 @@
 //!
 //! The types here are the harness's pure core (design §1.2): untrusted data,
 //! run ids and nonces, the one SHA-256 function, the strict JSON reader, the
-//! run meter and loop detection, and the environment-sample vocabulary.
+//! pure glob matcher (P-08), the run meter and loop detection, and the
+//! environment-sample vocabulary.
 //!
 //! The gate-layer outcome type lives in the sibling `gate-outcome` crate
 //! (`GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`); this
@@ -22,8 +23,10 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod diff;
 pub mod display;
 pub mod environment;
+pub mod glob;
 pub mod strict_json;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -241,6 +244,12 @@ pub enum Source {
     Model,
     /// Read from a file inside the confined workspace.
     Workspace(String),
+    /// A message from the user at the interface (P-05/P-10): trusted
+    /// intent, handled with the `Untrusted` mechanics — escaping in the
+    /// journal, invisibles stripped and nonce-checked when rendered. Only
+    /// the session loop constructs it (P-13), and only for a user turn's
+    /// text.
+    User,
 }
 
 impl<T> Untrusted<T> {
@@ -390,6 +399,10 @@ pub enum StopCause {
     ModelUnavailable,
     /// A human cancelled.
     Cancelled,
+    /// The user's input ended the session (P-05/P-10: end of input, exit or
+    /// an input timeout, journaled as `InputEnded` and followed by
+    /// `RunStopped` with this cause). Never a verdict (INV-18).
+    SessionEnded,
     /// The sandbox was lost.
     SandboxLost,
     /// The journal rejected an operation.

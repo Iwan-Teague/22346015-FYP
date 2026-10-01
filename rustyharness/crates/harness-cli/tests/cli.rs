@@ -670,6 +670,140 @@ fn exec_replies() -> Vec<String> {
     ]
 }
 
+/// P-11: the exec-by-name flags refuse, as unreadable input (exit 4),
+/// every disagreement with the task file: an exec section the file already
+/// pins, a task that never grants the runner, a name that is not on PATH.
+/// None of them starts a run. (The full --allow-exec run is the sandbox's
+/// to prove, as with a task-file allowlist; the resolution itself is
+/// exec_presets' unit tests.)
+#[test]
+fn allow_exec_flags_refuse_conflicts_and_names_off_the_path() {
+    let fx = fixture("allow-exec-refused");
+    let m = mock(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--allow-exec", "cargo"]);
+
+    // A task file with its own exec section takes none of the flags.
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"x","grants":["harness.exec.run","harness.task.submit"],
+  "exec":{"programs":[{"name":"perl","path":"/usr/bin/perl"}]}}"#,
+    )
+    .unwrap();
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(4), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("do not go with a task file that has"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Without the grant, no allowlist is built.
+    std::fs::write(&fx.task, r#"{"task":"x","grants":["harness.task.submit"]}"#).unwrap();
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(4), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("needs the task to grant"));
+
+    // A name nothing on PATH provides is refused by name.
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"x","grants":["harness.exec.run","harness.task.submit"]}"#,
+    )
+    .unwrap();
+    args.pop();
+    args.push("rh11-absent-tool");
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(4), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("no rh11-absent-tool on PATH"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// P-11: `--shell` builds the exec section from names (`sh` resolved on
+/// this process's own PATH, pinned to its real path), the header stamps
+/// `shell_enabled: true`, and the audit of the run matches only when the
+/// replay is given the same flag. macOS only, like every run that starts
+/// with a command runner here: the header is written only past the
+/// witness (INV-6).
+#[cfg(target_os = "macos")]
+#[test]
+fn shell_flag_sets_shell_enabled_in_header() {
+    let fx = fixture("shell-header");
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"Say done.","grants":["harness.task.submit","harness.exec.run"]}"#,
+    )
+    .unwrap();
+    let m = mock(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.push("--shell");
+    let o = cli(&args, true, &fx.marker);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "{err}");
+    // Printed before the run started, name -> pinned real path.
+    assert!(err.contains("will allow: sh -> /bin/sh"), "{err}");
+    let id = run_id(&o);
+    let jp = fx
+        .state
+        .join("runs")
+        .join(&id)
+        .join("attempt-1/journal.jsonl");
+    let first = std::fs::read_to_string(jp)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let h: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(h["kind"], "RunStarted");
+    assert_eq!(h["body"]["shell_enabled"], true);
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    let rp = |with_shell: bool| {
+        let mut a = vec![
+            "replay",
+            "--run",
+            &id,
+            "--task",
+            fx.task.to_str().unwrap(),
+            "--state-root",
+            fx.state.to_str().unwrap(),
+            "--profile",
+            fx.profile.to_str().unwrap(),
+            "--anchor",
+            &head,
+        ];
+        if with_shell {
+            a.push("--shell");
+        }
+        cli(&a, true, &fx.marker)
+    };
+    // The allowlist is a header input: without the flag the audit
+    // diverges, with it the run replays clean.
+    let without = rp(false);
+    assert!(
+        String::from_utf8_lossy(&without.stderr).contains("DIVERGED"),
+        "{}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    let with = rp(true);
+    assert!(
+        String::from_utf8_lossy(&with.stderr).contains(REPLAY_MATCHED),
+        "{}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+}
+
 /// INV-6 through the CLI: a task that executes, on a host whose
 /// confinement refuses, exits 3 with an Indeterminate report and writes
 /// nothing; the model server is checked but never asked for a step.
@@ -1861,4 +1995,474 @@ fn h3a_a_spent_bound_is_reported_as_a_check_still_failing() {
     );
     let rerr = String::from_utf8_lossy(&rp.stderr);
     assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
+}
+
+// ---- P-15: the events projection, --follow, and the usage footer ------------
+
+use harness_journal::canon::{EventKind as JK, RecordFields, GENESIS};
+
+/// A mock whose every chat reply reports usage with a cached-token claim
+/// (`usage.prompt_tokens_details.cached_tokens`, which the wire layer keeps
+/// as the `claimed_stats` untrusted payload).
+fn mock_cached(replies: Vec<String>) -> Mock {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
+    let requests = Arc::new(Mutex::new(0usize));
+    let p = requests.clone();
+    thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let req = read_request(&mut s);
+            *p.lock().unwrap() += 1;
+            if req.starts_with("GET /v1/models ") {
+                respond(&mut s, r#"{"data":[{"id":"m"}]}"#);
+            } else {
+                let content = queue.lock().unwrap().pop_front().unwrap_or_default();
+                let body = serde_json::json!({
+                    "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 10,
+                              "prompt_tokens_details": {"cached_tokens": 64}}
+                })
+                .to_string();
+                respond(&mut s, &body);
+            }
+        }
+    });
+    Mock { port, requests }
+}
+
+/// Canonical journal bytes (one line per kind) for a hand-built attempt.
+fn chain_bytes(run: &str, attempt: u32, kinds: &[JK]) -> Vec<u8> {
+    let rid = harness_core::RunId::parse(run).unwrap();
+    let mut out = Vec::new();
+    let mut prev = GENESIS;
+    for (i, kind) in kinds.iter().enumerate() {
+        let fields = RecordFields {
+            seq: i as u64,
+            prev,
+            t_mono_ms: 100 * (i as u64 + 1),
+            t_wall: "2026-01-01T00:00:00.000Z".into(),
+            run: rid.clone(),
+            attempt,
+            step: 0,
+            kind: *kind,
+            body: serde_json::Map::new(),
+        };
+        let (line, hash) = fields.encode();
+        out.extend_from_slice(&line);
+        out.push(b'\n');
+        prev = hash;
+    }
+    out
+}
+
+/// A hand-built `attempt-1` under `state`: the directory names the reader
+/// and the tail require.
+fn hand_attempt(state: &Path, run: &str) -> PathBuf {
+    let dir = state.join("runs").join(run).join("attempt-1");
+    std::fs::create_dir_all(dir.join("blobs")).unwrap();
+    dir
+}
+
+/// A fresh run id-shaped id (32 lowercase hex) for hand-built journals.
+fn hand_run(tag: u64) -> String {
+    format!("{:032x}", tag)
+}
+
+/// An in-process run with its own mock (the usual two replies: read, then
+/// submit), returning the output. `extra` appends run options.
+fn run_tool_run(fx: &Fx, extra: &[&str], replies: Vec<String>) -> Output {
+    let m = mock(replies);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(fx, &ep);
+    args.extend_from_slice(extra);
+    cli(&args, true, &fx.marker)
+}
+
+fn events_args<'a>(fx: &'a Fx, id: &'a str) -> Vec<&'a str> {
+    vec![
+        "events",
+        "--run",
+        id,
+        "--state-root",
+        fx.state.to_str().unwrap(),
+    ]
+}
+
+const SCHEMA: &str = r#"{"schema":"rh-events/1"}"#;
+
+/// stdout as lines (the schema line first, then one line per record).
+fn stream_lines(o: &Output) -> Vec<String> {
+    String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn events_ndjson_one_line_per_record() {
+    let fx = fixture("events-basic");
+    let o = run_tool_run(
+        &fx,
+        &[],
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act("harness.task.submit", r#"{"note":"done"}"#),
+        ],
+    );
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let id = run_id(&o);
+    let ev = cli(&events_args(&fx, &id), true, &fx.marker);
+    assert_eq!(
+        ev.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ev.stderr)
+    );
+    let lines = stream_lines(&ev);
+    assert_eq!(lines[0], SCHEMA, "the first line names the schema");
+    let journal = fx
+        .state
+        .join("runs")
+        .join(&id)
+        .join("attempt-1")
+        .join("journal.jsonl");
+    let on_disk = std::fs::read_to_string(&journal).unwrap().lines().count();
+    assert_eq!(lines.len() - 1, on_disk, "one line per record");
+    for line in &lines[1..] {
+        let v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+        let obj = v.as_object().unwrap();
+        for k in [
+            "attempt",
+            "body",
+            "hash",
+            "kind",
+            "prev",
+            "run",
+            "seq",
+            "step",
+            "t_mono_ms",
+            "t_wall",
+        ] {
+            assert!(obj.contains_key(k), "{k} missing from {line}");
+        }
+        assert_eq!(obj["run"], id, "every record names the run");
+    }
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "RunStopped");
+    let first: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(first["kind"], "RunStarted");
+    assert_eq!(first["seq"], 0);
+}
+
+#[test]
+fn events_chain_verifiable_from_stream() {
+    let fx = fixture("events-chain");
+    let o = run_tool_run(
+        &fx,
+        &[],
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act("harness.task.submit", r#"{"note":"done"}"#),
+        ],
+    );
+    let id = run_id(&o);
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    let ev = cli(&events_args(&fx, &id), true, &fx.marker);
+    let lines = stream_lines(&ev);
+    // The hash chain, recomputed straight off the stream (§7.1): hash =
+    // sha256(prev_raw_bytes || canonical(line without "hash")).
+    let mut prev = "0".repeat(64);
+    for line in &lines[1..] {
+        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        let stated = obj.remove("hash").unwrap().as_str().unwrap().to_owned();
+        assert_eq!(obj["prev"].as_str().unwrap(), prev, "record links back");
+        let canonical = serde_json::Value::Object(obj.clone()).to_string();
+        let raw: Vec<u8> = (0..64)
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&prev[i..i + 2], 16).unwrap())
+            .collect();
+        let digest = harness_core::sha256_parts(&[&raw, canonical.as_bytes()]).to_string();
+        assert_eq!(digest, stated, "record {line}");
+        prev = stated;
+    }
+    assert_eq!(prev, head, "the stream's head is the run's chain head");
+}
+
+#[test]
+fn events_untrusted_payload_sanitised() {
+    let fx = fixture("events-sanitised");
+    // Zero-width and bidi characters are valid inside the model's JSON, so
+    // they reach the journal verbatim in the tool call; the journal's
+    // payload escaping (§7.1) must neutralise them in the stream.
+    let sneaky = "zero\u{200B}width\u{202E}bidi\u{2066}iso\u{2069}";
+    let o = run_tool_run(
+        &fx,
+        &[],
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act("harness.task.submit", &format!(r#"{{"note":"{sneaky}"}}"#)),
+        ],
+    );
+    let id = run_id(&o);
+    let ev = cli(&events_args(&fx, &id), true, &fx.marker);
+    assert_eq!(ev.code(), Some(0));
+    let text = String::from_utf8(ev.stdout.clone()).unwrap();
+    for raw in ['\u{200b}', '\u{202e}', '\u{2066}', '\u{2069}'] {
+        assert!(
+            !text.contains(raw),
+            "a raw invisible character is in the stream"
+        );
+    }
+    assert!(
+        text.contains("\\\\u{200B}"),
+        "the escaped spelling should be in the stream: {text}"
+    );
+    assert!(text.contains("\\\\u{202E}"), "{text}");
+}
+
+#[test]
+fn events_torn_tail_not_emitted() {
+    let fx = fixture("events-torn");
+    let id = hand_run(2);
+    let dir = hand_attempt(&fx.state, &id);
+    let whole = chain_bytes(&id, 1, &[JK::RunStarted, JK::ContextBuilt]);
+    let split = whole.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let mut torn = whole[..split].to_vec();
+    torn.extend_from_slice(&whole[split..split + 20]); // half a line, no newline
+    std::fs::write(dir.join("journal.jsonl"), torn).unwrap();
+    let ev = cli(&events_args(&fx, &id), true, &fx.marker);
+    assert_eq!(
+        ev.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ev.stderr)
+    );
+    let lines = stream_lines(&ev);
+    assert_eq!(lines.len(), 2, "only the verified prefix: {lines:?}");
+    assert_eq!(lines[0], SCHEMA);
+    let v: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(v["kind"], "RunStarted");
+    assert!(
+        !lines[1].contains("ContextBuilt"),
+        "the torn line is not shown"
+    );
+}
+
+/// stdout that a background thread writes into, so a test can drive a
+/// `--follow` tail by appending to the journal while it polls.
+struct SharedOut(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn wait_until(pred: impl Fn() -> bool) -> bool {
+    for _ in 0..200 {
+        if pred() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+#[test]
+fn events_follow_sees_new_records() {
+    let fx = fixture("events-follow");
+    let id = hand_run(3);
+    let dir = hand_attempt(&fx.state, &id);
+    let whole = chain_bytes(&id, 1, &[JK::RunStarted, JK::ContextBuilt, JK::RunStopped]);
+    let split = whole.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let mut partial = whole[..split].to_vec();
+    partial.extend_from_slice(&whole[split..split + 10]); // line 2 torn
+    std::fs::write(dir.join("journal.jsonl"), partial).unwrap();
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let args = [
+        "events".to_owned(),
+        "--run".to_owned(),
+        id.clone(),
+        "--state-root".to_owned(),
+        fx.state.to_str().unwrap().to_owned(),
+        "--follow".to_owned(),
+    ];
+    let watch = out.clone();
+    let inner = out.clone();
+    let handle = thread::spawn(move || {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut sink = SharedOut(inner);
+        let mut sink_err = SharedOut(Arc::new(Mutex::new(Vec::new())));
+        let cx = harness_cli::Cx {
+            probe: &Local,
+            gate_ok_file: None,
+            out: RefCell::new(&mut sink),
+            err: RefCell::new(&mut sink_err),
+            approver: harness_cli::ApproverSource::None,
+            confinement: &harness_sandbox::SystemConfinement,
+        };
+        harness_cli::main_with(&cx, &borrowed)
+    });
+    assert!(
+        wait_until(|| {
+            let g = watch.lock().unwrap();
+            let t = String::from_utf8_lossy(&g);
+            t.lines().count() >= 2 && t.contains("RunStarted")
+        }),
+        "the tail should show the first record: {}",
+        String::from_utf8_lossy(&out.lock().unwrap())
+    );
+    // The run commits: the torn line completes and `RunStopped` lands.
+    std::fs::write(dir.join("journal.jsonl"), whole).unwrap();
+    let watch2 = out.clone();
+    assert!(
+        wait_until(|| String::from_utf8_lossy(&watch2.lock().unwrap()).contains("RunStopped")),
+        "the tail should see the commit: {}",
+        String::from_utf8_lossy(&out.lock().unwrap())
+    );
+    let code = handle.join().expect("the tail thread");
+    assert_eq!(code, 0);
+    let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], SCHEMA);
+    assert_eq!(lines.len(), 4, "all three records, once each: {text}");
+    assert!(lines[1].contains("RunStarted"));
+    assert!(lines[2].contains("ContextBuilt"));
+    assert!(lines[3].contains("RunStopped"));
+    // The torn half-line was never emitted before it completed: the
+    // ContextBuilt line appears exactly once.
+    assert_eq!(text.matches("ContextBuilt").count(), 1);
+}
+
+#[test]
+fn usage_matches_budget_charged() {
+    let fx = fixture("usage-footer");
+    let m = mock_cached(vec![
+        act("harness.fs.read", r#"{"path":"a.txt"}"#),
+        act("harness.task.submit", r#"{"note":"done"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--output", "stream-json"]);
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let id = run_id(&o);
+    let lines = stream_lines(&o);
+    let usage_at = lines
+        .iter()
+        .position(|l| l.starts_with("usage {"))
+        .expect("a usage line");
+    let u: serde_json::Value =
+        serde_json::from_str(&lines[usage_at][6..]).expect("the usage object");
+    // What the server charged (two replies, 100 in / 10 out / 64 claimed
+    // cached each) is what the footer says.
+    assert_eq!(u["model_calls"], 2);
+    assert_eq!(u["tokens"]["in"], 200);
+    assert_eq!(u["tokens"]["out"], 20);
+    assert_eq!(u["tokens"]["cached"], 128);
+    assert_eq!(u["steps"], 2, "the loop's steps, from the journal");
+    assert_eq!(
+        u["tools"],
+        serde_json::json!({"harness.fs.read": 1, "harness.task.submit": 1}),
+        "tool calls started, by capability"
+    );
+    let wall = u["wall_ms"].as_u64().unwrap();
+    assert!(wall > 0, "a real run takes some milliseconds");
+    // Cross-checked against the journal itself.
+    let journal = std::fs::read_to_string(
+        fx.state
+            .join("runs")
+            .join(&id)
+            .join("attempt-1")
+            .join("journal.jsonl"),
+    )
+    .unwrap();
+    let asked = journal.matches("\"kind\":\"ModelRequested\"").count();
+    assert_eq!(u["model_calls"].as_u64().unwrap(), asked as u64);
+    assert_eq!(journal.matches("\"kind\":\"ToolStarted\"").count(), 2);
+    // The words, for the person at the terminal.
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains(
+            "usage: 2 step(s), 2 model call(s), tokens in 200 out 20 (cached 128, server-claimed)"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn final_stdout_line_still_gatereport() {
+    let fx = fixture("stream-report");
+    let m = mock_cached(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--output", "stream-json"]);
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(5));
+    let lines = stream_lines(&o);
+    let last = lines.last().unwrap();
+    let rep: serde_json::Value = serde_json::from_str(last).expect("the report line");
+    assert_eq!(rep["gate"], "rustyharness.run");
+    assert_eq!(rep["outcome"]["Indeterminate"]["why"], "NothingChecked");
+    let head_at = lines
+        .iter()
+        .position(|l| l.starts_with("chain_head "))
+        .expect("a chain head line");
+    let usage_at = lines
+        .iter()
+        .position(|l| l.starts_with("usage {"))
+        .expect("a usage line");
+    assert!(usage_at < head_at, "usage comes before the chain head");
+    assert_eq!(head_at, lines.len() - 2, "chain head, then the report");
+    assert!(lines[0].starts_with(SCHEMA), "the stream opens the output");
+}
+
+#[test]
+fn stream_json_run_exit_codes_unchanged() {
+    let fx = fixture("stream-exit");
+    let replies = vec![act("harness.task.submit", r#"{"note":"done"}"#)];
+    let plain = run_tool_run(&fx, &[], replies.clone());
+    let streamed = run_tool_run(&fx, &["--output", "stream-json"], replies.clone());
+    assert_eq!(plain.code(), streamed.code(), "same exit code");
+    assert_eq!(plain.code(), Some(5));
+    assert_eq!(
+        report(&plain)["outcome"],
+        report(&streamed)["outcome"],
+        "same verdict"
+    );
+    let last = last_line(&streamed);
+    serde_json::from_str::<serde_json::Value>(&last).expect("still a GateReport");
+    assert!(
+        !fx.marker.exists(),
+        "NothingChecked never writes the marker"
+    );
+    // An unknown output mode is a usage error through the report path,
+    // before anything runs.
+    let bad = run_tool_run(&fx, &["--output", "fancy"], replies.clone());
+    assert_eq!(
+        bad.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    let rep = report(&bad);
+    assert_eq!(rep["gate"], "rustyharness.run");
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("--output must be stream-json"), "{err}");
 }

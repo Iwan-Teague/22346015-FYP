@@ -201,6 +201,9 @@ pub(crate) fn source_value(s: &Source) -> Value {
             m.insert("kind", Value::from("workspace"));
             m.insert("path", Value::from(escape(p)));
         }
+        Source::User => {
+            m.insert("kind", Value::from("user"));
+        }
     }
     Value::Object(m.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
 }

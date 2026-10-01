@@ -235,7 +235,10 @@ pub struct Pinned {
     programs_digest: Digest,
 }
 
-fn plain_name(s: &str) -> bool {
+/// Whether `s` is a plain program name: what the exec allowlist and
+/// `--allow-exec` (P-11) accept as `argv[0]` (letters, digits, '.', '_',
+/// '+', '-'; no path, at most 64 bytes).
+pub fn plain_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())

@@ -378,5 +378,22 @@ mod inv_30 {
         fs::create_dir(base.join("real")).unwrap();
         symlink(base.join("real"), base.join("ws")).unwrap();
         assert!(ReadTools::new(&base.join("ws")).is_err());
+        // Also with a trailing separator or `.`, which make the OS resolve
+        // the link (H1 phase-exit review F-9 item 10, W5).
+        let link = base.join("ws").into_os_string().into_string().unwrap();
+        for spelled in [format!("{link}/"), format!("{link}//"), format!("{link}/.")] {
+            assert!(
+                matches!(
+                    ReadTools::new(Path::new(&spelled)),
+                    Err(harness_tools::builtin::RootRefused::Symlink)
+                ),
+                "{spelled}"
+            );
+        }
+        // Control: the real directory, spelled the same ways, is admitted.
+        let real = base.join("real").into_os_string().into_string().unwrap();
+        for spelled in [real.clone(), format!("{real}/"), format!("{real}/.")] {
+            assert!(ReadTools::new(Path::new(&spelled)).is_ok(), "{spelled}");
+        }
     }
 }

@@ -20,8 +20,12 @@
 //! them could still redirect a read; in an H1 session nothing the agent can
 //! do creates one (no write or exec tools), and H2's confined file-op helper
 //! makes the kernel enforce the view. A hard link inside the workspace to a
-//! file outside it is indistinguishable from a file (materialisation, H2,
-//! controls what the workspace contains).
+//! file outside it is indistinguishable from a file, and a mount point
+//! inside the workspace (a bind, network or FUSE mount, a disk image) is
+//! read through like a directory (materialisation, H2, controls what the
+//! workspace contains; H1 phase-exit review F-7). The per-call deadline is
+//! cooperative (checked before a call and between a walk's entries), so a
+//! read blocked in the kernel is not interrupted (design §11).
 //!
 //! **Bounds.** A read returns at most 100 lines of a text file of at most
 //! [`READ_MAX_BYTES`]; search reports at most [`SEARCH_MAX_HITS`] hits,
@@ -130,7 +134,12 @@ impl ReadTools {
     /// of the workspace may be symlinks (`/tmp` on macOS), its contents may
     /// not.
     pub fn new(root: &Path) -> Result<Self, RootRefused> {
-        let m = fs::symlink_metadata(root)?;
+        // The root as its components: a trailing separator or `.` makes the
+        // OS resolve a final symlink (`symlink_metadata("link/")` follows
+        // the link), and `components()` drops both (H1 phase-exit review
+        // F-9 item 10).
+        let root: PathBuf = root.components().collect();
+        let m = fs::symlink_metadata(&root)?;
         if m.file_type().is_symlink() {
             return Err(RootRefused::Symlink);
         }
@@ -626,8 +635,10 @@ impl Walk {
                     self.unreadable += 1;
                     continue;
                 };
-                // A non-UTF-8 name is shown lossily (it stays in the
-                // tree digest); `path` keeps the real name.
+                // A non-UTF-8 name is shown lossily, and the tree digest
+                // hashes that lossy form too, so two names that differ
+                // only in their invalid bytes hash alike (a named
+                // residual, design row H1g); `path` keeps the real name.
                 let name = d.file_name().to_string_lossy().into_owned();
                 let path = d.path();
                 let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -678,12 +689,16 @@ pub struct WorkspaceFacts {
 
 /// Measure the workspace facts: a full walk that follows no symlink, in
 /// name order, digesting every entry as `kind ‖ path ‖ NUL ‖ content` where
-/// the content is a file's SHA-256 (streamed in 64 KiB chunks, never read
-/// whole) or, for a file over [`FACTS_FILE_MAX_BYTES`], its size (kind
-/// `F`). So the digest changes when any name, kind or (capped) file
-/// content changes. Refused (an `Err`) past [`FACTS_MAX_ENTRIES`] entries,
-/// on any unreadable entry, or when `deadline` passes: a fact the harness
-/// cannot measure is not stated.
+/// the path is the relative path in its lossy UTF-8 form and the content is
+/// a file's SHA-256 (streamed in 64 KiB chunks, never read whole) or, for a
+/// file over [`FACTS_FILE_MAX_BYTES`], its size (kind `F`). So the digest
+/// changes when any name, kind or (capped) file content changes, except a
+/// rename between two non-UTF-8 names with the same lossy form. Refused
+/// (an `Err`) past [`FACTS_MAX_ENTRIES`] entries, on any unreadable entry,
+/// or when `deadline` passes: a fact the harness cannot measure is not
+/// stated. The deadline is cooperative: it is checked between entries and
+/// between chunks, so a read blocked in the kernel (a network or FUSE mount
+/// inside the workspace) is not interrupted (design §11).
 pub fn workspace_facts(root: &Path, deadline: Instant) -> io::Result<WorkspaceFacts> {
     facts_with(root, deadline, FACTS_FILE_MAX_BYTES)
 }

@@ -472,8 +472,11 @@ pub(crate) struct HeaderInputs<'a> {
 }
 
 /// The header keys an audit replay or a resume recomputes from its own
-/// inputs and requires to be equal to the recorded ones.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 9] = [
+/// inputs and requires to be equal to the recorded ones. `limits` is one
+/// (H1 phase-exit review F-1): the replay recomputes every budget stop
+/// from the limits, so limits taken from the journal would let a
+/// re-chained edit choose the stop the audit then "recomputes".
+pub(crate) const HEADER_INPUT_KEYS: [&str; 10] = [
     "task",
     "grants",
     "workspace_public",
@@ -483,7 +486,24 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 9] = [
     "checks",
     "builtin_manifest",
     "shell_enabled",
+    "limits",
 ];
+
+/// The header's `limits` object, field by field: the one encoding the
+/// header writes and an audit or a resume compares.
+pub(crate) fn limits_fields(l: &MeterLimits) -> [(&'static str, u64); 6] {
+    [
+        ("steps", u64::from(l.steps)),
+        ("tokens", l.tokens),
+        (
+            "wall_ms",
+            u64::try_from(l.wall.as_millis()).unwrap_or(u64::MAX),
+        ),
+        ("cost_micros", l.cost_micros),
+        ("format_errors", u64::from(l.format_errors)),
+        ("repair_rounds", u64::from(l.repair_rounds)),
+    ]
+}
 
 /// The SHA-256 of the compiled-in manifest (§7.1 header "manifest
 /// SHA-256s": in H1 the built-in provider is the only one admission
@@ -514,7 +534,6 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
         })
         .map(Trusted::Id)
         .collect();
-    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let mut hd = Header::new(version)
         .field(
             "endpoint",
@@ -548,20 +567,12 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
         .field("workspace_oversize", Trusted::U64(h.facts.oversize))
         .field(
             "limits",
-            Trusted::Obj(vec![
-                ("steps", Trusted::U64(u64::from(h.limits.steps))),
-                ("tokens", Trusted::U64(h.limits.tokens)),
-                ("wall_ms", Trusted::U64(ms(h.limits.wall))),
-                ("cost_micros", Trusted::U64(h.limits.cost_micros)),
-                (
-                    "format_errors",
-                    Trusted::U64(u64::from(h.limits.format_errors)),
-                ),
-                (
-                    "repair_rounds",
-                    Trusted::U64(u64::from(h.limits.repair_rounds)),
-                ),
-            ]),
+            Trusted::Obj(
+                limits_fields(h.limits)
+                    .into_iter()
+                    .map(|(k, v)| (k, Trusted::U64(v)))
+                    .collect(),
+            ),
         )
         .field("checks", Trusted::U64(0))
         .field(

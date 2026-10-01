@@ -310,6 +310,12 @@ fn a_symlinked_workspace_root_is_refused() {
     std::os::unix::fs::symlink(&ws, &link).unwrap();
     let err = go(&state, &link, vec![submit()], &Local).unwrap_err();
     assert!(matches!(err, RunRefused::Workspace(_)), "{err:?}");
+    // H1 phase-exit review F-9 item 10 (W5): also with a trailing
+    // separator, which makes the OS resolve the link; nothing is written.
+    let with_slash = PathBuf::from(format!("{}/", link.display()));
+    let err = go(&state, &with_slash, vec![submit()], &Local).unwrap_err();
+    assert!(matches!(err, RunRefused::Workspace(_)), "{err:?}");
+    assert!(!state.join("runs").exists(), "nothing was written");
 }
 
 #[test]

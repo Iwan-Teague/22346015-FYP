@@ -440,6 +440,13 @@ fn inputs(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Inputs, Outcome> {
     })
 }
 
+/// The budgets and timeouts of every run and resume this binary starts
+/// (§2.4 defaults). `replay` passes the same limits to the audit, which
+/// requires them to equal the recorded ones (H1 phase-exit review F-1).
+fn run_config() -> RunConfig {
+    RunConfig::defaults(1_000_000)
+}
+
 fn builtin_registry() -> Result<Registry, String> {
     let v = SemVer::parse(env!("CARGO_PKG_VERSION")).ok_or("harness version")?;
     let ctx = ValidationContext::new(v, &[]).map_err(|e| e.to_string())?;
@@ -483,7 +490,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
                 refused(exit::UNREADABLE_INPUT, format!("endpoint refused: {e}"))
             })?;
     let probe = cx.probe;
-    let config = RunConfig::defaults(1_000_000);
+    let config = run_config();
     // The state root's locality first (§2.8): a run that cannot start does
     // not contact the model server. The run checks it again itself.
     let root = std::fs::canonicalize(state_root)
@@ -607,6 +614,15 @@ fn harness_journal_cause(c: &harness_core::StopCause) -> &'static str {
     harness_journal::writer::stop_cause_name(c)
 }
 
+/// What an audit replay re-feeds and what it recomputes (H1 phase-exit
+/// review, named item 2): the recorded inputs are re-fed, not re-run, so a
+/// match never means every record was recomputed.
+const REPLAY_SCOPE: &str = "Re-fed from the journal, not re-run: the model replies, the tool results and the environment samples. Recomputed and compared: every context, parse, loop-detector and policy decision";
+
+/// [`REPLAY_SCOPE`] in the report's finding.
+const REPLAY_SCOPE_SHORT: &str =
+    "replies, tool results and samples re-fed; contexts, parses and decisions recomputed";
+
 fn replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Outcome {
     match try_replay(cx, o) {
         Ok(x) | Err(x) => x,
@@ -638,6 +654,7 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
                 .map_err(|_| usage("--anchor is not a sha256 in hex"))?,
         ),
     };
+    let config = run_config();
     let rep = harness_run::audit(Audit {
         state_root: std::path::Path::new(state_root),
         run: &run,
@@ -647,6 +664,7 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
         registry: &inp.registry,
         policy: &inp.policy,
         profile: &inp.profile,
+        limits: &config.limits,
     })
     .map_err(|e| {
         note!(cx, "the replay did not start: {e}");
@@ -655,19 +673,46 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
             format!("the replay did not start: {e}"),
         )
     })?;
+    // Wall-budget records are left out of the comparison (their timing is
+    // the clock's) after a shape check; say how many (review F-1).
+    let (walls, walls_short) = if rep.wall_skipped == 0 {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(
+                " Not recomputable, checked for shape only: {} wall-budget record(s).",
+                rep.wall_skipped
+            ),
+            format!(
+                "; {} wall-budget record(s) checked for shape only",
+                rep.wall_skipped
+            ),
+        )
+    };
     let findings = match &rep.divergence {
         None if rep.stop_recomputed => {
+            // H1 phase-exit review, named item 2: what was re-fed and what
+            // recomputed, never "every record recomputed".
             note!(
                 cx,
-                "replay of run {run} attempt {}: every record recomputed and matched ({} records)",
+                "replay of run {run} attempt {}: {} records matched. {REPLAY_SCOPE}, and the stop.{walls} {}",
                 rep.attempt,
-                rep.matched
+                rep.matched,
+                if rep.anchored {
+                    "The anchor matched the journal's chain head."
+                } else {
+                    "Without --anchor, a journal rewritten consistently is not detected (the chain is unkeyed)."
+                }
             );
             info(
                 "harness.replay",
                 &format!("run {run} attempt {}", rep.attempt),
                 "the recorded journal",
-                format!("{} records recomputed and matched", rep.matched),
+                format!(
+                    "{} records matched ({REPLAY_SCOPE_SHORT}){walls_short}{}",
+                    rep.matched,
+                    if rep.anchored { "; anchor matched" } else { "" }
+                ),
             )
         }
         None if matches!(
@@ -693,7 +738,7 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
         None if rep.anchored => {
             note!(
                     cx,
-                    "replay of run {run} attempt {}: {} records matched; the stop is not recomputable, and the anchor pins the whole journal",
+                    "replay of run {run} attempt {}: {} records matched. {REPLAY_SCOPE}; the stop, a wall-budget stop, is not recomputable.{walls} The anchor matched the journal's chain head, so no record was cut from it.",
                     rep.attempt,
                     rep.matched
                 );
@@ -702,7 +747,7 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
                 &format!("run {run} attempt {}", rep.attempt),
                 "the recorded journal",
                 format!(
-                    "{} records matched; stop not recomputable; the anchor matched",
+                    "{} records matched ({REPLAY_SCOPE_SHORT}){walls_short}; stop not recomputable; the anchor matched",
                     rep.matched
                 ),
             )

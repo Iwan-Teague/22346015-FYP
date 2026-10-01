@@ -20,19 +20,21 @@ In scope for reports today, a way to:
   through the agent (H1 is read-only; the one write-class capability is the
   submit sentinel `harness.task.submit`, granted to every session, which only
   ends the loop, §2.5);
-- read outside the workspace, beyond the residuals the design names (hard links
-  and the check-then-open window, the design's H1e-2 "Read tools" row);
+- read outside the workspace, beyond the residuals the design names (hard links,
+  mount points inside the workspace and the check-then-open window, the
+  design's H1e-2 "Read tools" row);
 - reach a model endpoint that is not loopback;
 - run with a `state_root` on a filesystem not identified as local (INV-35),
   beyond the residuals the design names (the H1e-2c row: a mount placed over the
   path between the probe's reads; §11: local filesystems on network block
   storage); `replay`'s missing check is a known open question, not a finding;
 - outlast a budget (INV-14), beyond the residual the design names (§11: an
-  in-process read blocked in the kernel, e.g. on a network mount inside the
-  workspace, is not interrupted until H2); or get outside text into a trusted
-  journal field;
+  in-process read blocked in the kernel, by a read tool or by the
+  workspace-facts walk at run start or resume, e.g. on a network mount inside
+  the workspace, is not interrupted until H2); or get outside text into a
+  trusted journal field;
 - alter or forge a journal undetectably beyond the residuals the design names
-  (§7.1, §11, and the anchor-only residuals in rows H1e-2b and H1f-3);
+  (§7.1, §11, and the anchor-only residuals in rows H1e-2b, H1f-3 and H1g);
 - make a run report a pass;
 - put a payload on an argv (INV-23), or redraw the terminal from a manifest,
   a model reply or a tool result (§7.1 display paths).

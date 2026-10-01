@@ -616,6 +616,38 @@ fn inv_11_records_after_run_stopped_or_from_another_run_are_refused() {
     );
 }
 
+/// H1 phase-exit review F-2: bytes after `RunStopped` with no trailing
+/// newline are not a crash's torn tail (no crash writes past a durable
+/// `RunStopped`), and the chain head, so the anchor, would not cover them.
+/// They are refused like a record there; a torn tail anywhere else is
+/// still a crash's, reported and resumable.
+#[test]
+fn inv_11_bytes_after_run_stopped_are_refused_even_without_a_newline() {
+    let (r, b, head) = good_journal();
+    assert_eq!(verify(&b, &r.blobs).unwrap().head, head);
+    for planted in [
+        &br#"{"attempt":1,"body":{"cause":"submitted","outcome":"passed"},"kind":"RunStopped"}"#[..],
+        b"x",
+    ] {
+        let mut tampered = b.clone();
+        tampered.extend_from_slice(planted);
+        assert_eq!(
+            verify(&tampered, &r.blobs).unwrap_err(),
+            Broken {
+                record: 6,
+                why: BreakKind::AfterRunStopped
+            }
+        );
+    }
+    // Control: a torn line after any other record is a crash mid-append.
+    let ls = lines(&b);
+    let mut torn = join(&ls[..5]);
+    torn.extend_from_slice(&ls[5][..20]);
+    let v = verify(&torn, &r.blobs).unwrap();
+    assert!(v.torn_tail.is_some() && !v.is_complete());
+    assert_eq!(v.records.len(), 5);
+}
+
 #[test]
 fn missing_or_altered_payloads_are_detected() {
     let (r, b, _) = good_journal();

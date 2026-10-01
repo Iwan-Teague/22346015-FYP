@@ -1,0 +1,21 @@
+[package]
+name = "harness-core"
+description = "rustyharness core: untrusted data, the run meter, loop detection, SHA-256, strict JSON, the environment-sample vocabulary. Pure, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The ONE outcome type (design §1.2: harness-core depends only on gate-outcome).
+gate-outcome = { path = "../gate-outcome" }
+# harness_core::sha256, the one digest function (design §1.4).
+sha2.workspace = true
+# The strict (duplicate-key-refusing) JSON reader, shared by the manifest
+# and model-action parsers (INV-22).
+serde.workspace = true
+serde_json.workspace = true

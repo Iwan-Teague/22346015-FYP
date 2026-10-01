@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+# Source-available, noncommercial (docs/adr/0003-licence.md): free for any
+# noncommercial use; commercial use needs a separate licence from the author.
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/Iwan-Teague/rustyharness"
+
+[workspace.dependencies]
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.100"
+thiserror = "2.0.0"
+# The ONE SHA-256 implementation (design §1.2, §1.4): RustCrypto, pure Rust,
+# default features off (no alloc/oid; never the `asm` path).
+sha2 = { version = "0.11.0", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# T2-A4 panic set, ratchet posture: warn + `-D warnings` in gates = denied
+# outside test code; crate roots cfg_attr(test)-allow loose asserts in tests.
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+panic = "warn"

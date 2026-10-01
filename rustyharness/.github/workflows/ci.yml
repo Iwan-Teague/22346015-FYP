@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Least privilege (suite AQ-97): read-only token; no job publishes or writes.
+permissions:
+  contents: read
+
+jobs:
+  # The member gate entrypoint itself, exactly as tooling/dev-push.sh runs
+  # it (scripts/ci/gates.sh): fmt, the purity gate and its refusal
+  # witnesses, cargo-deny, clippy and tests over the workspace, clippy and
+  # tests of gate-outcome alone (the only build without gate-outcome/json:
+  # harness-cli enables it, so every workspace build has it), and the
+  # compile-fail doctests with their error codes. The purity gate reads
+  # `cargo tree --target all`, so the dependency shape of every target,
+  # Windows included, is checked here.
+  gates:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: Member gates (scripts/ci/gates.sh)
+        run: sh scripts/ci/gates.sh
+
+  # Windows runs the gates' cargo steps except the RUSTC_BOOTSTRAP error-code
+  # doctests (their result does not depend on the target). The purity scripts
+  # are POSIX sh and run in the job above, where `cargo tree --target all`
+  # also checks Windows dependencies.
+  gates-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
+      # Every step after cargo-deny's install runs even when an earlier one
+      # failed (`!cancelled()`), and the test steps use --no-fail-fast: one
+      # failure must not hide the others. The job still fails if any did.
+      - name: Supply-chain check (advisories, bans, licenses, sources)
+        if: ${{ !cancelled() }}
+        run: cargo deny check advisories bans licenses sources
+      - name: Format
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy (gate-outcome alone, without json)
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked -p gate-outcome --all-targets -- -D warnings
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --workspace --no-fail-fast
+      - name: Test (gate-outcome alone, without json)
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p gate-outcome --no-fail-fast

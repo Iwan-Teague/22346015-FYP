@@ -1,0 +1,26 @@
+[package]
+name = "harness-tools"
+description = "rustyharness tool providers: the ToolProvider seam and the built-in read tools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Design §1.2 edges: the ToolProvider seam (§4.5) takes only
+# Journaled<Authorized<Call>>, so it names harness-journal and harness-policy.
+harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+harness-manifest = { path = "../harness-manifest" }
+harness-policy = { path = "../harness-policy" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The sealed JournalFile seam's fault-injecting file, for the INV-33 test.
+harness-journal = { path = "../harness-journal", features = ["fault-injection"] }
+gate-outcome = { path = "../gate-outcome" }

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "provider": "example",
+  "provider_version": "0.0.1",
+  "min_harness": "0.0.1",
+  "transport": {
+    "kind": "mcp-stdio",
+    "argv": ["/opt/example/bin/example-mcp"],
+    "env_allow": []
+  },
+  "mcp_protocols": ["2025-06-18"],
+  "capabilities": [
+    {
+      "id": "example.status.read",
+      "mcp_name": "status",
+      "summary": "Report the app's health",
+      "effect": "read",
+      "sensitivity": "operational",
+      "blast_radius": "own",
+      "egress": "none",
+      "content": "own",
+      "confirmation": "none",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "schema_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "description_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "example.config.set",
+      "mcp_name": "set_config",
+      "summary": "Change one config value",
+      "effect": "write",
+      "sensitivity": "operational",
+      "blast_radius": "own",
+      "egress": "none",
+      "content": "own",
+      "confirmation": "user_confirm",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": { "type": "string", "maxLength": 64 },
+          "value": { "type": "string", "maxLength": 256 }
+        },
+        "required": ["key", "value"]
+      },
+      "schema_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "description_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

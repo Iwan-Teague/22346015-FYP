@@ -1,0 +1,32 @@
+# cargo-deny configuration — rustyharness.
+# Gate: `cargo deny check advisories bans licenses sources` (scripts/ci/gates.sh, CI).
+# `licenses` is gated too: this project's licence is decided (docs/adr/0003-licence.md).
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# The workspace's own crates are PolyForm-Noncommercial-1.0.0 (docs/adr/0003-licence.md);
+# third-party dependencies must stay on permissive licences.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "PolyForm-Noncommercial-1.0.0"]
+confidence-threshold = 1.0
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace path dependencies carry no version; they are not registry
+# wildcards. Allowed only because every crate here is publish = false.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []

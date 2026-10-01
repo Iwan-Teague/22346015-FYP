@@ -1,0 +1,27 @@
+[package]
+name = "harness-run"
+description = "rustyharness run driver: session planning, the run loop, per-call journaling, audit replay and resume. The embedding API for apps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Design §1.2: the driver depends on every layer below it.
+gate-outcome = { path = "../gate-outcome" }
+harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+harness-manifest = { path = "../harness-manifest" }
+harness-model = { path = "../harness-model" }
+harness-policy = { path = "../harness-policy" }
+harness-tools = { path = "../harness-tools" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The sealed JournalFile seam's fault-injecting file, for the INV-33 run test.
+harness-journal = { path = "../harness-journal", features = ["fault-injection"] }

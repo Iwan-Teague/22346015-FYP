@@ -1,0 +1,32 @@
+[package]
+name = "harness-cli"
+description = "The rustyharness command-line entrypoint."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustyharness"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The CLI is a gate child (design §7.7): its last stdout line is a
+# GateReport, so it needs gate-outcome's wire form.
+gate-outcome = { path = "../gate-outcome", features = ["json"] }
+harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+harness-manifest = { path = "../harness-manifest" }
+harness-model = { path = "../harness-model" }
+harness-policy = { path = "../harness-policy" }
+harness-run = { path = "../harness-run" }
+harness-sandbox = { path = "../harness-sandbox" }
+serde.workspace = true
+serde_json.workspace = true

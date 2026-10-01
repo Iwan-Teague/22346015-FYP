@@ -1,0 +1,19 @@
+[package]
+name = "harness-policy"
+description = "rustyharness policy for read classes: effective class (max-rule), fail-closed decision order, workspace-path and filesystem-locality rules. Pure, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# harness_core::CallDigest (the journal computes an intent's digest from the
+# authorised call itself, H1c review F-7) and sha256.
+harness-core = { path = "../harness-core" }
+harness-manifest = { path = "../harness-manifest" }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -109,6 +109,33 @@ impl fmt::Display for Ident {
 }
 
 /// Event kinds (design §7.2). A closed set: the reader refuses any other.
+///
+/// **Session kinds (P-05/P-10, hotspot H-E: reserved once).** Three are
+/// defined now with their canonical field lists (the bodies are written by
+/// the session loop, P-13); six more names are reserved for later slices,
+/// which own their bodies. The reader accepts every name here;
+/// `replay::recorded` treats a reserved kind as "not a shape the loop
+/// writes" until its owner defines the body. Canonical bodies are JSON
+/// objects whose keys are exactly the fields listed (sorted on the wire,
+/// like every body):
+///
+/// - `UserTurn` (fsynced; one per user message, refused ones included):
+///   `external_change` (Bool), `shown` (Text `yes` | `withheld` |
+///   `over_share`), `text` (UntrustedBlob, `source: {"kind":"user"}`),
+///   `turn` (U64, 1-based count of `UserTurn` records), `turn_steps`
+///   (U64, the turn's step allowance), `wall_used_ms` (U64),
+///   `workspace_files` (U64), `workspace_oversize` (U64),
+///   `workspace_tree` (Digest).
+/// - `TurnEnded` (fsynced; the turn boundary): `reason` (Text:
+///   `answered`, `submitted`, `submitted_checks_failed`, `turn_steps`,
+///   `format_errors`, `loop:repeat`, `loop:edit_churn`,
+///   `loop:no_progress`, `loop:denied`, `model_unavailable`,
+///   `input_refused`), `steps` (U64), `turn` (U64).
+/// - `InputEnded` (fsynced; the user's input ended the session):
+///   `reason` (Text `eof` | `exit` | `timeout`), `turn` (U64).
+/// - Reserved: `ModeChanged` (P-28), `RuleGranted` (P-23), `Restored`
+///   (P-22/P-26), `InstructionsLoaded` (P-30), `ForkedFrom` (P-32),
+///   `ChildRun` (P-38). No code writes them in this wave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(missing_docs)] // names are the §7.2 table, verbatim
 pub enum EventKind {
@@ -141,6 +168,15 @@ pub enum EventKind {
     ReviewerRefused,
     ReviewReported,
     RunStopped,
+    UserTurn,
+    TurnEnded,
+    InputEnded,
+    ModeChanged,
+    RuleGranted,
+    Restored,
+    InstructionsLoaded,
+    ForkedFrom,
+    ChildRun,
 }
 
 const KINDS: &[(EventKind, &str)] = &[
@@ -173,6 +209,15 @@ const KINDS: &[(EventKind, &str)] = &[
     (EventKind::ReviewerRefused, "ReviewerRefused"),
     (EventKind::ReviewReported, "ReviewReported"),
     (EventKind::RunStopped, "RunStopped"),
+    (EventKind::UserTurn, "UserTurn"),
+    (EventKind::TurnEnded, "TurnEnded"),
+    (EventKind::InputEnded, "InputEnded"),
+    (EventKind::ModeChanged, "ModeChanged"),
+    (EventKind::RuleGranted, "RuleGranted"),
+    (EventKind::Restored, "Restored"),
+    (EventKind::InstructionsLoaded, "InstructionsLoaded"),
+    (EventKind::ForkedFrom, "ForkedFrom"),
+    (EventKind::ChildRun, "ChildRun"),
 ];
 
 impl EventKind {
@@ -192,7 +237,10 @@ impl EventKind {
     /// Kinds the writer fsyncs right after appending (§7.1 "Detection and
     /// durability"): the header, every intent (`ToolStarted`, via
     /// `append_intent`) and result (`ToolFinished`), `Egress` (appended
-    /// before forwarding), the verification events and `RunStopped`.
+    /// before forwarding), the verification events and `RunStopped`. The
+    /// session kinds (P-05/P-10) are all fsynced: they are inputs or turn
+    /// boundaries, and resume keys on them (decided now so owners never
+    /// touch `canon.rs` again).
     pub fn needs_fsync(self) -> bool {
         matches!(
             self,
@@ -204,6 +252,15 @@ impl EventKind {
                 | EventKind::CheckReported
                 | EventKind::VerificationFinished
                 | EventKind::RunStopped
+                | EventKind::UserTurn
+                | EventKind::TurnEnded
+                | EventKind::InputEnded
+                | EventKind::ModeChanged
+                | EventKind::RuleGranted
+                | EventKind::Restored
+                | EventKind::InstructionsLoaded
+                | EventKind::ForkedFrom
+                | EventKind::ChildRun
         )
     }
 }
@@ -429,6 +486,44 @@ mod tests {
         }
         assert_eq!(EventKind::parse("runstarted"), None);
         assert_eq!(EventKind::parse("Shell"), None);
+    }
+
+    // P-05/P-10 (hotspot H-E): the six reserved names are in the closed set
+    // now, parse back, and collide with nothing; no code writes them yet.
+    #[test]
+    fn reserved_kinds_parse() {
+        for (k, n) in [
+            (EventKind::ModeChanged, "ModeChanged"),
+            (EventKind::RuleGranted, "RuleGranted"),
+            (EventKind::Restored, "Restored"),
+            (EventKind::InstructionsLoaded, "InstructionsLoaded"),
+            (EventKind::ForkedFrom, "ForkedFrom"),
+            (EventKind::ChildRun, "ChildRun"),
+        ] {
+            assert_eq!(k.as_str(), n);
+            assert_eq!(EventKind::parse(n), Some(k));
+        }
+        let names: std::collections::BTreeSet<&str> = KINDS.iter().map(|(_, n)| *n).collect();
+        assert_eq!(names.len(), KINDS.len(), "every kind has its own name");
+    }
+
+    // P-05/P-10: the session kinds are inputs or turn boundaries and resume
+    // keys on them, so every one of the nine is fsynced.
+    #[test]
+    fn session_kinds_are_fsynced() {
+        for k in [
+            EventKind::UserTurn,
+            EventKind::TurnEnded,
+            EventKind::InputEnded,
+            EventKind::ModeChanged,
+            EventKind::RuleGranted,
+            EventKind::Restored,
+            EventKind::InstructionsLoaded,
+            EventKind::ForkedFrom,
+            EventKind::ChildRun,
+        ] {
+            assert!(k.needs_fsync(), "{}", k.as_str());
+        }
     }
 
     #[test]

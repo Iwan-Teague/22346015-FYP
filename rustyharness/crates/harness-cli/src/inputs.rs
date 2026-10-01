@@ -164,17 +164,6 @@ impl ExecFile {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    #[serde(default)]
-    deny: Vec<String>,
-    #[serde(default)]
-    ask: Vec<String>,
-    #[serde(default)]
-    allow: Vec<String>,
-}
-
 /// Largest input file read (task, policy, profile).
 const INPUT_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -217,30 +206,51 @@ pub(crate) fn required<'a>(
     })
 }
 
-pub(crate) fn inputs(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Inputs, Outcome> {
+pub(crate) fn inputs(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    cfg: &Option<crate::config::UserConfig>,
+) -> Result<Inputs, Outcome> {
     let unreadable = |e: String| {
         note!(cx, "{e}");
         refused(exit::UNREADABLE_INPUT, e)
     };
     let task: TaskFile = strict(required(cx, o, "task")?).map_err(unreadable)?;
-    let policy = match o.get("policy") {
+    let policy = match crate::config::value(o, cfg, "policy") {
         None => UserPolicy::default(),
         Some(p) => {
-            let f: PolicyFile = strict(p).map_err(unreadable)?;
-            fn v(l: &[String]) -> Vec<&str> {
-                l.iter().map(String::as_str).collect()
-            }
-            UserPolicy::new(&v(&f.deny), &v(&f.ask), &v(&f.allow))
-                .map_err(|e| unreadable(format!("policy: {e}")))?
+            // v2 (P-08): the policy crate parses the file itself, so the
+            // CLI and the audit read one grammar; unknown keys, malformed
+            // rules and failing `examples` refuse the file here, by name.
+            let bytes = read_input(p).map_err(unreadable)?;
+            let v = harness_core::strict_json::parse(&bytes)
+                .map_err(|e| unreadable(format!("{p} is not strict JSON: {e}")))?;
+            UserPolicy::from_json(&v).map_err(|e| unreadable(format!("policy: {e}")))?
         }
     };
-    let profile_path = required(cx, o, "profile")?;
+    let profile_path = crate::config::value(o, cfg, "profile").ok_or_else(|| {
+        note!(cx, "--profile is required\n{USAGE}");
+        refused(exit::USAGE, "--profile missing".into())
+    })?;
     let profile = Profile::parse(&read_input(profile_path).map_err(unreadable)?)
         .map_err(|e| unreadable(format!("{profile_path}: {e}")))?;
     let registry = builtin_registry().map_err(unreadable)?;
+    // The exec section (H2d): the task file's own, or the one --allow-exec,
+    // --preset and --shell describe (P-11). The two never mix: a task file
+    // with an exec section already pins its programs, and exec_presets
+    // refuses every disagreement as unreadable input (exit 4).
     let exec = match task.exec {
-        None => None,
-        Some(e) => Some(e.spec().map_err(unreadable)?),
+        Some(e) => {
+            if crate::exec_presets::request(o, cfg).is_some() {
+                return Err(unreadable(
+                    "--allow-exec, --preset and --shell do not go with a task file that has \
+                     its own exec section"
+                        .into(),
+                ));
+            }
+            Some(e.spec().map_err(unreadable)?)
+        }
+        None => crate::exec_presets::section(cx, o, cfg, &task.grants)?,
     };
     let config = run_config(task.budget.as_ref(), exec.is_some()).map_err(unreadable)?;
     // The checks (H3a): bounded and on the allowlist, in a task that grants

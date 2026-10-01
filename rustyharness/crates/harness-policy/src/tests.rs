@@ -248,9 +248,16 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
         Active {
             class: effective_class(c, Confirmation::None),
             schema: c.input_schema().clone(),
-            user_deny: None,
-            user_ask: None,
-            user_allow: allow_idx,
+            user_deny: Vec::new(),
+            user_ask: Vec::new(),
+            user_allow: allow_idx
+                .map(|index| {
+                    vec![UserCandidate {
+                        index,
+                        matcher: None,
+                    }]
+                })
+                .unwrap_or_default(),
             fs_tool: false,
             submit: false,
             todo: false,
@@ -1822,4 +1829,393 @@ fn policy_default_table_unchanged() {
             ids[i]
         );
     }
+}
+
+// ---- P-08: policy argument matchers ---------------------------------------------
+
+/// A v2 policy file straight from parsed JSON (what the CLI hands over).
+fn policy_json(v: Value) -> UserPolicy {
+    UserPolicy::from_json(&v).unwrap()
+}
+
+/// An allow rule on `harness.edit.replace` narrowed to `src/**`: edits under
+/// `src/` go through without an approver, anything else falls to the edit
+/// default (an ask, which with no approver present is a deny, §5.2).
+#[test]
+fn matcher_path_glob_allows_only_under_src() {
+    let p = policy_json(json!({
+        "deny": [], "ask": [],
+        "allow": [
+            {"capability": "harness.edit.replace", "match": {"path_glob": "src/**"}}
+        ]
+    }));
+    let s = edit_session(false, &p);
+    assert_eq!(
+        s.decide(&replace("src/lib.rs")),
+        PolicyDecision::Allow {
+            rule: RuleId::User {
+                list: RuleList::Allow,
+                index: 0
+            }
+        }
+    );
+    // `src/**` is "under src", not src itself; outside the glob the allow
+    // does not reach, and the un-allowed edit asks (here: denies).
+    for path in ["src", "docs/a.md", "srcx/a.rs"] {
+        assert!(
+            matches!(
+                s.decide(&replace(path)),
+                PolicyDecision::Deny {
+                    reason: DenyReason::NoApprover,
+                    ..
+                }
+            ),
+            "{path}"
+        );
+    }
+    // A different edit capability has no rule at all: same default.
+    assert!(matches!(
+        s.decide(&write("src/a.rs")),
+        PolicyDecision::Deny {
+            reason: DenyReason::NoApprover,
+            ..
+        }
+    ));
+}
+
+/// `allow cargo test` (the slice card): an argv prefix matcher allows
+/// exactly the matching commands; within a list, FIRST match wins.
+#[test]
+fn matcher_argv_prefix_cargo_test() {
+    let p = policy_json(json!({
+        "deny": [], "ask": [],
+        "allow": [
+            {"capability": EXEC_ID, "match": {"argv_prefix": ["cargo", "test"]}},
+            {"capability": EXEC_ID, "match": {"argv_prefix": ["cargo"]}}
+        ]
+    }));
+    let s = exec_session(false, &["cargo", "git"], &p);
+    for (argv, index) in [
+        (&["cargo", "test"][..], 0),
+        (&["cargo", "test", "--lib"][..], 0),
+        (&["cargo", "build"][..], 1),
+    ] {
+        assert_eq!(
+            s.decide(&run(argv)),
+            PolicyDecision::Allow {
+                rule: RuleId::User {
+                    list: RuleList::Allow,
+                    index
+                }
+            },
+            "{argv:?}"
+        );
+    }
+    // No allow reaches a git command: the exec default asks, and with no
+    // approver an ask denies.
+    assert!(matches!(
+        s.decide(&run(&["git", "status"])),
+        PolicyDecision::Deny {
+            reason: DenyReason::NoApprover,
+            ..
+        }
+    ));
+}
+
+/// The §5.1 order never moves: a deny matcher beats a (broader) allow
+/// matcher on the very calls it covers, and only on them.
+#[test]
+fn deny_matcher_beats_allow_matcher() {
+    let p = policy_json(json!({
+        "deny": [
+            {"capability": "harness.edit.replace", "match": {"path_glob": "secrets/**"}}
+        ],
+        "ask": [],
+        "allow": [
+            {"capability": "harness.edit.replace", "match": {"path_glob": "**"}}
+        ]
+    }));
+    let s = edit_session(true, &p);
+    assert_eq!(
+        s.decide(&replace("secrets/k.env")),
+        PolicyDecision::Deny {
+            reason: DenyReason::UserDenied,
+            rule: RuleId::User {
+                list: RuleList::Deny,
+                index: 0
+            }
+        }
+    );
+    assert_eq!(
+        s.decide(&replace("src/a.rs")),
+        PolicyDecision::Allow {
+            rule: RuleId::User {
+                list: RuleList::Allow,
+                index: 0
+            }
+        }
+    );
+}
+
+/// A user allow can never lower a floor (§5.2): a `personal` read keeps its
+/// derived `user_confirm` even where the matcher matches. The fixture's
+/// schema takes a `path` so the allow matcher can genuinely match.
+#[test]
+fn allow_matcher_cannot_lower_floor() {
+    let cap = json!({
+        "id": "fixture.p", "mcp_name": "p", "summary": "fixture capability",
+        "effect": "read", "sensitivity": "personal", "blast_radius": "own",
+        "egress": "none", "content": "own", "confirmation": "none",
+        "input_schema": {"type": "object", "additionalProperties": false,
+            "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        "schema_sha256": PIN, "description_sha256": PIN
+    });
+    let m = fixture(vec![cap]);
+    let p = policy_json(json!({
+        "deny": [], "ask": [],
+        "allow": [{"capability": "fixture.p", "match": {"path_glob": "**"}}]
+    }));
+    let mut sp = spec(&["fixture.p"]);
+    sp.workspace = None;
+    sp.approver_present = true;
+    sp.personal_data_granted = true;
+    let s = plan_over(std::slice::from_ref(&m), &sp, &p).unwrap();
+    assert_eq!(
+        s.decide(&call("fixture.p", json!({"path": "a"}))),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin("ask.confirmation-floor")
+        }
+    );
+}
+
+/// An ask with a matcher narrows without raising the floor (P-08):
+/// `ask git push` must not make `cargo test` ask, but where it matches it
+/// is the credited ask rule at its own tier.
+#[test]
+fn an_ask_matcher_does_not_raise_the_floor_outside_its_match() {
+    let p = policy_json(json!({
+        "deny": [],
+        "ask": [{"capability": EXEC_ID, "match": {"argv_prefix": ["git", "push"]}}],
+        "allow": [{"capability": EXEC_ID, "match": {"argv_prefix": ["cargo", "test"]}}]
+    }));
+    // No approver: the matched ask is a deny; the allowed command is not
+    // dragged up with it.
+    let s = exec_session(false, &["cargo", "git"], &p);
+    assert!(matches!(
+        s.decide(&run(&["git", "push"])),
+        PolicyDecision::Deny {
+            reason: DenyReason::NoApprover,
+            ..
+        }
+    ));
+    assert_eq!(
+        s.decide(&run(&["cargo", "test"])),
+        PolicyDecision::Allow {
+            rule: RuleId::User {
+                list: RuleList::Allow,
+                index: 0
+            }
+        }
+    );
+    // With an approver the matched ask is the user rule at `user_confirm`
+    // (the class floor is `none`: the matcher ask never raised it).
+    let s = exec_session(true, &["cargo", "git"], &p);
+    assert_eq!(
+        s.decide(&run(&["git", "push"])),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::User {
+                list: RuleList::Ask,
+                index: 0
+            }
+        }
+    );
+    // An unmatched command consults neither the ask matcher nor the allow:
+    // the exec default asks.
+    assert!(matches!(
+        s.decide(&run(&["cargo", "build"])),
+        PolicyDecision::Ask {
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+            ..
+        }
+    ));
+}
+
+/// A v1 policy file parses identically and digests identically (v2 is a
+/// superset, P-08); a matcher appends its canonical form to the rule's
+/// digest line.
+#[test]
+fn old_policy_file_same_digest() {
+    let v1 = json!({
+        "deny": ["harness.edit.write"],
+        "ask": ["fixture.p"],
+        "allow": ["harness.fs.read", "harness.*"]
+    });
+    let from_file = UserPolicy::from_json(&v1).unwrap();
+    let from_new = UserPolicy::new(
+        &["harness.edit.write"],
+        &["fixture.p"],
+        &["harness.fs.read", "harness.*"],
+    )
+    .unwrap();
+    assert_eq!(from_file, from_new);
+    assert_eq!(from_file.digest(), from_new.digest());
+
+    let v2 = json!({
+        "deny": [], "ask": [],
+        "allow": [{"capability": EXEC_ID, "match": {"argv_prefix": ["cargo", "test"]}}]
+    });
+    let with = UserPolicy::from_json(&v2).unwrap();
+    let bare = UserPolicy::new(&[], &[], &[EXEC_ID]).unwrap();
+    assert_ne!(with.digest(), bare.digest());
+}
+
+/// A rule's `examples` are unit tests run at load (§4.8, R1 §3.1): they
+/// pass or the whole file is refused.
+#[test]
+fn rule_examples_checked_at_load() {
+    let good = json!({
+        "deny": [], "ask": [],
+        "allow": [{
+            "capability": EXEC_ID,
+            "match": {"argv_prefix": ["cargo"]},
+            "examples": [
+                {"args": {"argv": ["cargo", "test"]}, "expect": "match"},
+                {"args": {"argv": ["git", "push"]}, "expect": "not_match"},
+                {"args": {}, "expect": "not_match"}
+            ]
+        }]
+    });
+    assert!(UserPolicy::from_json(&good).is_ok());
+
+    // A rule that does not do what its author documented refuses the file.
+    let bad = json!({
+        "deny": [], "ask": [],
+        "allow": [{
+            "capability": EXEC_ID,
+            "match": {"argv_prefix": ["cargo"]},
+            "examples": [{"args": {"argv": ["git", "push"]}, "expect": "match"}]
+        }]
+    });
+    assert!(matches!(
+        UserPolicy::from_json(&bad),
+        Err(PolicyConfigError::BadExample(_))
+    ));
+
+    // Under a provider selector an example must name its capability.
+    let no_cap = json!({
+        "deny": [], "ask": [],
+        "allow": [{
+            "capability": "harness.*",
+            "match": {"path_glob": "src/**"},
+            "examples": [{"args": {"path": "src/a.rs"}, "expect": "match"}]
+        }]
+    });
+    assert!(matches!(
+        UserPolicy::from_json(&no_cap),
+        Err(PolicyConfigError::BadExample(_))
+    ));
+    let with_cap = json!({
+        "deny": [], "ask": [],
+        "allow": [{
+            "capability": "harness.*",
+            "match": {"path_glob": "src/**"},
+            "examples": [{
+                "capability": "harness.edit.replace",
+                "args": {"path": "src/a.rs"}, "expect": "match"
+            }]
+        }]
+    });
+    assert!(UserPolicy::from_json(&with_cap).is_ok());
+}
+
+/// A glob the pure matcher refuses refuses the file: a policy never loads
+/// with a condition that cannot be evaluated (fail-closed, P-08).
+#[test]
+fn bad_glob_refused() {
+    for pattern in ["../x", "/abs", "[ab", "a//b", "", "a\\b"] {
+        let p = json!({
+            "deny": [], "ask": [],
+            "allow": [
+                {"capability": "harness.edit.replace", "match": {"path_glob": pattern}}
+            ]
+        });
+        assert!(
+            matches!(
+                UserPolicy::from_json(&p),
+                Err(PolicyConfigError::BadMatcher(_))
+            ),
+            "{pattern:?}"
+        );
+    }
+}
+
+/// The v2 shapes fail closed: unknown keys, missing lists, malformed rules
+/// and matchers are refused; the same selector with different matchers is
+/// two rules, the same rule twice is refused (as in v1).
+#[test]
+fn v2_policy_files_fail_closed_on_bad_shapes() {
+    let bad_file = |v: Value| UserPolicy::from_json(&v).unwrap_err();
+    assert!(matches!(bad_file(json!([])), PolicyConfigError::BadRule(_)));
+    // An absent list is empty (v1 files rely on it); a mis-typed one is not.
+    assert!(UserPolicy::from_json(&json!({"deny": [], "ask": []})).is_ok());
+    assert!(matches!(
+        bad_file(json!({"deny": [], "ask": [], "allow": {}})),
+        PolicyConfigError::BadRule(_)
+    ));
+    assert!(matches!(
+        bad_file(json!({"deny": [], "ask": [], "allow": [], "extra": []})),
+        PolicyConfigError::BadRule(_)
+    ));
+    assert!(matches!(
+        bad_file(json!({"deny": [], "ask": [], "allow": [42]})),
+        PolicyConfigError::BadRule(_)
+    ));
+    // A rule that is only `match` lacks its capability (the matcher's own
+    // emptiness is checked first, so this is a BadMatcher either way).
+    assert!(matches!(
+        bad_file(json!({"deny": [], "ask": [], "allow": [{"match": {}}]})),
+        PolicyConfigError::BadMatcher(_)
+    ));
+    // An empty `match` names no condition; unknown match keys are refused.
+    for m in [json!({}), json!({"path_glob": "src/**", "argv": ["x"]})] {
+        assert!(matches!(
+            bad_file(
+                json!({"deny": [], "ask": [], "allow": [{"capability": EXEC_ID, "match": m}]})
+            ),
+            PolicyConfigError::BadMatcher(_)
+        ));
+    }
+    // An empty (or empty-string) prefix would match every argv or none.
+    for pre in [json!([]), json!([""])] {
+        assert!(matches!(
+            bad_file(json!({
+                "deny": [], "ask": [],
+                "allow": [{"capability": EXEC_ID, "match": {"argv_prefix": pre}}]
+            })),
+            PolicyConfigError::BadMatcher(_)
+        ));
+    }
+    // The same selector twice with DIFFERENT matchers is two rules; the
+    // same rule twice is ambiguous, as in v1.
+    let two = json!({
+        "deny": [], "ask": [],
+        "allow": [
+            {"capability": EXEC_ID, "match": {"argv_prefix": ["cargo"]}},
+            {"capability": EXEC_ID, "match": {"argv_prefix": ["git"]}}
+        ]
+    });
+    assert!(UserPolicy::from_json(&two).is_ok());
+    let dup = json!({
+        "deny": [], "ask": [],
+        "allow": [
+            {"capability": EXEC_ID, "match": {"argv_prefix": ["cargo"]}},
+            {"capability": EXEC_ID, "match": {"argv_prefix": ["cargo"]}}
+        ]
+    });
+    assert!(matches!(
+        UserPolicy::from_json(&dup),
+        Err(PolicyConfigError::Ambiguous(_))
+    ));
 }

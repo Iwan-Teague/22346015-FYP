@@ -1200,3 +1200,309 @@ fn header_claims_are_untrusted_payloads_never_trusted_text() {
         .unwrap()
         .contains('\u{202e}'));
 }
+
+// ---- P-05/P-10: session kinds, the user source and the UI tap --------------
+
+/// The session stop cause's wire name (P-05/P-10), distinct from every
+/// other cause's.
+#[test]
+fn stop_cause_session_ended_wire_name() {
+    assert_eq!(
+        crate::writer::stop_cause_name(&StopCause::SessionEnded),
+        "session_ended"
+    );
+    let names: std::collections::BTreeSet<&str> = [
+        StopCause::Submitted,
+        StopCause::SubmittedChecksFailed,
+        StopCause::Budget(harness_core::BudgetDim::Steps),
+        StopCause::FormatErrors,
+        StopCause::Loop(harness_core::LoopKind::Repeat),
+        StopCause::ContextExhausted,
+        StopCause::PolicyAbort,
+        StopCause::ModelUnavailable,
+        StopCause::Cancelled,
+        StopCause::SessionEnded,
+        StopCause::SandboxLost,
+        StopCause::JournalUnavailable {
+            op: "append".into(),
+            error: "e".into(),
+        },
+    ]
+    .iter()
+    .map(crate::writer::stop_cause_name)
+    .collect();
+    assert_eq!(names.len(), 12, "every cause names itself");
+}
+
+/// A session-shaped journal: header, one `UserTurn` (its text a user-source
+/// payload), `TurnEnded`, `InputEnded`, and `RunStopped{session_ended}`.
+fn session_journal() -> (Rig, Vec<u8>, Digest) {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let text = w
+        .untrusted(&Untrusted::new("what changed?".to_owned(), Source::User))
+        .unwrap();
+    w.append(
+        0,
+        Event::new(EventKind::UserTurn)
+            .field("external_change", Trusted::Bool(false))
+            .field("shown", Trusted::Text("yes"))
+            .field("text", Trusted::Untrusted(text))
+            .field("turn", Trusted::U64(1))
+            .field("turn_steps", Trusted::U64(50))
+            .field("wall_used_ms", Trusted::U64(12))
+            .field("workspace_files", Trusted::U64(3))
+            .field("workspace_oversize", Trusted::U64(0))
+            .field("workspace_tree", Trusted::Digest(sha256(b"tree"))),
+    )
+    .unwrap();
+    w.append(
+        2,
+        Event::new(EventKind::TurnEnded)
+            .field("reason", Trusted::Text("answered"))
+            .field("steps", Trusted::U64(2))
+            .field("turn", Trusted::U64(1)),
+    )
+    .unwrap();
+    w.append(
+        2,
+        Event::new(EventKind::InputEnded)
+            .field("reason", Trusted::Text("eof"))
+            .field("turn", Trusted::U64(1)),
+    )
+    .unwrap();
+    let rel = w.commit(2, &StopCause::SessionEnded, unreadable(), None);
+    assert!(rel.chain_head.is_some(), "{rel:?}");
+    let head = rel.chain_head.unwrap();
+    let b = bytes(&r);
+    (r, b, head)
+}
+
+/// INV-11 / P-10: the three defined session kinds round trip through the
+/// canonical encoding and the verifying reader, with the user text bound by
+/// its payload home, and the stop cause names itself.
+#[test]
+fn new_event_kinds_round_trip_canonical() {
+    let (r, b, head) = session_journal();
+    let v = verify(&b, &r.blobs).unwrap();
+    let kinds: Vec<EventKind> = v.records.iter().map(|x| x.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::RunStarted,
+            EventKind::UserTurn,
+            EventKind::TurnEnded,
+            EventKind::InputEnded,
+            EventKind::RunStopped
+        ]
+    );
+    assert!(v.is_complete());
+    assert_eq!(v.head, head);
+    let turn = &v.records[1].body;
+    assert_eq!(turn.len(), 9, "exactly the canonical fields");
+    let text = turn.get("text").unwrap();
+    assert_eq!(
+        text.get("source"),
+        Some(&serde_json::json!({"kind": "user"}))
+    );
+    assert_eq!(text.get("inline"), Some(&Value::from("what changed?")));
+    assert_eq!(turn.get("shown"), Some(&Value::from("yes")));
+    assert_eq!(turn.get("turn"), Some(&Value::from(1u64)));
+    // The session stop cause's wire name is on the committed record.
+    assert_eq!(
+        v.records[4].body.get("cause"),
+        Some(&Value::from("session_ended"))
+    );
+    assert_eq!(
+        crate::writer::stop_cause_name(&StopCause::SessionEnded),
+        "session_ended"
+    );
+    // Durable: the header, the three session kinds and the stop are synced.
+    assert_eq!(r.syncs.get(), 5);
+}
+
+/// The reader's closed set stays closed: a canonical, correctly re-chained
+/// record with an unknown kind is refused by name (P-10 adds nine kinds,
+/// nothing else).
+#[test]
+fn unknown_kind_still_refused() {
+    let (r, b, _) = session_journal();
+    let ls = lines(&b);
+    let v = verify(&b, &r.blobs).unwrap();
+    let mut forged: serde_json::Map<String, Value> = serde_json::from_slice(&ls[2]).unwrap();
+    forged.insert("kind".into(), Value::from("ModeChangedLater"));
+    let (l2, _) = recompute_hash(
+        Value::Object(forged).to_string().as_bytes(),
+        &v.records[1].hash,
+    );
+    let mut ls2 = ls.clone();
+    ls2[2] = l2;
+    assert_eq!(
+        verify(&join(&ls2[..3]), &r.blobs).unwrap_err(),
+        Broken {
+            record: 2,
+            why: BreakKind::UnknownKind
+        }
+    );
+}
+
+/// A user-source payload verifies: the reader recomputes the payload's
+/// hash from its escaped inline text and it matches.
+#[test]
+fn user_source_payload_verifies() {
+    let (r, b, _) = session_journal();
+    let v = verify(&b, &r.blobs).unwrap();
+    let text = v.records[1].body.get("text").unwrap();
+    assert_eq!(
+        text.get("sha256"),
+        Some(&Value::from(sha256(b"what changed?").to_string()))
+    );
+    assert_eq!(text.get("len"), Some(&Value::from(13u64)));
+    assert_eq!(v.records.len(), 5);
+}
+
+/// A user message's bytes are evidence: an edit with the record hash
+/// recomputed (so only the payload check can catch it) is refused.
+#[test]
+fn user_source_payload_tamper_detected() {
+    let (r, b, _) = session_journal();
+    let v = verify(&b, &r.blobs).unwrap();
+    let ls = lines(&b);
+    let t = String::from_utf8(ls[1].clone())
+        .unwrap()
+        .replacen("changed", "CHANGED", 1);
+    let (l1, _) = recompute_hash(t.as_bytes(), &v.records[0].hash);
+    let mut ls2 = ls.clone();
+    ls2[1] = l1;
+    assert_eq!(
+        verify(&join(&ls2[..2]), &r.blobs).unwrap_err().why,
+        BreakKind::UntrustedMismatch
+    );
+    // The unaltered journal still verifies.
+    let again = verify(&b, &r.blobs).unwrap();
+    assert_eq!(again.head, v.head);
+}
+
+/// The wire source `{"kind":"user"}` is exact: any extra field in the
+/// source object is a malformed payload home, refused by name.
+#[test]
+fn user_source_with_extra_field_refused() {
+    let (r, b, _) = session_journal();
+    let ls = lines(&b);
+    let v = verify(&b, &r.blobs).unwrap();
+    let mut forged: serde_json::Map<String, Value> = serde_json::from_slice(&ls[1]).unwrap();
+    let body = forged.get_mut("body").unwrap().as_object_mut().unwrap();
+    let text = body.get_mut("text").unwrap().as_object_mut().unwrap();
+    let source = text.get_mut("source").unwrap().as_object_mut().unwrap();
+    source.insert("id".into(), Value::from("someone"));
+    let (l1, _) = recompute_hash(
+        Value::Object(forged).to_string().as_bytes(),
+        &v.records[0].hash,
+    );
+    let mut ls2 = ls.clone();
+    ls2[1] = l1;
+    assert_eq!(
+        verify(&join(&ls2[..2]), &r.blobs).unwrap_err().why,
+        BreakKind::UntrustedMalformed
+    );
+}
+
+/// A journal written by the build before P-10 (bytes pinned from the
+/// pre-change build's `good_journal`) still verifies, kinds and all: the
+/// batch journal shape is unchanged.
+#[test]
+fn old_journal_still_reads() {
+    const FIXTURE: [&str; 6] = [
+        r#"{"attempt":1,"body":{"harness_version":"0.0.1","os":"test"},"hash":"7cbc47d5a01b397b8a37e074785e0e9789e1b659af44fed5f4dc99a2b4c8b662","kind":"RunStarted","prev":"0000000000000000000000000000000000000000000000000000000000000000","run":"00000000000100000000000000000000","seq":0,"step":0,"t_mono_ms":5,"t_wall":"2026-09-21T14:13:20.005Z"}"#,
+        r#"{"attempt":1,"body":{"call":"7edb360f06acaef2cc80dba16cf563f199d347db4443da04da0c8173e3f9e4ed","capability":"harness.fs.read"},"hash":"2dbf1873b2720f4234d3fe75cfacfc94bdafa71c87bd2d7c59baad198822dcd4","kind":"ToolStarted","prev":"7cbc47d5a01b397b8a37e074785e0e9789e1b659af44fed5f4dc99a2b4c8b662","run":"00000000000100000000000000000000","seq":1,"step":1,"t_mono_ms":10,"t_wall":"2026-09-21T14:13:20.010Z"}"#,
+        r#"{"attempt":1,"body":{"status":"ok"},"hash":"2691ef4d46a1a4f91b8c5af8b7c397b90590e489a08fcee9d78f39d8fe091ff6","kind":"ToolFinished","prev":"2dbf1873b2720f4234d3fe75cfacfc94bdafa71c87bd2d7c59baad198822dcd4","run":"00000000000100000000000000000000","seq":2,"step":1,"t_mono_ms":15,"t_wall":"2026-09-21T14:13:20.015Z"}"#,
+        r#"{"attempt":1,"body":{"content":{"inline":"reply \\u{1B}[2J\\u{202E}","len":13,"sha256":"10a3922feb76ea7fe6a3b739c193e070229a2766a9300345e0ad9b62f9c671ed","source":{"kind":"model"},"untrusted":true},"raw":{"blob":"2bf7158cb3d8f419f1e19ee71df61927cc17017f37ea8820f3bd719d2b4f88f8","len":10000,"sha256":"2bf7158cb3d8f419f1e19ee71df61927cc17017f37ea8820f3bd719d2b4f88f8","source":{"id":"harness.fs.read","kind":"tool"},"untrusted":true}},"hash":"90ebef0579db3e05631bfd6603e6bc9383f86279452df454941461358bc1b444","kind":"ModelReplied","prev":"2691ef4d46a1a4f91b8c5af8b7c397b90590e489a08fcee9d78f39d8fe091ff6","run":"00000000000100000000000000000000","seq":3,"step":2,"t_mono_ms":20,"t_wall":"2026-09-21T14:13:20.020Z"}"#,
+        r#"{"attempt":1,"body":{"steps":2},"hash":"07b178cca2baed19b7b2dc739eb3f9cfce3e3543b6b313bf5bd2b0753ce6243e","kind":"BudgetCharged","prev":"90ebef0579db3e05631bfd6603e6bc9383f86279452df454941461358bc1b444","run":"00000000000100000000000000000000","seq":4,"step":2,"t_mono_ms":25,"t_wall":"2026-09-21T14:13:20.025Z"}"#,
+        r#"{"attempt":1,"body":{"cause":"submitted","outcome":"passed"},"hash":"5151b3c0bf9c2d0716a6b72d08f27568050c9e99348a9db6e7acd189ab9c5ff3","kind":"RunStopped","prev":"07b178cca2baed19b7b2dc739eb3f9cfce3e3543b6b313bf5bd2b0753ce6243e","run":"00000000000100000000000000000000","seq":5,"step":2,"t_mono_ms":30,"t_wall":"2026-09-21T14:13:20.030Z"}"#,
+    ];
+    /// The fixture's one blob: 10 000 bytes of 0xff, named by their digest.
+    struct FixtureBlobs;
+    impl crate::reader::BlobSource for FixtureBlobs {
+        fn get(&self, name: &str) -> Option<Vec<u8>> {
+            (name == "2bf7158cb3d8f419f1e19ee71df61927cc17017f37ea8820f3bd719d2b4f88f8")
+                .then(|| vec![0xffu8; 10_000])
+        }
+    }
+    let bytes = join(
+        &FIXTURE
+            .iter()
+            .map(|l| l.as_bytes().to_vec())
+            .collect::<Vec<_>>(),
+    );
+    let v = verify(&bytes, &FixtureBlobs).unwrap();
+    let kinds: Vec<EventKind> = v.records.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::RunStarted,
+            EventKind::ToolStarted,
+            EventKind::ToolFinished,
+            EventKind::ModelReplied,
+            EventKind::BudgetCharged,
+            EventKind::RunStopped
+        ]
+    );
+    assert!(v.is_complete());
+    let anchor: Digest = "5151b3c0bf9c2d0716a6b72d08f27568050c9e99348a9db6e7acd189ab9c5ff3"
+        .parse()
+        .unwrap();
+    v.check_anchor(&anchor).unwrap();
+}
+
+// The UI tap (P-05 §1.3): off by default, seq order, nothing from a
+// poisoned writer.
+
+#[test]
+fn tap_disabled_buffers_nothing() {
+    let (_, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let invoked = Cell::new(0);
+    step_once(&mut w, 1, &invoked).unwrap();
+    assert!(w.drain_tap().is_empty(), "no tap, no records");
+}
+
+#[test]
+fn tap_drains_records_in_seq_order() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    w.enable_tap();
+    let invoked = Cell::new(0);
+    step_once(&mut w, 1, &invoked).unwrap();
+    w.append(1, Event::new(EventKind::ContextBuilt)).unwrap();
+    let tapped = w.drain_tap();
+    let seqs: Vec<u64> = tapped.iter().map(|t| t.seq).collect();
+    assert_eq!(seqs, [1, 2, 3], "intent, result, ContextBuilt");
+    assert_eq!(tapped[0].kind, EventKind::ToolStarted);
+    assert_eq!(tapped[0].step, 1);
+    assert_eq!(
+        tapped[0].body.get("capability"),
+        Some(&Value::from("harness.fs.read"))
+    );
+    // Drained: the next drain is empty until more records are written.
+    assert!(w.drain_tap().is_empty());
+    w.append(2, Event::new(EventKind::FormatError)).unwrap();
+    assert_eq!(w.drain_tap().len(), 1);
+    let _ = r;
+}
+
+#[test]
+fn tap_has_nothing_after_poison() {
+    // write #1 = header, #2 = the intent (fails).
+    let (r, w) = rig(FaultPlan {
+        fail_write: Some(2),
+        ..Default::default()
+    });
+    let mut w = w.unwrap();
+    w.enable_tap();
+    let invoked = Cell::new(0);
+    assert!(step_once(&mut w, 1, &invoked).is_err());
+    assert!(w.is_poisoned());
+    // The failed record was never written, so nothing is tapped.
+    assert!(w.drain_tap().is_empty());
+    let _ = r;
+}

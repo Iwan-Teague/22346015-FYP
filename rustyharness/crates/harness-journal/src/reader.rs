@@ -110,6 +110,38 @@ impl Verified {
             })
         }
     }
+
+    /// Re-encode record `i` as its canonical line bytes, without the
+    /// trailing newline. The reader accepts a line only as the byte-exact
+    /// canonical encoding of what it parses (see the module docs), so this
+    /// is byte-for-byte the journal's own line: `prev` is rebuilt from the
+    /// chain ([`GENESIS`] for seq 0) and `run`/`attempt` from the header,
+    /// none of which [`Record`] carries. `None` if `i` is out of range or
+    /// the header does not re-parse (which [`verify`] has already ruled
+    /// out).
+    pub fn line_bytes(&self, i: usize) -> Option<Vec<u8>> {
+        let r = self.records.get(i)?;
+        let prev = if r.seq == 0 {
+            GENESIS
+        } else {
+            // seq == index (the reader enforces it), so seq > 0 has i > 0.
+            self.records.get(i - 1).map(|p| p.hash)?
+        };
+        let fields = crate::canon::RecordFields {
+            seq: r.seq,
+            prev,
+            t_mono_ms: r.t_mono_ms,
+            t_wall: r.t_wall.clone(),
+            run: harness_core::RunId::parse(&self.run)?,
+            attempt: u32::try_from(self.attempt).ok()?,
+            step: r.step,
+            kind: r.kind,
+            body: r.body.clone(),
+        };
+        let (line, hash) = fields.encode();
+        debug_assert_eq!(hash, r.hash);
+        Some(line)
+    }
 }
 
 /// The first broken record.
@@ -170,7 +202,7 @@ pub enum BreakKind {
     WrongAttempt,
 }
 
-fn broken(record: usize, why: BreakKind) -> Broken {
+pub(crate) fn broken(record: usize, why: BreakKind) -> Broken {
     Broken { record, why }
 }
 
@@ -384,6 +416,9 @@ fn check_source(v: &Value) -> Result<(), BreakKind> {
         Some("model") if o.len() == 1 => Ok(()),
         Some("tool") if o.len() == 2 => text("id").map(drop),
         Some("workspace") if o.len() == 2 => text("path").map(drop),
+        // The user at the interface (P-05/P-10): only the session loop
+        // writes the source, and only for a `UserTurn`'s text.
+        Some("user") if o.len() == 1 => Ok(()),
         _ => Err(m),
     }
 }
@@ -409,7 +444,11 @@ pub enum ReadError {
 #[derive(Debug)]
 pub struct JournalReader;
 
-fn require_real(path: &Path, want_dir: bool, what: &'static str) -> Result<(), ReadError> {
+pub(crate) fn require_real(
+    path: &Path,
+    want_dir: bool,
+    what: &'static str,
+) -> Result<(), ReadError> {
     let m = fs::symlink_metadata(path).map_err(|e| ReadError::Io(e.to_string()))?;
     if m.file_type().is_symlink() || m.is_dir() != want_dir {
         return Err(ReadError::NotReal(what));

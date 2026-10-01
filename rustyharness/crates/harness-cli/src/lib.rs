@@ -50,6 +50,14 @@
 //! `cmd_replay`, `cmd_profile`, `cmd_manifest`), with the option parsing
 //! (`args`), the input readers (`inputs`), the approver (`approver`), the
 //! gate-child ending (`report`) and the dispatch (`dispatch`) beside them.
+//!
+//! `events` (slice P-15) is not a gate child either: it projects an
+//! attempt's journal to stdout as newline-delimited JSON — a schema line,
+//! then one line per record, byte-for-byte the journal's canonical line —
+//! and `--follow` tails a live journal until the run commits. `run` and
+//! `resume` accept `--output stream-json` to print the same stream, plus a
+//! `usage {...}` line, before the `chain_head` line (the usage module
+//! computes the footer from the journal).
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -75,13 +83,17 @@ macro_rules! say {
 
 mod approver;
 mod args;
+mod cmd_events;
 mod cmd_manifest;
 mod cmd_profile;
 mod cmd_replay;
 mod cmd_run;
+mod config;
 mod dispatch;
+mod exec_presets;
 mod inputs;
 mod report;
+mod usage;
 
 pub use approver::{ApproverSource, TerminalApprover};
 pub use dispatch::main_with;

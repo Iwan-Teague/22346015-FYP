@@ -22,15 +22,36 @@ const REPLAY_SCOPE: &str = "Re-fed from the journal, not re-run: the model repli
 const REPLAY_SCOPE_SHORT: &str =
     "replies, tool results and samples re-fed; contexts, parses and decisions recomputed";
 
-pub(crate) fn replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Outcome {
-    match try_replay(cx, o) {
+pub(crate) fn replay(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    cfg: &Option<crate::config::UserConfig>,
+) -> Outcome {
+    match try_replay(cx, o, cfg) {
         Ok(x) | Err(x) => x,
     }
 }
 
-fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome> {
-    let inp = inputs(cx, o)?;
-    let state_root = required(cx, o, "state-root")?;
+fn try_replay(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    cfg: &Option<crate::config::UserConfig>,
+) -> Result<Outcome, Outcome> {
+    let inp = inputs(cx, o, cfg)?;
+    let state_root = match crate::config::state_root(o, cfg) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            note!(
+                cx,
+                "--state-root is required here (no default state root on this platform)\n{USAGE}"
+            );
+            return Err(refused(exit::USAGE, "--state-root missing".into()));
+        }
+        Err(e) => {
+            note!(cx, "{e}");
+            return Err(refused(exit::UNREADABLE_INPUT, e));
+        }
+    };
     let usage = |what: &str| {
         note!(cx, "{what}\n{USAGE}");
         refused(exit::USAGE, what.to_owned())
@@ -54,7 +75,7 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
         ),
     };
     let rep = harness_run::audit(Audit {
-        state_root: std::path::Path::new(state_root),
+        state_root: std::path::Path::new(state_root.as_ref()),
         run: &run,
         attempt,
         anchor,

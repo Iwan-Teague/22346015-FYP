@@ -361,6 +361,21 @@ pub struct Released {
     pub error: Option<JournalError>,
 }
 
+/// What the session's UI drain (P-05 §1.3, P-13's `EventSink`) sees of one
+/// appended record: a projection of what was written and fsynced (where the
+/// kind requires it), never an input.
+#[derive(Debug, Clone)]
+pub struct Tapped {
+    /// Sequence number.
+    pub seq: u64,
+    /// Loop step.
+    pub step: u64,
+    /// Kind.
+    pub kind: EventKind,
+    /// Body (untrusted payloads still escaped and marked).
+    pub body: Map<String, Value>,
+}
+
 /// Append-only, hash-chained, per-attempt journal writer.
 ///
 /// There is no seek, truncate, remove or rewrite in its API, and no way to
@@ -382,6 +397,9 @@ pub struct JournalWriter<F, B, K> {
     last_mono: u64,
     poison: Option<JournalError>,
     conditions: StandingConditions,
+    /// The UI tap (P-05 §1.3): `None` (off) unless [`JournalWriter::enable_tap`]
+    /// was called; off by default, so a batch run pays nothing.
+    tap: Option<Vec<Tapped>>,
 }
 
 impl<F, B, K> std::fmt::Debug for JournalWriter<F, B, K> {
@@ -551,6 +569,7 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
             last_mono: 0,
             poison: None,
             conditions: StandingConditions::default(),
+            tap: None,
         };
         let mut ev = Event::new(EventKind::RunStarted);
         for (k, v) in header.fields {
@@ -580,6 +599,25 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
     /// Whether the writer is poisoned.
     pub fn is_poisoned(&self) -> bool {
         self.poison.is_some()
+    }
+
+    /// Turn the UI tap on (P-05 §1.3). Off by default, so a batch run
+    /// buffers nothing. Tapped records accumulate in seq order until
+    /// [`JournalWriter::drain_tap`].
+    pub fn enable_tap(&mut self) {
+        self.tap = Some(Vec::new());
+    }
+
+    /// Every record written since the last drain, in seq order, when the
+    /// tap is on; nothing when it is off. A record is tapped only after its
+    /// write (and its fsync, when the kind requires one) succeeded; a
+    /// poisoned writer taps nothing. `RunStarted` is tapped like any other
+    /// record; `RunStopped` is never drained (commit consumes the writer).
+    pub fn drain_tap(&mut self) -> Vec<Tapped> {
+        match &mut self.tap {
+            Some(buf) => std::mem::take(buf),
+            None => Vec::new(),
+        }
     }
 
     /// The hash of the last record written.
@@ -643,6 +681,16 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
                 // Never retried on this file (§7.1): the writer is poisoned.
                 return Err(self.poison("fsync", &e));
             }
+        }
+        // The UI tap sees only what was written, and fsynced where the kind
+        // requires it; a poisoned writer never gets here.
+        if let Some(buf) = &mut self.tap {
+            buf.push(Tapped {
+                seq,
+                step,
+                kind,
+                body: fields.body.clone(),
+            });
         }
         Ok((seq, hash))
     }
@@ -828,6 +876,7 @@ pub fn stop_cause_name(c: &StopCause) -> &'static str {
         StopCause::PolicyAbort => "policy_abort",
         StopCause::ModelUnavailable => "model_unavailable",
         StopCause::Cancelled => "cancelled",
+        StopCause::SessionEnded => "session_ended",
         StopCause::SandboxLost => "sandbox_lost",
         StopCause::JournalUnavailable { .. } => "journal_unavailable",
     }

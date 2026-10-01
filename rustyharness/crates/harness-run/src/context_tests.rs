@@ -25,7 +25,11 @@ use harness_policy::{Authorized, Call, UserPolicy};
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 use serde_json::Value;
 
-use crate::driver::{commit, new_meter, plan, Approvals, Loop, NonceSource, ReadLog};
+use crate::driver::approvals::Approvals;
+use crate::driver::plan::plan;
+use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
+use crate::driver::stop::commit;
+use crate::driver::{new_meter, ReadLog};
 use crate::{RunConfig, TaskSpec};
 
 const NA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -171,7 +175,7 @@ fn drive(
         .iter()
         .map(|(s, n)| (*s, Nonce::new(n).unwrap()))
         .collect();
-    let mut lp = Loop {
+    let mut lp = Loop::new(LoopInit {
         session,
         registry: &reg,
         tools,
@@ -201,9 +205,9 @@ fn drive(
         pressure: Vec::new(),
         reads_seen: Default::default(),
         todo: None,
-        notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
+        notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
-    };
+    });
     let end = lp.drive(&mut w);
     commit(w, &end, None);
     let journal = buf.borrow().clone();

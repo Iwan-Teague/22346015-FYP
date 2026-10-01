@@ -1,7 +1,9 @@
 //! Glob patterns over workspace-relative paths (design row H2e): the
 //! pattern of `harness.fs.glob` and the `include` / `exclude` filters of
 //! `harness.fs.search`. Written here rather than taken from a crate: the
-//! syntax is small, and the matcher below is linear by construction.
+//! syntax is small, and the matcher below is linear by construction. The
+//! module is pure (no I/O), so it lives in `harness-core` (P-08), where the
+//! policy matcher reuses it; `harness-tools` re-exports it unchanged.
 //!
 //! **Syntax.** Paths are `/`-separated and relative (the walk's own
 //! strings, never the host's):
@@ -471,15 +473,37 @@ mod tests {
     }
 
     // No backtracking: a pattern that is exponential for a naive matcher
-    // over a long non-matching path finishes at once.
+    // over a long non-matching path is refused (fails to match) in the
+    // reachable-position set, one character at a time. The matcher is pure,
+    // so it may not read a clock to time itself; the wall-clock pin on the
+    // same hostile patterns lives in `harness-tools`' tests (`glob_linear`),
+    // where a clock read is allowed.
     #[test]
     fn matching_is_linear_on_hostile_patterns() {
         let p = format!("{}b", "*a".repeat(40));
         let path = "a".repeat(200);
-        let t = std::time::Instant::now();
         assert!(!m(&p, &path));
         let q = format!("{}/x", vec!["**"; 20].join("/"));
         assert!(!m(&q, "a/".repeat(90).trim_end_matches('/')));
-        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    // P-08: the matcher moved from `harness-tools` to `harness-core`; this
+    // pins the behaviours the policy path_glob relies on, so a future edit
+    // here is caught by the policy crate's contract too.
+    #[test]
+    fn glob_behaviour_unchanged() {
+        // `src/**` is "under src/", not src itself (the P-08 policy test
+        // leans on exactly this edge).
+        let under_src = Glob::new("src/**").unwrap();
+        assert!(under_src.matches("src/a.rs"));
+        assert!(under_src.matches("src/a/b.rs"));
+        assert!(!under_src.matches("src"));
+        assert!(!under_src.matches("other/a.rs"));
+        // Name-only patterns reach every depth; slash patterns are whole-path.
+        assert!(Glob::new("*.rs").unwrap().matches("deep/nested/x.rs"));
+        assert!(!Glob::new("src/*.rs").unwrap().matches("src/d/x.rs"));
+        // The `..` refusal the policy loader relies on (`bad_glob_refused`).
+        assert_eq!(Glob::new("../x").unwrap_err(), GlobError::DotComponent);
+        assert_eq!(Glob::new("[ab").unwrap_err(), GlobError::UnclosedClass);
     }
 }

@@ -22,10 +22,19 @@
 //!   reading fails the first send that times out). The loopback server is
 //!   the user's own process (trust base, design §11);
 //! - response head ≤ `max_head_bytes`, body ≤ `max_body_bytes` (a server
-//!   that streams forever hits the deadline or the size cap);
+//!   that streams forever hits the deadline or the size cap), each bound
+//!   still checked as every piece arrives (P-06);
 //! - `Transfer-Encoding` other than exactly `chunked`, both
 //!   `Transfer-Encoding` and `Content-Length`, conflicting lengths, a bad
 //!   chunk size, or a non-HTTP status line are `Malformed`.
+//!
+//! **The chunk callback (P-06).** `exchange` takes an optional sink that is
+//! handed each contiguous piece of the body as it arrives, so a streamed
+//! reply can be parsed while it is still being read. The body is collected
+//! whole exactly as before either way, the sink is invoked only for a
+//! `200` reply with `Content-Type: text/event-stream` (the one kind a
+//! caller can parse incrementally; other bodies, and every non-200 status,
+//! are collected as before), and a sink error aborts the exchange at once.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -86,6 +95,10 @@ struct Head {
 const SERVER_CLAIM_MAX: usize = 256;
 /// Largest `Retry-After` honoured, in seconds.
 const RETRY_AFTER_MAX_SECS: u64 = 86_400;
+
+/// A sink for one contiguous piece of a streamed response body (P-06):
+/// handed each piece as it arrives; an error aborts the exchange.
+pub(crate) type OnChunk<'a> = dyn FnMut(&[u8]) -> Result<(), HttpError> + 'a;
 
 /// Why an exchange failed. Messages are harness-authored; no request or
 /// response bytes, and never a header value, are included.
@@ -308,6 +321,9 @@ enum Framing {
 }
 
 /// One exchange: connect to `addr`, send the request, read the response.
+/// `on_chunk`, when the reply turns out to be an event stream, is handed
+/// each contiguous piece of the body as it arrives (P-06); an error from it
+/// aborts the read at once and is returned as-is.
 #[allow(clippy::too_many_arguments)]
 pub fn exchange(
     addr: SocketAddr,
@@ -318,6 +334,7 @@ pub fn exchange(
     body: &[u8],
     limits: &HttpLimits,
     deadline: Instant,
+    on_chunk: Option<&mut OnChunk<'_>>,
 ) -> Result<HttpResponse, HttpError> {
     let wait = limits.connect_timeout.min(left(deadline)?);
     let stream = TcpStream::connect_timeout(&addr, wait).map_err(|e| {
@@ -398,19 +415,55 @@ pub fn exchange(
         server,
     } = parse_head(&lines)?;
     c.compact();
+    // The chunk callback runs only for a 200 event stream (P-06): every
+    // other status and content type is collected whole as before, so the
+    // retry logic in client.rs never sees a partial body.
+    let mut on_chunk = if status == 200 && content_type.as_deref() == Some("text/event-stream") {
+        on_chunk
+    } else {
+        None
+    };
     let body = match framing {
         Framing::Length(n) => {
             if n > limits.max_body_bytes {
                 return Err(HttpError::TooLarge("response body"));
             }
-            c.exact(n)?
+            let mut out = Vec::new();
+            while out.len() < n {
+                if c.available().is_empty() && c.fill()? == 0 {
+                    return Err(HttpError::Malformed("connection closed mid-body"));
+                }
+                let take = c.available().len().min(n - out.len());
+                let piece = c.available().get(..take).unwrap_or(&[]).to_vec();
+                if let Some(sink) = on_chunk.as_mut() {
+                    sink(&piece)?;
+                }
+                out.extend_from_slice(&piece);
+                c.pos += take;
+                c.compact();
+            }
+            out
         }
         Framing::Close => {
+            // Bytes that arrived with the head are still buffered here, so
+            // they are the sink's first piece; each fill then adds one more.
+            if let Some(sink) = on_chunk.as_mut() {
+                sink(c.available())?;
+            }
             while !c.eof {
                 if c.available().len() > limits.max_body_bytes {
                     return Err(HttpError::TooLarge("response body"));
                 }
-                c.fill()?;
+                let had = c.available().len();
+                if c.fill()? == 0 {
+                    break;
+                }
+                let new = c.available().len();
+                if new > had {
+                    if let Some(sink) = on_chunk.as_mut() {
+                        sink(c.available().get(had..new).unwrap_or(&[]))?;
+                    }
+                }
             }
             if c.available().len() > limits.max_body_bytes {
                 return Err(HttpError::TooLarge("response body"));
@@ -447,7 +500,11 @@ pub fn exchange(
                 if out.len().saturating_add(n) > limits.max_body_bytes {
                     return Err(HttpError::TooLarge("response body"));
                 }
-                out.extend_from_slice(&c.exact(n)?);
+                let piece = c.exact(n)?;
+                if let Some(sink) = on_chunk.as_mut() {
+                    sink(&piece)?;
+                }
+                out.extend_from_slice(&piece);
                 if !c.line(2, "chunk terminator")?.is_empty() {
                     return Err(HttpError::Malformed("chunk terminator"));
                 }

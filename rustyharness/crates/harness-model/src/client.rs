@@ -16,7 +16,12 @@
 //!
 //! The socket-level HTTP client is crate-private (H1d review F-1): the only
 //! way to reach a server is [`OpenAiCompatible`], whose constructor checks
-//! that the endpoint is loopback (INV-24).
+//! that the endpoint is loopback (INV-24). A streamed reply is parsed as it
+//! arrives (P-06) and may be watched through
+//! [`OpenAiCompatible::with_observer`]; the observer is display state only —
+//! it is not on the [`ModelBackend`] trait, and the returned `Completion`
+//! is the same with or without one, so what the journal records does not
+//! change.
 //!
 //! ```compile_fail,E0603
 //! let _ = harness_model::http::exchange;
@@ -31,9 +36,9 @@ use serde_json::Value;
 
 use crate::endpoint::{Endpoint, EndpointRefused, LoopbackHost};
 pub use crate::http::HttpLimits;
-use crate::http::{exchange, HttpError};
+use crate::http::{exchange, HttpError, OnChunk};
 use crate::profile::Profile;
-use crate::wire::{parse_json_reply, parse_sse_reply, render_request};
+use crate::wire::{parse_json_reply, render_request, SseReader, StreamObserver};
 use crate::{
     Completion, EndpointClass, ModelBackend, ModelError, ModelIdentity, ModelRequest, Unavailable,
 };
@@ -145,7 +150,6 @@ pub struct ClientConfig {
 }
 
 /// The loopback OpenAI-compatible backend.
-#[derive(Debug)]
 pub struct OpenAiCompatible {
     endpoint: Endpoint,
     addr: SocketAddr,
@@ -153,6 +157,26 @@ pub struct OpenAiCompatible {
     key: Option<ApiKey>,
     config: ClientConfig,
     claims: std::cell::RefCell<crate::ServerClaims>,
+    /// The streaming observer, if any (P-06). Caller state, never printed:
+    /// it sees the reply's deltas as they arrive and nothing else, and the
+    /// `Completion` is built without it, so the loop, the journal and
+    /// replay are unaffected. `Send`: a backend may move between threads
+    /// (the callbacks run on whichever thread calls `complete`).
+    observer: Option<Box<dyn StreamObserver + Send>>,
+}
+
+impl fmt::Debug for OpenAiCompatible {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiCompatible")
+            .field("endpoint", &self.endpoint)
+            .field("addr", &self.addr)
+            .field("profile", &self.profile)
+            .field("key", &self.key)
+            .field("config", &self.config)
+            .field("claims", &self.claims)
+            .field("observer", &self.observer.is_some())
+            .finish()
+    }
 }
 
 fn map_http(e: HttpError) -> ModelError {
@@ -203,6 +227,7 @@ impl OpenAiCompatible {
             key,
             config,
             claims: std::cell::RefCell::new(crate::ServerClaims::default()),
+            observer: None,
         })
     }
 
@@ -210,6 +235,17 @@ impl OpenAiCompatible {
     /// read timeout (H2f) when it sets one.
     pub fn limits(&self) -> HttpLimits {
         self.config.limits
+    }
+
+    /// Set a streaming observer (P-06): it is told the reply's content,
+    /// reasoning and tool-call name deltas as the server sends them, before
+    /// the call returns. Deliberately NOT on the [`ModelBackend`] trait: the
+    /// loop and replay never see it, and the returned `Completion` — the
+    /// thing the journal records — is byte-identical with or without one.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Box<dyn StreamObserver + Send>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     fn headers(&self) -> Vec<(&str, String)> {
@@ -226,6 +262,7 @@ impl OpenAiCompatible {
         path: &str,
         body: &[u8],
         deadline: Instant,
+        on_chunk: Option<&mut crate::http::OnChunk<'_>>,
     ) -> Result<crate::http::HttpResponse, HttpError> {
         let owned = self.headers();
         let headers: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -238,20 +275,51 @@ impl OpenAiCompatible {
             body,
             &self.config.limits,
             deadline,
+            on_chunk,
         )
     }
 
     fn attempt(&self, body: &[u8], deadline: Instant, retried: &[u16]) -> Attempt {
-        let resp = match self.send("POST", "/chat/completions", body, deadline) {
-            Ok(r) => r,
-            Err(e) => return Attempt::Done(Err(map_http(e))),
-        };
         let req_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        // P-06: a streamed reply is parsed as it arrives, feeding the
+        // observer, if one is set, while the bytes are still collected; the
+        // completion is built from what arrived exactly as the one-shot
+        // parse builds it. A parse error aborts the read at once and is
+        // carried in `error`, since the exchange itself can only report an
+        // `HttpError`.
+        let mut reader = SseReader::new(match self.observer.as_deref() {
+            // The stored observer is `+ Send`; the reader wants the trait.
+            Some(o) => Some(o as &dyn StreamObserver),
+            None => None,
+        });
+        let error: std::cell::RefCell<Option<ModelError>> = std::cell::RefCell::new(None);
+        let mut sink = |bytes: &[u8]| -> Result<(), HttpError> {
+            match reader.feed(bytes) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    *error.borrow_mut() = Some(e);
+                    Err(HttpError::Malformed("stream"))
+                }
+            }
+        };
+        let resp = match self.send(
+            "POST",
+            "/chat/completions",
+            body,
+            deadline,
+            Some(&mut sink as &mut OnChunk),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Attempt::Done(Err(match error.into_inner() {
+                    Some(e) => e,
+                    None => map_http(e),
+                }));
+            }
+        };
         match resp.status {
             200 => Attempt::Done(match resp.content_type.as_deref() {
-                Some("text/event-stream") => {
-                    parse_sse_reply(&resp.body, req_bytes, retried.to_vec())
-                }
+                Some("text/event-stream") => reader.finish(req_bytes, retried.to_vec()),
                 Some("application/json") => {
                     parse_json_reply(&resp.body, req_bytes, retried.to_vec())
                 }
@@ -263,11 +331,38 @@ impl OpenAiCompatible {
         }
     }
 
+    /// The models the server lists (`GET /models`, P-07): `profile init`
+    /// offers them before a profile exists. Fails closed with a typed
+    /// error; unlike [`startup_check`](Self::startup_check) it needs no
+    /// profile, so it never sets server claims.
+    pub fn list_models(&self, deadline: Instant) -> Result<Vec<String>, ModelError> {
+        let resp = self
+            .send("GET", "/models", &[], deadline, None)
+            .map_err(map_http)?;
+        if resp.status != 200 {
+            return Err(ModelError::Unusable(format!(
+                "GET /models returned {}",
+                resp.status
+            )));
+        }
+        let v = strict_json::parse(&resp.body)
+            .map_err(|_| ModelError::Unusable("GET /models: malformed JSON".into()))?;
+        Ok(v.get("data")
+            .and_then(Value::as_array)
+            .map(|d| {
+                d.iter()
+                    .filter_map(|m| m.get("id").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Startup check (§3.2): `GET /models` must answer and list the
     /// profile's model. Fails closed with a typed error.
     pub fn startup_check(&self, deadline: Instant) -> Result<(), ModelError> {
         let resp = self
-            .send("GET", "/models", &[], deadline)
+            .send("GET", "/models", &[], deadline, None)
             .map_err(map_http)?;
         if resp.status != 200 {
             return Err(ModelError::Unusable(format!(

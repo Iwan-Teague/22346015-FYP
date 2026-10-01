@@ -62,6 +62,25 @@ so the history stays readable. What is still open is listed first.
    execute grant (§4.8); H2d ships the named interim instead (option (b): the run stops
    unless the sandbox confirms every process a command started is gone). Building the
    helper (option (a)) is the design-conformant follow-up; when is yours to decide.
+8. **(owner) The active-tool cap** (H2e). §3.4 caps a session at 5-8 active tools
+   (R1 §1.7: fewer tools help small models; profiles refuse `max_active_tools`
+   outside 5-8, and the dev profiles set 6, the submit sentinel included). The
+   built-in set is ten tools since H2e (four read, three edit, the runner, the
+   checklist, the sentinel), so a task picks: a coding task with search, glob,
+   edits, the runner and the checklist needs 8. *Default:* the 5-8 range stands
+   and tasks choose their grants; raising it (Claude Code offers about 15 tools,
+   opencode about 12) is a profile-range change for the owner to decide, ideally
+   after measuring a small model with 8 against 10 (design rows H2e).
+9. **(owner) Several read-only tool calls in one reply** (H2e). §2.2 runs one action
+   per reply, and a reply with several calls is a format error that costs a step and
+   a repair. Z.ai ignores `parallel_tool_calls: false` (H1h, finding F2), and in the
+   H2e dev runs at `6720a60` GLM-5.3-flash's native replies held two calls in 6 of 13
+   runs; Qwen3-4B (text) sent two replacements in one reply on e2. Claude Code and
+   opencode run a turn's calls in order. *Default:* one action per reply stands. The
+   narrow change would run up to N calls whose labels are read-only, each
+   policy-checked and journaled as its own record in reply order, and keep the
+   one-action rule for anything that writes or executes. It changes §2.2 and the
+   loop's step accounting, so it is the owner's call.
 
 ## Answered by the design
 

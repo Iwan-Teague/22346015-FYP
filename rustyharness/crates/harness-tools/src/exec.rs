@@ -38,7 +38,9 @@
 //! **What the model sees** is a bounded excerpt: the exit status, then each
 //! stream's size and at most its first [`SHOW_HEAD_LINES`] and last
 //! [`SHOW_TAIL_LINES`] lines, each cut at [`SHOW_LINE_BYTES`] (compiler
-//! errors come first, test summaries last). The excerpt's digest is over
+//! errors come first, test summaries last), and, when the middle is left out,
+//! the first [`SHOW_MID_LINES`] lines of it that look like a failure, with
+//! their line numbers (H2f). The excerpt's digest is over
 //! the excerpt, and `truncated` says whether anything was left out.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,9 +97,26 @@ pub const SHELLS: &[&str] = &[
 pub const BUILT_ENV: &[&str] = &["PATH", "HOME", "TMPDIR", "CARGO_HOME", "CARGO_TARGET_DIR"];
 
 /// Lines shown from the start of a stream.
-pub const SHOW_HEAD_LINES: usize = 10;
+pub const SHOW_HEAD_LINES: usize = 8;
 /// Lines shown from the end of a stream.
-pub const SHOW_TAIL_LINES: usize = 26;
+pub const SHOW_TAIL_LINES: usize = 24;
+/// Lines of a stream's middle that look like a failure, shown with their line
+/// numbers when the middle is left out (H2f: a `cargo test` result cut in
+/// its middle hid the one panic that mattered).
+pub const SHOW_MID_LINES: usize = 6;
+/// What makes a line of a stream's omitted middle look like a failure: the
+/// compiler's and the test harness's own words.
+/// Longest such line shown, in bytes: with the head and the tail, two streams
+/// of them still fit the context's 16 KiB for one observation.
+const SHOW_MID_LINE_BYTES: usize = 120;
+const FAILURE_MARKERS: &[&str] = &[
+    "panicked at",
+    "FAILED",
+    "error[E",
+    "error:",
+    "assertion",
+    "thread '",
+];
 /// Longest line shown, in bytes (cut on a character boundary).
 pub const SHOW_LINE_BYTES: usize = 200;
 /// Longest value of a task-declared environment variable.
@@ -670,7 +689,7 @@ fn excerpt(name: &str, bytes: &[u8], dropped: bool, out: &mut String) -> bool {
         if shown_all {
             String::new()
         } else {
-            format!("; showing the first {SHOW_HEAD_LINES} and the last {SHOW_TAIL_LINES}")
+            format!("; showing the first {SHOW_HEAD_LINES} and the last {SHOW_TAIL_LINES}, and up to {SHOW_MID_LINES} failure-looking lines from the middle")
         },
     ));
     let mut cut = dropped || !shown_all;
@@ -688,7 +707,33 @@ fn excerpt(name: &str, bytes: &[u8], dropped: bool, out: &mut String) -> bool {
     } else {
         lines.iter().take(SHOW_HEAD_LINES).for_each(|l| push(l));
         let skipped = n - SHOW_HEAD_LINES - SHOW_TAIL_LINES;
-        push(&format!("[... {skipped} lines not shown ...]"));
+        // The omitted middle may hold the one line that matters: keep the
+        // first few that look like a failure, with where they are.
+        let mid: Vec<(usize, &str)> = lines
+            .iter()
+            .enumerate()
+            .skip(SHOW_HEAD_LINES)
+            .take(skipped)
+            .filter(|(_, l)| FAILURE_MARKERS.iter().any(|m| l.contains(m)))
+            .map(|(i, l)| (i + 1, *l))
+            .take(SHOW_MID_LINES)
+            .collect();
+        if mid.is_empty() {
+            push(&format!("[... {skipped} lines not shown ...]"));
+        } else {
+            push(&format!(
+                "[... {skipped} lines not shown; the first {} that look like failures, with their line numbers ...]",
+                mid.len()
+            ));
+            for (no, l) in &mid {
+                let mut end = l.len().min(SHOW_MID_LINE_BYTES);
+                while !l.is_char_boundary(end) {
+                    end -= 1;
+                }
+                push(&format!("{no}: {}", l.get(..end).unwrap_or("")));
+            }
+            push("[... the rest of the middle is not shown ...]");
+        }
         lines.iter().skip(n - SHOW_TAIL_LINES).for_each(|l| push(l));
     }
     cut

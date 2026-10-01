@@ -141,6 +141,7 @@ impl Rig {
                 personal_data_granted: false,
                 conformed: true,
                 exec_programs: vec!["perl".into(), "sh".into()],
+                read_window: None,
             },
             &reg,
             &UserPolicy::new(&[], &[], &[EXEC_ID]).unwrap(),

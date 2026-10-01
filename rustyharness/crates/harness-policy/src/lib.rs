@@ -12,7 +12,9 @@
 //!   (INV-9, pure half), and every class this slice does not decide. The
 //!   write-class capabilities it does decide are the built-in submit
 //!   sentinel [`SUBMIT_ID`] (§2.5), allowed by the named rule
-//!   `allow.task-submit` after every deny rule and schema check, and the
+//!   `allow.task-submit` after every deny rule and schema check, the
+//!   built-in checklist [`TODO_ID`] (H2e), allowed the same way by its
+//!   rule [`TODO_RULE`], and the
 //!   built-in workspace edits [`EDIT_IDS`] (H2b): allowed only by a user
 //!   allow rule, otherwise an ask (rule [`EDIT_DEFAULT_RULE`]), a deny with
 //!   no approver present. §5.2's default allow for them assumes a sandbox
@@ -456,6 +458,10 @@ pub struct SessionSpec {
     /// The program names on the task's exec allowlist (§4.8, H2d): a
     /// command runs only when its `argv[0]` is one of them (INV-13).
     pub exec_programs: Vec<String>,
+    /// The run's read window, in lines (H2e: the profile's): a read's
+    /// `lines` above it is denied like any argument outside the schema the
+    /// model was shown. `None`: the manifest's maximum alone.
+    pub read_window: Option<u64>,
 }
 
 /// Why a session was refused at planning. Nothing has run.
@@ -542,6 +548,9 @@ struct Active {
     fs_tool: bool,
     /// The built-in submit sentinel (§2.5).
     submit: bool,
+    /// The built-in checklist (`harness.task.todo`, H2e): allowed by its
+    /// named rule after every deny rule and the schema.
+    todo: bool,
     /// A built-in workspace edit (`harness.edit.*`, §4.8, H2b): its `path`
     /// must stay in the workspace, and it is allowed only by a user allow
     /// rule or an approval (see [`Session::decide`]).
@@ -563,9 +572,21 @@ pub struct Session {
     personal_granted: bool,
     conformed: bool,
     exec_programs: BTreeSet<String>,
+    read_window: Option<u64>,
+}
+
+impl Session {
+    /// The program names on the task's exec allowlist (H2f), in name order:
+    /// task configuration, so a denial may list them.
+    pub fn exec_programs(&self) -> impl Iterator<Item = &str> {
+        self.exec_programs.iter().map(String::as_str)
+    }
 }
 
 const FS_PREFIX: &str = "harness.fs.";
+
+/// The built-in read tool, whose `lines` the run's read window bounds.
+const READ_ID: &str = "harness.fs.read";
 
 /// The submit sentinel's id (§2.5, §4.8). Only the compiled-in `harness`
 /// manifest can declare it (the namespace is reserved, §4.3).
@@ -586,8 +607,13 @@ fn is_submit_sentinel(c: &Capability) -> bool {
         && c.confirmation() == Confirmation::None
 }
 
-/// The built-in workspace edit tools (§4.8, §4.9; H2b).
-pub const EDIT_IDS: [&str; 2] = ["harness.edit.replace", "harness.edit.write"];
+/// The built-in workspace edit tools (§4.8, §4.9; H2b; `harness.edit.multi`
+/// since H2e).
+pub const EDIT_IDS: [&str; 3] = [
+    "harness.edit.replace",
+    "harness.edit.write",
+    "harness.edit.multi",
+];
 
 /// The rule id of the built-in edits' default decision in this build (§5.2,
 /// H2b): an ask, since the workspace is edited in place.
@@ -602,6 +628,29 @@ fn is_builtin_edit(c: &Capability) -> bool {
         && c.id().provider() == BUILTIN_NAMESPACE
         && c.effect() == Effect::Write
         && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::Own
+        && c.confirmation() == Confirmation::None
+}
+
+/// The built-in checklist (H2e): the model's own list of steps, kept in the
+/// run's state and echoed in its result. It touches nothing outside the run.
+pub const TODO_ID: &str = "harness.task.todo";
+
+/// The rule that allows the checklist (H2e), after every deny rule and the
+/// schema, like the sentinel's.
+pub const TODO_RULE: &str = "allow.task-todo";
+
+/// Whether `c` is the built-in checklist with exactly the labels the
+/// manifest gives it (write / public / own / none, content own, no declared
+/// confirmation), like the sentinel. Anything else under that id would not
+/// be the harness's checklist, and its write class is then out of scope.
+fn is_builtin_todo(c: &Capability) -> bool {
+    c.id().as_str() == TODO_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Write
+        && c.sensitivity() == Sensitivity::Public
         && c.blast_radius() == BlastRadius::Own
         && c.egress() == Egress::None
         && c.content() == Content::Own
@@ -713,6 +762,7 @@ impl Session {
             }
             if cl.effect != Effect::Read
                 && !is_submit_sentinel(c)
+                && !is_builtin_todo(c)
                 && !is_builtin_edit(c)
                 && !is_builtin_exec(c)
             {
@@ -741,6 +791,7 @@ impl Session {
                     fs_tool: c.id().provider() == BUILTIN_NAMESPACE
                         && c.id().as_str().starts_with(FS_PREFIX),
                     submit: is_submit_sentinel(c),
+                    todo: is_builtin_todo(c),
                     edit: is_builtin_edit(c),
                     exec: is_builtin_exec(c),
                 },
@@ -753,6 +804,7 @@ impl Session {
             personal_granted: spec.personal_data_granted,
             conformed: spec.conformed,
             exec_programs: spec.exec_programs.iter().cloned().collect(),
+            read_window: spec.read_window,
         })
     }
 
@@ -789,7 +841,7 @@ impl Session {
             return deny(DenyReason::Quarantined, "deny.quarantined");
         }
         let cl = a.class;
-        if cl.effect != Effect::Read && !a.submit && !a.edit && !a.exec {
+        if cl.effect != Effect::Read && !a.submit && !a.todo && !a.edit && !a.exec {
             return deny(
                 DenyReason::ClassOutOfScope(cl.effect),
                 "deny.class-out-of-scope",
@@ -819,6 +871,23 @@ impl Session {
         }
         if let Err(e) = a.schema.validate_args(&call.args) {
             return deny(DenyReason::Args(e), "deny.args-schema");
+        }
+        // The run's read window (H2e): the manifest's maximum for `lines` is
+        // the widest any profile may set; the window is the maximum the
+        // model is shown, and the one policy holds a read to.
+        if a.fs_tool && call.capability == READ_ID {
+            let lines = call.args.get("lines").and_then(Value::as_u64);
+            if let (Some(max), Some(n)) = (self.read_window, lines) {
+                if n > max {
+                    return deny(
+                        DenyReason::Args(ArgsError {
+                            at: "/lines".into(),
+                            detail: format!("above the read window of {max} lines"),
+                        }),
+                        "deny.args-schema",
+                    );
+                }
+            }
         }
         if a.fs_tool || a.edit {
             if let Some(p) = call.args.get("path") {
@@ -882,6 +951,13 @@ impl Session {
         if a.submit {
             return PolicyDecision::Allow {
                 rule: RuleId::Builtin("allow.task-submit"),
+            };
+        }
+        // The checklist (H2e) changes only the run's own list, which the
+        // model sees in the result; nothing in the workspace or outside it.
+        if a.todo {
+            return PolicyDecision::Allow {
+                rule: RuleId::Builtin(TODO_RULE),
             };
         }
         // Built-in workspace edits (H2b). §5.2 allows them by default

@@ -26,14 +26,15 @@ this is not built yet: see Status below, and the owner decisions in
 slice H1h makes the native protocol send past actions back as the model's own
 tool calls (a model copied the old text form), and the owner's sign-off on the
 design's open questions remains before H2. H2 is being built on an integration
-branch: edits (H2b), the macOS sandbox (H2a, H2c) and commands in it (H2d).
+branch: edits (H2b), the macOS sandbox (H2a, H2c), commands in it (H2d) and
+tool power (H2e).
 What works today:
 
 - **A read-only agent loop** against a model served on loopback
   (`http://127.0.0.1`, `[::1]` or `localhost`; OpenAI-compatible, e.g. llama.cpp),
   with native tool calls or a text action protocol, hard budgets, loop detection,
-  and three read tools confined to a workspace (`harness.fs.read`, `.search`,
-  `.list`).
+  and read tools confined to a workspace (`harness.fs.read`, `.search`,
+  `.list` and, since H2e, `.glob`).
 - **Evidence, not claims.** Every run that starts writes a hash-chained,
   write-ahead journal. `replay` re-drives a run from its recorded model replies
   and tool results, recomputes every context digest and policy decision, and
@@ -66,6 +67,19 @@ What works today:
   `--policy` file allows the runner. Where no backend passes (Linux and Windows
   today), a task that executes is refused before anything starts (exit 3);
   `rustyharness sandbox` shows the witness or the reason (design rows H2d).
+- **Tool power (H2e, on the integration branch).** `harness.fs.search`
+  matches a literal text or, with `regex: true`, a regular expression (the
+  linear-time `regex` crate), with `include`/`exclude` globs and up to five
+  context lines; every hit is counted, at most ten are shown per file, and
+  the files not shown are named. `harness.fs.glob` finds files by a glob
+  (`**/*.rs`). `harness.edit.multi` makes several exact replacements in one
+  file, all or none. A profile may widen the read window (`max_read_lines`,
+  up to 2000 lines, bounded by its context budget). `harness.task.todo`
+  keeps the model's checklist, shown in its results. And the harness tells
+  the model how much of its step and time budgets is used (at 50%, 80%, 90%
+  and before the last step), so it submits an answer it has. All journaled:
+  an audit recomputes the checklist and the step notices and re-feeds the
+  wall-clock notices (design rows H2e).
 - **Local disks only.** `run` and `resume` refuse a `state_root` that is not on
   a filesystem positively identified as local; on Windows every one is refused
   until spike S-W1, so runs work on Linux and macOS. `replay` does not check yet
@@ -145,6 +159,12 @@ build output and caches go to the run's scratch directory
           "env": {"DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "CARGO_NET_OFFLINE": "true"},
           "limits": {"memory_mib": 2048, "processes": 128}}}
 ```
+
+A task may set its own budgets: `"budget": {"steps": 20, "wall_secs": 600}`,
+each optional (1 to 500 steps, 1 second to a day; the defaults are 50 steps and
+30 minutes). The model is told as it passes 50%, 80% and 90% of each. The
+limits are recorded in the journal's header, so `replay` and `resume` must be
+given the same task file.
 
 `run` prints the run id on stderr (`run <id> attempt 1: stopped …`) and, on
 stdout, `chain_head <hex>`: keep the hex, it is the anchor. `rustyharness` with no

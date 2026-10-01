@@ -1379,3 +1379,215 @@ fn inv_23_the_task_text_reaches_no_argv() {
         );
     }
 }
+
+/// H2e: a task file's `budget` section sets the run's limits. The model is
+/// told as it goes (budget notices against the task's limit, not the
+/// default 50), the run stops at that limit, the header records it, and
+/// `replay` needs the same budget from the task file: with it the audit
+/// matches; without it the header's limits differ and the replay says so.
+#[test]
+fn h2e_a_task_budget_sets_the_limits_and_replay_needs_the_same() {
+    let fx = fixture("task-budget");
+    let with_budget = r#"{"task":"What does a.txt say?","grants":["harness.fs.read","harness.fs.list"],
+        "budget":{"steps":4,"wall_secs":600}}"#;
+    std::fs::write(&fx.task, with_budget).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = requests.clone();
+    // Four different calls and never a submit.
+    let m = mock_with(
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act("harness.fs.list", r#"{"path":"."}"#),
+            act("harness.fs.read", r#"{"path":"a.txt","lines":1}"#),
+            act("harness.fs.list", r#"{"path":".","depth":1}"#),
+        ],
+        move |req| seen.lock().unwrap().push(req.to_owned()),
+    );
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.code(), Some(5), "{err}");
+    assert!(err.contains("stopped (budget) after"), "{err}");
+    let reqs = requests.lock().unwrap().clone();
+    // The model was asked four times: the fifth step is refused by the
+    // budget before its call.
+    assert_eq!(reqs.len(), 4);
+    // 50% of 4 after step 2; one step left after step 3.
+    assert!(!reqs[2 - 1].contains("Budget:"), "{}", reqs[1]);
+    assert!(
+        reqs[3 - 1].contains("Budget: 2 of 4 steps used, 2 left."),
+        "{}",
+        reqs[2]
+    );
+    assert!(
+        reqs[4 - 1].contains("Budget: 3 of 4 steps used; your next reply is your last step."),
+        "{}",
+        reqs[3]
+    );
+    let id = run_id(&o);
+    let jp = fx
+        .state
+        .join("runs")
+        .join(&id)
+        .join("attempt-1/journal.jsonl");
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&jp)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["body"]["limits"]["steps"], 4, "{header}");
+    assert_eq!(header["body"]["limits"]["wall_ms"], 600_000, "{header}");
+
+    let clean = replay_bin(&fx, &id, &[]);
+    let rerr = String::from_utf8_lossy(&clean.stderr);
+    assert_eq!(clean.code(), Some(5), "{rerr}");
+    assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
+    // The same task without its budget section: the default limits, which
+    // the recorded header does not hold.
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"What does a.txt say?","grants":["harness.fs.read","harness.fs.list"]}"#,
+    )
+    .unwrap();
+    let o = replay_bin(&fx, &id, &[]);
+    assert_replay_diverged(&o, "budget limits", &fx.marker);
+}
+
+/// H2e: a budget out of range, a `null`, or a key the section does not
+/// have is unreadable input (exit 4), refused before the model server is
+/// contacted.
+#[test]
+fn h2e_a_task_budget_out_of_range_is_unreadable_input() {
+    let fx = fixture("task-budget-bad");
+    let m = mock(Vec::new());
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    for (budget, words) in [
+        (r#"{"steps":0}"#, "budget: steps must be from 1 to 500"),
+        (r#"{"steps":501}"#, "budget: steps must be from 1 to 500"),
+        (
+            r#"{"wall_secs":0}"#,
+            "budget: wall_secs must be from 1 to 86400",
+        ),
+        (
+            r#"{"wall_secs":86401}"#,
+            "budget: wall_secs must be from 1 to 86400",
+        ),
+        (r#"{"steps":null}"#, "does not have the expected shape"),
+        (r#"{"steps":-1}"#, "does not have the expected shape"),
+        (r#"{"step":10}"#, "does not have the expected shape"),
+        (r#"{"tokens":10}"#, "does not have the expected shape"),
+    ] {
+        std::fs::write(
+            &fx.task,
+            format!(r#"{{"task":"x","grants":["harness.fs.read"],"budget":{budget}}}"#),
+        )
+        .unwrap();
+        let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.code(), Some(4), "{budget}: {err}");
+        assert!(err.contains(words), "{budget}: {err}");
+        assert_eq!(report(&o)["outcome"]["Indeterminate"]["why"], "CouldNotRun");
+    }
+    assert_eq!(*m.requests.lock().unwrap(), 0, "the server was never asked");
+    assert!(!fx.marker.exists());
+}
+
+// H2f: a task's budget section may set each command's wall clock.
+#[test]
+fn h2f_an_exec_budget_out_of_range_or_without_an_exec_section_is_unreadable_input() {
+    let fx = fixture("task-exec-budget-bad");
+    let m = mock(Vec::new());
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let exec = r#","exec":{"programs":[{"name":"perl","path":"/usr/bin/perl"}]}"#;
+    for (budget, with_exec, words) in [
+        (
+            r#"{"exec_secs":0}"#,
+            true,
+            "budget: exec_secs must be from 1 to 3600",
+        ),
+        (
+            r#"{"exec_secs":3601}"#,
+            true,
+            "budget: exec_secs must be from 1 to 3600",
+        ),
+        (
+            r#"{"exec_secs":null}"#,
+            true,
+            "does not have the expected shape",
+        ),
+        (
+            r#"{"exec_secs":30}"#,
+            false,
+            "budget: exec_secs is for a task with an exec section",
+        ),
+    ] {
+        let grants = if with_exec {
+            r#"["harness.fs.read","harness.exec.run"]"#
+        } else {
+            r#"["harness.fs.read"]"#
+        };
+        let exec = if with_exec { exec } else { "" };
+        std::fs::write(
+            &fx.task,
+            format!(r#"{{"task":"x","grants":{grants},"budget":{budget}{exec}}}"#),
+        )
+        .unwrap();
+        let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.code(), Some(4), "{budget}: {err}");
+        assert!(err.contains(words), "{budget}: {err}");
+    }
+    assert_eq!(*m.requests.lock().unwrap(), 0, "the server was never asked");
+    assert!(!fx.marker.exists());
+}
+
+/// The exec budget reaches the run: the header records the command wall
+/// (`exec_timeout_ms`), a task without the field keeps the 120 s default,
+/// and the anchored replay of the run matches.
+#[cfg(target_os = "macos")]
+#[test]
+fn h2f_an_exec_budget_sets_the_commands_wall_clock_in_the_header() {
+    for (secs, want_ms) in [(Some(45u64), 45_000u64), (None, 120_000)] {
+        let (fx, allow) = exec_fixture(&format!("exec-budget-{}", secs.unwrap_or(0)));
+        if let Some(s) = secs {
+            std::fs::write(
+                &fx.task,
+                format!(
+                    r#"{{"task":"Write ran.txt.","grants":["harness.fs.read","harness.exec.run"],
+  "exec":{{"programs":[{{"name":"perl","path":"/usr/bin/perl"}}],"env":{{"RH_TASK":"1"}},
+          "limits":{{"memory_mib":1024,"processes":64}}}},
+  "budget":{{"exec_secs":{s}}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let m = mock(exec_replies());
+        let ep = format!("http://127.0.0.1:{}/v1", m.port);
+        let mut args = run_args(&fx, &ep);
+        args.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+        let o = cli(&args, false, &fx.marker);
+        assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+        let id = run_id(&o);
+        let jp = fx
+            .state
+            .join("runs")
+            .join(&id)
+            .join("attempt-1/journal.jsonl");
+        let header: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&jp)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["body"]["exec_timeout_ms"], want_ms, "{header}");
+        std::fs::remove_file(fx.ws.join("ran.txt")).unwrap();
+        let rp = replay_bin(&fx, &id, &["--policy", allow.to_str().unwrap()]);
+        let rerr = String::from_utf8_lossy(&rp.stderr);
+        assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
+    }
+}

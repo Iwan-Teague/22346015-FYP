@@ -207,6 +207,8 @@ fn drive_full(
         env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
+        todo: None,
+        notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
     };
     let end = lp.drive(&mut w);
     let pressure = lp.pressure.clone();
@@ -925,6 +927,8 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         env: &env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
+        todo: None,
+        notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
     };
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::PolicyAbort);

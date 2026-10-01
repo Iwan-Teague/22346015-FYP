@@ -88,6 +88,7 @@ fn session() -> Session {
             personal_data_granted: false,
             conformed: false,
             exec_programs: Vec::new(),
+            read_window: None,
         },
         &reg,
         &UserPolicy::default(),

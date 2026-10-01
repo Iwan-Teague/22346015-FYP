@@ -184,9 +184,14 @@ impl OpenAiCompatible {
         url: &str,
         profile: Profile,
         key: Option<ApiKey>,
-        config: ClientConfig,
+        mut config: ClientConfig,
     ) -> Result<Self, EndpointRefused> {
         let endpoint = Endpoint::parse(url)?;
+        // H2f: a profile that sets a read timeout decides how long one read
+        // from this model may take; without one, the config's stands.
+        if let Some(t) = profile.read_timeout() {
+            config.limits.read_timeout = t;
+        }
         let ip = match endpoint.host {
             LoopbackHost::V4 => std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
             LoopbackHost::V6 => std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -199,6 +204,12 @@ impl OpenAiCompatible {
             config,
             claims: std::cell::RefCell::new(crate::ServerClaims::default()),
         })
+    }
+
+    /// The HTTP limits this client uses: the config's, with the profile's
+    /// read timeout (H2f) when it sets one.
+    pub fn limits(&self) -> HttpLimits {
+        self.config.limits
     }
 
     fn headers(&self) -> Vec<(&str, String)> {

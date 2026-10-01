@@ -314,6 +314,56 @@ impl Seatbelt {
     }
 }
 
+/// The pauses, in milliseconds, before each retry of the live probe (H2f):
+/// at most this many retries, so at most `len + 1` attempts.
+const PROBE_BACKOFFS_MS: &[u64] = &[250, 1000];
+
+/// Whether a failed live probe failed the way a loaded machine makes it
+/// fail, rather than by finding a confinement guard not to hold (H2f).
+///
+/// Only failures of the probe's own running are retried: a spawn that did
+/// not start (`spawn`, `mem-spawn`, `proc-spawn`), the probe run itself
+/// timing out or ending without a status (`run`), and a domain sweep the
+/// stub could not confirm in its deadline (`sweep`, `proc-sweep`, an
+/// `Unconfirmed` cleanup). Every result that says a guard did not hold is
+/// final at once: a named probe not refused, the network, the write outside
+/// the roots, the memory bound, the process limit, `Confirmed` with no
+/// kill. A retry therefore never turns a breach into a pass: the attempt
+/// that passes ran and checked every guard itself, in its own fresh
+/// private directory.
+fn load_shaped(u: &Unavailable) -> bool {
+    match &u.reason {
+        UnavailableReason::LiveProbeFailed { probe, observed } => match *probe {
+            "spawn" | "mem-spawn" | "proc-spawn" => true,
+            "run" => observed.starts_with("TimedOut") || observed.starts_with("Unknown"),
+            "sweep" | "proc-sweep" => observed.starts_with("Unconfirmed("),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Run `attempt` (the whole live probe) and, when it fails in a
+/// [`load_shaped`] way, again after each pause in `backoffs_ms`, at most
+/// `backoffs_ms.len() + 1` times. The last failure is returned as it is:
+/// a probe that really fails still refuses, with its own error.
+fn probe_with_retries<T>(
+    mut attempt: impl FnMut() -> Result<T, Unavailable>,
+    backoffs_ms: &[u64],
+    mut pause: impl FnMut(u64),
+) -> Result<T, Unavailable> {
+    let mut retries = backoffs_ms.iter();
+    loop {
+        match attempt() {
+            Err(e) if load_shaped(&e) => match retries.next() {
+                Some(&ms) => pause(ms),
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
 /// The FT-6 probe's address-space budget: enough for perl to start, far less
 /// than its self-capped 512 MiB attempt, so the attempt must be refused.
 const MEM_PROBE_BUDGET: u64 = 64 * 1024 * 1024;
@@ -393,7 +443,11 @@ impl Backend for Seatbelt {
                 });
             }
         }
-        let observed = self.live_probe()?;
+        let observed = probe_with_retries(
+            || self.live_probe(),
+            PROBE_BACKOFFS_MS,
+            |ms| std::thread::sleep(Duration::from_millis(ms)),
+        )?;
         let digest = harness_core::sha256_parts(&[
             crate::profile::PROFILE_VERSION.as_bytes(),
             b"\n",
@@ -409,5 +463,123 @@ impl Backend for Seatbelt {
             return Err(SpawnError::WrongWitness);
         }
         self.start(spec)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    fn failed(probe: &'static str, observed: &str) -> Unavailable {
+        Unavailable {
+            backend: Some(BackendKind::Seatbelt),
+            reason: UnavailableReason::LiveProbeFailed {
+                probe,
+                observed: observed.into(),
+            },
+        }
+    }
+
+    const SWEEP: &str =
+        "Unconfirmed(\"processes of the domain would not die within the sweep deadline (3 s)\")";
+
+    #[test]
+    fn a_load_shaped_failure_is_retried_until_it_passes() {
+        let mut calls = 0;
+        let mut pauses = Vec::new();
+        let r = probe_with_retries(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(failed("sweep", SWEEP))
+                } else {
+                    Ok(calls)
+                }
+            },
+            PROBE_BACKOFFS_MS,
+            |ms| pauses.push(ms),
+        );
+        assert_eq!(r, Ok(3));
+        assert_eq!(pauses, vec![250, 1000], "short, growing pauses, in order");
+    }
+
+    #[test]
+    fn a_probe_that_really_fails_still_refuses_after_the_bounded_retries() {
+        let mut calls = 0;
+        let r: Result<(), _> = probe_with_retries(
+            || {
+                calls += 1;
+                Err(failed("sweep", SWEEP))
+            },
+            PROBE_BACKOFFS_MS,
+            |_| {},
+        );
+        assert_eq!(calls, 3, "one attempt and two retries, no more");
+        assert_eq!(r, Err(failed("sweep", SWEEP)), "the failure, unchanged");
+    }
+
+    #[test]
+    fn a_guard_that_did_not_hold_is_final_at_the_first_attempt() {
+        for (probe, observed) in [
+            ("net", "the listener saw Ok(..)"),
+            ("write", "the file exists outside the roots"),
+            ("read", "read fail"),
+            ("mem-bound", "Exited(0): NOTBOUNDED"),
+            ("mem-applied", "TimedOut: "),
+            ("proc-limit", "TimedOut: forked"),
+            ("run", "Exited(1): boom"),
+            ("sweep", "Confirmed { kills: 0 }"),
+            ("proc-sweep", "Confirmed { kills: 0 }"),
+        ] {
+            let mut calls = 0;
+            let mut paused = false;
+            let r: Result<(), _> = probe_with_retries(
+                || {
+                    calls += 1;
+                    Err(failed(probe, observed))
+                },
+                PROBE_BACKOFFS_MS,
+                |_| paused = true,
+            );
+            assert_eq!(calls, 1, "{probe}: never retried");
+            assert!(!paused, "{probe}");
+            assert_eq!(r, Err(failed(probe, observed)));
+        }
+        // An I/O or missing-primitive refusal is not a load symptom either.
+        let io = Unavailable {
+            backend: Some(BackendKind::Seatbelt),
+            reason: UnavailableReason::Io("no space".into()),
+        };
+        let mut calls = 0;
+        let _ = probe_with_retries::<()>(
+            || {
+                calls += 1;
+                Err(io.clone())
+            },
+            PROBE_BACKOFFS_MS,
+            |_| {},
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_breach_after_a_load_failure_is_not_forgiven() {
+        // The first attempt fails by load, the second finds a guard not
+        // holding: that is the answer, not a third try.
+        let mut calls = 0;
+        let r: Result<(), _> = probe_with_retries(
+            || {
+                calls += 1;
+                Err(if calls == 1 {
+                    failed("spawn", "SpawnError")
+                } else {
+                    failed("write", "the file exists outside the roots")
+                })
+            },
+            PROBE_BACKOFFS_MS,
+            |_| {},
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(r, Err(failed("write", "the file exists outside the roots")));
     }
 }

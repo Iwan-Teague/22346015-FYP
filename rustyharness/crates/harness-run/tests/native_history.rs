@@ -638,14 +638,22 @@ fn an_edited_native_call_diverges_at_the_next_context_built() {
 /// The compatibility breaks of H1h and H1i, named (like H1f-3's): a
 /// journal whose header records no context format (every journal written
 /// before H1h) or another one (rh-context/2: H1h, before H1i's
-/// per-observation nonces and append-mostly context) cannot be recomputed
+/// per-observation nonces and append-mostly context; rh-context/3: H1i,
+/// before H2e's budget notices and read-window caps; rh-context/4: an
+/// H2e commit before its repair messages named the fault) cannot be recomputed
 /// by this build, so audit and resume refuse it at the header, saying why,
 /// instead of diverging at its first context or request. Text-protocol
 /// journals are refused the same way.
 #[test]
 fn a_journal_from_before_h1i_is_refused_by_name_by_audit_and_resume() {
     for (case, text_protocol) in [("native", false), ("text", true)] {
-        for recorded in [None, Some("rh-context/1"), Some("rh-context/2")] {
+        for recorded in [
+            None,
+            Some("rh-context/1"),
+            Some("rh-context/2"),
+            Some("rh-context/3"),
+            Some("rh-context/4"),
+        ] {
             let tag = recorded.unwrap_or("none").replace('/', "-");
             let (state, ws) = scratch(&format!("old-{case}-{tag}"));
             let r = if text_protocol {
@@ -676,7 +684,7 @@ fn a_journal_from_before_h1i_is_refused_by_name_by_audit_and_resume() {
             };
             assert_eq!(
                 records(&r, 1)[0].body["context_format"],
-                "rh-context/3",
+                "rh-context/5",
                 "this build records its format"
             );
             let path = journal_path(&r, 1);

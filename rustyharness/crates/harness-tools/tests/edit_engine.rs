@@ -87,7 +87,9 @@ fn no_match_names_nearest_lines_and_hints_at_crlf() {
     let reads = read_of(&d, "c.txt");
     // LF `old` never byte-matches a CRLF file…
     match e.replace(&rep("c.txt", "two\nthree", "X"), &reads) {
-        Err(EditError::ZeroMatches { nearest, crlf_hint }) => {
+        Err(EditError::ZeroMatches {
+            nearest, crlf_hint, ..
+        }) => {
             assert_eq!(nearest, vec![2]);
             assert!(crlf_hint);
         }
@@ -102,7 +104,9 @@ fn no_match_names_nearest_lines_and_hints_at_crlf() {
     file(&d.join("f.txt"), "a\nb\nc\n");
     let reads = read_of(&d, "f.txt");
     match e.replace(&rep("f.txt", "zzz", "X"), &reads) {
-        Err(EditError::ZeroMatches { nearest, crlf_hint }) => {
+        Err(EditError::ZeroMatches {
+            nearest, crlf_hint, ..
+        }) => {
             assert!(nearest.is_empty());
             assert!(!crlf_hint);
         }
@@ -293,11 +297,10 @@ fn write_creates_only_where_nothing_exists() {
         other => panic!("wrong result: {other:?}"),
     }
     assert_eq!(fs::read(d.join("new.txt")).unwrap(), b"fresh\n");
-    // A create under a missing parent is refused.
-    match e.write(&wr("nodir/x.txt", "x\n"), &empty) {
-        Err(EditError::NotFound) => {}
-        other => panic!("wrong result: {other:?}"),
-    }
+    // A create under a missing parent makes the parent (H2f), and says so.
+    let made = e.write(&wr("nodir/x.txt", "x\n"), &empty).unwrap();
+    assert_eq!(made.dirs, vec!["nodir".to_owned()]);
+    assert_eq!(fs::read(d.join("nodir/x.txt")).unwrap(), b"x\n");
 }
 
 #[test]
@@ -511,4 +514,16 @@ mod unix {
             );
         }
     }
+}
+
+// H2f: a write over the size cap is refused before any directory is made.
+#[test]
+fn a_write_over_the_cap_makes_no_directory() {
+    let (d, e) = engine("cap-dirs");
+    let big = "y".repeat(4 * 1024 * 1024 + 1);
+    match e.write(&wr("big/dir/x.txt", &big), &ReadLog::default()) {
+        Err(EditError::TooLarge { .. }) => {}
+        other => panic!("wrong result: {other:?}"),
+    }
+    assert!(!d.join("big").exists());
 }

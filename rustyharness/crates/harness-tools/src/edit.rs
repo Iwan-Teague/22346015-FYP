@@ -4,9 +4,10 @@
 //! resolved from the workspace root one component at a time with
 //! `symlink_metadata`; a symlink at ANY component is refused, never
 //! followed), and [`EditTools`], which serves it to the model as
-//! `harness.edit.replace` and `harness.edit.write` through the
-//! [`ToolProvider`] seam (H2b): a call reaches the engine only as a
-//! `Journaled<Authorized<Call>>`, anchored on the run's reads.
+//! `harness.edit.replace` and `harness.edit.write` (H2b) and
+//! `harness.edit.multi` (H2e) through the [`ToolProvider`] seam: a call
+//! reaches the engine only as a `Journaled<Authorized<Call>>`, anchored on
+//! the run's reads.
 //!
 //! **Stale reads (§2.3, R1 §2).** An edit is anchored on an earlier
 //! read: the file must have been read this run ([`ReadLog`]) and its
@@ -17,12 +18,21 @@
 //! byte-exact matches of `old` must number exactly `count` (default 1,
 //! the unique match of R1 §1.5). Zero matches reports the nearest
 //! match after line-ending normalisation plus, when the file is CRLF
-//! and `old` uses LF, a hint saying so; a wrong number of matches
-//! reports the match line numbers. Either way the file is untouched.
+//! and `old` uses LF, a hint saying so, and, for a multi-line `old`, where
+//! it stops matching ([`PartialMatch`], H2e: line numbers, never text); a
+//! wrong number of matches reports the match line numbers. Either way the
+//! file is untouched.
+//!
+//! **Multi (H2e, `harness.edit.multi`).** Up to [`MULTI_MAX_EDITS`]
+//! replacements in one file, all or none: each `old` must be non-empty,
+//! differ from its `new` and match exactly once in the text as the
+//! replacements before it left it; the first that fails is named and
+//! nothing is written. The result is written once and verified like a
+//! replace, so it is one edit in the journal (one `EditApplied`).
 //!
 //! **Write (§4.8 `harness.edit.write`).** The §4.8 schema is one
 //! capability with no mode flag, so the regime follows existence: a
-//! free path (whose parent exists) is created — the "CREATING: must
+//! free path is created (H2f: with the directories it needs) — the "CREATING: must
 //! not exist" rule holds by construction — while an existing file is
 //! the OVERWRITING regime: a fresh read of at most
 //! [`WRITE_OVERWRITE_MAX_LINES`] lines.
@@ -78,6 +88,72 @@ pub const EDIT_MAX_BYTES: u64 = crate::builtin::READ_MAX_BYTES;
 pub const WRITE_OVERWRITE_MAX_LINES: usize = 400;
 /// Most "nearest match" line numbers a [`EditError::ZeroMatches`] lists.
 const NEAREST_MAX: usize = 10;
+/// Most lines of `old` a zero-match diagnosis compares.
+const PARTIAL_MAX_OLD_LINES: usize = 400;
+/// Most file lines a zero-match diagnosis tries as a start.
+const PARTIAL_MAX_STARTS: usize = 1000;
+
+/// Where a multi-line `old` that matches nowhere stops matching (H2e):
+/// the longest run of its leading lines that matches the file line by line
+/// (its first line as the end of a file line, its middle lines whole, its
+/// last line as the start of one), earliest first. The zero-match message
+/// gives these numbers, never the text: a local model sent the same
+/// `old` three times, missing one doc-comment line in its middle, and was
+/// told only that it matched nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialMatch {
+    /// The file line (1-based) where `old`'s first line matches.
+    pub at: usize,
+    /// How many of `old`'s leading lines match from there: at least one,
+    /// fewer than all.
+    pub matched: usize,
+    /// The file ends before `old`'s next line.
+    pub file_ended: bool,
+}
+
+/// [`PartialMatch`] of `old` in `text`, both LF-normalised; `None` for a
+/// one-line `old`, one longer than [`PARTIAL_MAX_OLD_LINES`], or one whose
+/// first line matches no line's end.
+fn partial_match(text: &str, old: &str) -> Option<PartialMatch> {
+    let want: Vec<&str> = old.split('\n').collect();
+    if want.len() < 2 || want.len() > PARTIAL_MAX_OLD_LINES {
+        return None;
+    }
+    let mut file: Vec<&str> = text.split('\n').collect();
+    // A final newline ends the last line; it does not start another.
+    if text.ends_with('\n') {
+        file.pop();
+    }
+    let first = want.first()?;
+    let mut best: Option<PartialMatch> = None;
+    let starts = file
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.ends_with(first))
+        .take(PARTIAL_MAX_STARTS);
+    for (i, _) in starts {
+        let mut k = 1;
+        while let (Some(w), Some(f)) = (want.get(k), file.get(i + k)) {
+            let same = if k + 1 == want.len() {
+                f.starts_with(w)
+            } else {
+                f == w
+            };
+            if !same {
+                break;
+            }
+            k += 1;
+        }
+        if k < want.len() && best.is_none_or(|b| k > b.matched) {
+            best = Some(PartialMatch {
+                at: i + 1,
+                matched: k,
+                file_ended: i + k >= file.len(),
+            });
+        }
+    }
+    best
+}
 
 /// The files read this run, with the SHA-256 of each file's whole
 /// content at its latest read (design §2.3 "Stale reads"). The driver
@@ -135,6 +211,30 @@ pub struct ReplaceReq {
     pub count: usize,
 }
 
+/// Most replacements one `harness.edit.multi` call makes (H2e; the schema
+/// subset has no `maxItems`, so the engine bounds it).
+pub const MULTI_MAX_EDITS: usize = 20;
+
+/// One replacement of a [`MultiReq`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// The byte-exact text to replace; non-empty, and matching exactly once
+    /// in the file as the replacements before it left it.
+    pub old: String,
+    /// The replacement.
+    pub new: String,
+}
+
+/// Several exact replacements in one file, all or none (H2e,
+/// `harness.edit.multi`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiReq {
+    /// Workspace path of the file.
+    pub path: String,
+    /// The replacements, applied in order.
+    pub edits: Vec<Replacement>,
+}
+
 /// A whole-file write request (§4.8 `harness.edit.write`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteReq {
@@ -159,6 +259,9 @@ pub struct Applied {
     pub lines: Vec<usize>,
     /// How many lines the file has after the edit.
     pub lines_after: usize,
+    /// The directories a write created for a new file (H2f), as paths
+    /// relative to the workspace root, shallowest first. Empty otherwise.
+    pub dirs: Vec<String>,
 }
 
 /// Why an edit was refused or failed. Only [`EditError::Unverified`] can
@@ -216,13 +319,16 @@ pub enum EditError {
     /// `old` matches nowhere; `nearest` lists the line numbers (after
     /// line-ending normalisation, at most [`NEAREST_MAX`]) of the
     /// closest thing that does match, and `crlf_hint` is set when the
-    /// file uses CRLF line endings while `old` uses LF.
-    #[error("`old` matches nowhere; nearest line-ending-normalised match line(s): {nearest:?}; the file uses CRLF while `old` uses LF: {crlf_hint}")]
+    /// file uses CRLF line endings while `old` uses LF. `partial` says
+    /// where a multi-line `old` stops matching (H2e).
+    #[error("`old` matches nowhere; nearest line-ending-normalised match line(s): {nearest:?}; the file uses CRLF while `old` uses LF: {crlf_hint}; partial: {partial:?}")]
     ZeroMatches {
         /// Nearest normalised-match line numbers, ascending.
         nearest: Vec<usize>,
         /// The file is CRLF and `old` uses bare LF.
         crlf_hint: bool,
+        /// Where the longest run of `old`'s leading lines matches the file.
+        partial: Option<PartialMatch>,
     },
     /// `old` matched a different number of times than `count`; `lines`
     /// lists every match's line number.
@@ -254,12 +360,42 @@ pub enum EditError {
     /// Any other file-system error.
     #[error("the file system refused the operation: {0}")]
     Io(#[from] io::Error),
+    /// A directory a new file needs cannot be made (H2f): a component of its
+    /// path is a file, not a directory.
+    #[error("a component of the path is a file, not a directory")]
+    NotADirectory,
+    /// A new file's path needs more new directories than one write makes
+    /// (H2f).
+    #[error("the path needs more than {WRITE_MAX_NEW_DIRS} new directories")]
+    TooManyDirs,
     /// The new content was renamed over the file, but the re-read after it
     /// (§4.9 step 4) did not find the expected splice: the inner error says
     /// what it found. The only variant after which the workspace may have
     /// changed (H2b: the run treats it so).
     #[error("the edit was written but not verified: {0}")]
     Unverified(Box<EditError>),
+    /// A `harness.edit.multi` call with no replacements, or more than
+    /// [`MULTI_MAX_EDITS`] (H2e).
+    #[error("{count} edits; one call makes 1 to {max}")]
+    EditCount {
+        /// The number given.
+        count: usize,
+        /// The most allowed.
+        max: usize,
+    },
+    /// Replacement `index` (1-based) of `total` failed (H2e): nothing was
+    /// written. `error` is what failed (empty or no-op `old`, no match,
+    /// several matches), checked against the file as the replacements
+    /// before it left it.
+    #[error("edit {index} of {total}: {error}")]
+    Item {
+        /// Which replacement, 1-based.
+        index: usize,
+        /// How many the call made.
+        total: usize,
+        /// Why it failed.
+        error: Box<EditError>,
+    },
 }
 
 impl EditError {
@@ -352,6 +488,10 @@ impl EditEngine {
             // the silent no-op it is.
             return Err(EditError::NoChange { sha256: before });
         }
+        // An edit that would leave a file the harness cannot read back is
+        // refused before anything is written (H2e: before, it was written
+        // and then failed its verification, which stops the run).
+        check_cap(&spliced)?;
         let expected = sha256(&spliced);
         atomic_write(&path, &spliced, Some(meta.permissions()))?;
         let mut applied = self.verify(&wp, Some(before), expected, line_count(&spliced))?;
@@ -359,29 +499,141 @@ impl EditEngine {
         Ok(applied)
     }
 
+    /// Several exact replacements in one file, all or none (H2e,
+    /// `harness.edit.multi`). The file is anchored on the run's reads like
+    /// every edit (§2.3); the replacements are applied in order to the text
+    /// in memory, and each `old` must be non-empty, differ from its `new`,
+    /// and match exactly once in the text as the replacements before it
+    /// left it. The first that fails is named ([`EditError::Item`]) and
+    /// nothing is written. Then the result is written once, atomically, and
+    /// verified, exactly as [`EditEngine::replace`] does; `lines` holds the
+    /// line of each match, in the text each replacement was matched in.
+    pub fn multi(&self, req: &MultiReq, reads: &ReadLog) -> Result<Applied, EditError> {
+        let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        let total = req.edits.len();
+        if total == 0 || total > MULTI_MAX_EDITS {
+            return Err(EditError::EditCount {
+                count: total,
+                max: MULTI_MAX_EDITS,
+            });
+        }
+        let item = |index: usize, error: EditError| EditError::Item {
+            index,
+            total,
+            error: Box::new(error),
+        };
+        for (i, e) in req.edits.iter().enumerate() {
+            if e.old.is_empty() {
+                return Err(item(i + 1, EditError::EmptyOld));
+            }
+            if e.old == e.new {
+                return Err(item(i + 1, EditError::NoOp));
+            }
+        }
+        let (path, meta) = resolve_path(&self.root, &wp)?;
+        let Some(meta) = meta else {
+            return Err(EditError::NotFound);
+        };
+        if !meta.is_file() {
+            return Err(EditError::NotAFile);
+        }
+        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        let before = sha256(&bytes);
+        reads.check(wp.as_str(), before)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
+        // Every replacement takes the file's dominant line endings, as the
+        // file was before the call.
+        let crlf = crlf_dominant(text);
+        let mut cur = text.to_owned();
+        let mut lines = Vec::with_capacity(total);
+        for (i, e) in req.edits.iter().enumerate() {
+            let offsets = find_offsets(&cur, &e.old);
+            if offsets.is_empty() {
+                return Err(item(i + 1, zero_matches(&cur, &e.old)));
+            }
+            if offsets.len() != 1 {
+                return Err(item(
+                    i + 1,
+                    EditError::MatchCount {
+                        expected: 1,
+                        found: offsets.len(),
+                        lines: offsets.iter().map(|&o| line_of(&cur, o)).collect(),
+                    },
+                ));
+            }
+            lines.extend(offsets.iter().map(|&o| line_of(&cur, o)));
+            let new = if crlf {
+                lf_to_crlf(&e.new)
+            } else {
+                e.new.clone()
+            };
+            // A match starts and ends on character boundaries, so the
+            // splice of UTF-8 into UTF-8 is UTF-8.
+            let spliced = splice(cur.as_bytes(), &offsets, e.old.len(), new.as_bytes());
+            cur = String::from_utf8(spliced).map_err(|_| EditError::NotUtf8)?;
+            if cur.len() as u64 > EDIT_MAX_BYTES {
+                return Err(item(
+                    i + 1,
+                    EditError::TooLarge {
+                        len: cur.len() as u64,
+                        cap: EDIT_MAX_BYTES,
+                    },
+                ));
+            }
+        }
+        let spliced = cur.into_bytes();
+        if spliced == bytes {
+            // The replacements undo each other.
+            return Err(EditError::NoChange { sha256: before });
+        }
+        let expected = sha256(&spliced);
+        atomic_write(&path, &spliced, Some(meta.permissions()))?;
+        let mut applied = self.verify(&wp, Some(before), expected, line_count(&spliced))?;
+        applied.lines = lines;
+        Ok(applied)
+    }
+
     /// Whole-file write (§4.8 `harness.edit.write`). A free path is
-    /// created (its parent must exist); an existing file is
+    /// created, with the directories it needs (H2f: [`create_parents`], at
+    /// most [`WRITE_MAX_NEW_DIRS`], no link followed); an existing file is
     /// overwritten, which requires a fresh read of at most
     /// [`WRITE_OVERWRITE_MAX_LINES`] lines.
     pub fn write(&self, req: &WriteReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
-        let (path, meta) = resolve_path(&self.root, &wp)?;
+        let mut made: Vec<String> = Vec::new();
+        let (path, meta) = match resolve_path(&self.root, &wp) {
+            Ok(x) => x,
+            // A directory on the way is missing (H2f): a new file makes
+            // it. The size is checked first, so nothing is created for a
+            // write that would be refused anyway.
+            Err(ResolveErr::NotFound) => {
+                check_cap(req.content.as_bytes())?;
+                made = create_parents(&self.root, &wp)?;
+                match resolve_path(&self.root, &wp) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        remove_dirs(&self.root, &made);
+                        return Err(e.into());
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
         match meta {
             // Create: nothing at the path, so nothing to be stale
             // about ("CREATING: must not exist", §4.8, holds by
             // construction).
             None => {
                 let content = req.content.as_bytes();
-                let len = u64::try_from(content.len()).unwrap_or(u64::MAX);
-                if len > EDIT_MAX_BYTES {
-                    return Err(EditError::TooLarge {
-                        len,
-                        cap: EDIT_MAX_BYTES,
-                    });
-                }
+                check_cap(content)?;
                 let expected = sha256(content);
-                atomic_write(&path, content, None)?;
-                self.verify(&wp, None, expected, line_count(content))
+                if let Err(e) = atomic_write(&path, content, None) {
+                    remove_dirs(&self.root, &made);
+                    return Err(e.into());
+                }
+                let mut applied = self.verify(&wp, None, expected, line_count(content))?;
+                applied.dirs = made;
+                Ok(applied)
             }
             Some(meta) => {
                 if !meta.is_file() {
@@ -437,6 +689,7 @@ impl EditEngine {
                 after,
                 lines: Vec::new(),
                 lines_after,
+                dirs: Vec::new(),
             })
             .map_err(|e| EditError::Unverified(Box::new(e)))
     }
@@ -470,6 +723,70 @@ impl EditEngine {
     }
 }
 
+/// Most directories one `harness.edit.write` may create for a new file (H2f).
+pub const WRITE_MAX_NEW_DIRS: usize = 8;
+
+/// Create the directories a new file's path needs (H2f), one at a time and
+/// never through a link: each existing component is looked at without being
+/// followed and must be a real directory (a symlink is refused, as
+/// everywhere), each missing one is made with a single `mkdir` and looked at
+/// again, so a link planted in its place is refused too. At most
+/// [`WRITE_MAX_NEW_DIRS`]. Returns the paths made, relative to the
+/// workspace root, shallowest first; when it fails, what it made is removed
+/// again. The path was checked lexically ([`WorkspacePath`]: no `..`, no
+/// absolute path, no empty component), so the walk stays below `root`.
+fn create_parents(root: &Path, wp: &WorkspacePath) -> Result<Vec<String>, EditError> {
+    let comps: Vec<&str> = wp.components().collect();
+    let parents = comps.len().saturating_sub(1);
+    let mut made: Vec<String> = Vec::new();
+    let mut cur = root.to_path_buf();
+    let fail = |made: &[String], e: EditError| {
+        remove_dirs(root, made);
+        Err(e)
+    };
+    for (i, c) in comps.iter().take(parents).enumerate() {
+        cur.push(c);
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return fail(&made, EditError::Symlink),
+            Ok(m) if m.is_dir() => continue,
+            Ok(_) => return fail(&made, EditError::NotADirectory),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return fail(&made, EditError::Io(e)),
+        }
+        if made.len() >= WRITE_MAX_NEW_DIRS {
+            return fail(&made, EditError::TooManyDirs);
+        }
+        match fs::create_dir(&cur) {
+            Ok(()) => made.push(
+                comps
+                    .iter()
+                    .take(i + 1)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ),
+            Err(e) => return fail(&made, EditError::Io(e)),
+        }
+        // What is there now must be the directory just made.
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Ok(m) if m.file_type().is_symlink() => return fail(&made, EditError::Symlink),
+            Ok(_) => return fail(&made, EditError::NotADirectory),
+            Err(e) => return fail(&made, EditError::Io(e)),
+        }
+    }
+    Ok(made)
+}
+
+/// Remove directories [`create_parents`] made, deepest first. Best effort:
+/// `remove_dir` removes an empty directory only, so it never removes
+/// anything the edit did not make.
+fn remove_dirs(root: &Path, made: &[String]) {
+    for rel in made.iter().rev() {
+        let _ = fs::remove_dir(root.join(rel));
+    }
+}
+
 /// How many lines `bytes` has, as `str::lines` counts them (a final line
 /// without a newline counts; a trailing newline adds none).
 fn line_count(bytes: &[u8]) -> usize {
@@ -479,6 +796,19 @@ fn line_count(bytes: &[u8]) -> usize {
         Some(b'\n') => nl,
         Some(_) => nl + 1,
     }
+}
+
+/// Refuse content over the edit cap before it is written: the re-read of
+/// the verification could not read it back.
+fn check_cap(content: &[u8]) -> Result<(), EditError> {
+    let len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    if len > EDIT_MAX_BYTES {
+        return Err(EditError::TooLarge {
+            len,
+            cap: EDIT_MAX_BYTES,
+        });
+    }
+    Ok(())
 }
 
 /// Read at most `cap` bytes of `path` (`len` its metadata size, so an
@@ -512,7 +842,17 @@ fn zero_matches(text: &str, old: &str) -> EditError {
         .collect();
     nearest.truncate(NEAREST_MAX);
     let crlf_hint = text.contains("\r\n") && old.contains('\n') && !old.contains("\r\n");
-    EditError::ZeroMatches { nearest, crlf_hint }
+    // Only when line endings are not the explanation.
+    let partial = if nearest.is_empty() {
+        partial_match(&norm, &normalize_lf(old))
+    } else {
+        None
+    };
+    EditError::ZeroMatches {
+        nearest,
+        crlf_hint,
+        partial,
+    }
 }
 
 /// Byte offsets of the non-overlapping occurrences of `needle` in
@@ -652,6 +992,8 @@ fn atomic_write(target: &Path, bytes: &[u8], perms: Option<fs::Permissions>) -> 
 pub const REPLACE: &str = "harness.edit.replace";
 /// `harness.edit.write`.
 pub const WRITE: &str = "harness.edit.write";
+/// `harness.edit.multi` (H2e).
+pub const MULTI: &str = "harness.edit.multi";
 
 /// The built-in edit tools, `harness.edit.replace` and `harness.edit.write`
 /// (§4.8, §4.9), as a [`ToolProvider`] over one workspace: every call is a
@@ -738,6 +1080,60 @@ impl EditTools {
         }
     }
 
+    fn multi(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
+        let bad = || {
+            (
+                err(
+                    code::BAD_ARGS,
+                    "path must be a string and edits a list of {old, new} strings",
+                ),
+                None,
+            )
+        };
+        let (Some(path), Some(list)) = (
+            args.get("path").and_then(Value::as_str),
+            args.get("edits").and_then(Value::as_array),
+        ) else {
+            return bad();
+        };
+        let mut edits = Vec::with_capacity(list.len());
+        for e in list {
+            let (Some(old), Some(new)) = (
+                e.get("old").and_then(Value::as_str),
+                e.get("new").and_then(Value::as_str),
+            ) else {
+                return bad();
+            };
+            edits.push(Replacement {
+                old: old.to_owned(),
+                new: new.to_owned(),
+            });
+        }
+        let req = MultiReq {
+            path: path.to_owned(),
+            edits,
+        };
+        match self.engine.multi(&req, reads) {
+            Ok(a) => {
+                let at: Vec<String> = a.lines.iter().map(usize::to_string).collect();
+                let text = format!(
+                    "edited {}: applied {} edit{} in order, at line{} {} (each line as the edits before it left the file); the file now has {} line{}; sha256 {} (was {})\n",
+                    a.path.as_str(),
+                    a.lines.len(),
+                    if a.lines.len() == 1 { "" } else { "s" },
+                    if a.lines.len() == 1 { "" } else { "s" },
+                    at.join(", "),
+                    a.lines_after,
+                    if a.lines_after == 1 { "" } else { "s" },
+                    a.after,
+                    a.before.map_or_else(|| "absent".to_owned(), |d| d.to_string()),
+                );
+                (ok(text), Some(record(&a)))
+            }
+            Err(e) => (edit_err(&e), None),
+        }
+    }
+
     fn write(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
         let (Some(path), Some(content)) = (
             args.get("path").and_then(Value::as_str),
@@ -756,11 +1152,20 @@ impl EditTools {
             Ok(a) => {
                 let text = match a.before {
                     None => format!(
-                        "created {}: {} line{}; sha256 {}\n",
+                        "created {}: {} line{}; sha256 {}{}\n",
                         a.path.as_str(),
                         a.lines_after,
                         if a.lines_after == 1 { "" } else { "s" },
-                        a.after
+                        a.after,
+                        if a.dirs.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; created director{} {}",
+                                if a.dirs.len() == 1 { "y" } else { "ies" },
+                                a.dirs.join(", ")
+                            )
+                        }
                     ),
                     Some(before) => format!(
                         "rewrote {}: {} line{}; sha256 {} (was {})\n",
@@ -796,21 +1201,34 @@ fn edit_err(e: &EditError) -> Out {
             .join(", ")
     };
     match e {
-        EditError::PathRefused(p) => err(code::PATH_REFUSED, &format!("the path is refused: {p}")),
-        EditError::BadCount => err(code::BAD_ARGS, "count must be at least 1"),
-        EditError::EmptyOld => err(code::BAD_ARGS, "old is empty"),
-        EditError::NoOp => err(code::NO_OP, "the edit would not change the file"),
+        EditError::PathRefused(p) => err(
+            code::PATH_REFUSED,
+            &format!("the path is refused: {p}; write it relative to the workspace root, like src/lib.rs"),
+        ),
+        EditError::BadCount => err(code::BAD_ARGS, "count must be at least 1; leave count out for one replacement"),
+        EditError::EmptyOld => err(code::BAD_ARGS, "old is empty; give the exact text to replace, copied from the file (to make a new file use harness.edit.write)"),
+        EditError::NoOp => err(code::NO_OP, "the edit would not change the file: old and new are the same text; change new, or submit if the file is already right"),
         EditError::NotFound => err(
             code::NOT_FOUND,
-            "no such file or directory (a new file's directory must already exist)",
+            "no such file or directory: find the path with harness.fs.glob or harness.fs.list, then repeat; to create a new file use harness.edit.write",
         ),
         EditError::Symlink => err(
             code::SYMLINK,
-            "a path component is a symlink; symlinks are never followed",
+            "a path component is a symlink; symlinks are never followed: use the real path, or leave that file alone and say so in the submit note",
         ),
-        EditError::NotAFile => err(code::NOT_A_FILE, "not a regular file"),
-        EditError::NotUtf8 => err(code::NOT_TEXT, "not UTF-8 text"),
-        EditError::TooLarge { .. } => err(code::TOO_LARGE, "the file is larger than the edit cap"),
+        EditError::NotADirectory => err(
+            code::NOT_A_FILE,
+            "a component of the path is a file, not a directory: nothing was created; choose a path whose directories are directories",
+        ),
+        EditError::TooManyDirs => err(
+            code::BAD_ARGS,
+            &format!(
+                "the path needs more than {WRITE_MAX_NEW_DIRS} new directories; nothing was created: use a path with fewer new directories, or an existing directory"
+            ),
+        ),
+        EditError::NotAFile => err(code::NOT_A_FILE, "not a regular file: name a file, not a directory (harness.fs.list shows what a directory holds)"),
+        EditError::NotUtf8 => err(code::NOT_TEXT, "not UTF-8 text: this tool edits text files only; leave the file alone"),
+        EditError::TooLarge { .. } => err(code::TOO_LARGE, "the file is larger than the edit cap: this tool cannot edit it; leave it alone and say so in the submit note"),
         EditError::TooManyLines { lines, cap } => err(
             code::LINE_CAP,
             &format!(
@@ -818,12 +1236,16 @@ fn edit_err(e: &EditError) -> Out {
             ),
         ),
         EditError::Stale(StaleRead::NeverRead) => {
-            err(code::STALE_READ, "file not read in this run; read it first")
+            err(code::STALE_READ, "file not read in this run; read it first: call harness.fs.read on this path (a search does not count as a read), then repeat this call")
         }
         EditError::Stale(StaleRead::Changed) => {
-            err(code::STALE_READ, "file changed since read; re-read first")
+            err(code::STALE_READ, "file changed since read; re-read first: call harness.fs.read on this path, then copy old from the fresh text and repeat this call")
         }
-        EditError::ZeroMatches { nearest, crlf_hint } => {
+        EditError::ZeroMatches {
+            nearest,
+            crlf_hint,
+            partial,
+        } => {
             let mut m = String::from(
                 "old was not found in the file; it must match exactly, whitespace and line endings included",
             );
@@ -835,6 +1257,26 @@ fn edit_err(e: &EditError) -> Out {
             }
             if *crlf_hint {
                 m.push_str("; the file uses CRLF line endings and old uses LF");
+            }
+            // Numbers only: where old stops matching, never its text.
+            if let Some(p) = partial {
+                let next = p.matched + 1;
+                if p.file_ended {
+                    m.push_str(&format!(
+                        "; old's first {} line(s) match the file from line {}, and the file ends before old's line {next}",
+                        p.matched, p.at
+                    ));
+                } else {
+                    m.push_str(&format!(
+                        "; old's first {} line(s) match the file from line {}, and old's line {next} differs from the file's line {}: read the file there and copy old from it",
+                        p.matched,
+                        p.at,
+                        p.at + p.matched
+                    ));
+                }
+            }
+            if partial.is_none() {
+                m.push_str("; read the file with harness.fs.read at the place you mean and copy old from that text");
             }
             err(code::NO_MATCH, &m)
         }
@@ -851,17 +1293,43 @@ fn edit_err(e: &EditError) -> Out {
         ),
         EditError::NoChange { .. } => err(
             code::NO_OP,
-            "the edit would not change the file (after its line endings were converted)",
+            "the edit would not change the file (after its line endings were converted): the file already holds this text; submit if that is what the task asks",
         ),
         EditError::Verify { .. } => err(
             code::UNVERIFIED,
-            "the edit was written but the file does not hold the expected content",
+            "the edit was written but the file does not hold the expected content: read the file with harness.fs.read to see what it holds now before any other edit",
         ),
-        EditError::Io(_) => err(code::IO, "the file system refused the operation"),
+        EditError::Io(_) => err(code::IO, "the file system refused the operation: check the path with harness.fs.list; if it keeps failing, leave the file and say so in the submit note"),
         EditError::Unverified(_) => err(
             code::UNVERIFIED,
-            "the edit was written but could not be verified; the file may have changed",
+            "the edit was written but could not be verified; the file may have changed: read the file with harness.fs.read to see what it holds now before any other edit",
         ),
+        EditError::EditCount { count, max } => err(
+            code::BAD_ARGS,
+            &format!("edits has {count} item(s); one call makes 1 to {max} edits: split the edits into calls of at most {max}"),
+        ),
+        // The failing replacement's own error, named, with its code (H2e).
+        EditError::Item {
+            index,
+            total,
+            error,
+        } => {
+            let inner = edit_err(error);
+            let msg = inner.text.strip_prefix("error: ").unwrap_or(&inner.text);
+            let code = match inner.status {
+                crate::provider::ToolStatus::Error { code } => code,
+                _ => code::BAD_ARGS,
+            };
+            let when = if *index > 1 {
+                " (checked against the file as the edits before it left it)"
+            } else {
+                ""
+            };
+            err(
+                code,
+                &format!("edit {index} of {total}{when}: {msg}; nothing was written"),
+            )
+        }
     }
 }
 
@@ -871,7 +1339,7 @@ impl ToolProvider for EditTools {
     }
 
     fn serves(&self, capability: &str) -> bool {
-        matches!(capability, REPLACE | WRITE)
+        matches!(capability, REPLACE | WRITE | MULTI)
     }
 
     fn invoke(
@@ -887,10 +1355,10 @@ impl ToolProvider for EditTools {
         if Instant::now() >= ctx.deadline {
             return Ok(refused(cap, RefusalKind::DeadlinePassed));
         }
-        let (out, edit) = if cap == REPLACE {
-            self.replace(&c.args, ctx.reads)
-        } else {
-            self.write(&c.args, ctx.reads)
+        let (out, edit) = match cap {
+            REPLACE => self.replace(&c.args, ctx.reads),
+            MULTI => self.multi(&c.args, ctx.reads),
+            _ => self.write(&c.args, ctx.reads),
         };
         let mut res = finish(cap, out);
         res.edit = edit;
@@ -951,7 +1419,9 @@ mod tests {
     fn zero_matches_names_nearest_lines_after_normalisation() {
         let text = "one\r\ntwo\r\nthree\r\n";
         match zero_matches(text, "two\nthree") {
-            EditError::ZeroMatches { nearest, crlf_hint } => {
+            EditError::ZeroMatches {
+                nearest, crlf_hint, ..
+            } => {
                 assert_eq!(nearest, vec![2]);
                 assert!(crlf_hint);
             }
@@ -959,7 +1429,9 @@ mod tests {
         }
         // Normalising `old` (CRLF) lets it match an LF file, line 3.
         match zero_matches("a\nb\nc\n", "b\r\nc") {
-            EditError::ZeroMatches { nearest, crlf_hint } => {
+            EditError::ZeroMatches {
+                nearest, crlf_hint, ..
+            } => {
                 assert_eq!(nearest, vec![2]);
                 assert!(!crlf_hint);
             }
@@ -967,12 +1439,72 @@ mod tests {
         }
         // Nothing close: no nearest lines, no hint.
         match zero_matches(text, "four") {
-            EditError::ZeroMatches { nearest, crlf_hint } => {
+            EditError::ZeroMatches {
+                nearest, crlf_hint, ..
+            } => {
                 assert!(nearest.is_empty());
                 assert!(!crlf_hint);
             }
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    // H2e: where a multi-line `old` stops matching, in line numbers.
+    #[test]
+    fn h2e_zero_matches_say_where_a_multi_line_old_stops_matching() {
+        let partial = |text: &str, old: &str| match zero_matches(text, old) {
+            EditError::ZeroMatches { partial, .. } => partial,
+            other => panic!("wrong error: {other:?}"),
+        };
+        // The local model's edit: one doc-comment line missing in the middle.
+        let units = "//! Units.\n\n/// cm per foot.\npub const CM_PER_FOOT: f64 = 30.48;\n\n/// cm to ft.\npub fn cm_to_ft(cm: f64) -> f64 {\n    cm / 3.048\n}\n\n/// ft to cm.\npub fn ft_to_cm(ft: f64) -> f64 {\n    ft * CM_PER_FOOT\n}\n";
+        let old = "pub fn cm_to_ft(cm: f64) -> f64 {\n    cm / 3.048\n}\n\npub fn ft_to_cm(ft: f64) -> f64 {";
+        assert_eq!(
+            partial(units, old),
+            Some(PartialMatch {
+                at: 7,
+                matched: 4,
+                file_ended: false
+            })
+        );
+        // `old` may start and end inside a line; the longest run wins, and
+        // the earliest of equal runs.
+        assert_eq!(
+            partial("x = 1;\ny = 2;\nx = 1;\ny = 2;\nz = 3;\n", "1;\ny = 2;\nq"),
+            Some(PartialMatch {
+                at: 1,
+                matched: 2,
+                file_ended: false
+            })
+        );
+        assert_eq!(
+            partial("a\nb\nc\nb\nc\nd\n", "b\nc\nd\ne"),
+            Some(PartialMatch {
+                at: 4,
+                matched: 3,
+                file_ended: true
+            })
+        );
+        // Past the file's end (a final newline starts no line).
+        assert_eq!(
+            partial("a\nb\n", "a\nb\nc"),
+            Some(PartialMatch {
+                at: 1,
+                matched: 2,
+                file_ended: true
+            })
+        );
+        // One line, a first line found nowhere, or a line-ending cause: none.
+        assert_eq!(partial(units, "cm / 3.049"), None);
+        assert_eq!(partial(units, "nowhere\n    cm / 3.048"), None);
+        assert_eq!(partial("one\r\ntwo\r\nthree\r\n", "two\nthree"), None);
+        // The message gives numbers and harness words, never old's text.
+        let t = edit_err(&zero_matches(units, old)).text;
+        assert!(
+            t.contains("old's first 4 line(s) match the file from line 7, and old's line 5 differs from the file's line 11: read the file there and copy old from it"),
+            "{t}"
+        );
+        assert!(!t.contains("ft_to_cm") && !t.contains("3.048"), "{t}");
     }
 
     #[test]

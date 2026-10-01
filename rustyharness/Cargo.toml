@@ -19,6 +19,17 @@ thiserror = "2.0.0"
 # The ONE SHA-256 implementation (design §1.2, §1.4): RustCrypto, pure Rust,
 # default features off (no alloc/oid; never the `asm` path).
 sha2 = { version = "0.11.0", default-features = false }
+# The regex engine of `harness.fs.search` (design §4.8; row H2e): the
+# rust-lang crate, whose matching is linear in pattern × input (finite
+# automata, no backtracking over the input), so a model-supplied pattern
+# cannot make a search run away. Pure Rust, no build script, no C, MIT OR
+# Apache-2.0. `perf-literal` is left out, so aho-corasick and memchr are not
+# pulled in: the tree adds exactly regex, regex-automata and regex-syntax.
+regex = { version = "1.12", default-features = false, features = ["std", "unicode", "perf-cache", "perf-dfa", "perf-onepass", "perf-backtrack", "perf-inline"] }
+# The regex crate's parser, used directly for its TYPED errors: a bad
+# pattern is reported to the model as a static harness message chosen by
+# the error's kind, never as the parser's text (which quotes the pattern).
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

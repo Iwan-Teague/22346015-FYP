@@ -12,10 +12,13 @@
 //!   meaningless, and so is `parallel_tool_calls_false_ok: true`.
 //!
 //! **Optional fields within version 1.** `parallel_tool_calls_false_ok`
-//! (design row H1h) and `stream_include_usage_ok` (row H1i) are optional
-//! and off by default, like `kv_quant_note`: every profile written before
-//! them still parses, and still has the same content digest (each joins the
-//! digest only when it is on), so its `profile check` stamp stays valid. An
+//! (design row H1h), `stream_include_usage_ok` (row H1i) and
+//! `max_read_lines` (row H2e: the read window, 10 to 2000 lines, bounded by
+//! the context budget) and `read_timeout_secs` (row H2f: the model read
+//! timeout, 5 to 600 s) are optional and off by default, like
+//! `kv_quant_note`: every profile written before them still parses, and
+//! still has the same content digest (each joins the digest only when it is
+//! on), so its `profile check` stamp stays valid. An
 //! older harness refuses a profile that sets one (unknown fields are
 //! refused), so no build silently ignores it.
 //!
@@ -111,6 +114,10 @@ struct ProfileWire {
     parallel_tool_calls_false_ok: bool,
     #[serde(default)]
     stream_include_usage_ok: bool,
+    #[serde(default)]
+    max_read_lines: Option<u64>,
+    #[serde(default)]
+    read_timeout_secs: Option<u64>,
     grammar: Grammar,
     max_active_tools: u32,
     edit_format: EditFormat,
@@ -136,6 +143,8 @@ pub struct Profile {
     tool_choice_required_ok: bool,
     parallel_tool_calls_false_ok: bool,
     stream_include_usage_ok: bool,
+    max_read_lines: Option<u64>,
+    read_timeout_secs: Option<u64>,
     max_active_tools: u32,
     edit_format: EditFormat,
     recent_turns: u32,
@@ -143,6 +152,50 @@ pub struct Profile {
     kv_quant_note: Option<String>,
     validated: Option<Stamp>,
     sha256: Option<Digest>,
+}
+
+/// The shortest model read timeout a profile may set, in seconds (H2f).
+pub const READ_TIMEOUT_MIN_SECS: u64 = 5;
+/// The longest, in seconds (H2f): the run drives a model call to at most its
+/// own call deadline (300 s by default), whatever this says.
+pub const READ_TIMEOUT_MAX_SECS: u64 = 600;
+/// The read window a profile sets when it does not say (§4.8): 100 lines.
+pub const READ_WINDOW_DEFAULT_LINES: u64 = 100;
+/// The narrowest window a profile may set, in lines (H2e).
+pub const READ_WINDOW_MIN_LINES: u64 = 10;
+/// The widest window a profile may set, in lines (H2e): the built-in
+/// manifest's hard maximum for `harness.fs.read`'s `lines`.
+pub const READ_WINDOW_MAX_LINES: u64 = 2000;
+/// Bytes a window allows per line of it (H2e). A window of N lines holds at
+/// most `max(16 KiB, N × 64)` bytes, and never more than 64 KiB, the tool
+/// result cap: a read of longer lines stops at a line boundary before the
+/// bytes run out and says where to continue.
+pub const READ_WINDOW_BYTES_PER_LINE: u64 = 64;
+/// The fewest bytes a window allows (the default window's).
+pub const READ_WINDOW_MIN_BYTES: u64 = 16 * 1024;
+/// The most bytes a window allows (the tool result cap).
+pub const READ_WINDOW_MAX_BYTES: u64 = 64 * 1024;
+
+/// A run's read window (H2e): the most lines one `harness.fs.read` returns,
+/// and the most bytes of its result. It also sets the context's
+/// per-observation cap, so a read is never cut in the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadWindow {
+    /// Most lines per read.
+    pub lines: u64,
+    /// Most bytes of a read's result.
+    pub bytes: u64,
+}
+
+impl ReadWindow {
+    /// The window of `lines` lines (clamped to the allowed range).
+    pub fn of_lines(lines: u64) -> Self {
+        let lines = lines.clamp(READ_WINDOW_MIN_LINES, READ_WINDOW_MAX_LINES);
+        let bytes = lines
+            .saturating_mul(READ_WINDOW_BYTES_PER_LINE)
+            .clamp(READ_WINDOW_MIN_BYTES, READ_WINDOW_MAX_BYTES);
+        Self { lines, bytes }
+    }
 }
 
 /// Why a profile was refused.
@@ -154,6 +207,18 @@ pub enum ProfileError {
     /// A field out of range or outside its grammar.
     #[error("profile field {0} is out of range or malformed")]
     Field(&'static str),
+    /// `max_read_lines` asks for a window the context budget cannot hold
+    /// (H2e): a window's lines at 64 bytes each must fit in half the
+    /// budget.
+    #[error("profile field max_read_lines: {lines} lines need about {needs} tokens, more than half of the context budget of {budget} tokens")]
+    ReadWindow {
+        /// The lines asked for.
+        lines: u64,
+        /// Their estimate, in tokens.
+        needs: u64,
+        /// The context budget (`context_window × fill_ratio`), in tokens.
+        budget: u64,
+    },
     /// A field this build cannot honour.
     #[error("profile field {field}: {why}")]
     NotInThisBuild {
@@ -182,6 +247,22 @@ impl Profile {
     /// Parse and validate a profile file's bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self, ProfileError> {
         let v = strict_json::parse(bytes).map_err(|e| ProfileError::Shape(e.to_string()))?;
+        // An explicit null is not "absent" (H2e: the read window is a
+        // number when it is there at all).
+        if v.get("max_read_lines")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            return Err(ProfileError::Shape(
+                "max_read_lines is null; leave it out for the default window".into(),
+            ));
+        }
+        if v.get("read_timeout_secs")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            return Err(ProfileError::Shape(
+                "read_timeout_secs is null; leave it out for the default timeout".into(),
+            ));
+        }
         let w: ProfileWire =
             serde_json::from_value(v).map_err(|e| ProfileError::Shape(e.to_string()))?;
         let f = ProfileError::Field;
@@ -247,6 +328,30 @@ impl Profile {
         if w.parallel_tool_calls_false_ok && w.protocol == Protocol::Text {
             return Err(f("parallel_tool_calls_false_ok"));
         }
+        if let Some(t) = w.read_timeout_secs {
+            if !(READ_TIMEOUT_MIN_SECS..=READ_TIMEOUT_MAX_SECS).contains(&t) {
+                return Err(f("read_timeout_secs"));
+            }
+        }
+        if let Some(lines) = w.max_read_lines {
+            if !(READ_WINDOW_MIN_LINES..=READ_WINDOW_MAX_LINES).contains(&lines) {
+                return Err(f("max_read_lines"));
+            }
+            // Bounded by the context budget (H2e): the window's lines, at 64
+            // bytes each and 3 bytes to a token (the estimate of §2.3), must
+            // fit in half of it, beside the rules, the task and the turns.
+            // context_window ≤ 4 Mi and 0 < fill_ratio ≤ 1 (checked above).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let budget = (w.context_window as f64 * w.fill_ratio).floor() as u64;
+            let needs = lines.saturating_mul(READ_WINDOW_BYTES_PER_LINE).div_ceil(3);
+            if needs.saturating_mul(2) > budget {
+                return Err(ProfileError::ReadWindow {
+                    lines,
+                    needs,
+                    budget,
+                });
+            }
+        }
         Ok(Self {
             id: w.id,
             model: w.model,
@@ -256,6 +361,8 @@ impl Profile {
             tool_choice_required_ok: w.tool_choice_required_ok,
             parallel_tool_calls_false_ok: w.parallel_tool_calls_false_ok,
             stream_include_usage_ok: w.stream_include_usage_ok,
+            max_read_lines: w.max_read_lines,
+            read_timeout_secs: w.read_timeout_secs,
             max_active_tools: w.max_active_tools,
             edit_format: w.edit_format,
             recent_turns: w.recent_turns,
@@ -278,6 +385,8 @@ impl Profile {
             tool_choice_required_ok: false,
             parallel_tool_calls_false_ok: false,
             stream_include_usage_ok: false,
+            max_read_lines: None,
+            read_timeout_secs: None,
             max_active_tools: 5,
             edit_format: EditFormat::Replace,
             recent_turns: 4,
@@ -333,6 +442,17 @@ impl Profile {
     /// request. Z.ai accepts it (measured 2026-09-28) and sends usage anyway.
     pub fn stream_include_usage_ok(&self) -> bool {
         self.stream_include_usage_ok
+    }
+    /// The read window (H2e): the profile's `max_read_lines`, or 100 lines
+    /// when it does not set one, with the bytes that allows.
+    pub fn read_window(&self) -> ReadWindow {
+        ReadWindow::of_lines(self.max_read_lines.unwrap_or(READ_WINDOW_DEFAULT_LINES))
+    }
+    /// The model read timeout (H2f): the longest the harness waits for any
+    /// single read from the model server, when the profile sets one.
+    /// `None` keeps the client's default (60 s).
+    pub fn read_timeout(&self) -> Option<std::time::Duration> {
+        self.read_timeout_secs.map(std::time::Duration::from_secs)
     }
     /// Cap on the active tool set.
     pub fn max_active_tools(&self) -> u32 {
@@ -415,6 +535,15 @@ impl Profile {
                 "stream_include_usage_ok".into(),
                 serde_json::Value::Bool(true),
             );
+        }
+        // And for H2e's read window: only when set, so every profile
+        // without it keeps its digest and its stamp.
+        if let (Some(n), Some(o)) = (self.max_read_lines, v.as_object_mut()) {
+            o.insert("max_read_lines".into(), serde_json::Value::from(n));
+        }
+        // And for H2f's read timeout: only when set.
+        if let (Some(n), Some(o)) = (self.read_timeout_secs, v.as_object_mut()) {
+            o.insert("read_timeout_secs".into(), serde_json::Value::from(n));
         }
         sha256(v.to_string().as_bytes())
     }
@@ -729,6 +858,133 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    // H2f: the model read timeout. Optional, off by default (a profile
+    // without it keeps the digest pinned in the read-window test and its
+    // stamp); set, it is content. 5 to 600 seconds.
+    #[test]
+    fn read_timeout_secs_is_optional_bounded_and_content_when_set() {
+        let p = Profile::parse(GOOD.as_bytes()).unwrap();
+        assert_eq!(p.read_timeout(), None);
+        assert_eq!(Profile::conservative_default("m").read_timeout(), None);
+        let t = Profile::parse(with("read_timeout_secs", "240").as_bytes()).unwrap();
+        assert_eq!(t.read_timeout(), Some(std::time::Duration::from_secs(240)));
+        assert_ne!(t.content_sha256(), p.content_sha256());
+        assert_eq!(
+            Profile::parse(with("read_timeout_secs", "5").as_bytes())
+                .unwrap()
+                .read_timeout(),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert!(Profile::parse(with("read_timeout_secs", "600").as_bytes()).is_ok());
+        for v in ["4", "601", "0"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("read_timeout_secs", v).as_bytes()),
+                    Err(ProfileError::Field("read_timeout_secs"))
+                ),
+                "{v}"
+            );
+        }
+        for v in ["null", "\"60\"", "-1", "1.5"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("read_timeout_secs", v).as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{v}"
+            );
+        }
+    }
+
+    // H2e: the read window. Optional, off by default, and a profile without
+    // it keeps the digest pinned above (and its stamp); set, it is content.
+    // Its range is 10 to 2000 lines, and its lines at 64 bytes each must fit
+    // in half the context budget.
+    #[test]
+    fn max_read_lines_is_optional_and_bounded_by_the_context_budget() {
+        let p = Profile::parse(GOOD.as_bytes()).unwrap();
+        assert_eq!(
+            p.read_window(),
+            ReadWindow {
+                lines: 100,
+                bytes: 16 * 1024
+            }
+        );
+        assert_eq!(
+            p.content_sha256().to_string(),
+            "b8bf6a5e7b6c3f107548dc8cb096d84b2900f8e0846e474845521be5f8fcfb6f"
+        );
+        assert_eq!(
+            Profile::conservative_default("m").read_window(),
+            ReadWindow::of_lines(100)
+        );
+        // GOOD: 32768 × 0.6 = 19660 tokens; half is 9830, so at most
+        // 9830 × 3 / 64 = 460 lines.
+        let w = Profile::parse(with("max_read_lines", "400").as_bytes()).unwrap();
+        assert_eq!(
+            w.read_window(),
+            ReadWindow {
+                lines: 400,
+                bytes: 400 * 64
+            }
+        );
+        assert_ne!(w.content_sha256(), p.content_sha256());
+        let explicit = Profile::parse(with("max_read_lines", "100").as_bytes()).unwrap();
+        assert_ne!(
+            explicit.content_sha256(),
+            p.content_sha256(),
+            "set is content, even to the default"
+        );
+        assert_eq!(explicit.read_window(), p.read_window());
+        assert!(Profile::parse(with("max_read_lines", "460").as_bytes()).is_ok());
+        assert!(matches!(
+            Profile::parse(with("max_read_lines", "461").as_bytes()),
+            Err(ProfileError::ReadWindow {
+                lines: 461,
+                budget: 19660,
+                ..
+            })
+        ));
+        for v in ["9", "2001", "0"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("max_read_lines", v).as_bytes()),
+                    Err(ProfileError::Field("max_read_lines"))
+                ),
+                "{v}"
+            );
+        }
+        for v in ["null", "\"400\"", "-1", "1.5"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("max_read_lines", v).as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{v}"
+            );
+        }
+        // A big window on a big context: the bytes stop at the result cap.
+        let mut o: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&with("context_window", "131072")).unwrap();
+        o.insert("max_read_lines".into(), 2000.into());
+        let big = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes());
+        // 131072 × 0.6 = 78643 tokens; 2000 lines need 42667, over half.
+        assert!(matches!(big, Err(ProfileError::ReadWindow { .. })));
+        let mut o: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&with("context_window", "131072")).unwrap();
+        o.insert("max_read_lines".into(), 1800.into());
+        let big = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
+        assert_eq!(
+            big.read_window(),
+            ReadWindow {
+                lines: 1800,
+                bytes: 64 * 1024
+            }
+        );
+        assert_eq!(ReadWindow::of_lines(5).lines, READ_WINDOW_MIN_LINES);
+        assert_eq!(ReadWindow::of_lines(9999).lines, READ_WINDOW_MAX_LINES);
     }
 
     #[test]

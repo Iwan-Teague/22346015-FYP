@@ -24,12 +24,21 @@
 //! **Repair messages name the protocol's own form (design row H1h).** A
 //! native-protocol error is repaired in native terms: call exactly one tool
 //! through the function-calling interface, never write the call as text,
-//! one tool call per reply. The text protocol's messages are unchanged.
-//! Every message is static harness text: none echoes the model.
+//! one tool call per reply. H2e: the text protocol's messages for no
+//! action and for an unbalanced block show the block's form, and one
+//! `<action>` followed by a stray `</action>` is unbalanced, not several
+//! actions.
+//!
+//! **A malformed action is told its fault (H2e):** empty, one whole object
+//! then more text (an extra `}`?), ended before its object closed, a key
+//! repeated, or a syntax error, with the line and column the reader
+//! measured where there is one. Every message is harness text: static
+//! words and, at most, those two numbers. None echoes the model.
 
 use serde_json::{Map, Value};
 
-use harness_core::{strict_json, Meter, Source, StopCause, Untrusted};
+use harness_core::strict_json::{self, Fault};
+use harness_core::{Meter, Source, StopCause, Untrusted};
 
 use crate::profile::Protocol;
 use crate::wire::wire_name;
@@ -74,9 +83,10 @@ pub enum FormatError {
     /// Native tool calls in a text-protocol reply.
     #[error("tool calls in a text-protocol reply")]
     ToolCallsInTextMode,
-    /// The action JSON is malformed or repeats a key.
+    /// The action JSON is malformed or repeats a key; the fault says how
+    /// (H2e), so the repair message can name it.
     #[error("action JSON is malformed or repeats a key")]
-    BadJson,
+    BadJson(Fault),
     /// Not exactly `{"tool": string, "args": object}`.
     #[error("action is not {{\"tool\": ..., \"args\": {{...}}}}")]
     WrongShape,
@@ -91,7 +101,9 @@ pub enum FormatError {
 impl FormatError {
     /// The harness-authored repair message (§2.2 step 4) for a reply under
     /// `protocol`. It names the error and the protocol's own form; it is
-    /// static text and never echoes the model.
+    /// harness text and never echoes the model: static words, and for a
+    /// malformed action its fault, with at most a line and column the
+    /// harness measured (H2e).
     ///
     /// Native (H1h): the loop does not show a reply that was not exactly
     /// one well-formed call back to the model (see `context`), so these
@@ -102,21 +114,23 @@ impl FormatError {
     pub fn repair_message(&self, protocol: Protocol) -> HarnessText {
         HarnessText::from_static(match protocol {
             Protocol::Text => match self {
+                // H2e: the form itself, so a reply that named the tool as
+                // a tag (`<harness.task.submit>{...}`) is shown the block.
                 FormatError::NoAction => {
-                    "Format error: no action. Reply with exactly one action."
+                    "Format error: no action. Reply with exactly one action, written as \
+                     <action>{\"tool\": \"<tool id>\", \"args\": {...}}</action>."
                 }
                 FormatError::SeveralActions => {
-                    "Format error: more than one action. Reply with exactly one action."
+                    "Format error: more than one <action> block. Reply with exactly one action."
                 }
                 FormatError::Unbalanced => {
-                    "Format error: unbalanced <action> block. Reply with exactly one <action>{...}</action>."
+                    "Format error: unbalanced <action> block: each <action> needs exactly one </action> after it. \
+                     Reply with exactly one <action>{\"tool\": \"<tool id>\", \"args\": {...}}</action>."
                 }
                 FormatError::ToolCallsInTextMode => {
                     "Format error: use the <action> block, not native tool calls."
                 }
-                FormatError::BadJson => {
-                    "Format error: the action is not valid JSON (or repeats a key)."
-                }
+                FormatError::BadJson(f) => return bad_json_message(protocol, *f),
                 FormatError::WrongShape => {
                     "Format error: the action must be {\"tool\": \"<id>\", \"args\": {...}}."
                 }
@@ -138,10 +152,7 @@ impl FormatError {
                      Call exactly one tool through the function-calling interface; \
                      do not write the call as text."
                 }
-                FormatError::BadJson => {
-                    "Format error: the arguments of your last tool call are not valid JSON (or repeat a key), \
-                     so it did not run. Call the tool again with one JSON object of arguments."
-                }
+                FormatError::BadJson(f) => return bad_json_message(protocol, *f),
                 FormatError::WrongShape => {
                     "Format error: the arguments of your last tool call are not one JSON object, \
                      so it did not run. Call the tool again with one JSON object of arguments."
@@ -162,10 +173,69 @@ fn strict_object(text: &str) -> Result<Map<String, Value>, FormatError> {
     if text.len() > ACTION_MAX_BYTES {
         return Err(FormatError::TooLarge);
     }
-    match strict_json::parse(text.as_bytes()) {
+    match strict_json::parse_typed(text.as_bytes()) {
         Ok(Value::Object(o)) => Ok(o),
         Ok(_) => Err(FormatError::WrongShape),
-        Err(_) => Err(FormatError::BadJson),
+        Err(f) => Err(FormatError::BadJson(f)),
+    }
+}
+
+/// The repair message for a malformed action (H2e): its fault in static
+/// words and, for a fault at a place, the line and column the reader
+/// measured. "Not valid JSON (or repeats a key)" did not say what was
+/// wrong: on dev task x2 (text protocol) GLM sent an edit with one extra
+/// `}` three times in a row, and the third format error stopped a run
+/// that was nearly done.
+fn bad_json_message(protocol: Protocol, f: Fault) -> HarnessText {
+    match (protocol, f) {
+        (Protocol::Text, Fault::Empty) => HarnessText::from_static(
+            "Format error: the <action> block is empty. \
+             Reply with exactly one <action>{\"tool\": \"<id>\", \"args\": {...}}</action>.",
+        ),
+        (Protocol::Text, Fault::Trailing { line, column }) => HarnessText::rendered(format!(
+            "Format error: the action's JSON object is complete before line {line}, column {column}, \
+             and more text follows it inside the <action> block (an extra `}}` or `]`?). \
+             Reply with the action again, each `{{` and `[` closed exactly once."
+        )),
+        (Protocol::Text, Fault::Truncated) => HarnessText::from_static(
+            "Format error: the action's JSON ends before its object is closed \
+             (a missing `}`, `]` or `\"`?). \
+             Reply with the action again, each `{`, `[` and string closed.",
+        ),
+        (Protocol::Text, Fault::DuplicateKey) => HarnessText::from_static(
+            "Format error: the action's JSON repeats a key in one object. \
+             Reply with the action again, each key once.",
+        ),
+        (Protocol::Text, Fault::Syntax { line, column }) => HarnessText::rendered(format!(
+            "Format error: the action is not valid JSON \
+             (the reader stopped at line {line}, column {column}). \
+             Reply with the action again as strict JSON: keys and strings in double quotes, \
+             no trailing commas, no comments."
+        )),
+        (Protocol::Native, Fault::Empty) => HarnessText::from_static(
+            "Format error: the arguments of your last tool call are empty, so it did not run. \
+             Call the tool again with one JSON object of arguments ({} when it takes none).",
+        ),
+        (Protocol::Native, Fault::Trailing { line, column }) => HarnessText::rendered(format!(
+            "Format error: the arguments of your last tool call are one JSON object and then more text, \
+             from line {line}, column {column} (an extra `}}` or `]`?), so it did not run. \
+             Call the tool again with one JSON object of arguments, each `{{` and `[` closed exactly once."
+        )),
+        (Protocol::Native, Fault::Truncated) => HarnessText::from_static(
+            "Format error: the arguments of your last tool call end before their JSON object is closed \
+             (a missing `}`, `]` or `\"`?), so it did not run. \
+             Call the tool again with one complete JSON object of arguments.",
+        ),
+        (Protocol::Native, Fault::DuplicateKey) => HarnessText::from_static(
+            "Format error: the arguments of your last tool call repeat a key, so it did not run. \
+             Call the tool again with each key once.",
+        ),
+        (Protocol::Native, Fault::Syntax { line, column }) => HarnessText::rendered(format!(
+            "Format error: the arguments of your last tool call are not valid JSON \
+             (the reader stopped at line {line}, column {column}), so it did not run. \
+             Call the tool again with one JSON object of arguments: \
+             keys and strings in double quotes, no trailing commas."
+        )),
     }
 }
 
@@ -183,8 +253,14 @@ pub fn parse_reply(
             }
             let opens = content.matches(OPEN).count();
             let closes = content.matches(CLOSE).count();
-            if opens > 1 || closes > 1 {
+            if opens > 1 {
                 return Err(FormatError::SeveralActions);
+            }
+            // One `<action>` and a stray `</action>` is one action badly
+            // closed, not several (H2e: a local model's `...</action>\n</action>`
+            // was told "more than one action" seven times and repeated it).
+            if closes > 1 {
+                return Err(FormatError::Unbalanced);
             }
             if opens == 0 && closes == 0 {
                 return Err(FormatError::NoAction);
@@ -399,10 +475,19 @@ mod tests {
                 FormatError::Unbalanced,
             ),
             ("</action> x <action>", FormatError::Unbalanced),
-            ("<action>{broken</action>", FormatError::BadJson),
+            // H2e: one action and a stray close tag is unbalanced, not two.
+            (
+                "<action>{\"tool\":\"harness.fs.read\",\"args\":{}}</action>\n</action>",
+                FormatError::Unbalanced,
+            ),
+            ("</action></action>", FormatError::Unbalanced),
+            (
+                "<action>{broken</action>",
+                FormatError::BadJson(Fault::Syntax { line: 1, column: 2 }),
+            ),
             (
                 r#"<action>{"tool":"harness.fs.read","tool":"harness.exec.run","args":{}}</action>"#,
-                FormatError::BadJson,
+                FormatError::BadJson(Fault::DuplicateKey),
             ),
             (
                 r#"<action>{"tool":"harness.fs.read","args":{},"why":"x"}</action>"#,
@@ -452,9 +537,13 @@ mod tests {
         for (name, args, want) in [
             ("harness.fs.read", "{}", FormatError::UnknownTool),
             ("harness_exec_run", "{}", FormatError::UnknownTool),
-            ("harness_fs_read", "{\"a\":1,\"a\":2}", FormatError::BadJson),
+            (
+                "harness_fs_read",
+                "{\"a\":1,\"a\":2}",
+                FormatError::BadJson(Fault::DuplicateKey),
+            ),
             ("harness_fs_read", "[1]", FormatError::WrongShape),
-            ("harness_fs_read", "", FormatError::BadJson),
+            ("harness_fs_read", "", FormatError::BadJson(Fault::Empty)),
         ] {
             assert_eq!(
                 parse_reply(&reply("", &[(name, args)]), Protocol::Native, &tools()).unwrap_err(),
@@ -498,12 +587,19 @@ mod tests {
         assert_eq!(account(&mut m, &bad), Err(StopCause::FormatErrors));
     }
 
-    const ALL: [FormatError; 8] = [
+    const ALL: [FormatError; 12] = [
         FormatError::NoAction,
         FormatError::SeveralActions,
         FormatError::Unbalanced,
         FormatError::ToolCallsInTextMode,
-        FormatError::BadJson,
+        FormatError::BadJson(Fault::Empty),
+        FormatError::BadJson(Fault::Trailing {
+            line: 1,
+            column: 28,
+        }),
+        FormatError::BadJson(Fault::Truncated),
+        FormatError::BadJson(Fault::DuplicateKey),
+        FormatError::BadJson(Fault::Syntax { line: 3, column: 7 }),
         FormatError::WrongShape,
         FormatError::UnknownTool,
         FormatError::TooLarge,
@@ -515,15 +611,100 @@ mod tests {
             for e in ALL {
                 let m = e.repair_message(p);
                 assert!(m.as_str().starts_with("Format error:"));
-                // Static text (`from_static`): the same for every reply, so
-                // nothing the model wrote can be in it.
+                // Built from the error alone (static words, and a fault's
+                // line and column): the same for every reply with that
+                // error, so nothing the model wrote can be in it.
                 assert_eq!(m, e.repair_message(p));
             }
         }
     }
 
-    // H1h: a native error is repaired in native terms; the text protocol's
-    // messages are exactly what they were.
+    // H2e: a malformed action is told its fault, in harness words with at
+    // most the line and column the reader measured, never its own text.
+    #[test]
+    fn h2e_a_malformed_action_is_told_its_fault_and_never_quoted() {
+        let text = |c: &str| {
+            let e = parse_reply(&reply(c, &[]), Protocol::Text, &tools()).unwrap_err();
+            (e, e.repair_message(Protocol::Text).as_str().to_owned())
+        };
+        // The dev-suite reply (x2, GLM, text protocol): one `}` too many.
+        let extra = r#"Retrying. <action>{"tool":"harness.fs.read","args":{"path":"src/units.rs","start":1}}}</action>"#;
+        let (e, m) = text(extra);
+        assert_eq!(
+            e,
+            FormatError::BadJson(Fault::Trailing {
+                line: 1,
+                column: 68
+            })
+        );
+        assert!(m.contains("complete before line 1, column 68"), "{m}");
+        assert!(m.contains("an extra `}` or `]`?"), "{m}");
+        let (e, m) =
+            text(r#"<action>{"tool":"harness.fs.read","args":{"path":"units.rs"}</action>"#);
+        assert_eq!(e, FormatError::BadJson(Fault::Truncated));
+        assert!(m.contains("ends before its object is closed"), "{m}");
+        let (e, m) =
+            text("<action>\n{\"tool\": \"harness.fs.read\",\n \"args\": {'path': 1}}</action>");
+        assert_eq!(
+            e,
+            FormatError::BadJson(Fault::Syntax {
+                line: 2,
+                column: 11
+            })
+        );
+        assert!(m.contains("stopped at line 2, column 11"), "{m}");
+        let (e, m) = text("<action>  </action>");
+        assert_eq!(e, FormatError::BadJson(Fault::Empty));
+        assert!(m.contains("block is empty"), "{m}");
+        let native = |args: &str| {
+            let e = parse_reply(
+                &reply("", &[("harness_fs_read", args)]),
+                Protocol::Native,
+                &tools(),
+            )
+            .unwrap_err();
+            (e, e.repair_message(Protocol::Native).as_str().to_owned())
+        };
+        let (e, m) = native(r#"{"path":"units.rs"}}"#);
+        assert_eq!(
+            e,
+            FormatError::BadJson(Fault::Trailing {
+                line: 1,
+                column: 20
+            })
+        );
+        assert!(
+            m.contains("one JSON object and then more text, from line 1, column 20"),
+            "{m}"
+        );
+        assert!(!m.contains("<action>") && !m.contains("\"args\""), "{m}");
+        let (e, m) = native(r#"{"path":"units.rs","path":"b"}"#);
+        assert_eq!(e, FormatError::BadJson(Fault::DuplicateKey));
+        assert!(m.contains("repeat a key"), "{m}");
+        // Nothing the model wrote reaches a message: every fault, both
+        // protocols, from replies full of marker text.
+        for (p, m) in [
+            (Protocol::Text, text(extra).1),
+            (
+                Protocol::Text,
+                text(r#"<action>{"tool":"harness.fs.read","args":{"path":"units.rs"}</action>"#).1,
+            ),
+            (Protocol::Native, native(r#"{"path":"units.rs"}}"#).1),
+            (
+                Protocol::Native,
+                native(r#"{"path":"units.rs","path":"b"}"#).1,
+            ),
+            (Protocol::Native, native(r#"{"path":units.rs}"#).1),
+        ] {
+            for marker in ["units.rs", "Retrying", "harness.fs.read\""] {
+                assert!(!m.contains(marker), "{p:?}: {m}");
+            }
+        }
+    }
+
+    // H1h: a native error is repaired in native terms. H2e: the text
+    // protocol's messages for no action and an unbalanced block show the
+    // block's form; the others are what they were.
     #[test]
     fn repair_messages_name_the_protocols_own_form() {
         let native = |e: FormatError| e.repair_message(Protocol::Native).as_str().to_owned();
@@ -539,12 +720,14 @@ mod tests {
         let text = |e: FormatError| e.repair_message(Protocol::Text).as_str().to_owned();
         assert_eq!(
             text(FormatError::NoAction),
-            "Format error: no action. Reply with exactly one action."
+            "Format error: no action. Reply with exactly one action, written as <action>{\"tool\": \"<tool id>\", \"args\": {...}}</action>."
         );
         assert_eq!(
             text(FormatError::SeveralActions),
-            "Format error: more than one action. Reply with exactly one action."
+            "Format error: more than one <action> block. Reply with exactly one action."
         );
+        assert!(text(FormatError::Unbalanced)
+            .contains("each <action> needs exactly one </action> after it"));
         assert_eq!(
             text(FormatError::WrongShape),
             "Format error: the action must be {\"tool\": \"<id>\", \"args\": {...}}."

@@ -29,11 +29,15 @@
 pub mod builtin;
 pub mod edit;
 pub mod exec;
+pub mod glob;
 pub mod provider;
+pub mod search;
+pub mod todo;
 pub use builtin::{workspace_tree, ReadTools, WorkspaceTree};
-pub use edit::{EditEngine, EditTools, ReadLog, StaleRead};
+pub use edit::{EditEngine, EditTools, MultiReq, ReadLog, Replacement, StaleRead};
 pub use exec::{ExecLimits, ExecProgram, ExecSetupError, ExecSpec, ExecTools, Pinned};
 pub use provider::{
     EditRecord, ExecCleanup, ExecEnd, ExecRecord, InvokeCtx, ReadRecord, RefusalKind, ToolError,
     ToolProvider, ToolResult, ToolStatus,
 };
+pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};

@@ -1591,3 +1591,284 @@ fn h2f_an_exec_budget_sets_the_commands_wall_clock_in_the_header() {
         assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
     }
 }
+
+// ---- H3a: pre-submit checks ----------------------------------------------------------
+
+/// A task with the command runner (perl, pinned) and a `presubmit` section.
+fn presubmit_task(name: &str, presubmit: &str, grants: &str, with_exec: bool) -> (Fx, PathBuf) {
+    let fx = fixture(name);
+    let exec = if with_exec {
+        r#","exec":{"programs":[{"name":"perl","path":"/usr/bin/perl"}]}"#
+    } else {
+        ""
+    };
+    std::fs::write(
+        &fx.task,
+        format!(r#"{{"task":"Make it pass.","grants":{grants}{exec},"presubmit":{presubmit}}}"#),
+    )
+    .unwrap();
+    let allow = fx.base.join("allow-exec.json");
+    std::fs::write(&allow, r#"{"allow":["harness.exec.run"]}"#).unwrap();
+    (fx, allow)
+}
+
+/// A section that is not a bounded list of commands on the allowlist in a
+/// task that grants the runner is unreadable input (exit 4), refused before
+/// the model server is contacted, with the reason named.
+#[test]
+fn h3a_a_bad_presubmit_section_is_unreadable_input() {
+    let m = mock(Vec::new());
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let with_runner = r#"["harness.fs.read","harness.exec.run"]"#;
+    let five = r#"{"commands":[["perl"],["perl"],["perl"],["perl"],["perl"]]}"#;
+    for (i, (presubmit, grants, with_exec, words)) in [
+        // The checks are commands in the sandbox: no runner, no checks.
+        (
+            r#"{"commands":[["perl","-e","1"]]}"#,
+            r#"["harness.fs.read"]"#,
+            false,
+            "presubmit needs the task to grant harness.exec.run",
+        ),
+        (
+            r#"{"commands":[["perl","-e","1"]]}"#,
+            r#"["harness.fs.read"]"#,
+            true,
+            "presubmit needs the task to grant harness.exec.run",
+        ),
+        (
+            r#"{"commands":[]}"#,
+            with_runner,
+            true,
+            "presubmit.commands must hold 1 to 4 commands",
+        ),
+        (
+            five,
+            with_runner,
+            true,
+            "presubmit.commands must hold 1 to 4 commands",
+        ),
+        (
+            r#"{"commands":[["perl","-e","1"],[]]}"#,
+            with_runner,
+            true,
+            "presubmit command 2 must be 1 to 32 arguments",
+        ),
+        (
+            r#"{"commands":[["cargo","build"]]}"#,
+            with_runner,
+            true,
+            "presubmit command 1 does not start with a program name on the exec allowlist",
+        ),
+        (
+            r#"{"commands":[["/usr/bin/perl","-e","1"]]}"#,
+            with_runner,
+            true,
+            "presubmit command 1 does not start with a program name",
+        ),
+        (
+            r#"{"commands":[["perl","-e","1"]],"max_rounds":0}"#,
+            with_runner,
+            true,
+            "presubmit.max_rounds must be from 1 to 5",
+        ),
+        (
+            r#"{"commands":[["perl","-e","1"]],"max_rounds":6}"#,
+            with_runner,
+            true,
+            "presubmit.max_rounds must be from 1 to 5",
+        ),
+        (
+            r#"{"commands":[["perl","-e","1"]],"max_rounds":null}"#,
+            with_runner,
+            true,
+            "does not have the expected shape",
+        ),
+        (
+            r#"{"commands":[["perl","-e","1"]],"rounds":2}"#,
+            with_runner,
+            true,
+            "does not have the expected shape",
+        ),
+        (
+            r#"{}"#,
+            with_runner,
+            true,
+            "does not have the expected shape",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (fx, _) = presubmit_task(&format!("presubmit-bad-{i}"), presubmit, grants, with_exec);
+        let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.code(), Some(4), "{presubmit}: {err}");
+        assert!(err.contains(words), "{presubmit}: {err}");
+        assert_eq!(report(&o)["outcome"]["Indeterminate"]["why"], "CouldNotRun");
+        assert!(!fx.marker.exists());
+        assert!(!fx.state.join("runs").exists());
+    }
+    assert_eq!(*m.requests.lock().unwrap(), 0, "the server was never asked");
+}
+
+/// A check the policy would deny (no allow rule and nobody to ask, so the
+/// ask is a deny) never starts the run: exit 4 with the reason, nothing
+/// written. Every OS: the refusal comes before the sandbox is asked.
+#[test]
+fn h3a_checks_the_policy_denies_do_not_start_the_run() {
+    let (fx, _) = presubmit_task(
+        "presubmit-denied",
+        r#"{"commands":[["perl","-e","1"]]}"#,
+        r#"["harness.fs.read","harness.exec.run"]"#,
+        true,
+    );
+    // A program that pins on every OS (never run): perl's path does not
+    // exist on Windows.
+    let tools = fx.base.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("tool"), b"#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tools.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let tools = std::fs::canonicalize(&tools).unwrap();
+    let task = serde_json::json!({
+        "task": "Make it pass.",
+        "grants": ["harness.fs.read", "harness.exec.run"],
+        "exec": {"programs": [{"name": "perl", "path": tools.join("tool")}], "read_only": [tools]},
+        "presubmit": {"commands": [["perl", "-e", "1"]]},
+    });
+    std::fs::write(&fx.task, task.to_string()).unwrap();
+    let m = mock(Vec::new());
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(4), "{err}");
+    assert!(
+        err.contains("the policy denies presubmit command 1"),
+        "{err}"
+    );
+    assert!(!fx.state.join("runs").exists(), "nothing was written");
+    assert!(!fx.marker.exists());
+}
+
+/// Through the real binary (its confinement is the production
+/// `SystemConfinement`): the first submission's check fails, so it is turned
+/// back and the model repairs the workspace with a command of its own; the
+/// second submission's check passes and it is accepted. The report says so
+/// in words and as a finding, and the anchored replay matches without
+/// running anything.
+#[cfg(target_os = "macos")]
+#[test]
+fn h3a_the_binary_turns_a_submission_back_and_the_replay_matches() {
+    let (fx, allow) = presubmit_task(
+        "presubmit-run",
+        r#"{"commands":[["perl","-e","exit(-e q{fixed.txt} ? 0 : 3)"]],"max_rounds":2}"#,
+        r#"["harness.fs.read","harness.exec.run"]"#,
+        true,
+    );
+    let m = mock(vec![
+        act("harness.task.submit", r#"{"note":"first"}"#),
+        act(
+            "harness.exec.run",
+            r#"{"argv":["perl","-e","open(my $f, q{>}, q{fixed.txt}) or die; print $f q{ok}"]}"#,
+        ),
+        act("harness.task.submit", r#"{"note":"second"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+    let o = cli(&args, false, &fx.marker);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "{err}");
+    assert!(err.contains("stopped (submitted) after 3 step(s)"), "{err}");
+    assert!(
+        err.contains("pre-submit checks: 2 submission(s) ran the checks, 1 turned back (the bound is 2); every check passed"),
+        "{err}"
+    );
+    let rep = report(&o);
+    let f = rep["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "harness.presubmit")
+        .unwrap();
+    assert!(
+        f["observed"].as_str().unwrap().contains("1 turned back"),
+        "{f}"
+    );
+    let id = run_id(&o);
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    std::fs::remove_file(fx.ws.join("fixed.txt")).unwrap();
+    let rp = replay_bin(
+        &fx,
+        &id,
+        &["--anchor", &head, "--policy", allow.to_str().unwrap()],
+    );
+    let rerr = String::from_utf8_lossy(&rp.stderr);
+    assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
+    assert!(!fx.ws.join("fixed.txt").exists(), "the replay ran nothing");
+    // The same run replayed with the checks left out of the task file is a
+    // header mismatch, by name.
+    let mut without: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&fx.task).unwrap()).unwrap();
+    without.as_object_mut().unwrap().remove("presubmit");
+    std::fs::write(&fx.task, without.to_string()).unwrap();
+    let o = replay_bin(&fx, &id, &["--policy", allow.to_str().unwrap()]);
+    assert_replay_diverged(&o, "pre-submit checks", &fx.marker);
+}
+
+/// A submission accepted with a check still failing is said so, in words,
+/// as a finding and as its own stop cause.
+#[cfg(target_os = "macos")]
+#[test]
+fn h3a_a_spent_bound_is_reported_as_a_check_still_failing() {
+    let (fx, allow) = presubmit_task(
+        "presubmit-spent",
+        r#"{"commands":[["perl","-e","exit 1"]],"max_rounds":1}"#,
+        r#"["harness.fs.read","harness.exec.run"]"#,
+        true,
+    );
+    let m = mock(vec![
+        act("harness.task.submit", r#"{"note":"a"}"#),
+        act("harness.task.submit", r#"{"note":"b"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--policy", allow.to_str().unwrap()]);
+    let o = cli(&args, false, &fx.marker);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "{err}");
+    assert!(err.contains("stopped (submitted_checks_failed)"), "{err}");
+    assert!(
+        err.contains("a check still failed at the last submission, which was accepted anyway"),
+        "{err}"
+    );
+    let rep = report(&o);
+    assert_eq!(rep["outcome"]["Indeterminate"]["why"], "NothingChecked");
+    let id = run_id(&o);
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    let rp = replay_bin(
+        &fx,
+        &id,
+        &["--anchor", &head, "--policy", allow.to_str().unwrap()],
+    );
+    let rerr = String::from_utf8_lossy(&rp.stderr);
+    assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
+}

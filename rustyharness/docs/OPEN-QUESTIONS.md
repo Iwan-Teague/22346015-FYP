@@ -81,6 +81,20 @@ so the history stays readable. What is still open is listed first.
    policy-checked and journaled as its own record in reply order, and keep the
    one-action rule for anything that writes or executes. It changes §2.2 and the
    loop's step accounting, so it is the owner's call.
+10. **(owner) Pre-submit checks: the defaults and what they stand for** (H3a, design
+    rows H3a). Four choices were made to build the slice and are the owner's to
+    confirm: (a) **a check round costs no step**, and is bounded by the wall budget and
+    `max_rounds` (1 to 5, default 2); (b) **the first failing command ends the round**,
+    so the model sees one failure per submission; (c) **each check goes through the
+    policy as a `harness.exec.run` call**, so an interactive run's approver is asked once
+    per check per submission unless the policy allows the runner, and an unattended task
+    needs the allow rule or the run does not start; a declined or unanswered check is
+    recorded `not_run` and the submission is accepted; (d) **a task's checks are
+    evidence for the model, not for the harness**: the outcome stays
+    `Indeterminate { NothingChecked }` and a check can be passed by editing the tests it
+    runs. Whether H3's verification should reuse a task's checks as its plan, and
+    whether a submission accepted with a failing check should ever be a `Failed`
+    outcome, belongs with H3 (§7.3, §7.6).
 
 ## Answered by the design
 

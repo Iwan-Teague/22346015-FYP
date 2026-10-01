@@ -369,6 +369,11 @@ pub struct MeterLimits {
 pub enum StopCause {
     /// The task was submitted; the run produced its deliverable.
     Submitted,
+    /// The task was submitted while a pre-submit check still failed, after
+    /// the bound on how many submissions a failing check turns back was
+    /// spent (H3a): accepted, and the failure is recorded, never passed off
+    /// as a plain [`StopCause::Submitted`].
+    SubmittedChecksFailed,
     /// A budget dimension was exhausted (never FormatErrors: that has its
     /// own variant below, per §2.4).
     Budget(BudgetDim),

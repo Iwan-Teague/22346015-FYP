@@ -114,11 +114,12 @@ use serde_json::{Map, Value};
 
 use crate::approve::{nonce_bytes, Approver, ApproverKind, RecordedApproval};
 use crate::driver::{
-    attempt_check, builtin_manifest_sha256, commit, exec_tools, facts_block, header, is_edit,
-    is_exec, limits_fields, new_meter, new_meter_resumed, parse_exec, plan, prepare, todo_for,
+    attempt_check, builtin_manifest_sha256, commit, exec_tools, header, is_edit, is_exec,
+    limits_fields, loop_facts, new_meter, new_meter_resumed, parse_exec, plan, prepare, todo_for,
     Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, NonceSource, Prepared, ReadLog,
     RecordedEdit, RecordedResult, SandboxRecord, HEADER_INPUT_KEYS,
 };
+use crate::presubmit::PresubmitState;
 use crate::sample;
 
 /// The audit's probe: a replay never measures a host.
@@ -473,6 +474,10 @@ fn expected_inputs(
         o.insert("programs".into(), Value::from(e.programs.len() as u64));
         m.insert("exec".into(), Value::Object(o));
     }
+    // The pre-submit checks (H3a): no key without them, as the header writes it.
+    if let Some(p) = &spec.presubmit {
+        m.insert("presubmit".into(), p.header_value());
+    }
     m.insert("context_format".into(), Value::from(CONTEXT_FORMAT));
     m.insert(
         "limits".into(),
@@ -514,6 +519,7 @@ fn header_mismatch(key: &str) -> &'static str {
             "another harness build wrote this journal (its built-in manifest differs)"
         }
         "shell_enabled" | "exec" => "the exec allowlist given differs from the recorded header",
+        "presubmit" => "the pre-submit checks given differ from the recorded header",
         "context_format" => {
             "another harness build wrote this journal (its context format differs: since H1h the \
              native protocol shows past actions as tool calls, since H1i each observation keeps \
@@ -1043,7 +1049,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         registry: a.registry,
         tools,
         task: &a.spec.task,
-        facts: facts_block(&facts),
+        facts: loop_facts(&facts, a.spec),
         profile: a.profile,
         backend: &rec.backend,
         providers: Vec::new(),
@@ -1079,6 +1085,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
             recorded_through: u64::MAX,
             wall_announced: 0,
         },
+        presubmit: PresubmitState::of(&a.spec.presubmit),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -1382,7 +1389,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         registry: r.registry,
         tools: pre.tools,
         task: &r.spec.task,
-        facts: facts_block(&start),
+        facts: loop_facts(&start, r.spec),
         profile: r.profile,
         backend: &chain,
         providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec),
@@ -1418,6 +1425,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             recorded_through: kept_through,
             wall_announced: 0,
         },
+        presubmit: PresubmitState::of(&r.spec.presubmit),
     };
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);
@@ -1432,5 +1440,6 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         steps: end.step,
         journal_error: released.error,
         possibly_environmental: lp.pressure,
+        presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
     })
 }

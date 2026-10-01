@@ -112,6 +112,7 @@ fn spec() -> TaskSpec {
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
         exec: None,
+        presubmit: None,
     }
 }
 

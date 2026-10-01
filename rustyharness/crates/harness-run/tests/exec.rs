@@ -103,6 +103,7 @@ fn spec_with(grants: &[&str], exec: Option<ExecSpec>) -> TaskSpec {
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
         exec,
+        presubmit: None,
     }
 }
 

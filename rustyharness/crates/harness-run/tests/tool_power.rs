@@ -99,6 +99,7 @@ fn spec(grants: &[&str]) -> TaskSpec {
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
         exec: None,
+        presubmit: None,
     }
 }
 

@@ -166,6 +166,31 @@ each optional (1 to 500 steps, 1 second to a day; the defaults are 50 steps and
 limits are recorded in the journal's header, so `replay` and `resume` must be
 given the same task file.
 
+A task that runs commands may also name **pre-submit checks**: commands the
+harness runs, in the same sandbox and under the same policy as the model's own
+commands, when the model calls `harness.task.submit`. If one fails (a non-zero
+exit, a signal, a timeout), the submission is not accepted: the model is shown
+that command's output, delimited like any tool output, with a harness notice,
+and goes on. After `max_rounds` submissions turned back the next one is
+accepted and the run stops with the cause `submitted_checks_failed`, never a
+plain `submitted`. The outcome is still `NothingChecked`: these checks are not
+the verification of design §7.3.
+
+```json
+ "presubmit": {"commands": [["cargo", "build"], ["cargo", "test"]], "max_rounds": 3}
+```
+
+Each command is an argv whose first item is a program name from the `exec`
+allowlist (1 to 4 commands, run in order, the first failure ends the round;
+`max_rounds` is 1 to 5, 2 when absent). The section needs `harness.exec.run` in
+the grants and its `exec` section, and the policy must not deny the command (an
+unattended run needs the allow rule for `harness.exec.run`, as for the model's
+own commands); otherwise the task file is refused (exit 4). A check round costs
+no step of its own; each command runs under the run's per-command time limit and
+the wall budget. The checks are recorded in the journal's header, so `replay`
+and `resume` must be given the same task file. Without the section a submit is
+accepted at once, as before.
+
 `run` prints the run id on stderr (`run <id> attempt 1: stopped …`) and, on
 stdout, `chain_head <hex>`: keep the hex, it is the anchor. `rustyharness` with no
 arguments prints every verb. The last stdout line of `run`, `resume` and `replay`

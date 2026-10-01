@@ -339,7 +339,7 @@ fn shown(s: &str) -> String {
 /// bidi code point becomes `\u{HEX}`. At most `max` characters of `s` are
 /// kept (H1f-2 review F-1: a refused manifest could otherwise redraw the
 /// terminal, e.g. print a forged "OK" over its own refusal).
-fn display_safe(s: &str, max: usize) -> String {
+pub fn display_safe(s: &str, max: usize) -> String {
     let mut out = String::new();
     for c in s.chars().take(max) {
         if c == '\\' {

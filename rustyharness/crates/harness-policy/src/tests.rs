@@ -245,6 +245,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             user_allow: allow_idx,
             fs_tool: false,
             submit: false,
+            edit: false,
         },
     );
     Session {
@@ -385,7 +386,7 @@ fn personal_data_asks_only_when_granted_and_denies_without_an_approver() {
 }
 
 #[test]
-fn an_ask_never_mints_authorized_in_this_build() {
+fn an_ask_never_mints_authorized_without_a_redeemed_token() {
     let m = fixture(vec![cap_json(
         "p",
         ["read", "personal", "own", "none", "own", "none"],
@@ -752,4 +753,470 @@ fn the_policy_digest_distinguishes_lists_and_order() {
     assert_ne!(a.digest(), b.digest());
     assert_ne!(c.digest(), d.digest(), "order matters: first match wins");
     assert_ne!(UserPolicy::default().digest(), a.digest());
+}
+
+// ---- §5.3 approval tokens: INV-5 and INV-16 --------------------------------------
+//
+// Session-level half: a session over a personal-data read (ask floor
+// user_confirm) with an approver present. The token mechanics (MAC flips,
+// TTL boundary, cross-run, scope) are exercised against the authority in
+// `approval.rs`; here the laws are about what the SESSION mints.
+
+use crate::approval::{
+    ApprovalAuthority, ApprovalRequest, ApprovalScope, BoundCall, MintRequest, PrincipalId, StepId,
+    APPROVAL_TTL,
+};
+use std::time::Duration;
+
+/// The ask-session fixture: `fixture.p` (personal read, one `path`
+/// argument) with an approver present and personal data granted, so
+/// `decide` is `Ask(user_confirm)` and `{"path": ...}` calls validate.
+fn ask_session() -> Session {
+    let mut cap = cap_json("p", ["read", "personal", "own", "none", "own", "none"]);
+    cap["input_schema"]["properties"]["path"] = json!({"type": "string"});
+    let m = fixture(vec![cap]);
+    let mut sp = spec(&["fixture.p"]);
+    sp.workspace = None;
+    sp.approver_present = true;
+    sp.personal_data_granted = true;
+    plan_over(std::slice::from_ref(&m), &sp, &UserPolicy::default()).unwrap()
+}
+
+fn ask_call() -> Call {
+    call("fixture.p", json!({"path": "a"}))
+}
+
+fn ask_bound() -> BoundCall {
+    BoundCall::for_call(1, StepId::new(3), &ask_call(), Confirmation::UserConfirm).unwrap()
+}
+
+fn mint_req(bound: &BoundCall, scope: ApprovalScope) -> MintRequest {
+    MintRequest {
+        attempt: bound.attempt,
+        step: bound.step,
+        capability: bound.capability.clone(),
+        args_sha256: bound.args_sha256,
+        tier: bound.tier,
+        scope,
+        approver: PrincipalId::new("cli").unwrap(),
+    }
+}
+
+fn minted(
+    bound: &BoundCall,
+    scope: ApprovalScope,
+    nonce: [u8; 16],
+) -> (ApprovalAuthority, crate::approval::Approval) {
+    let mut a = ApprovalAuthority::new(harness_core::RunId::new(1_000, [3; 10]), [0x11; 32]);
+    let t = a
+        .mint(&mint_req(bound, scope), nonce, Duration::from_secs(1_000))
+        .unwrap();
+    (a, t)
+}
+
+#[test]
+fn inv_5_an_ask_without_any_approval_refuses_every_time() {
+    let s = ask_session();
+    // No token at all: an Ask is never minted, however often asked.
+    for _ in 0..3 {
+        assert!(matches!(
+            s.authorize(ask_call()),
+            Err(PolicyDecision::Ask { .. })
+        ));
+    }
+}
+
+#[test]
+fn inv_5_an_approval_for_different_args_refuses() {
+    let s = ask_session();
+    let bound = ask_bound();
+    let (mut a, t) = minted(&bound, ApprovalScope::Once, [0x22; 16]);
+    // Redeem layer: the token's digest is for other arguments.
+    let other = call("fixture.p", json!({"path": "b"}));
+    let other_bound =
+        BoundCall::for_call(1, StepId::new(3), &other, Confirmation::UserConfirm).unwrap();
+    assert_eq!(
+        a.redeem(&t, &other_bound, Duration::from_secs(1_000)),
+        Err(crate::approval::ApprovalRefused::ArgsMismatch)
+    );
+    // Mint layer: nothing new for the other args; authorize layer: a proof
+    // redeemed for THIS call's binding never covers different arguments.
+    let redeemed = a.redeem(&t, &bound, Duration::from_secs(1_001)).unwrap();
+    assert!(matches!(
+        s.authorize_approved(other, redeemed),
+        Err(PolicyDecision::Ask { .. })
+    ));
+}
+
+#[test]
+fn inv_5_an_expired_approval_refuses() {
+    let bound = ask_bound();
+    let (mut a, t) = minted(&bound, ApprovalScope::Once, [0x33; 16]);
+    assert_eq!(
+        a.redeem(&t, &bound, Duration::from_secs(1_000) + APPROVAL_TTL),
+        Err(crate::approval::ApprovalRefused::Expired)
+    );
+    // No redemption means nothing to show the session: fail closed.
+    let s = ask_session();
+    assert!(matches!(
+        s.authorize(ask_call()),
+        Err(PolicyDecision::Ask { .. })
+    ));
+}
+
+#[test]
+fn inv_5_a_reused_approval_refuses() {
+    let s = ask_session();
+    let bound = ask_bound();
+    let (mut a, t) = minted(&bound, ApprovalScope::Once, [0x44; 16]);
+    let redeemed = a.redeem(&t, &bound, Duration::from_secs(1_000)).unwrap();
+    // The first spend mints the Authorized call...
+    assert!(s.authorize_approved(ask_call(), redeemed).is_ok());
+    // ...and the token is dead: a replayed redemption refuses, so nothing
+    // can ever be minted from it again.
+    assert_eq!(
+        a.redeem(&t, &bound, Duration::from_secs(1_001)),
+        Err(crate::approval::ApprovalRefused::NonceReused)
+    );
+}
+
+#[test]
+fn an_ask_plus_a_matching_token_mints_exactly_this_call() {
+    let s = ask_session();
+    let bound = ask_bound();
+    let (mut a, t) = minted(&bound, ApprovalScope::Once, [0x55; 16]);
+    let redeemed = a.redeem(&t, &bound, Duration::from_secs(1_000)).unwrap();
+    let authorized = s.authorize_approved(ask_call(), redeemed).unwrap();
+    assert_eq!(authorized.call().capability, "fixture.p");
+    // The Ask's rule id is what authorised it (journaled with the intent).
+    assert_eq!(authorized.rule(), RuleId::Builtin("ask.confirmation-floor"));
+}
+
+#[test]
+fn an_approval_for_another_tier_or_a_denied_call_never_mints() {
+    let s = ask_session();
+    // Tier: a protected_action token for the same call does not satisfy a
+    // user_confirm ask (and vice versa).
+    let bound_pa = BoundCall::for_call(
+        1,
+        StepId::new(3),
+        &ask_call(),
+        Confirmation::ProtectedAction,
+    )
+    .unwrap();
+    let (mut a, t) = minted(&bound_pa, ApprovalScope::Once, [0x66; 16]);
+    let redeemed = a.redeem(&t, &bound_pa, Duration::from_secs(1_000)).unwrap();
+    assert!(matches!(
+        s.authorize_approved(ask_call(), redeemed),
+        Err(PolicyDecision::Ask { .. })
+    ));
+    // A Deny decision passes through untouched: no approval can un-deny.
+    let (mut a2, t2) = minted(&ask_bound(), ApprovalScope::Once, [0x67; 16]);
+    let r2 = a2
+        .redeem(&t2, &ask_bound(), Duration::from_secs(1_000))
+        .unwrap();
+    let denied = call("harness.fs.read", json!({"path": "a"})); // not granted here
+    assert!(is_deny(
+        &s.authorize_approved(denied, r2).unwrap_err(),
+        &DenyReason::NotGranted
+    ));
+}
+
+#[test]
+fn a_run_scoped_approval_covers_identical_calls_only() {
+    let s = ask_session();
+    let bound = ask_bound();
+    let (mut a, t) = minted(&bound, ApprovalScope::Run, [0x77; 16]);
+    // Same capability, same arg digest: redeems and re-mints.
+    let first = a.redeem(&t, &bound, Duration::from_secs(1_000)).unwrap();
+    assert!(s.authorize_approved(ask_call(), first).is_ok());
+    let second = a.redeem(&t, &bound, Duration::from_secs(1_001)).unwrap();
+    assert!(s.authorize_approved(ask_call(), second).is_ok());
+    // Different arguments: the authority refuses, and the session was
+    // never even asked with a proof for them.
+    let other = call("fixture.p", json!({"path": "b"}));
+    let other_bound =
+        BoundCall::for_call(1, StepId::new(3), &other, Confirmation::UserConfirm).unwrap();
+    assert_eq!(
+        a.redeem(&t, &other_bound, Duration::from_secs(1_002)),
+        Err(crate::approval::ApprovalRefused::ArgsMismatch)
+    );
+}
+
+#[test]
+fn the_approval_request_shows_the_class_the_args_and_the_step() {
+    let m = fixture(vec![cap_json(
+        "p",
+        ["read", "personal", "own", "none", "own", "none"],
+    )]);
+    let cap = &m.capabilities()[0];
+    let req = ApprovalRequest::new(
+        cap.id().clone(),
+        "fixture capability".into(),
+        effective_class(cap, Confirmation::None),
+        json!({"path": "a"}),
+        Confirmation::UserConfirm,
+        1,
+        StepId::new(3),
+    );
+    assert_eq!(req.tier(), Confirmation::UserConfirm); // derived floor
+    assert_eq!(req.step().get(), 3);
+    let shown = req.to_string();
+    assert!(shown.contains("fixture.p"), "{shown}");
+    assert!(shown.contains("personal data"), "{shown}");
+    assert!(shown.contains(r#""path":"a""#), "{shown}");
+}
+
+// ---- H2b: the built-in workspace edits ----------------------------------------
+
+const EDIT_GRANTS: [&str; 3] = [
+    "harness.fs.read",
+    "harness.edit.replace",
+    "harness.edit.write",
+];
+
+fn edit_session(approver: bool, policy: &UserPolicy) -> Session {
+    let mut sp = spec(&EDIT_GRANTS);
+    sp.approver_present = approver;
+    Session::plan(&sp, &builtin_registry(), policy).unwrap()
+}
+
+fn replace(path: &str) -> Call {
+    call(
+        "harness.edit.replace",
+        json!({"path": path, "old": "a", "new": "b"}),
+    )
+}
+
+fn write(path: &str) -> Call {
+    call(
+        "harness.edit.write",
+        json!({"path": path, "content": "fn main() {}\n"}),
+    )
+}
+
+#[test]
+fn h2b_edits_are_planned_only_with_a_workspace() {
+    let s = edit_session(false, &UserPolicy::default());
+    assert_eq!(
+        s.class("harness.edit.replace").map(|c| c.effect),
+        Some(Effect::Write)
+    );
+    for id in EDIT_IDS {
+        let mut sp = spec(&[id]);
+        sp.workspace = None;
+        assert_eq!(
+            Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+            SessionRefused::NoWorkspace(id.to_owned()),
+            "{id}"
+        );
+    }
+}
+
+// §5.2 as H2b applies it: an edit in place asks, and with no approver the
+// ask is a deny; the tier is user_confirm although the class declares none.
+#[test]
+fn h2b_an_edit_asks_by_default_and_is_denied_without_an_approver() {
+    let with = edit_session(true, &UserPolicy::default());
+    let without = edit_session(false, &UserPolicy::default());
+    for c in [replace("src/lib.rs"), write("src/new.rs")] {
+        assert_eq!(
+            with.decide(&c),
+            PolicyDecision::Ask {
+                tier: Confirmation::UserConfirm,
+                rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+            },
+            "{c:?}"
+        );
+        assert_eq!(
+            without.decide(&c),
+            PolicyDecision::Deny {
+                reason: DenyReason::NoApprover,
+                rule: RuleId::Builtin("deny.no-approver"),
+            }
+        );
+        // Neither mints by itself.
+        assert!(with.authorize(c.clone()).is_err());
+        assert!(without.authorize(c).is_err());
+    }
+}
+
+// A user allow rule is how an unattended run edits: it allows without an
+// approver. A user deny still wins, and a user ask asks.
+#[test]
+fn h2b_user_policy_allows_denies_or_asks_for_edits() {
+    let allow = UserPolicy::new(&[], &[], &["harness.edit.replace", "harness.edit.write"]).unwrap();
+    let s = edit_session(false, &allow);
+    assert_eq!(
+        s.decide(&replace("src/lib.rs")),
+        PolicyDecision::Allow {
+            rule: RuleId::User {
+                list: RuleList::Allow,
+                index: 0
+            }
+        }
+    );
+    let a = s.authorize(write("docs/new.md")).unwrap();
+    assert_eq!(
+        a.rule(),
+        RuleId::User {
+            list: RuleList::Allow,
+            index: 1
+        }
+    );
+    let deny = UserPolicy::new(&["harness.edit.replace"], &[], &[]).unwrap();
+    assert!(is_deny(
+        &edit_session(true, &deny).decide(&replace("a.txt")),
+        &DenyReason::UserDenied
+    ));
+    let ask = UserPolicy::new(&[], &["harness.edit.write"], &["harness.edit.replace"]).unwrap();
+    let s = edit_session(true, &ask);
+    assert_eq!(
+        s.decide(&write("a.txt")),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::User {
+                list: RuleList::Ask,
+                index: 0
+            }
+        }
+    );
+    assert!(matches!(
+        s.decide(&replace("a.txt")),
+        PolicyDecision::Allow { .. }
+    ));
+}
+
+// The edit's path takes the workspace rule, and its arguments the schema,
+// before any allow rule: an allowed edit outside the workspace is denied.
+#[test]
+fn h2b_an_edit_outside_the_workspace_or_off_schema_is_denied_even_when_allowed() {
+    let allow = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
+    let s = edit_session(true, &allow);
+    for p in [
+        "../etc/passwd",
+        "/etc/passwd",
+        "a/../../b",
+        "C:\\x",
+        ".git/../x",
+    ] {
+        assert!(
+            matches!(
+                s.decide(&replace(p)),
+                PolicyDecision::Deny {
+                    reason: DenyReason::Path(_),
+                    ..
+                }
+            ),
+            "{p}"
+        );
+    }
+    for bad in [
+        json!({"path": "a", "old": "x"}),
+        json!({"path": "a", "old": "x", "new": "y", "count": 0}),
+        json!({"path": "a", "old": "x", "new": "y", "extra": 1}),
+    ] {
+        assert!(
+            matches!(
+                s.decide(&call("harness.edit.replace", bad.clone())),
+                PolicyDecision::Deny {
+                    reason: DenyReason::Args(_),
+                    ..
+                }
+            ),
+            "{bad}"
+        );
+    }
+}
+
+// The approval path for an edit: the Ask's own tier binds the token, and
+// the proof mints exactly the call it was redeemed for.
+#[test]
+fn h2b_an_approved_edit_mints_only_the_call_it_binds() {
+    let s = edit_session(true, &UserPolicy::default());
+    let c = replace("src/lib.rs");
+    let d = s.decide(&c);
+    assert!(
+        matches!(
+            d,
+            PolicyDecision::Ask {
+                tier: Confirmation::UserConfirm,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    let bound = BoundCall::for_call(1, StepId::new(2), &c, Confirmation::UserConfirm).unwrap();
+    let (mut a, t) = minted(&bound, ApprovalScope::Once, [0x42; 16]);
+    let proof = a.redeem(&t, &bound, Duration::from_secs(1_000)).unwrap();
+    // Another call with this proof stays an Ask; the right one mints.
+    let other = replace("src/main.rs");
+    let (mut a2, t2) = minted(&bound, ApprovalScope::Once, [0x43; 16]);
+    let proof2 = a2.redeem(&t2, &bound, Duration::from_secs(1_000)).unwrap();
+    assert!(matches!(
+        s.authorize_approved(other, proof2),
+        Err(PolicyDecision::Ask { .. })
+    ));
+    let ok = s.authorize_approved(c, proof).unwrap();
+    assert_eq!(ok.rule(), RuleId::Builtin(EDIT_DEFAULT_RULE));
+}
+
+// §7.1 display paths: model-chosen arguments reach the approver escaped
+// (no ANSI, bidi or zero-width character survives) and bounded.
+#[test]
+fn h2b_the_approval_request_escapes_and_bounds_the_arguments() {
+    let m = builtin::manifest(&ctx()).unwrap();
+    let capability = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id().as_str() == "harness.edit.write")
+        .unwrap();
+    let hostile = "\u{1b}[2K\rapproved: harmless\u{202e}txt.exe\u{200b}";
+    let req = ApprovalRequest::new(
+        capability.id().clone(),
+        capability.summary().to_owned(),
+        effective_class(capability, Confirmation::None),
+        json!({"path": "a.txt", "content": hostile}),
+        Confirmation::UserConfirm,
+        1,
+        StepId::new(4),
+    );
+    let shown = req.to_string();
+    assert!(
+        !shown
+            .chars()
+            .any(|c| c == '\u{1b}' || c == '\u{202e}' || c == '\u{200b}' || c == '\r'),
+        "{shown:?}"
+    );
+    // JSON already writes the ESC and CR as `\u001b` and `\r` (escaped
+    // again, reversibly); the bidi and zero-width characters JSON leaves raw
+    // are escaped by the display rule.
+    assert!(
+        shown.contains("\\\\u001b") && shown.contains("\\\\r"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("\\u{202E}") && shown.contains("\\u{200B}"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("user_confirm") && shown.contains("step 4"),
+        "{shown}"
+    );
+    let long = "x".repeat(10_000);
+    let req = ApprovalRequest::new(
+        capability.id().clone(),
+        capability.summary().to_owned(),
+        effective_class(capability, Confirmation::None),
+        json!({"path": "a.txt", "content": long}),
+        Confirmation::UserConfirm,
+        1,
+        StepId::new(4),
+    );
+    let shown = req.to_string();
+    assert!(shown.len() < 5_000, "bounded: {} bytes", shown.len());
+    assert!(
+        shown.contains("more characters not shown; sha256 of the call"),
+        "{shown}"
+    );
 }

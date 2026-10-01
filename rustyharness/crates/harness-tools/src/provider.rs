@@ -1,6 +1,8 @@
 //! The tool-provider seam (design §4.5, §2.2 steps 7-8). The built-in read
-//! tools implement it ([`crate::builtin`]) and the loop in `harness-run`
-//! drives it (both H1e-2); the MCP adapter is H4.
+//! tools ([`crate::builtin`], H1e-2) and edit tools ([`crate::edit`], H2b)
+//! implement it, and the loop in `harness-run` drives it, sending each call
+//! to the first provider that serves its capability
+//! ([`ToolProvider::serves`]); the MCP adapter is H4.
 //!
 //! `ToolProvider::invoke` accepts exactly one argument type for the call,
 //! `Journaled<Authorized<Call>>`:
@@ -48,6 +50,8 @@ use harness_core::{Digest, Untrusted};
 use harness_journal::Journaled;
 use harness_manifest::ProviderName;
 use harness_policy::{Authorized, Call};
+
+use crate::edit::ReadLog;
 
 /// Why a provider refused a call it was handed (§4.5 `ToolStatus::Refused`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +103,13 @@ pub struct ToolResult {
     pub digest: Digest,
     /// For a successful `fs.read`: which file, and the SHA-256 of its whole
     /// content when read (§2.3 "Stale reads"; the run keeps these so an
-    /// edit (H2) can refuse a file that changed since it was read).
+    /// edit can refuse a file that changed since it was read).
     pub read: Option<ReadRecord>,
+    /// For a successful, verified edit (§4.9 step 5, H2b): which file, its
+    /// digest before (absent for a create) and after. The run journals it
+    /// (`EditApplied`), records the after digest as the file's latest read,
+    /// and keeps its workspace tree digest current with it.
+    pub edit: Option<EditRecord>,
 }
 
 /// A file read and its content digest (§2.3 "Stale reads").
@@ -112,6 +121,19 @@ pub struct ReadRecord {
     pub sha256: Digest,
 }
 
+/// A verified edit (§4.9 step 5): the file, and its whole content's
+/// SHA-256 before and after. `before` is `None` for a created file (the
+/// journal's convention for a create: no `before` key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditRecord {
+    /// The workspace path (lexically checked).
+    pub path: harness_policy::WorkspacePath,
+    /// SHA-256 of the file before the edit; `None` when the edit created it.
+    pub before: Option<Digest>,
+    /// SHA-256 of the file after the edit, as re-read and verified.
+    pub after: Digest,
+}
+
 /// A provider-level failure (the provider could not even report a status).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("tool provider failed: {0}")]
@@ -120,11 +142,16 @@ pub struct ToolError(pub String);
 /// Per-invocation context (§4.5). `conformed` joins when `Conformed`
 /// exists (H2); secrets handles join with §5.5 (H2).
 #[derive(Debug, Clone, Copy)]
-pub struct InvokeCtx {
+pub struct InvokeCtx<'a> {
     /// The loop step.
     pub step: u64,
     /// The per-call deadline.
     pub deadline: Instant,
+    /// The files read in this run and their digests at the latest read
+    /// (§2.3 "Stale reads"): an edit is anchored on them (H2b). Read-only,
+    /// so no provider can mark a file as read; the run records reads from
+    /// results.
+    pub reads: &'a ReadLog,
 }
 
 /// A provider of capabilities (§4.5).
@@ -132,11 +159,22 @@ pub trait ToolProvider {
     /// The namespace this provider serves.
     fn namespace(&self) -> &ProviderName;
 
+    /// Whether this provider runs `capability` (an admitted capability id).
+    /// By default, every capability in its namespace; the built-in
+    /// providers share the `harness` namespace and split it by verb
+    /// (H2b), so the run dispatches a call to the first provider that
+    /// serves its capability.
+    fn serves(&self, capability: &str) -> bool {
+        capability
+            .split_once('.')
+            .is_some_and(|(ns, _)| ns == self.namespace().as_str())
+    }
+
     /// Run one call. The only accepted call type is a policy-authorised call
     /// whose intent is durably journaled.
     fn invoke(
         &mut self,
         call: Journaled<Authorized<Call>>,
-        ctx: &InvokeCtx,
+        ctx: &InvokeCtx<'_>,
     ) -> Result<ToolResult, ToolError>;
 }

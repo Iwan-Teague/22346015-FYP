@@ -1,24 +1,33 @@
-//! The built-in manifest for H1's read tools (design §4.8, §9 H1: read tools
-//! in-process, no exec).
+//! The built-in manifest (design §4.8): the read tools, the edit tools
+//! (H2b) and the submit sentinel, all in process; no exec.
 //!
 //! The built-ins are declared by a `harness` manifest and take the same
 //! validation and policy path as any provider, with no special case beyond
 //! the origin: this text is compiled in, so it alone may use the reserved
 //! `harness` namespace and the `builtin` transport.
 //!
-//! H1 declares the three read tools and the submit sentinel
-//! `harness.task.submit` (§2.5, H1e-2). `harness.edit.*`, `harness.exec.run`
-//! and `harness.notes.write` are write/execute class and arrive with the
-//! slices that implement their policy (H2).
+//! It declares the three read tools, the two edit tools
+//! `harness.edit.replace` and `harness.edit.write` (§4.9, H2b) and the
+//! submit sentinel `harness.task.submit` (§2.5, H1e-2). `harness.exec.run`
+//! and `harness.notes.write` arrive with the slices that implement them.
 //!
 //! Read tools: read / operational / own / none, as §4.8's table says;
 //! `content` is `third_party` because file contents in a workspace are other
 //! people's text by default (§5.4). That changes no default decision (§5.2
 //! allows both read rows) and only makes the trifecta label honest.
 //!
+//! Edit tools: write / operational / own / none (§4.8), `content: own` (an
+//! edit's result is the harness's report of what it changed: a path, line
+//! numbers and digests, never file text), confirmation `none` as declared.
+//! What policy decides for them is `harness-policy`'s (§5.2): allowed by a
+//! user allow rule, otherwise an ask, and with no approver a deny. Their
+//! schemas are §4.9's `{path, old, new, count = 1}` and §4.8's
+//! `{path, content}`; the string caps sit above the 64 KiB action cap
+//! (`harness_model_core::protocol::ACTION_MAX_BYTES`), which binds first.
+//!
 //! The sentinel: write / public / own / none (§4.8), `content: own`. It
 //! changes nothing but the run's phase; policy allows it by one named rule
-//! (`allow.task-submit`), the only write-class capability H1 decides.
+//! (`allow.task-submit`).
 //!
 //! `harness.fs.search` matches a literal substring, not a regular
 //! expression: H1 adds no regex crate (§4.8 deviation, recorded in the
@@ -36,7 +45,7 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
   "capabilities": [
     {
       "id": "harness.fs.read",
-      "summary": "Read a window of lines from a file inside the workspace",
+      "summary": "Read a window of lines (at most 100) from a file inside the workspace. Paths are relative to the workspace root",
       "effect": "read",
       "sensitivity": "operational",
       "blast_radius": "own",
@@ -56,7 +65,7 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
     },
     {
       "id": "harness.fs.search",
-      "summary": "Search files inside the workspace for a literal text",
+      "summary": "Search files inside the workspace for a literal text. Paths are relative to the workspace root; \".\" is the root",
       "effect": "read",
       "sensitivity": "operational",
       "blast_radius": "own",
@@ -75,7 +84,7 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
     },
     {
       "id": "harness.fs.list",
-      "summary": "List a directory inside the workspace, bounded in depth and count",
+      "summary": "List a directory inside the workspace, bounded in depth and count. Paths are relative to the workspace root; \".\" is the root",
       "effect": "read",
       "sensitivity": "operational",
       "blast_radius": "own",
@@ -90,6 +99,46 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
           "depth": { "type": "integer", "minimum": 1, "maximum": 4 }
         },
         "required": ["path"]
+      }
+    },
+    {
+      "id": "harness.edit.replace",
+      "summary": "Replace an exact text in a workspace file read in this run; it must match exactly count times (default 1). Paths are relative to the workspace root",
+      "effect": "write",
+      "sensitivity": "operational",
+      "blast_radius": "own",
+      "egress": "none",
+      "content": "own",
+      "confirmation": "none",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "maxLength": 4096 },
+          "old": { "type": "string", "maxLength": 65536 },
+          "new": { "type": "string", "maxLength": 65536 },
+          "count": { "type": "integer", "minimum": 1, "maximum": 1000 }
+        },
+        "required": ["path", "old", "new"]
+      }
+    },
+    {
+      "id": "harness.edit.write",
+      "summary": "Create a new workspace file, or rewrite a whole file of at most 400 lines read in this run. Paths are relative to the workspace root",
+      "effect": "write",
+      "sensitivity": "operational",
+      "blast_radius": "own",
+      "egress": "none",
+      "content": "own",
+      "confirmation": "none",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "maxLength": 4096 },
+          "content": { "type": "string", "maxLength": 65536 }
+        },
+        "required": ["path", "content"]
       }
     },
     {

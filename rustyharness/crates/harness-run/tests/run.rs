@@ -100,6 +100,7 @@ fn go(
         probe,
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
+        approver: None,
     })
 }
 
@@ -296,6 +297,7 @@ fn an_unknown_grant_refuses_the_session() {
         probe: &Local,
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000),
+        approver: None,
     })
     .unwrap_err();
     assert!(matches!(err, RunRefused::Session(_)), "{err:?}");
@@ -348,6 +350,7 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         probe: &Local,
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
+        approver: None,
     })
     .unwrap();
     assert_eq!(

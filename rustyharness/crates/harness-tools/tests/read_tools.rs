@@ -116,6 +116,7 @@ impl Rig {
                 &InvokeCtx {
                     step: self.step,
                     deadline,
+                    reads: &harness_tools::ReadLog::default(),
                 },
             )
             .unwrap()
@@ -234,14 +235,11 @@ fn list_is_sorted_bounded_in_depth_and_count() {
     fs::write(ws.join("a/f.txt"), "12345").unwrap();
     let mut r = Rig::new(&ws);
     let t = text(&r.call("harness.fs.list", json!({"path": ".", "depth": 2})));
-    assert_eq!(
-        t,
-        "3 entr(y/ies) under .\nd a/\nd a/b/\nf a/f.txt 5 bytes\n"
-    );
+    assert_eq!(t, "3 entr(y/ies) under .\nd a\nd a/b\nf a/f.txt 5 bytes\n");
     let t = text(&r.call("harness.fs.list", json!({"path": "a", "depth": 4})));
-    assert!(t.contains("d a/b/c/d/e/"), "{t}");
+    assert!(t.contains("d a/b/c/d/e"), "{t}");
     let t = text(&r.call("harness.fs.list", json!({"path": ".", "depth": 4})));
-    assert!(t.contains("d a/b/c/d/") && !t.contains("a/b/c/d/e"), "{t}");
+    assert!(t.contains("d a/b/c/d") && !t.contains("a/b/c/d/e"), "{t}");
 
     let many = scratch("list-many");
     for i in 0..510 {

@@ -2,9 +2,11 @@
 //! filesystem-locality probe (`harness_sandbox::locality::SystemProbe`,
 //! spike S-F1; it measures, `harness_policy::locality::classify` decides,
 //! and anything unknown or unreadable is refused; design §2.8, INV-35),
-//! real stdout and stderr, and `GATE_OK_FILE` from the environment.
-//! Nothing here, in any build, can select another probe (H1e-2b review
-//! F-2); the purity gate pins this file's shape (§2e).
+//! real stdout and stderr, `GATE_OK_FILE` from the environment, and the
+//! terminal as the approver when stdin is a terminal (nobody otherwise, so
+//! every ask is a deny; design §5.2, §5.3). Nothing here, in any build, can
+//! select another probe (H1e-2b review F-2) or another approver; the purity
+//! gate pins this file's shape (§2e).
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +25,7 @@ fn main() -> ExitCode {
         gate_ok_file: std::env::var_os("GATE_OK_FILE").map(Into::into),
         out: RefCell::new(&mut out),
         err: RefCell::new(&mut err),
+        approver: harness_cli::ApproverSource::StdinIfTerminal,
     };
     ExitCode::from(harness_cli::main_with(&cx, &args))
 }

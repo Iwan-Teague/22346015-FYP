@@ -41,8 +41,10 @@ use harness_journal::{
 };
 use harness_journal::{Condition, ConditionKind};
 use harness_manifest::admission::{Registry, Resolved};
-use harness_manifest::{builtin, Capability};
-use harness_model::context::{self, ContextError, Fact, FactValue, Feedback, Turn};
+use harness_manifest::{builtin, Capability, Confirmation};
+use harness_model::context::{
+    self, ContextError, Fact, FactValue, Feedback, ShownCall, Turn, CONTEXT_FORMAT,
+};
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
 use harness_model::replay::{replied_event, requested_event};
@@ -50,15 +52,19 @@ use harness_model::wire::{render_request, RenderError};
 use harness_model::{
     Completion, HarnessText, ModelBackend, ModelError, ModelRequest, TaskText, ToolSpec,
 };
+use harness_policy::approval::{
+    ApprovalAuthority, ApprovalRequest, ApprovalScope, BoundCall, MintRequest, PrincipalId, StepId,
+};
 use harness_policy::locality::{self, LocalityProbe, LocalityRefused};
 use harness_policy::{
-    Call, DenyReason, PolicyDecision, RuleId, RuleList, Session, SessionRefused, SessionSpec,
-    UserPolicy, WorkspaceDecl, SUBMIT_ID,
+    Authorized, Call, DenyReason, PolicyDecision, RuleId, RuleList, Session, SessionRefused,
+    SessionSpec, UserPolicy, WorkspaceDecl, SUBMIT_ID,
 };
-use harness_tools::builtin::{workspace_facts, RootRefused, WorkspaceFacts};
-use harness_tools::{InvokeCtx, ReadTools, ToolProvider, ToolStatus};
+use harness_tools::builtin::{workspace_tree, RootRefused, WorkspaceFacts, WorkspaceTree};
+use harness_tools::{EditTools, InvokeCtx, ReadTools, ToolProvider, ToolStatus};
 use serde_json::Value;
 
+use crate::approve::{nonce_name, ApprovalAnswer, Approver, RecordedApproval};
 use crate::sample;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +96,9 @@ pub struct RunConfig {
     pub tool_call_timeout: Duration,
     /// Longest the pre-start workspace-facts walk may take.
     pub facts_timeout: Duration,
+    /// Longest an approver may take to answer (§2.4: 15 min; past it the
+    /// request is a deny, §5.3). Not charged to the wall budget.
+    pub approval_timeout: Duration,
 }
 
 impl RunConfig {
@@ -107,6 +116,7 @@ impl RunConfig {
             model_call_timeout: Duration::from_secs(300),
             tool_call_timeout: Duration::from_secs(30),
             facts_timeout: Duration::from_secs(120),
+            approval_timeout: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -136,6 +146,11 @@ pub struct Run<'a> {
     pub env: &'a dyn EnvProbe,
     /// Budgets and timeouts.
     pub config: &'a RunConfig,
+    /// Who answers an `Ask` (§5.3): the CLI's terminal prompt, an
+    /// embedding UI, or nobody. With `None`, policy turns every ask into a
+    /// deny (§5.2); the choice is recorded in the journal header
+    /// (`approver_present`), and a resume must make the same one.
+    pub approver: Option<&'a dyn Approver>,
 }
 
 /// A run that did not start: nothing ran, nothing was journaled
@@ -231,6 +246,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         r.state_root,
         r.probe,
         r.config,
+        r.approver.is_some(),
     )?;
     let facts = pre.facts;
 
@@ -250,6 +266,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         resumed_from: None,
         environment: r.env.sample(),
         environment_recorded: false,
+        approver_present: r.approver.is_some(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -268,7 +285,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         facts: facts_block(&facts),
         profile: r.profile,
         backend: r.backend,
-        providers: vec![Box::new(pre.read_tools)],
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools),
         meter,
         detector: LoopDetector::new(),
         turns: Vec::new(),
@@ -277,8 +294,17 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         nonces: NonceSource::default(),
         feed: std::collections::VecDeque::new(),
         reads: ReadLog::default(),
+        tree: facts.tree,
+        workspace: Some(pre.tree),
+        approvals: Approvals::new(
+            &run_id,
+            attempt,
+            r.approver,
+            std::collections::VecDeque::new(),
+        ),
         env: r.env,
         pressure: Vec::new(),
+        reads_seen: Default::default(),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -300,8 +326,23 @@ pub(crate) struct Prepared {
     pub(crate) session: Session,
     pub(crate) tools: Vec<ToolSpec>,
     pub(crate) read_tools: ReadTools,
+    pub(crate) edit_tools: EditTools,
     pub(crate) state_root: PathBuf,
     pub(crate) facts: WorkspaceFacts,
+    /// The listing the facts were measured over, kept so the tree digest
+    /// follows the run's own edits (H2b).
+    pub(crate) tree: WorkspaceTree,
+}
+
+impl Prepared {
+    /// The built-in providers: the read tools and the edit tools, which
+    /// share the `harness` namespace and split it by verb (H2b).
+    pub(crate) fn providers<'p>(
+        read: ReadTools,
+        edit: EditTools,
+    ) -> Vec<Box<dyn ToolProvider + 'p>> {
+        vec![Box::new(read), Box::new(edit)]
+    }
 }
 
 /// The pre-start checks shared by `run` and `resume` (§2.1): plan the
@@ -317,9 +358,11 @@ pub(crate) fn prepare(
     state_root: &Path,
     probe: &dyn LocalityProbe,
     config: &RunConfig,
+    approver_present: bool,
 ) -> Result<Prepared, RunRefused> {
-    let (session, tools) = plan(spec, registry, policy, profile)?;
+    let (session, tools) = plan(spec, registry, policy, profile, approver_present)?;
     let read_tools = ReadTools::new(workspace)?;
+    let edit_tools = EditTools::new(workspace)?;
     let ws = read_tools.root().to_path_buf();
     let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
     if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
@@ -332,14 +375,16 @@ pub(crate) fn prepare(
         ))
     })?;
     locality::check(probe, state_str)?;
-    let facts =
-        workspace_facts(&ws, Instant::now() + config.facts_timeout).map_err(RunRefused::Facts)?;
+    let tree =
+        workspace_tree(&ws, Instant::now() + config.facts_timeout).map_err(RunRefused::Facts)?;
     Ok(Prepared {
         session,
         tools,
         read_tools,
+        edit_tools,
         state_root,
-        facts,
+        facts: tree.facts(),
+        tree,
     })
 }
 
@@ -398,11 +443,14 @@ pub(crate) fn new_meter_resumed(
 }
 
 /// Plan the session and the tool definitions (§2.1 "plan session").
+/// `approver_present`: whether anyone answers an ask (§5.2: with nobody,
+/// every ask is a deny).
 pub(crate) fn plan(
     spec: &TaskSpec,
     registry: &Registry,
     policy: &UserPolicy,
     profile: &Profile,
+    approver_present: bool,
 ) -> Result<(Session, Vec<ToolSpec>), RunRefused> {
     let mut grants = spec.grants.clone();
     if !grants.iter().any(|g| g == SUBMIT_ID) {
@@ -414,7 +462,7 @@ pub(crate) fn plan(
             workspace: Some(WorkspaceDecl {
                 declared_public: spec.workspace_public,
             }),
-            approver_present: false,
+            approver_present,
             personal_data_granted: false,
         },
         registry,
@@ -460,15 +508,18 @@ pub(crate) struct HeaderInputs<'a> {
     pub(crate) facts: WorkspaceFacts,
     pub(crate) limits: &'a MeterLimits,
     /// A resumed attempt: the attempt it continues, that journal's chain
-    /// head, and the wall time carried into this attempt (every earlier
-    /// attempt's, in milliseconds).
-    pub(crate) resumed_from: Option<(u32, Digest, u64)>,
+    /// head, the wall time carried into this attempt (every earlier
+    /// attempt's, in milliseconds), and the later attempts passed over as
+    /// holding no evidence (H1 phase-exit review F-5).
+    pub(crate) resumed_from: Option<(u32, Digest, u64, Vec<u32>)>,
     /// The environment sample (§7.1): measured for a live attempt, the
     /// recorded one for an audit replay.
     pub(crate) environment: EnvSample,
     /// Whether `environment` was copied from a recording (an audit replay's
     /// header) rather than measured here (H1f-3 review F-9).
     pub(crate) environment_recorded: bool,
+    /// Whether an approver answers asks in this run (§5.2, H2b).
+    pub(crate) approver_present: bool,
 }
 
 /// The header keys an audit replay or a resume recomputes from its own
@@ -476,7 +527,10 @@ pub(crate) struct HeaderInputs<'a> {
 /// (H1 phase-exit review F-1): the replay recomputes every budget stop
 /// from the limits, so limits taken from the journal would let a
 /// re-chained edit choose the stop the audit then "recomputes".
-pub(crate) const HEADER_INPUT_KEYS: [&str; 10] = [
+/// `builtin_manifest`, `shell_enabled` (H1f-3) and `context_format` (H1h)
+/// belong to the harness build: a journal another build wrote is refused
+/// by name, never replayed into a mismatch.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 11] = [
     "task",
     "grants",
     "workspace_public",
@@ -486,6 +540,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 10] = [
     "checks",
     "builtin_manifest",
     "shell_enabled",
+    "context_format",
     "limits",
 ];
 
@@ -560,6 +615,9 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
             Trusted::Bool(h.identity.profile_validated),
         )
         .field("policy", Trusted::Digest(h.policy.digest()))
+        // Whether asks can be answered (H2b): it decides every ask, so an
+        // audit plans with the recorded value and a resume must match it.
+        .field("approver_present", Trusted::Bool(h.approver_present))
         .field("grants", Trusted::List(grants))
         .field("workspace_public", Trusted::Bool(spec.workspace_public))
         .field("workspace_tree", Trusted::Digest(h.facts.tree))
@@ -582,6 +640,9 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
         // No execute-class capability exists in H1, so no shell can be on
         // any exec allowlist (§4.8) and there is no sandbox backend (§6).
         .field("shell_enabled", Trusted::Bool(false))
+        // What this build's contexts and requests are (H1h): a replay
+        // recomputes them, so it needs the same format.
+        .field("context_format", Trusted::Text(CONTEXT_FORMAT))
         .field(
             "sandbox",
             Trusted::Obj(vec![("backend", Trusted::Text("none"))]),
@@ -597,17 +658,27 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
                 "measured"
             }),
         );
-    if let Some((attempt, head, carried_ms)) = h.resumed_from {
-        hd = hd.field(
-            "resumed_from",
-            Trusted::Obj(vec![
-                ("attempt", Trusted::U64(u64::from(attempt))),
-                ("chain_head", Trusted::Digest(head)),
-                // H1e-2b confirming review NF-1: the wall time of EVERY
-                // earlier attempt, so a chain of resumes is charged in full.
-                ("wall_carried_ms", Trusted::U64(carried_ms)),
-            ]),
-        );
+    if let Some((attempt, head, carried_ms, skipped)) = &h.resumed_from {
+        let mut from = vec![
+            ("attempt", Trusted::U64(u64::from(*attempt))),
+            ("chain_head", Trusted::Digest(*head)),
+            // H1e-2b confirming review NF-1: the wall time of EVERY
+            // earlier attempt, so a chain of resumes is charged in full.
+            ("wall_carried_ms", Trusted::U64(*carried_ms)),
+        ];
+        // Named, not silently passed over (H1 phase-exit review F-5).
+        if !skipped.is_empty() {
+            from.push((
+                "skipped_attempts",
+                Trusted::List(
+                    skipped
+                        .iter()
+                        .map(|n| Trusted::U64(u64::from(*n)))
+                        .collect(),
+                ),
+            ));
+        }
+        hd = hd.field("resumed_from", Trusted::Obj(from));
     }
     // §3.5: what the server claims, as untrusted payloads, labelled.
     let c = &h.identity.claimed;
@@ -674,10 +745,62 @@ pub(crate) struct Loop<'a> {
     pub(crate) feed: std::collections::VecDeque<RecordedResult>,
     /// Files read this run and their digests (§2.3 "Stale reads").
     pub(crate) reads: ReadLog,
+    /// The workspace tree digest, kept current through the run's own edits
+    /// (the loop detector's repeat key includes it, §2.6).
+    pub(crate) tree: Digest,
+    /// The workspace listing the tree digest is computed over, for a live
+    /// run: each verified edit updates it (H2b). `None` in an audit, which
+    /// never reads the workspace: there the tree digest after an edit is
+    /// re-fed from the journal.
+    pub(crate) workspace: Option<WorkspaceTree>,
+    /// Where the answers to asks come from, and the attempt's approval
+    /// authority (§5.3, H2b).
+    pub(crate) approvals: Approvals<'a>,
     /// Samples the host when a live tool call times out or crashes (§7.1).
     pub(crate) env: &'a dyn EnvProbe,
     /// Steps whose tool timed out or crashed under host pressure.
     pub(crate) pressure: Vec<u64>,
+    /// Read-class calls already made, by (tool, args digest, tree digest),
+    /// with the digest of their output: an exact repeat on an unchanged
+    /// workspace that returns the same output gets a notice (the dev-suite
+    /// judge's finding (b), H2b). The loop detector's rules are unchanged.
+    pub(crate) reads_seen: std::collections::BTreeMap<(String, [u8; 32], [u8; 32]), [u8; 32]>,
+}
+
+/// Where the answers to asks come from (§5.3, H2b): recorded answers first
+/// (an audit, a resume's catch-up), then the live approver, if any. The
+/// attempt's approval authority mints and redeems every token with a key
+/// drawn here from OS randomness, held only in this struct.
+pub(crate) struct Approvals<'a> {
+    /// The live approver; `None` when nobody answers.
+    pub(crate) approver: Option<&'a dyn Approver>,
+    /// Recorded answers, re-fed in order before the approver is asked.
+    pub(crate) recorded: std::collections::VecDeque<RecordedApproval>,
+    /// The attempt's minter and verifier of approval tokens.
+    pub(crate) authority: ApprovalAuthority,
+    /// The attempt the tokens bind.
+    pub(crate) attempt: u32,
+    /// The authority's time origin (expiry is measured from it).
+    pub(crate) epoch: Instant,
+}
+
+impl<'a> Approvals<'a> {
+    /// The approvals of attempt `attempt` of `run`: a fresh per-attempt key
+    /// (the run-id randomness, §2.8), so no token outlives its attempt.
+    pub(crate) fn new(
+        run: &RunId,
+        attempt: u32,
+        approver: Option<&'a dyn Approver>,
+        recorded: std::collections::VecDeque<RecordedApproval>,
+    ) -> Self {
+        Self {
+            approver,
+            recorded,
+            authority: ApprovalAuthority::new(run.clone(), random_bytes::<32>()),
+            attempt,
+            epoch: Instant::now(),
+        }
+    }
 }
 
 /// Where render nonces come from: recorded ones in order (so a replayed
@@ -707,50 +830,39 @@ pub(crate) struct RecordedResult {
     /// The sample recorded with a `timeout`, `crashed` or `provider_error`
     /// result (§7.1).
     pub(crate) environment: Option<EnvSample>,
+    /// The `EditApplied` recorded before an ok edit's result (H2b).
+    pub(crate) edit: Option<RecordedEdit>,
+}
+
+/// What an `EditApplied` record says an edit did (the path is the call's).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordedEdit {
+    pub(crate) before: Option<Digest>,
+    pub(crate) after: Digest,
+    /// The workspace tree digest after the edit.
+    pub(crate) tree: Digest,
+}
+
+/// Whether `tool` is a built-in workspace edit (H2b).
+pub(crate) fn is_edit(tool: &str) -> bool {
+    harness_policy::EDIT_IDS.contains(&tool)
+}
+
+/// Whether `tool` is a built-in read tool (`harness.fs.*`).
+fn is_read(tool: &str) -> bool {
+    matches!(
+        tool,
+        "harness.fs.read" | "harness.fs.search" | "harness.fs.list"
+    )
 }
 
 /// The files read this run, with the SHA-256 of each file's whole content
-/// at its latest read (design §2.3 "Stale reads"). H1 has no edit tools,
-/// so nothing consumes it yet; H2's edits call [`ReadLog::check`], which
-/// refuses an edit to a file that changed since it was read, or was never
-/// read.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ReadLog {
-    files: std::collections::BTreeMap<String, Digest>,
-}
-
-/// Why an edit anchored on an earlier read is refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum StaleRead {
-    /// The file was never read in this run.
-    #[error("file not read in this run; read it first")]
-    NeverRead,
-    /// The file changed since it was last read.
-    #[error("file changed since read; re-read first")]
-    Changed,
-}
-
-impl ReadLog {
-    /// Record a read.
-    pub fn record(&mut self, path: &str, sha256: Digest) {
-        self.files.insert(path.to_owned(), sha256);
-    }
-
-    /// The digest recorded for `path`, if any.
-    pub fn get(&self, path: &str) -> Option<Digest> {
-        self.files.get(path).copied()
-    }
-
-    /// Whether an edit may rely on the last read of `path`, given the
-    /// file's current digest.
-    pub fn check(&self, path: &str, current: Digest) -> Result<(), StaleRead> {
-        match self.files.get(path) {
-            None => Err(StaleRead::NeverRead),
-            Some(d) if *d == current => Ok(()),
-            Some(_) => Err(StaleRead::Changed),
-        }
-    }
-}
+/// at its latest read (design §2.3 "Stale reads"). Defined by the edit
+/// engine's crate and re-exported here (the run loop and the edit engine
+/// must agree on one type); the edits themselves call [`ReadLog::check`],
+/// which refuses an edit to a file that changed since it was read, or was
+/// never read.
+pub use harness_tools::{ReadLog, StaleRead};
 
 /// One step's result.
 enum Flow {
@@ -876,10 +988,13 @@ impl<'a> Loop<'a> {
             Ok(p) => p,
             Err(fe) => {
                 self.feed_stall()?;
+                // No action: the native protocol withholds this reply and
+                // shows only the repair text (H1h; see `context`).
                 self.turns.push(Turn {
                     step,
                     reply,
-                    feedback: Feedback::Harness(fe.repair_message()),
+                    action: None,
+                    feedback: Feedback::Harness(fe.repair_message(self.profile.protocol())),
                     notice: None,
                 });
                 return Ok(Flow::Continue);
@@ -889,6 +1004,17 @@ impl<'a> Loop<'a> {
         let capability = self.capability(&tool)?;
         let args = Value::Object(parsed.action.args);
         let args_text = args.to_string();
+        // The action as the native protocol shows it back (H1h): the active
+        // tool's id and the canonical JSON of the arguments policy decides
+        // on, beside the reply's text; never the raw call the server sent.
+        let shown = ShownCall {
+            tool: tool.clone(),
+            arguments: Untrusted::new(args_text.clone(), Source::Model),
+            content: Untrusted::new(
+                completion.content.inspect("context: reply").clone(),
+                Source::Model,
+            ),
+        };
         let args_blob = w
             .untrusted(&Untrusted::new(args_text.clone(), Source::Model))
             .map_err(journal)?;
@@ -908,6 +1034,7 @@ impl<'a> Loop<'a> {
         match self.detector.observe(LoopEvent::Action {
             tool: tool.clone(),
             args_digest: sha256(args_text.as_bytes()),
+            tree: self.tree,
         }) {
             LoopSignal::Quiet => {}
             LoopSignal::Notice(_) => {
@@ -931,29 +1058,27 @@ impl<'a> Loop<'a> {
             capability: tool.clone(),
             args,
         };
-        let authorized = match self.session.authorize(call) {
-            Ok(a) => {
-                w.append(step, decided(&PolicyDecision::Allow { rule: a.rule() }))
-                    .map_err(journal)?;
-                a
-            }
-            Err(decision) => {
-                w.append(step, decided(&decision)).map_err(journal)?;
-                self.turns.push(Turn {
-                    step,
-                    reply,
-                    feedback: Feedback::Harness(denied_text(&decision)),
-                    notice,
-                });
-                if let LoopSignal::Stop(kind) = self
-                    .detector
-                    .observe(LoopEvent::PolicyDenied { capability: tool })
-                {
-                    return self.loop_stop(w, step, kind);
+        let decision = self.session.decide(&call);
+        w.append(step, decided(&decision)).map_err(journal)?;
+        let outcome = match decision {
+            // `decide` is pure, so `authorize` decides the same way.
+            PolicyDecision::Allow { .. } => self
+                .session
+                .authorize(call)
+                .map_err(|_| StopCause::PolicyAbort)?,
+            // §5.3: an ask runs only with an approval of exactly this call.
+            PolicyDecision::Ask { tier, .. } => {
+                match self.approve(w, step, capability, call, tier)? {
+                    Ok(a) => a,
+                    Err(text) => return self.refused(w, step, reply, shown, notice, text, tool),
                 }
-                return Ok(Flow::Continue);
+            }
+            PolicyDecision::Deny { .. } => {
+                let text = denied_text(&decision, &self.tools, &tool);
+                return self.refused(w, step, reply, shown, notice, text, tool);
             }
         };
+        let authorized = outcome;
 
         // 7. Write-ahead intent: only a Journaled call can run.
         let intent = Event::new(EventKind::ToolStarted).field("capability", Trusted::Id(tool_id));
@@ -995,15 +1120,18 @@ impl<'a> Loop<'a> {
         let ctx = InvokeCtx {
             step,
             deadline: Instant::now() + self.config.tool_call_timeout.min(self.remaining_wall()),
+            reads: &self.reads,
         };
-        let provider = capability.id().provider().to_owned();
         let mut fed_environment = None;
+        let mut fed_tree = None;
         let result = if let Some(rec) = self.feed.pop_front() {
             fed_environment = rec.environment;
+            fed_tree = rec.edit.as_ref().map(|e| e.tree);
             // Replaying (audit, or a resume catching up): the recorded
-            // result of this very call stands in for running it again. The
-            // intent above is journaled all the same, so the replayed
-            // journal has the recorded shape.
+            // result of this very call stands in for running it again, an
+            // edit's included: a replay re-feeds what an edit did and never
+            // applies it again (H2b). The intent above is journaled all the
+            // same, so the replayed journal has the recorded shape.
             let path = journaled
                 .call()
                 .call()
@@ -1014,11 +1142,10 @@ impl<'a> Loop<'a> {
             drop(journaled);
             rec.into_result(&tool, path.as_deref())
         } else {
-            match self
-                .providers
-                .iter_mut()
-                .find(|p| p.namespace().as_str() == provider)
-            {
+            // The built-in providers share the `harness` namespace, so a
+            // call goes to the first provider that serves its capability
+            // (H2b), never to one that merely shares its namespace.
+            match self.providers.iter_mut().find(|p| p.serves(&tool)) {
                 Some(p) => p.invoke(journaled, &ctx),
                 None => {
                     drop(journaled);
@@ -1031,9 +1158,46 @@ impl<'a> Loop<'a> {
         // `ToolFinished` is durable, so every intent that ran has its result.
 
         // 9. Journal the result.
+        let mut edited = None;
+        let mut unverified = false;
+        let mut repeated = false;
         let feedback = match result {
             Ok(res) => {
                 let out = w.untrusted(&res.output).map_err(journal)?;
+                // A verified edit (§4.9 step 5): `EditApplied` before its
+                // `ToolFinished`, so a durable result implies a durable
+                // record of the edit. The tree digest after it comes from
+                // the live listing, or from the journal when re-fed (a
+                // resume's catch-up measured its listing after the edit).
+                if let (Some(e), ToolStatus::Ok) = (&res.edit, res.status) {
+                    let tree = match (fed_tree, self.workspace.as_mut()) {
+                        (Some(t), _) => t,
+                        (None, Some(ws)) => ws.record_edit(&e.path, e.after),
+                        // An audit re-feeds every edit with its tree digest
+                        // (`recorded` refuses one without it).
+                        (None, None) => return Err(StopCause::PolicyAbort),
+                    };
+                    let path = w
+                        .untrusted(&Untrusted::new(e.path.as_str().to_owned(), Source::Model))
+                        .map_err(journal)?;
+                    let mut ev = Event::new(EventKind::EditApplied)
+                        .field("intent_seq", Trusted::U64(intent_seq))
+                        .field("path", Trusted::Untrusted(path));
+                    // A create has no `before` (the journal's convention).
+                    if let Some(b) = e.before {
+                        ev = ev.field("before", Trusted::Digest(b));
+                    }
+                    ev = ev
+                        .field("after", Trusted::Digest(e.after))
+                        .field("workspace_tree", Trusted::Digest(tree));
+                    w.append(step, ev).map_err(journal)?;
+                    // The harness wrote these bytes: they are the file's
+                    // latest read, so the model may edit it again without
+                    // re-reading; any other change still makes it stale.
+                    self.reads.record(e.path.as_str(), e.after);
+                    self.tree = tree;
+                    edited = Some(e.path.as_str().to_owned());
+                }
                 let mut ev = Event::new(EventKind::ToolFinished)
                     .field("intent_seq", Trusted::U64(intent_seq))
                     .field("status", Trusted::Text(status_name(res.status)))
@@ -1042,6 +1206,9 @@ impl<'a> Loop<'a> {
                     .field("output", Trusted::Untrusted(out));
                 if let ToolStatus::Error { code } = res.status {
                     ev = ev.field("code", Trusted::U64(u64::from(code)));
+                    // An edit written but not verified may have changed the
+                    // workspace in a way the harness cannot state (H2b).
+                    unverified = is_edit(&tool) && code == harness_tools::builtin::code::UNVERIFIED;
                 }
                 // Only an ok result records a read (the reader refuses a read
                 // digest on anything else; confirming review NF-3).
@@ -1062,6 +1229,24 @@ impl<'a> Loop<'a> {
                 w.append(step, ev).map_err(journal)?;
                 self.detector
                     .observe(LoopEvent::Observation { digest: res.digest });
+                // An exact repeat of a read on an unchanged workspace, with
+                // the same output as before, is said so (a read never
+                // changes the tree, so the tree now is the tree it was
+                // proposed on). Only a notice: the detector's rules stand.
+                if res.status == ToolStatus::Ok && is_read(&tool) {
+                    let key = (
+                        tool.clone(),
+                        *sha256(args_text.as_bytes()).as_bytes(),
+                        *self.tree.as_bytes(),
+                    );
+                    let out = *res.digest.as_bytes();
+                    match self.reads_seen.get(&key) {
+                        Some(first) => repeated = *first == out && notice.is_none(),
+                        None => {
+                            self.reads_seen.insert(key, out);
+                        }
+                    }
+                }
                 let body = String::from_utf8_lossy(res.output.inspect("context: observation"))
                     .into_owned();
                 let body = if body.is_empty() {
@@ -1095,9 +1280,31 @@ impl<'a> Loop<'a> {
                 ))
             }
         };
+        if unverified {
+            return Err(StopCause::PolicyAbort);
+        }
+        // §2.6: edit churn, and a changed tree is progress.
+        if let Some(file) = edited {
+            if let LoopSignal::Stop(kind) = self.detector.observe(LoopEvent::EditApplied { file }) {
+                return self.loop_stop(w, step, kind);
+            }
+            self.detector.observe(LoopEvent::WorkspaceChanged {
+                tree_digest: self.tree,
+            });
+        }
+        let notice = if repeated {
+            Some(HarnessText::from_static(
+                "Notice: this call repeats an earlier one exactly, on an unchanged workspace, \
+                 and its result is the same as before. Use what you already have, or try \
+                 something different.",
+            ))
+        } else {
+            notice
+        };
         self.turns.push(Turn {
             step,
             reply,
+            action: Some(shown),
             feedback,
             notice,
         });
@@ -1144,23 +1351,40 @@ impl<'a> Loop<'a> {
         // The prompt was sent (and possibly processed): charge the
         // conservative estimate for it.
         self.meter.record_tokens(None, request_bytes, 0)?;
-        let text = match e {
-            ModelError::Empty => "The reply was empty. Reply with exactly one action.",
-            ModelError::Truncated(_) => {
+        // Static text per protocol (H1h: the native protocol's names its
+        // own form, like its repair messages).
+        let native = self.profile.protocol() == Protocol::Native;
+        let text = match (e, native) {
+            (ModelError::Empty, false) => "The reply was empty. Reply with exactly one action.",
+            (ModelError::Empty, true) => {
+                "The reply was empty. Call exactly one tool through the function-calling interface."
+            }
+            (ModelError::Truncated(_), false) => {
                 "The reply was cut off. Keep the reasoning short and reply with exactly one action."
             }
-            ModelError::Unusable(_) => {
+            (ModelError::Truncated(_), true) => {
+                "The reply was cut off. Keep the reasoning short and call exactly one tool \
+                 through the function-calling interface."
+            }
+            (ModelError::Unusable(_), false) => {
                 "The reply could not be used. Reply with exactly one action."
             }
-            ModelError::Unavailable(_)
-            | ModelError::RateLimited { .. }
-            | ModelError::ReplayDiverged { .. } => return Err(StopCause::ModelUnavailable),
+            (ModelError::Unusable(_), true) => {
+                "The reply could not be used. Call exactly one tool through the function-calling interface."
+            }
+            (
+                ModelError::Unavailable(_)
+                | ModelError::RateLimited { .. }
+                | ModelError::ReplayDiverged { .. },
+                _,
+            ) => return Err(StopCause::ModelUnavailable),
         };
         self.meter.record_format_error()?;
         self.feed_stall()?;
         self.turns.push(Turn {
             step,
             reply: Untrusted::new(String::new(), Source::Model),
+            action: None,
             feedback: Feedback::Harness(HarnessText::from_static(text)),
             notice: None,
         });
@@ -1196,6 +1420,166 @@ impl<'a> Loop<'a> {
         }
     }
 
+    /// A call that did not run (a denial, a declined or unanswered
+    /// approval): its turn shows the static `text`, and it counts toward
+    /// denial hammering (§2.6).
+    #[allow(clippy::too_many_arguments)]
+    fn refused<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+        step: u64,
+        reply: Untrusted<String>,
+        shown: ShownCall,
+        notice: Option<HarnessText>,
+        text: HarnessText,
+        tool: String,
+    ) -> Result<Flow, StopCause> {
+        self.turns.push(Turn {
+            step,
+            reply,
+            action: Some(shown),
+            feedback: Feedback::Harness(text),
+            notice,
+        });
+        if let LoopSignal::Stop(kind) = self
+            .detector
+            .observe(LoopEvent::PolicyDenied { capability: tool })
+        {
+            return self.loop_stop(w, step, kind);
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// §5.3: an `Ask` becomes a call only with a yes for exactly this call.
+    /// Journals `ApprovalRequested`, takes the answer (recorded, when
+    /// replaying; else the live approver's, with the wall clock paused and
+    /// the approval timeout as its deadline; else none), and on a yes mints
+    /// a single-use token bound to this attempt, step, capability, argument
+    /// digest and tier, redeems it at once, and authorises the call with
+    /// the proof (`ApprovalGranted` records the consumed nonce, never the
+    /// MAC). A no is `ApprovalDenied`, no answer `ApprovalExpired`: the
+    /// call does not run and the model is told so in static text. A token
+    /// that fails to mint, redeem or authorise (a recorded nonce reused, a
+    /// harness bug) stops the run: `PolicyAbort`, never a call.
+    fn approve<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+        step: u64,
+        capability: &Capability,
+        call: Call,
+        tier: Confirmation,
+    ) -> Result<Result<Authorized<Call>, HarnessText>, StopCause> {
+        let abort = StopCause::PolicyAbort;
+        let cap_id = Ident::from_capability(capability).ok_or(abort.clone())?;
+        let class = self
+            .session
+            .class(capability.id().as_str())
+            .ok_or(abort.clone())?;
+        let at = StepId::new(step);
+        let attempt = self.approvals.attempt;
+        let bound = BoundCall::for_call(attempt, at, &call, tier).ok_or(abort.clone())?;
+        let about = |kind| {
+            Event::new(kind)
+                .field("capability", Trusted::Id(cap_id.clone()))
+                .field("args", Trusted::Digest(bound.args_sha256))
+                .field("tier", Trusted::Text(tier.as_str()))
+        };
+        w.append(step, about(EventKind::ApprovalRequested))
+            .map_err(journal)?;
+        let answer = match self.approvals.recorded.pop_front() {
+            Some(recorded) => recorded,
+            None => match self.approvals.approver {
+                Some(a) => {
+                    let req = ApprovalRequest::new(
+                        capability.id().clone(),
+                        capability.summary().to_owned(),
+                        class,
+                        call.args.clone(),
+                        tier,
+                        attempt,
+                        at,
+                    );
+                    let deadline = Instant::now() + self.config.approval_timeout;
+                    // §2.4: the wait for a human is not charged to the
+                    // wall budget (the guard resumes the clock on drop).
+                    let pause = self.meter.pause_wall()?;
+                    let said = a.ask(&req, deadline);
+                    drop(pause);
+                    match said {
+                        ApprovalAnswer::Yes => RecordedApproval::Granted {
+                            kind: a.kind(),
+                            nonce: random_bytes::<16>(),
+                        },
+                        ApprovalAnswer::No => RecordedApproval::Denied { kind: a.kind() },
+                        ApprovalAnswer::NoAnswer => RecordedApproval::Expired,
+                    }
+                }
+                // Policy asked with nobody here to answer (an audit whose
+                // journal ends in the wait): no yes, so no call.
+                None => RecordedApproval::Expired,
+            },
+        };
+        match answer {
+            RecordedApproval::Granted { kind, nonce } => {
+                let a = &mut self.approvals;
+                let now = a.epoch.elapsed();
+                let token = a
+                    .authority
+                    .mint(
+                        &MintRequest {
+                            attempt,
+                            step: at,
+                            capability: bound.capability.clone(),
+                            args_sha256: bound.args_sha256,
+                            tier,
+                            scope: ApprovalScope::Once,
+                            approver: PrincipalId::new(kind.as_str()).map_err(|_| abort.clone())?,
+                        },
+                        nonce,
+                        now,
+                    )
+                    .map_err(|_| abort.clone())?;
+                let redeemed = a
+                    .authority
+                    .redeem(&token, &bound, now)
+                    .map_err(|_| abort.clone())?;
+                let authorized = self
+                    .session
+                    .authorize_approved(call, redeemed)
+                    .map_err(|_| abort.clone())?;
+                let name = nonce_name(nonce).ok_or(abort.clone())?;
+                let nonce_id = Ident::from_trusted(&name).ok_or(abort)?;
+                w.append(
+                    step,
+                    about(EventKind::ApprovalGranted)
+                        .field("approver", Trusted::Text(kind.as_str()))
+                        .field("nonce", Trusted::Id(nonce_id))
+                        .field("scope", Trusted::Text("once")),
+                )
+                .map_err(journal)?;
+                Ok(Ok(authorized))
+            }
+            RecordedApproval::Denied { kind } => {
+                w.append(
+                    step,
+                    about(EventKind::ApprovalDenied)
+                        .field("approver", Trusted::Text(kind.as_str())),
+                )
+                .map_err(journal)?;
+                Ok(Err(HarnessText::from_static(
+                    "The approver declined the call, so it did not run.",
+                )))
+            }
+            RecordedApproval::Expired => {
+                w.append(step, about(EventKind::ApprovalExpired))
+                    .map_err(journal)?;
+                Ok(Err(HarnessText::from_static(
+                    "No approval arrived in time, so the call did not run.",
+                )))
+            }
+        }
+    }
+
     fn loop_stop<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
@@ -1224,8 +1608,11 @@ impl<'a> Loop<'a> {
     }
 }
 
-/// The model's reply as it is shown back to it: the content, plus (native
-/// protocol) each tool call. Untrusted, like the reply.
+/// The model's reply as the TEXT protocol shows it back: the content, plus
+/// each native tool call a text-protocol reply carried (a format error),
+/// written out so the model sees what it sent. Untrusted, like the reply.
+/// The native protocol never shows it: a native action is shown as a tool
+/// call (`ShownCall`), and a native reply without one is withheld (H1h).
 fn shown_reply(c: &Completion) -> Untrusted<String> {
     let mut s = c.content.inspect("context: reply").clone();
     for call in &c.tool_calls {
@@ -1262,6 +1649,10 @@ fn decided(d: &PolicyDecision) -> Event {
         .field("rule", rule);
     if let PolicyDecision::Deny { reason, .. } = d {
         ev = ev.field("reason", Trusted::Text(deny_name(reason)));
+    }
+    // An ask names its tier (it binds the approval token, §5.3).
+    if let PolicyDecision::Ask { tier, .. } = d {
+        ev = ev.field("tier", Trusted::Text(tier.as_str()));
     }
     ev
 }
@@ -1310,12 +1701,22 @@ impl RecordedResult {
             (None, _) => None,
             (Some(_), None) => return Err(unfit()),
         };
+        let edit = match (self.edit, path) {
+            (Some(e), Some(p)) if is_edit(tool) => Some(harness_tools::EditRecord {
+                path: harness_policy::workspace_path(p).map_err(|_| unfit())?,
+                before: e.before,
+                after: e.after,
+            }),
+            (None, _) => None,
+            _ => return Err(unfit()),
+        };
         Ok(harness_tools::ToolResult {
             status,
             output: Untrusted::new(self.output, Source::Tool(self.capability)),
             truncated: self.truncated,
             digest: self.digest,
             read,
+            edit,
         })
     }
 }
@@ -1339,13 +1740,32 @@ fn deny_name(r: &DenyReason) -> &'static str {
 
 /// What the model is told about a denial: static text per reason (the
 /// argument error's own detail may quote model text, so it is not shown).
-fn denied_text(d: &PolicyDecision) -> HarnessText {
+fn denied_text(d: &PolicyDecision, tools: &[ToolSpec], tool: &str) -> HarnessText {
+    // An argument outside its schema's bounds is named with its bounds, as
+    // the tool's own schema gives them (the argument's name is the schema's
+    // key, found by the error's path; the call's text is never shown).
+    if let PolicyDecision::Deny {
+        reason: DenyReason::Args(e),
+        ..
+    } = d
+    {
+        let bounded =
+            e.at.strip_prefix('/')
+                .filter(|p| !p.contains('/'))
+                .and_then(|p| {
+                    let spec = tools.iter().find(|t| t.id == tool)?;
+                    HarnessText::argument_bounds(spec, p)
+                });
+        if let Some(text) = bounded {
+            return text;
+        }
+    }
     HarnessText::from_static(match d {
         PolicyDecision::Deny {
             reason: DenyReason::Path(_),
             ..
         } => {
-            "Policy denied the call: the path must be a normalised relative path inside the workspace (no '..', no leading '/', no '\\\\' or ':')."
+            "Policy denied the call: the path must be a normalised relative path inside the workspace (no '..', no leading or trailing '/', no empty components, no '\\\\' or ':')."
         }
         PolicyDecision::Deny {
             reason: DenyReason::Args(_),
@@ -1355,6 +1775,12 @@ fn denied_text(d: &PolicyDecision) -> HarnessText {
             reason: DenyReason::NotGranted,
             ..
         } => "Policy denied the call: that tool is not granted in this session.",
+        PolicyDecision::Deny {
+            reason: DenyReason::NoApprover,
+            ..
+        } => {
+            "Policy denied the call: it needs a person's approval, and no approver is present in this run. It did not run."
+        }
         _ => "Policy denied the call.",
     })
 }

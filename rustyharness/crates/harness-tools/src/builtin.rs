@@ -17,8 +17,9 @@
 //!
 //! **Named residuals** (the design's H1 position, §4.8): the check and the
 //! open are separate calls, so a process that could create a symlink between
-//! them could still redirect a read; in an H1 session nothing the agent can
-//! do creates one (no write or exec tools), and H2's confined file-op helper
+//! them could still redirect a read; nothing the agent can do creates one
+//! (no exec tool; the edit tools write only regular files, through an
+//! exclusive temp file and a rename), and H2's confined file-op helper
 //! makes the kernel enforce the view. A hard link inside the workspace to a
 //! file outside it is indistinguishable from a file, and a mount point
 //! inside the workspace (a bind, network or FUSE mount, a disk image) is
@@ -101,6 +102,21 @@ pub mod code {
     pub const BAD_ARGS: u16 = 9;
     /// The line window starts past the end of the file.
     pub const WINDOW: u16 = 10;
+    /// An edit's file was not read in this run, or changed since it was
+    /// read (§2.3 "Stale reads"; H2b).
+    pub const STALE_READ: u16 = 11;
+    /// An edit's `old` text matches nowhere (H2b).
+    pub const NO_MATCH: u16 = 12;
+    /// An edit's `old` text matches a different number of times than
+    /// `count` (H2b).
+    pub const MATCH_COUNT: u16 = 13;
+    /// The edit would not change the file (H2b).
+    pub const NO_OP: u16 = 14;
+    /// A whole-file rewrite of a file over the line cap (H2b).
+    pub const LINE_CAP: u16 = 15;
+    /// The edit was written but could not be verified afterwards (§4.9
+    /// step 4; H2b): the file may have changed.
+    pub const UNVERIFIED: u16 = 16;
 }
 
 const READ: &str = "harness.fs.read";
@@ -134,19 +150,7 @@ impl ReadTools {
     /// of the workspace may be symlinks (`/tmp` on macOS), its contents may
     /// not.
     pub fn new(root: &Path) -> Result<Self, RootRefused> {
-        // The root as its components: a trailing separator or `.` makes the
-        // OS resolve a final symlink (`symlink_metadata("link/")` follows
-        // the link), and `components()` drops both (H1 phase-exit review
-        // F-9 item 10).
-        let root: PathBuf = root.components().collect();
-        let m = fs::symlink_metadata(&root)?;
-        if m.file_type().is_symlink() {
-            return Err(RootRefused::Symlink);
-        }
-        if !m.is_dir() {
-            return Err(RootRefused::NotADir);
-        }
-        let root = fs::canonicalize(root)?;
+        let root = canonical_root(root)?;
         let ns = ProviderName::new(harness_manifest::BUILTIN_NAMESPACE)
             .map_err(|_| RootRefused::Io(io::Error::other("builtin namespace")))?;
         Ok(Self { ns, root })
@@ -159,13 +163,13 @@ impl ReadTools {
 }
 
 /// A finished tool call, before capping.
-struct Out {
-    status: ToolStatus,
-    text: String,
-    read: Option<ReadRecord>,
+pub(crate) struct Out {
+    pub(crate) status: ToolStatus,
+    pub(crate) text: String,
+    pub(crate) read: Option<ReadRecord>,
 }
 
-fn err(code: u16, msg: &str) -> Out {
+pub(crate) fn err(code: u16, msg: &str) -> Out {
     Out {
         status: ToolStatus::Error { code },
         text: format!("error: {msg}"),
@@ -173,7 +177,7 @@ fn err(code: u16, msg: &str) -> Out {
     }
 }
 
-fn ok(text: String) -> Out {
+pub(crate) fn ok(text: String) -> Out {
     Out {
         status: ToolStatus::Ok,
         text,
@@ -194,10 +198,14 @@ impl ToolProvider for ReadTools {
         &self.ns
     }
 
+    fn serves(&self, capability: &str) -> bool {
+        matches!(capability, READ | SEARCH | LIST)
+    }
+
     fn invoke(
         &mut self,
         call: Journaled<Authorized<Call>>,
-        ctx: &InvokeCtx,
+        ctx: &InvokeCtx<'_>,
     ) -> Result<ToolResult, ToolError> {
         let c = call.call().call();
         let cap = c.capability.as_str();
@@ -216,7 +224,7 @@ impl ToolProvider for ReadTools {
     }
 }
 
-fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
+pub(crate) fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
     let text = b"error: refused before running".to_vec();
     ToolResult {
         status: ToolStatus::Refused { reason },
@@ -224,12 +232,13 @@ fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
         output: Untrusted::new(text, Source::Tool(cap.to_owned())),
         truncated: false,
         read: None,
+        edit: None,
     }
 }
 
 /// Cap the output at [`RESULT_MAX_BYTES`] (on a character boundary); the
 /// digest is over the full output.
-fn finish(cap: &str, out: Out) -> ToolResult {
+pub(crate) fn finish(cap: &str, out: Out) -> ToolResult {
     let digest = sha256(out.text.as_bytes());
     let mut text = out.text;
     let truncated = text.len() > RESULT_MAX_BYTES;
@@ -246,6 +255,7 @@ fn finish(cap: &str, out: Out) -> ToolResult {
         truncated,
         digest,
         read: out.read,
+        edit: None,
     }
 }
 
@@ -271,23 +281,96 @@ fn arg_u64(args: &Value, key: &str, default: u64, min: u64, max: u64) -> Result<
     }
 }
 
+/// Check and canonicalise a workspace root: a real directory, never a
+/// symlink (ancestors of the workspace may be symlinks — `/tmp` on
+/// macOS — its contents may not). Shared by the read tools (§4.8) and
+/// the edit engine (§4.9).
+pub(crate) fn canonical_root(root: &Path) -> Result<PathBuf, RootRefused> {
+    // The root as its components: a trailing separator or `.` makes the
+    // OS resolve a final symlink (`symlink_metadata("link/")` follows
+    // the link), and `components()` drops both (H1 phase-exit review
+    // F-9 item 10).
+    let root: PathBuf = root.components().collect();
+    let m = fs::symlink_metadata(&root)?;
+    if m.file_type().is_symlink() {
+        return Err(RootRefused::Symlink);
+    }
+    if !m.is_dir() {
+        return Err(RootRefused::NotADir);
+    }
+    fs::canonicalize(root).map_err(RootRefused::from)
+}
+
+/// Why a workspace path could not be resolved by [`resolve`].
+#[derive(Debug)]
+pub(crate) enum ResolveErr {
+    /// A component of the path (or the root) does not exist.
+    NotFound,
+    /// A component of the path is a symlink (never followed).
+    Symlink,
+    /// A component could not be examined.
+    Io(io::Error),
+}
+
+impl From<io::Error> for ResolveErr {
+    fn from(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::NotFound {
+            ResolveErr::NotFound
+        } else {
+            ResolveErr::Io(e)
+        }
+    }
+}
+
+/// Resolve `p` from `root` one component at a time with
+/// `symlink_metadata`, refusing a symlink at ANY component (INV-30,
+/// in-process half): a link inside the workspace can never make the
+/// harness touch a file outside it. `Ok((path, None))` means only the
+/// FINAL component is missing — a create candidate for the edit engine
+/// (§4.9); a missing intermediate component, or the root, is
+/// [`ResolveErr::NotFound`]. The metadata returned is the final
+/// component's own (not followed through).
+pub(crate) fn resolve(
+    root: &Path,
+    p: &WorkspacePath,
+) -> Result<(PathBuf, Option<Metadata>), ResolveErr> {
+    let mut cur = root.to_path_buf();
+    let mut meta = fs::symlink_metadata(&cur)?;
+    let comps: Vec<&str> = p.components().collect();
+    let last = comps.len();
+    for (i, c) in comps.into_iter().enumerate() {
+        cur.push(c);
+        let m = match fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            // Only the final component may be missing (create case).
+            Err(e) if i + 1 == last && e.kind() == io::ErrorKind::NotFound => {
+                return Ok((cur, None))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if m.file_type().is_symlink() {
+            return Err(ResolveErr::Symlink);
+        }
+        meta = m;
+    }
+    Ok((cur, Some(meta)))
+}
+
 impl ReadTools {
     /// Resolve a workspace path component by component, refusing a symlink
     /// at any component. Returns the path and its (not followed) metadata.
     fn resolve(&self, p: &WorkspacePath) -> Result<(PathBuf, Metadata), Out> {
-        let mut cur = self.root.clone();
-        let mut meta = fs::symlink_metadata(&cur).map_err(io_out)?;
-        for c in p.components() {
-            cur.push(c);
-            meta = fs::symlink_metadata(&cur).map_err(io_out)?;
-            if meta.file_type().is_symlink() {
-                return Err(err(
-                    code::SYMLINK,
-                    "a path component is a symlink; symlinks are never followed",
-                ));
+        match resolve(&self.root, p) {
+            Ok((path, Some(meta))) => Ok((path, meta)),
+            Ok((_, None)) | Err(ResolveErr::NotFound) => {
+                Err(err(code::NOT_FOUND, "no such file or directory"))
             }
+            Err(ResolveErr::Symlink) => Err(err(
+                code::SYMLINK,
+                "a path component is a symlink; symlinks are never followed",
+            )),
+            Err(ResolveErr::Io(e)) => Err(io_out(e)),
         }
-        Ok((cur, meta))
     }
 
     fn read(&self, args: &Value) -> Out {
@@ -494,7 +577,11 @@ impl ReadTools {
             let line = if e.symlink {
                 format!("l {} (symlink, not followed)\n", e.rel)
             } else if e.meta.is_dir() {
-                format!("d {}/\n", e.rel)
+                // No trailing '/': the listing is the model's vocabulary for
+                // the next call's path argument, and the workspace-path rule
+                // refuses a trailing slash (EmptyComponent). Never show the
+                // model a string the policy would refuse.
+                format!("d {}\n", e.rel)
             } else if e.meta.is_file() {
                 format!("f {} {} bytes\n", e.rel, e.meta.len())
             } else {
@@ -703,7 +790,133 @@ pub fn workspace_facts(root: &Path, deadline: Instant) -> io::Result<WorkspaceFa
     facts_with(root, deadline, FACTS_FILE_MAX_BYTES)
 }
 
+/// [`workspace_facts`], keeping the listing the digest was computed over
+/// (design §2.8 "snapshots": a path and a digest per entry, empty
+/// directories included), so the run can keep the tree digest current
+/// after its own edits without walking the workspace again
+/// ([`WorkspaceTree::record_edit`]).
+pub fn workspace_tree(root: &Path, deadline: Instant) -> io::Result<WorkspaceTree> {
+    tree_with(root, deadline, FACTS_FILE_MAX_BYTES)
+}
+
 fn facts_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<WorkspaceFacts> {
+    tree_with(root, deadline, file_cap).map(|t| t.facts())
+}
+
+/// One entry of a [`WorkspaceTree`]: what the facts walk digests for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    /// The relative path, `/`-separated, in its lossy UTF-8 form.
+    rel: String,
+    /// `d` directory, `f` file (content digested), `F` file over the cap
+    /// (size only), `l` symlink (never followed), `o` anything else.
+    kind: u8,
+    /// A file's SHA-256 in hex, `len:<n>` for kind `F`, empty otherwise.
+    content: String,
+}
+
+/// The workspace as the facts walk measured it: every entry in walk order
+/// with what the tree digest covers for it, and the facts derived from
+/// them. The walk visits siblings in name order, depth first, so walk
+/// order is the lexicographic order of the paths' component sequences;
+/// [`WorkspaceTree::record_edit`] keeps that order when it adds a file, so
+/// the digest it recomputes is the digest a fresh walk would measure when
+/// nothing but the run's own edits changed the workspace. Resume compares
+/// the two (design §2.10): a workspace changed any other way is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTree {
+    entries: Vec<TreeEntry>,
+    files: u64,
+    oversize: u64,
+    tree: Digest,
+}
+
+/// Compare two relative paths the way the walk orders them: component by
+/// component (so `a/b` sorts before `a-c`, although `-` < `/`).
+fn walk_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.split('/').cmp(b.split('/'))
+}
+
+impl WorkspaceTree {
+    fn from_entries(entries: Vec<TreeEntry>, files: u64, oversize: u64) -> Self {
+        let mut t = Self {
+            entries,
+            files,
+            oversize,
+            tree: sha256(b""),
+        };
+        t.tree = t.digest_entries();
+        t
+    }
+
+    fn digest_entries(&self) -> Digest {
+        let mut tree = Sha256Stream::new();
+        for e in &self.entries {
+            tree.update(&[e.kind]);
+            tree.update(e.rel.as_bytes());
+            tree.update(&[0]);
+            tree.update(e.content.as_bytes());
+            tree.update(b"\n");
+        }
+        tree.finish()
+    }
+
+    /// The facts: tree digest, regular files, files digested by size only.
+    pub fn facts(&self) -> WorkspaceFacts {
+        WorkspaceFacts {
+            tree: self.tree,
+            files: self.files,
+            oversize: self.oversize,
+        }
+    }
+
+    /// The current tree digest.
+    pub fn digest(&self) -> Digest {
+        self.tree
+    }
+
+    /// Record the run's own edit: `path` is now a regular file whose
+    /// content has SHA-256 `after` (an edit only ever leaves a regular file
+    /// of at most the edit cap, so it is always digested by content). A
+    /// path not in the listing is a created file, added in walk order.
+    /// Returns the new tree digest.
+    pub fn record_edit(&mut self, path: &WorkspacePath, after: Digest) -> Digest {
+        let rel = path.as_str();
+        let at = self
+            .entries
+            .partition_point(|e| walk_order(&e.rel, rel) == std::cmp::Ordering::Less);
+        let content = after.to_string();
+        match self.entries.get_mut(at) {
+            Some(e) if e.rel == rel => {
+                match e.kind {
+                    b'f' => {}
+                    b'F' => {
+                        self.oversize = self.oversize.saturating_sub(1);
+                    }
+                    // Not a file before: it is one now.
+                    _ => self.files = self.files.saturating_add(1),
+                }
+                e.kind = b'f';
+                e.content = content;
+            }
+            _ => {
+                self.entries.insert(
+                    at,
+                    TreeEntry {
+                        rel: rel.to_owned(),
+                        kind: b'f',
+                        content,
+                    },
+                );
+                self.files = self.files.saturating_add(1);
+            }
+        }
+        self.tree = self.digest_entries();
+        self.tree
+    }
+}
+
+fn tree_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<WorkspaceTree> {
     let m = fs::symlink_metadata(root)?;
     if m.file_type().is_symlink() || !m.is_dir() {
         return Err(io::Error::new(
@@ -725,7 +938,7 @@ fn facts_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<Works
         FACTS_MAX_ENTRIES,
     )
     .until(deadline);
-    let mut tree = Sha256Stream::new();
+    let mut entries = Vec::new();
     let mut files = 0u64;
     let mut oversize = 0u64;
     while let Some(e) = walk.next_entry() {
@@ -751,11 +964,11 @@ fn facts_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<Works
         } else {
             (b'o', String::new())
         };
-        tree.update(&[kind]);
-        tree.update(e.rel.as_bytes());
-        tree.update(&[0]);
-        tree.update(content.as_bytes());
-        tree.update(b"\n");
+        entries.push(TreeEntry {
+            rel: e.rel,
+            kind,
+            content,
+        });
     }
     if walk.timed_out {
         return Err(late());
@@ -768,11 +981,7 @@ fn facts_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<Works
     if walk.unreadable > 0 {
         return Err(io::Error::other("a workspace entry could not be read"));
     }
-    Ok(WorkspaceFacts {
-        tree: tree.finish(),
-        files,
-        oversize,
-    })
+    Ok(WorkspaceTree::from_entries(entries, files, oversize))
 }
 
 /// SHA-256 of a file read in chunks, at most `cap + 1` bytes: `None` when
@@ -875,6 +1084,64 @@ mod tests {
         let err = workspace_facts(&d, Instant::now()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    // H2b: the digest a tree keeps current through the run's own edits is
+    // the digest a fresh walk measures, whatever the created file's place
+    // in walk order (component order: `a/b` before `a-c` although `-` <
+    // `/`), for a changed file, and from an empty workspace.
+    #[test]
+    fn an_edited_tree_digests_as_a_fresh_walk_measures() {
+        let d = dir("tree-edits", 0);
+        fs::create_dir_all(d.join("a/deep")).unwrap();
+        fs::create_dir_all(d.join("z")).unwrap();
+        fs::write(d.join("a/b.txt"), "b\n").unwrap();
+        fs::write(d.join("a-c.txt"), "c\n").unwrap();
+        fs::write(d.join("a/deep/x.rs"), "x\n").unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        let mut t = workspace_tree(&d, far).unwrap();
+        assert_eq!(t.facts(), workspace_facts(&d, far).unwrap());
+        let edits: &[(&str, &str)] = &[
+            ("a/b.txt", "b changed\n"),    // an existing file
+            ("a/a.txt", "new before b\n"), // created, first in a/
+            ("a/deep0.txt", "between deep/ and deep0\n"),
+            ("a.txt", "before the a/ directory\n"),
+            ("a-b.txt", "after a/, before a-c\n"),
+            ("0.txt", "first of all\n"),
+            ("z/zz.txt", "last of all\n"),
+            ("zz.txt", "after z/\n"),
+            ("a/deep/x.rs", "x changed\n"),
+        ];
+        for (path, text) in edits {
+            fs::write(d.join(path), text).unwrap();
+            let wp = workspace_path(path).unwrap();
+            let got = t.record_edit(&wp, sha256(text.as_bytes()));
+            let fresh = workspace_facts(&d, far).unwrap();
+            assert_eq!(got, fresh.tree, "after editing {path}");
+            assert_eq!(t.facts(), fresh, "after editing {path}");
+        }
+        // From an empty workspace too.
+        let e = dir("tree-empty", 0);
+        let mut t = workspace_tree(&e, far).unwrap();
+        assert_eq!(t.facts().files, 0);
+        fs::write(e.join("new.rs"), "fn main() {}\n").unwrap();
+        let got = t.record_edit(
+            &workspace_path("new.rs").unwrap(),
+            sha256(b"fn main() {}\n"),
+        );
+        assert_eq!(got, workspace_facts(&e, far).unwrap().tree);
+        assert_eq!(t.facts().files, 1);
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&e);
+    }
+
+    #[test]
+    fn walk_order_is_component_order() {
+        use std::cmp::Ordering::*;
+        assert_eq!(walk_order("a/b", "a-c"), Less);
+        assert_eq!(walk_order("a", "a/b"), Less);
+        assert_eq!(walk_order("a/b", "a/b"), Equal);
+        assert_eq!(walk_order("b", "a/z"), Greater);
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl ToolProvider for Spy {
     fn invoke(
         &mut self,
         call: Journaled<Authorized<Call>>,
-        _ctx: &InvokeCtx,
+        _ctx: &InvokeCtx<'_>,
     ) -> Result<ToolResult, ToolError> {
         self.invoked.set(self.invoked.get() + 1);
         assert!(call.intent_seq() > 0, "the header is seq 0");
@@ -61,6 +61,7 @@ impl ToolProvider for Spy {
             truncated: false,
             digest: sha256(b"file text"),
             read: None,
+            edit: None,
         })
     }
 }
@@ -125,6 +126,7 @@ fn step(w: &mut W, s: &Session, p: &mut Spy, n: u64) -> Result<(), JournalError>
     let ctx = InvokeCtx {
         step: n,
         deadline: Instant::now(),
+        reads: &harness_tools::ReadLog::default(),
     };
     let result = p.invoke(journaled, &ctx).expect("spy never fails");
     let out = w.untrusted(&result.output)?;

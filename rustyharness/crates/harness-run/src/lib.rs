@@ -18,15 +18,24 @@
 //! 3. **The loop** (§2.2 steps 1-10): charge the meter → build the context
 //!    (§2.3) → call the model under the remaining wall budget → journal the
 //!    request and reply → feed token usage to the meter → parse exactly one
-//!    action → loop detection → policy decision (journaled with its rule) →
-//!    write-ahead intent (`Journaled<Authorized<Call>>`) → run the tool →
-//!    journal the result → stop checks.
+//!    action → loop detection (keyed by the workspace tree digest too) →
+//!    policy decision (journaled with its rule) → for an ask, the approver
+//!    ([`approve`], §5.3) → write-ahead intent
+//!    (`Journaled<Authorized<Call>>`) → run the tool (the provider that
+//!    serves its capability: the read tools, or the edit tools, anchored on
+//!    the run's reads) → journal the result (a verified edit's
+//!    `EditApplied` first, with the tree digest after it) → stop checks.
 //! 4. **Commit** (§7.1): `RunStopped` durable, then the outcome is released.
 //!
-//! **Every H1 outcome is `Indeterminate { NothingChecked }`** (INV-18): no
-//! H1 task has checks, so nothing the agent does, submitting included, can
-//! pass. A journal failure at any point after the header is
-//! `Indeterminate { UnreadableEvidence }` (INV-33).
+//! **Every outcome so far is `Indeterminate { NothingChecked }`** (INV-18):
+//! no task has checks yet (H3), so nothing the agent does, editing and
+//! submitting included, can pass. A journal failure at any point after the
+//! header is `Indeterminate { UnreadableEvidence }` (INV-33).
+//!
+//! **Edits (H2b)** change the task's workspace in place: there is no
+//! sandbox around them and no content snapshot to restore, so a built-in
+//! edit asks unless the caller's policy allows it (§5.2 as this build
+//! applies it), and with no approver it is denied.
 //!
 //! Audit replay and resume are [`replay`]; the CLI verbs over both are
 //! `harness-cli`.
@@ -43,10 +52,12 @@
     )
 )]
 
+pub mod approve;
 pub mod driver;
 pub mod replay;
 mod sample;
 
+pub use approve::{ApprovalAnswer, Approver, ApproverKind};
 pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
 pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Resume};
 

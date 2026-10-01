@@ -25,7 +25,7 @@
 pub mod environment;
 pub mod strict_json;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
@@ -798,12 +798,18 @@ impl fmt::Display for LoopKind {
 pub enum LoopEvent {
     /// A plain loop step was taken.
     Step,
-    /// A tool was invoked; `args_digest` identifies the arguments.
+    /// A tool was invoked; `args_digest` identifies the arguments and
+    /// `tree` the workspace it was invoked on.
     Action {
         /// Tool/capability id.
         tool: String,
         /// Digest over the serialized arguments.
         args_digest: Digest,
+        /// The workspace tree digest when the action was proposed (the
+        /// run's own edits keep it current). Part of the repeat key: the
+        /// same call on a changed workspace is not a repeat (design §2.6,
+        /// the H1e-2 row's H2 condition).
+        tree: Digest,
     },
     /// An edit to a file SUCCEEDED.
     EditApplied {
@@ -876,27 +882,38 @@ const DENIAL_LIMIT: u32 = 3;
 ///
 /// Two rules keep the detectors honest against interleaving:
 ///
-/// - The identical-action notice is remembered PER `(tool, args digest)`
-///   key FOR THE WHOLE RUN (the burst rule, design §2.6, H1a review N-1):
-///   the first time a key reaches the threshold in the window it gets the
-///   one notice; the next time it reaches the threshold — in the same burst
-///   or any later one, whatever came in between — the run stops with
-///   `Loop(Repeat)`. Episodes do not reset. The set grows by at most one key
-///   per action, bounded by the step budget.
+/// - The identical-action notice is remembered PER `(tool, args digest,
+///   workspace tree digest)` key FOR THE WHOLE RUN (the burst rule, design
+///   §2.6, H1a review N-1): the first time a key reaches the threshold in
+///   the window it gets the one notice; the next time it reaches the
+///   threshold — in the same burst or any later one, whatever came in
+///   between — the run stops with `Loop(Repeat)`. Episodes do not reset.
+///   The set grows by at most one key per action, bounded by the step
+///   budget. The tree digest is part of the key (H2b, the H1e-2 row's H2
+///   condition): re-reading a file after an edit changed the workspace is
+///   a new key, not a repeat.
 /// - "New" observation and tree digests mean never seen before in this run,
 ///   not merely different from the last one. Alternating between two
 ///   already-seen digests is not progress. The seen sets grow by at most one
 ///   entry per event, and the step budget bounds the events in a run.
+///
+/// Ordered collections only (H1 phase-exit review F-6): nothing here is
+/// keyed by OS-seeded hashing, so no iteration order can depend on the
+/// process.
 pub struct LoopDetector {
-    window: VecDeque<(String, Digest)>,
-    repeat_noticed: HashSet<(String, Digest)>,
-    edits_per_file: HashMap<String, u32>,
+    window: VecDeque<RepeatKey>,
+    repeat_noticed: BTreeSet<RepeatKey>,
+    edits_per_file: BTreeMap<String, u32>,
     steps_without_progress: u32,
-    seen_observations: HashSet<Digest>,
-    seen_trees: HashSet<Digest>,
-    denial_counts: HashMap<String, u32>,
+    seen_observations: BTreeSet<[u8; 32]>,
+    seen_trees: BTreeSet<[u8; 32]>,
+    denial_counts: BTreeMap<String, u32>,
     removed: Vec<String>,
 }
+
+/// The identical-action key: tool, argument digest and workspace tree
+/// digest (digests as their bytes: `Digest` has no order).
+type RepeatKey = (String, [u8; 32], [u8; 32]);
 
 impl Default for LoopDetector {
     fn default() -> Self {
@@ -909,12 +926,12 @@ impl LoopDetector {
     pub fn new() -> Self {
         Self {
             window: VecDeque::new(),
-            repeat_noticed: HashSet::new(),
-            edits_per_file: HashMap::new(),
+            repeat_noticed: BTreeSet::new(),
+            edits_per_file: BTreeMap::new(),
             steps_without_progress: 0,
-            seen_observations: HashSet::new(),
-            seen_trees: HashSet::new(),
-            denial_counts: HashMap::new(),
+            seen_observations: BTreeSet::new(),
+            seen_trees: BTreeSet::new(),
+            denial_counts: BTreeMap::new(),
             removed: Vec::new(),
         }
     }
@@ -926,9 +943,13 @@ impl LoopDetector {
                 self.bump_stall();
                 LoopSignal::Quiet
             }
-            LoopEvent::Action { tool, args_digest } => {
+            LoopEvent::Action {
+                tool,
+                args_digest,
+                tree,
+            } => {
                 self.bump_stall();
-                self.observe_action(tool, args_digest)
+                self.observe_action((tool, *args_digest.as_bytes(), *tree.as_bytes()))
             }
             LoopEvent::EditApplied { file } => {
                 let count = self.edits_per_file.entry(file).or_insert(0);
@@ -940,14 +961,14 @@ impl LoopDetector {
                 }
             }
             LoopEvent::Observation { digest } => {
-                if self.seen_observations.insert(digest) {
+                if self.seen_observations.insert(*digest.as_bytes()) {
                     // A never-seen observation is progress.
                     self.steps_without_progress = 0;
                 }
                 LoopSignal::Quiet
             }
             LoopEvent::WorkspaceChanged { tree_digest } => {
-                if self.seen_trees.insert(tree_digest) {
+                if self.seen_trees.insert(*tree_digest.as_bytes()) {
                     // A never-seen tree digest is progress.
                     self.steps_without_progress = 0;
                 }
@@ -980,13 +1001,12 @@ impl LoopDetector {
         self.steps_without_progress = self.steps_without_progress.saturating_add(1);
     }
 
-    fn observe_action(&mut self, tool: String, args_digest: Digest) -> LoopSignal {
-        self.window.push_back((tool.clone(), args_digest));
+    fn observe_action(&mut self, key: RepeatKey) -> LoopSignal {
+        self.window.push_back(key.clone());
         while self.window.len() > IDENTICAL_WINDOW {
             self.window.pop_front();
         }
         // A noticed key stays noticed for the whole run (burst rule, §2.6).
-        let key = (tool, args_digest);
         let count = self.window.iter().filter(|entry| *entry == &key).count();
         if count < IDENTICAL_LIMIT {
             return LoopSignal::Quiet;
@@ -1080,6 +1100,7 @@ mod tests {
                 match d.observe(LoopEvent::Action {
                     tool: "harness.fs.read".into(),
                     args_digest: key,
+                    tree: T0,
                 }) {
                     LoopSignal::Notice(_) => notices += 1,
                     LoopSignal::Stop(k) => {
@@ -1093,6 +1114,7 @@ mod tests {
                 d.observe(LoopEvent::Action {
                     tool: "harness.fs.list".into(),
                     args_digest: Digest::from_bytes([burst.wrapping_mul(8).wrapping_add(i); 32]),
+                    tree: T0,
                 });
                 d.observe(LoopEvent::Observation {
                     digest: Digest::from_bytes([burst.wrapping_mul(8).wrapping_add(i) ^ 0xff; 32]),
@@ -1256,6 +1278,8 @@ mod tests {
     const D1: Digest = Digest::from_bytes([1u8; 32]);
     const D2: Digest = Digest::from_bytes([2u8; 32]);
     const D3: Digest = Digest::from_bytes([3u8; 32]);
+    /// The workspace tree digest the Action events in these tests see.
+    const T0: Digest = Digest::from_bytes([0xEE; 32]);
 
     #[test]
     fn untrusted_debug_never_prints_content() {
@@ -1547,6 +1571,7 @@ mod tests {
         let action = || LoopEvent::Action {
             tool: "fs.write".to_string(),
             args_digest: D1,
+            tree: T0,
         };
         assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
         assert_eq!(d.observe(action()), LoopSignal::Quiet);
@@ -1568,6 +1593,7 @@ mod tests {
         let action = || LoopEvent::Action {
             tool: "fs.write".to_string(),
             args_digest: D1,
+            tree: T0,
         };
         for _ in 0..3 {
             d.observe(action());
@@ -1577,6 +1603,7 @@ mod tests {
             d.observe(LoopEvent::Action {
                 tool: format!("tool{i}"),
                 args_digest: D2,
+                tree: T0,
             });
         }
         // ...and a NEW observation keeps the no-progress counter quiet so the
@@ -1684,6 +1711,7 @@ mod tests {
         let action = || LoopEvent::Action {
             tool: "fs.write".to_string(),
             args_digest: D1,
+            tree: T0,
         };
         assert_eq!(d.observe(action()), LoopSignal::Quiet);
         assert_eq!(d.observe(action()), LoopSignal::Quiet);
@@ -1714,11 +1742,13 @@ mod tests {
                 LoopEvent::Action {
                     tool: "fs.read".to_string(),
                     args_digest: D1,
+                    tree: T0,
                 }
             } else {
                 LoopEvent::Action {
                     tool: format!("filler{i}"),
                     args_digest: D2,
+                    tree: T0,
                 }
             };
             let signal = d.observe(event);
@@ -1754,10 +1784,12 @@ mod tests {
         let a = || LoopEvent::Action {
             tool: "a".to_string(),
             args_digest: D1,
+            tree: T0,
         };
         let b = || LoopEvent::Action {
             tool: "b".to_string(),
             args_digest: D1,
+            tree: T0,
         };
         assert_eq!(d.observe(a()), LoopSignal::Quiet);
         assert_eq!(d.observe(b()), LoopSignal::Quiet);
@@ -1789,6 +1821,7 @@ mod tests {
             let signal = d.observe(LoopEvent::Action {
                 tool: format!("t{i}"),
                 args_digest: Digest::from_bytes([i; 32]),
+                tree: T0,
             });
             d.observe(LoopEvent::Observation {
                 digest: if i % 2 == 0 { D1 } else { D2 },
@@ -1850,6 +1883,7 @@ mod tests {
             detector.observe(LoopEvent::Action {
                 tool: "model.turn".to_string(),
                 args_digest: Digest::from_bytes([step; 32]),
+                tree: T0,
             });
             detector.observe(LoopEvent::Observation {
                 digest: Digest::from_bytes([step.wrapping_add(100); 32]),
@@ -1857,5 +1891,49 @@ mod tests {
         }
         assert_eq!(stops, vec![StopCause::Budget(BudgetDim::Steps)]);
         assert_eq!(meter.steps_spent(), 5);
+    }
+
+    // H2b (the H1e-2 row's H2 condition): the repeat key includes the
+    // workspace tree digest. The same read on a workspace an edit changed
+    // is a new key, so read → edit → read → edit → read never repeats;
+    // the same read three times on one tree still gets the notice, then
+    // the stop.
+    #[test]
+    fn detector_repeat_key_includes_the_workspace_tree() {
+        let read = |tree: Digest| LoopEvent::Action {
+            tool: "harness.fs.read".to_string(),
+            args_digest: D1,
+            tree,
+        };
+        let mut d = LoopDetector::new();
+        for (i, t) in [D1, D2, D3, D1, D2, D3].into_iter().enumerate() {
+            assert_eq!(d.observe(read(t)), LoopSignal::Quiet, "read {i}");
+        }
+        let mut d = LoopDetector::new();
+        assert_eq!(d.observe(read(T0)), LoopSignal::Quiet);
+        assert_eq!(d.observe(read(T0)), LoopSignal::Quiet);
+        assert!(matches!(d.observe(read(T0)), LoopSignal::Notice(_)));
+        assert_eq!(d.observe(read(D2)), LoopSignal::Quiet, "another tree");
+        assert_eq!(
+            d.observe(read(T0)),
+            LoopSignal::Stop(LoopKind::Repeat),
+            "the noticed key again"
+        );
+    }
+
+    // §2.6 edit churn: the ninth successful edit to one file stops the
+    // run; edits to another file count separately.
+    #[test]
+    fn detector_edit_churn_stops_after_eight_edits_to_one_file() {
+        let mut d = LoopDetector::new();
+        let edit = |f: &str| LoopEvent::EditApplied { file: f.into() };
+        for _ in 0..8 {
+            assert_eq!(d.observe(edit("src/lib.rs")), LoopSignal::Quiet);
+            assert_eq!(d.observe(edit("src/main.rs")), LoopSignal::Quiet);
+        }
+        assert_eq!(
+            d.observe(edit("src/lib.rs")),
+            LoopSignal::Stop(LoopKind::EditChurn)
+        );
     }
 }

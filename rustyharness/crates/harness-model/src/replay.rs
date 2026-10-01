@@ -1,18 +1,12 @@
 //! Replay, audit mode (design §2.9, INV-20): model half.
 //!
 //! **Recording.** Every call is journaled as a pair:
-//! - `ModelRequested { request: <sha256 of the rendered request> }`
-//!   ([`requested_event`]), plus, when the request shows a turn for the
-//!   first time (design row H1i), the nonce drawn for its observation and
-//!   that observation's step (`nonce`, `nonce_step`), and the step of a
-//!   withheld observation or reply (`withheld_output_step`,
-//!   `withheld_reply_step`); every later request shows the turn the same
-//!   way, with the same nonce;
+//! - `ModelRequested { request: <sha256 of the rendered request>, nonce }`
+//!   ([`requested_event`]);
 //! - `ModelReplied { … }` ([`replied_event`]) carrying either the completion
 //!   (content and each tool call's name and arguments as `UntrustedBlob`s;
-//!   finish reason; usage; byte counts; retried statuses; and, since H1i,
-//!   the server's own cache and timing report as an untrusted payload,
-//!   `claimed_stats`) or the typed error (`error` + its details).
+//!   finish reason; usage; byte counts; retried statuses) or the typed
+//!   error (`error` + its details).
 //!
 //! **Replaying.** [`ReplayBackend::from_journal`] reads those pairs from a
 //! verified journal (and its blob store) and implements [`ModelBackend`]:
@@ -40,7 +34,6 @@ use harness_journal::{
 };
 use serde_json::{Map, Value};
 
-use crate::context::{Delimiting, Shown};
 use crate::profile::Profile;
 use crate::wire::{render_request, request_digest};
 use crate::{
@@ -48,33 +41,13 @@ use crate::{
     RawToolCall, RenderNonce, ServerUsage, Unavailable,
 };
 
-/// The `ModelRequested` event for a rendered request. `first` is the turn
-/// this request shows for the first time, if any (H1i: at most one per
-/// request, the previous step's), with how it is shown: the nonce drawn
-/// for its observation is journaled here, once (`nonce`, `nonce_step`), and
-/// re-fed by a replay; a withheld observation (`withheld_output_step`) or
-/// reply (`withheld_reply_step`) is recorded too, and a replay recomputes
-/// those decisions and compares them.
-pub fn requested_event(rendered: &Value, first: Option<(u64, &Shown)>) -> Option<Event> {
-    let mut ev = Event::new(EventKind::ModelRequested)
-        .field("request", Trusted::Digest(request_digest(rendered)));
-    if let Some((step, shown)) = first {
-        match &shown.output {
-            Some(Delimiting::Nonce(n)) => {
-                ev = ev
-                    .field("nonce", Trusted::Id(Ident::from_trusted(n)?))
-                    .field("nonce_step", Trusted::U64(step));
-            }
-            Some(Delimiting::Withheld) => {
-                ev = ev.field("withheld_output_step", Trusted::U64(step));
-            }
-            None => {}
-        }
-        if shown.reply_withheld {
-            ev = ev.field("withheld_reply_step", Trusted::U64(step));
-        }
-    }
-    Some(ev)
+/// The `ModelRequested` event for a rendered request.
+pub fn requested_event(rendered: &Value, nonce: &RenderNonce) -> Option<Event> {
+    Some(
+        Event::new(EventKind::ModelRequested)
+            .field("request", Trusted::Digest(request_digest(rendered)))
+            .field("nonce", Trusted::Id(Ident::from_trusted(nonce)?)),
+    )
 }
 
 fn error_fields(e: &ModelError) -> Vec<(&'static str, Trusted)> {
@@ -161,11 +134,6 @@ pub fn replied_event<F: JournalFile, B: BlobSink, K: Clock>(
             ]),
         );
     }
-    // H1i: the server's own cache and timing report, a claim, kept as an
-    // untrusted payload beside the numbers the harness uses.
-    if let Some(s) = &c.server_stats {
-        ev = ev.field("claimed_stats", Trusted::Untrusted(w.untrusted(s)?));
-    }
     Ok(ev)
 }
 
@@ -190,9 +158,7 @@ pub enum ReplayError {
 #[derive(Debug, Clone)]
 struct Recorded {
     request: Digest,
-    /// The nonce drawn for the observation the request showed first, if
-    /// any (H1i).
-    nonce: Option<String>,
+    nonce: String,
     reply: RecordedReply,
 }
 
@@ -206,7 +172,6 @@ enum RecordedReply {
         request_bytes: u64,
         reply_bytes: u64,
         retried: Vec<u16>,
-        server_stats: Option<String>,
     },
     Err(ModelError),
 }
@@ -330,10 +295,6 @@ fn decode_reply(
         .iter()
         .map(|v| v.as_u64().and_then(|x| u16::try_from(x).ok()).ok_or_else(m))
         .collect::<Result<_, _>>()?;
-    let server_stats = match b.get("claimed_stats") {
-        None => None,
-        Some(v) => Some(payload(v, blobs, seq)?),
-    };
     Ok(RecordedReply::Ok {
         content,
         calls,
@@ -342,7 +303,6 @@ fn decode_reply(
         request_bytes: num("request_bytes")?,
         reply_bytes: num("reply_bytes")?,
         retried,
-        server_stats,
     })
 }
 
@@ -364,7 +324,7 @@ impl ReplayBackend {
         profile: Profile,
     ) -> Result<Self, ReplayError> {
         let mut exchanges = Vec::new();
-        let mut pending: Option<(Digest, Option<String>)> = None;
+        let mut pending: Option<(Digest, String)> = None;
         for r in &v.records {
             match r.kind {
                 EventKind::ModelRequested => {
@@ -377,18 +337,12 @@ impl ReplayBackend {
                         .and_then(Value::as_str)
                         .and_then(|s| s.parse().ok())
                         .ok_or(ReplayError::Malformed(r.seq))?;
-                    // Optional since H1i: only a request that shows an
-                    // observation for the first time draws a nonce.
-                    let n = match r.body.get("nonce") {
-                        None => None,
-                        Some(n) => Some(
-                            n.as_str()
-                                .filter(|s| RenderNonce::new(s).is_some())
-                                .ok_or(ReplayError::Malformed(r.seq))?
-                                .to_owned(),
-                        ),
-                    };
-                    pending = Some((d, n));
+                    let n = r
+                        .body
+                        .get("nonce")
+                        .and_then(Value::as_str)
+                        .ok_or(ReplayError::Malformed(r.seq))?;
+                    pending = Some((d, n.to_owned()));
                 }
                 EventKind::ModelReplied => {
                     let (request, nonce) = pending.take().ok_or(ReplayError::Unpaired(r.seq))?;
@@ -421,13 +375,12 @@ impl ReplayBackend {
         self.exchanges.is_empty()
     }
 
-    /// The nonce recorded for exchange `i`: the one drawn for the
-    /// observation that request showed first (H1i), if it showed one.
+    /// The nonce recorded for exchange `i` (the driver reuses it so the
+    /// request re-renders identically).
     pub fn recorded_nonce(&self, i: usize) -> Option<RenderNonce> {
         self.exchanges
             .get(i)
-            .and_then(|e| e.nonce.as_deref())
-            .and_then(RenderNonce::new)
+            .and_then(|e| RenderNonce::new(&e.nonce))
     }
 
     /// Whether every recorded exchange has been replayed.
@@ -479,7 +432,6 @@ impl ModelBackend for ReplayBackend {
                 request_bytes,
                 reply_bytes,
                 retried,
-                server_stats,
             } => Ok(Completion {
                 content: Untrusted::new(content.clone(), Source::Model),
                 tool_calls: calls
@@ -499,9 +451,6 @@ impl ModelBackend for ReplayBackend {
                 request_bytes: *request_bytes,
                 reply_bytes: *reply_bytes,
                 retried: retried.clone(),
-                server_stats: server_stats
-                    .as_ref()
-                    .map(|s| Untrusted::new(s.clone(), Source::Model)),
             }),
         }
     }

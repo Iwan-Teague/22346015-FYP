@@ -48,7 +48,6 @@ pub fn text_reply(content: &str) -> Completion {
         request_bytes: 0,
         reply_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
         retried: Vec::new(),
-        server_stats: None,
     }
 }
 
@@ -68,7 +67,6 @@ pub fn tool_reply(name: &str, arguments: &str) -> Completion {
         request_bytes: 0,
         reply_bytes: u64::try_from(name.len() + arguments.len()).unwrap_or(u64::MAX),
         retried: Vec::new(),
-        server_stats: None,
     }
 }
 

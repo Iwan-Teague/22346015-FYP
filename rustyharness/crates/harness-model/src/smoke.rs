@@ -13,8 +13,7 @@ use serde_json::json;
 
 use crate::profile::{score, CheckResult, Profile, SmokeResults};
 use crate::protocol::{parse_reply, protocol_system_text};
-use crate::wire::tool_name;
-use crate::{HarnessText, Message, ModelBackend, ModelRequest, TaskText, ToolSpec};
+use crate::{HarnessText, Message, ModelBackend, ModelRequest, RenderNonce, TaskText, ToolSpec};
 
 /// The paths the fixed cases ask for.
 pub const SMOKE_PATHS: [&str; 5] = [
@@ -53,18 +52,21 @@ pub fn run(
         format_errors: 0,
         call_failures: 0,
     };
-    for path in SMOKE_PATHS.iter() {
+    for (i, path) in SMOKE_PATHS.iter().enumerate() {
         r.cases += 1;
+        let Some(nonce) = RenderNonce::new(&format!("{:016x}", i + 1)) else {
+            r.call_failures += 1;
+            continue;
+        };
         let req = ModelRequest {
             messages: vec![
                 Message::System(protocol_system_text(profile.protocol(), &tools)),
-                // The tool as the model names it (design row H1i).
                 Message::Task(TaskText::new(format!(
-                    "Read the file {path} with {}. Do nothing else.",
-                    tool_name(profile.protocol(), "harness.fs.read")
+                    "Read the file {path} with harness.fs.read. Do nothing else."
                 ))),
             ],
             tools: tools.clone(),
+            nonce,
         };
         let completion = match backend.complete(&req, Instant::now() + per_call) {
             Ok(c) => c,

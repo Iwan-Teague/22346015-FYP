@@ -432,6 +432,23 @@ capture_case() {
 }
 capture_case "a relative program in capture.rs" 'Command::new("/sbin/mount")' 'Command::new("mount")'
 capture_case "an extra argument in capture.rs" '"hw.logicalcpu"]' '"hw.logicalcpu", "-a"]'
+# The confined spawn (H2a): only its three programs, and pinned.
+confine_case() {
+    fresh
+    awk -v from="$2" -v to="$3" '{ i = index($0, from); if (i) $0 = substr($0, 1, i - 1) to substr($0, i + length(from)); print }' \
+        "$copy/crates/harness-sandbox/src/confine_spawn.rs" >"$tmpdir/confine.planted" || fail "awk failed"
+    mv "$tmpdir/confine.planted" "$copy/crates/harness-sandbox/src/confine_spawn.rs" || fail "mv failed"
+    grep -qF "$3" "$copy/crates/harness-sandbox/src/confine_spawn.rs" || fail "confine plant '$1' did not land"
+    expect_refusal "$1" "$4"
+}
+confine_case "another program in confine_spawn.rs" 'Command::new("/bin/kill")' 'Command::new("/bin/sh")' \
+    'program "/bin/sh" is not one the confined spawn may run'
+confine_case "a relative program in confine_spawn.rs" 'Command::new("/bin/kill")' 'Command::new("kill")' \
+    "crates/harness-sandbox/src/confine_spawn.rs is not the reviewed version"
+confine_case "the start canary removed in confine_spawn.rs" "if(\$pp<=1 || kill(0,\$pp) || (\$!+0)!=1)" "if(0)" \
+    "crates/harness-sandbox/src/confine_spawn.rs is not the reviewed version"
+confine_case "the per-pass canary weakened in confine_spawn.rs" "if(\$hit || (\$en!=1 && \$en!=3))" "if(0)" \
+    "crates/harness-sandbox/src/confine_spawn.rs is not the reviewed version"
 # cargo metadata failing, or printing targets in a shape the gate does not
 # read, fails the gate.
 mkdir "$tmpdir/metashim" || fail "mkdir metashim failed"

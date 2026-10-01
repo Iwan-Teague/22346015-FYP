@@ -817,6 +817,7 @@ pub fn stop_cause_name(c: &StopCause) -> &'static str {
     use harness_core::LoopKind as L;
     match c {
         StopCause::Submitted => "submitted",
+        StopCause::SubmittedChecksFailed => "submitted_checks_failed",
         StopCause::Budget(_) => "budget",
         StopCause::FormatErrors => "format_errors",
         StopCause::Loop(L::Repeat) => "loop:repeat",

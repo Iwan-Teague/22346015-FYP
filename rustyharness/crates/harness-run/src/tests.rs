@@ -155,6 +155,7 @@ fn drive_full(
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
         exec: None,
+        presubmit: None,
     };
     let policy = UserPolicy::default();
     let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
@@ -209,6 +210,7 @@ fn drive_full(
         reads_seen: Default::default(),
         todo: None,
         notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
+        presubmit: None,
     };
     let end = lp.drive(&mut w);
     let pressure = lp.pressure.clone();
@@ -864,6 +866,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         grants: vec!["harness.edit.replace".into()],
         workspace_public: false,
         exec: None,
+        presubmit: None,
     };
     let policy = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
     let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
@@ -929,6 +932,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         reads_seen: Default::default(),
         todo: None,
         notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
+        presubmit: None,
     };
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::PolicyAbort);

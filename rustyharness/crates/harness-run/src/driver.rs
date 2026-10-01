@@ -83,6 +83,9 @@ use harness_tools::{
 use serde_json::Value;
 
 use crate::approve::{nonce_name, ApprovalAnswer, Approver, RecordedApproval};
+use crate::presubmit::{
+    PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec, PresubmitState, Round,
+};
 use crate::sample;
 
 // ---------------------------------------------------------------------------
@@ -103,6 +106,10 @@ pub struct TaskSpec {
     /// a command needs besides the workspace. Present exactly when the
     /// grants include `harness.exec.run`.
     pub exec: Option<ExecSpec>,
+    /// Commands the harness runs when the model submits (H3a): a failing
+    /// one turns the submission back, up to a bound. Needs the exec grant
+    /// and section; `None`: a submit is accepted at once, exactly as before.
+    pub presubmit: Option<PresubmitSpec>,
 }
 
 /// Budgets and timeouts (§2.4).
@@ -236,6 +243,9 @@ pub enum RunRefused {
     /// (INV-6, §6.1): refused, never run unconfined.
     #[error("{0}")]
     Confinement(Refused),
+    /// The task's pre-submit checks are refused (H3a).
+    #[error("presubmit refused: {0}")]
+    Presubmit(#[from] PresubmitRefused),
 }
 
 impl RunRefused {
@@ -279,6 +289,9 @@ pub struct RunReport {
     /// under 5% or load above twice the CPUs), for the report's
     /// `possibly-environmental` Info finding.
     pub possibly_environmental: Vec<u64>,
+    /// What the task's pre-submit checks did (H3a); `None` for a task
+    /// without any.
+    pub presubmit: Option<PresubmitReport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +354,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         registry: r.registry,
         tools: pre.tools,
         task: &r.spec.task,
-        facts: facts_block(&facts),
+        facts: loop_facts(&facts, r.spec),
         profile: r.profile,
         backend: r.backend,
         providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec_tools),
@@ -366,6 +379,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         reads_seen: Default::default(),
         todo: todo_for(&r.spec.grants),
         notices: BudgetNotices::live(r.config.limits.wall),
+        presubmit: PresubmitState::of(&r.spec.presubmit),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -379,6 +393,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         steps: end.step,
         journal_error: released.error,
         possibly_environmental: lp.pressure,
+        presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
     })
 }
 
@@ -546,6 +561,19 @@ pub(crate) fn attempt_check(
     }
 }
 
+/// Context block 4 of a run: the measured facts, then those of the task's
+/// pre-submit checks (H3a), when it has any.
+pub(crate) fn loop_facts(f: &WorkspaceFacts, spec: &TaskSpec) -> Vec<Fact> {
+    let mut facts = facts_block(f);
+    if let Some(p) = &spec.presubmit {
+        facts.extend(context::presubmit_facts(
+            p.commands.len() as u64,
+            u64::from(p.max_rounds),
+        ));
+    }
+    facts
+}
+
 /// Context block 4 from the measured facts.
 pub(crate) fn facts_block(f: &WorkspaceFacts) -> Vec<Fact> {
     vec![
@@ -619,6 +647,20 @@ pub(crate) fn plan(
         registry,
         policy,
     )?;
+    // Pre-submit checks (H3a): bounded and on the allowlist, and none of them
+    // denied by policy (a pure decision, the same the model's own command
+    // would meet), or the run does not start.
+    if let Some(p) = &spec.presubmit {
+        p.check(&spec.grants, spec.exec.as_ref())?;
+        for i in 0..p.commands.len() {
+            let denied = p
+                .call(i)
+                .is_none_or(|c| matches!(session.decide(&c), PolicyDecision::Deny { .. }));
+            if denied {
+                return Err(PresubmitRefused::Denied(i + 1).into());
+            }
+        }
+    }
     let mut tools = Vec::with_capacity(grants.len());
     for g in &grants {
         // Planning resolved every grant to exactly one capability.
@@ -785,7 +827,7 @@ impl ExecHeader {
 /// replayed into a mismatch. `shell_enabled` and `exec` (H2d) are the
 /// task's exec allowlist: absent without an exec grant, so a journal
 /// without one reads as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 12] = [
+pub(crate) const HEADER_INPUT_KEYS: [&str; 13] = [
     "task",
     "grants",
     "workspace_public",
@@ -798,6 +840,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 12] = [
     "context_format",
     "limits",
     "exec",
+    "presubmit",
 ];
 
 /// The header's `limits` object, field by field: the one encoding the
@@ -934,6 +977,18 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
             .field("exec_programs_sha256", Trusted::Digest(e.programs_sha256))
             .field("exec_timeout_ms", Trusted::U64(e.timeout_ms));
     }
+    // The task's pre-submit checks (H3a): a header input, compared by audit
+    // and resume; no key without checks, so older journals read as before.
+    if let Some(p) = &spec.presubmit {
+        hd = hd.field(
+            "presubmit",
+            Trusted::Obj(vec![
+                ("spec", Trusted::Digest(p.digest())),
+                ("commands", Trusted::U64(p.commands.len() as u64)),
+                ("max_rounds", Trusted::U64(u64::from(p.max_rounds))),
+            ]),
+        );
+    }
     if let Some((attempt, head, carried_ms, skipped)) = &h.resumed_from {
         let mut from = vec![
             ("attempt", Trusted::U64(u64::from(*attempt))),
@@ -1048,6 +1103,9 @@ pub(crate) struct Loop<'a> {
     pub(crate) todo: Option<TodoList>,
     /// The budget notices' state (H2e).
     pub(crate) notices: BudgetNotices,
+    /// The task's pre-submit checks and what they did so far (H3a); `None`
+    /// for a task without any: a submission is then accepted at once.
+    pub(crate) presubmit: Option<PresubmitState>,
 }
 
 /// Where the budget notices come from, and what was announced (H2e). The
@@ -1212,7 +1270,7 @@ enum Flow {
     Stop(StopCause, Option<Digest>),
 }
 
-fn journal(e: JournalError) -> StopCause {
+pub(crate) fn journal(e: JournalError) -> StopCause {
     e.stop_cause()
 }
 
@@ -1250,7 +1308,7 @@ impl<'a> Loop<'a> {
         }
     }
 
-    fn remaining_wall(&self) -> Duration {
+    pub(crate) fn remaining_wall(&self) -> Duration {
         self.config.limits.wall.saturating_sub(self.meter.elapsed())
     }
 
@@ -1558,14 +1616,78 @@ impl<'a> Loop<'a> {
                     .field("note", Trusted::Untrusted(blob)),
             )
             .map_err(journal)?;
+            let intent_seq = journaled.intent_seq();
+            drop(journaled);
+            // The task's pre-submit checks (H3a): run now, in the submit's
+            // own step. Without any, the submission is accepted at once.
+            let round = match self.presubmit {
+                Some(_) => Some(self.presubmit_round(w, step)?),
+                None => None,
+            };
+            if let Some(Round {
+                turned_back: Some(back),
+                ..
+            }) = round
+            {
+                // A failing check turned the submission back: its result is
+                // an error whose observation is that check's output, and the
+                // turn carries the harness's notice. The run goes on.
+                let out = w.untrusted(&back.body).map_err(journal)?;
+                w.append(
+                    step,
+                    Event::new(EventKind::ToolFinished)
+                        .field("intent_seq", Trusted::U64(intent_seq))
+                        .field("status", Trusted::Text("error"))
+                        .field("truncated", Trusted::Bool(false))
+                        .field("digest", Trusted::Digest(back.digest))
+                        .field("output", Trusted::Untrusted(out))
+                        .field(
+                            "code",
+                            Trusted::U64(u64::from(
+                                harness_tools::builtin::code::PRESUBMIT_REJECTED,
+                            )),
+                        ),
+                )
+                .map_err(journal)?;
+                self.detector.observe(LoopEvent::Observation {
+                    digest: back.digest,
+                });
+                let notice = Some(match notice {
+                    Some(n) => n.joined(&back.notice),
+                    None => back.notice,
+                });
+                self.turns.push(Turn {
+                    step,
+                    reply,
+                    action: Some(shown),
+                    feedback: Feedback::Observation {
+                        call: tool,
+                        body: back.body,
+                        digest: back.digest,
+                    },
+                    notice,
+                });
+                self.meter.tick_wall()?;
+                self.observe_budgets(w, step)?;
+                return Ok(Flow::Continue);
+            }
             w.append(
                 step,
                 Event::new(EventKind::ToolFinished)
                     .field("status", Trusted::Text("ok"))
-                    .field("intent_seq", Trusted::U64(journaled.intent_seq())),
+                    .field("intent_seq", Trusted::U64(intent_seq)),
             )
             .map_err(journal)?;
-            return Ok(Flow::Stop(StopCause::Submitted, Some(digest)));
+            // Accepted with a check that still fails (the bound is spent):
+            // its own stop cause, never a plain submit.
+            let cause = match round {
+                Some(Round {
+                    result: PresubmitResult::Failed,
+                    ..
+                }) => StopCause::SubmittedChecksFailed,
+                _ => StopCause::Submitted,
+            };
+            return Ok(Flow::Stop(cause, Some(digest)));
         }
 
         // The checklist (H2e): like the sentinel, recorded and never run by
@@ -2004,7 +2126,7 @@ impl<'a> Loop<'a> {
 
     /// The 80% standing condition per budget dimension (§2.6), journaled
     /// only when it begins or ends (`BudgetCharged`, key = dimension).
-    fn observe_budgets<F: JournalFile, B: BlobSink, K: Clock>(
+    pub(crate) fn observe_budgets<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
         step: u64,
@@ -2072,7 +2194,7 @@ impl<'a> Loop<'a> {
     /// call does not run and the model is told so in static text. A token
     /// that fails to mint, redeem or authorise (a recorded nonce reused, a
     /// harness bug) stops the run: `PolicyAbort`, never a call.
-    fn approve<F: JournalFile, B: BlobSink, K: Clock>(
+    pub(crate) fn approve<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
         step: u64,
@@ -2208,7 +2330,7 @@ impl<'a> Loop<'a> {
     }
 
     /// The admitted capability behind an active tool id.
-    fn capability(&self, id: &str) -> Result<&'a Capability, StopCause> {
+    pub(crate) fn capability(&self, id: &str) -> Result<&'a Capability, StopCause> {
         let registry: &'a Registry = self.registry;
         match registry.resolve(id) {
             Resolved::One { capability, .. } => Ok(capability),
@@ -2233,7 +2355,7 @@ fn shown_reply(c: &Completion) -> Untrusted<String> {
     Untrusted::new(s, Source::Model)
 }
 
-fn decided(d: &PolicyDecision) -> Event {
+pub(crate) fn decided(d: &PolicyDecision) -> Event {
     let rule = match d.rule() {
         RuleId::Builtin(name) => Trusted::Text(name),
         RuleId::User { list, index } => Trusted::Obj(vec![
@@ -2293,7 +2415,7 @@ impl RecordedResult {
     /// The recorded result as a tool result for this call. A recorded
     /// result for another capability is a provider failure here, so the
     /// replayed journal differs from the recorded one at this step.
-    fn into_result(
+    pub(crate) fn into_result(
         self,
         tool: &str,
         path: Option<&str>,
@@ -2567,7 +2689,7 @@ fn loop_name(k: LoopKind) -> &'static str {
     }
 }
 
-fn status_name(s: ToolStatus) -> &'static str {
+pub(crate) fn status_name(s: ToolStatus) -> &'static str {
     match s {
         ToolStatus::Ok => "ok",
         ToolStatus::Error { .. } => "error",

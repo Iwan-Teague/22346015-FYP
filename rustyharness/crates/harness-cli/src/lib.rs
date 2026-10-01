@@ -459,6 +459,35 @@ struct TaskFile {
     /// The run's budgets (§2.1: the task spec declares them; H2e).
     #[serde(default)]
     budget: Option<BudgetFile>,
+    /// Commands the harness runs when the model submits (H3a), in a task
+    /// that grants `harness.exec.run`.
+    #[serde(default)]
+    presubmit: Option<PresubmitFile>,
+}
+
+/// A task file's `presubmit` section (H3a): the commands run, in the
+/// sandbox, when the model calls `harness.task.submit` (each an argv whose
+/// first item is a program name on the exec allowlist, at most 4), and how
+/// many submissions a failing one turns back (`max_rounds`, 1 to 5, 2 when
+/// absent). It is a header input, so an audit or a resume must be given the
+/// task file the run was given.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresubmitFile {
+    commands: Vec<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    max_rounds: Option<u32>,
+}
+
+impl PresubmitFile {
+    fn spec(self) -> harness_run::PresubmitSpec {
+        harness_run::PresubmitSpec {
+            commands: self.commands,
+            max_rounds: self
+                .max_rounds
+                .unwrap_or(harness_run::presubmit::DEFAULT_ROUNDS),
+        }
+    }
 }
 
 /// A task file's `budget` section (H2e): the step budget and the wall-clock
@@ -636,12 +665,20 @@ fn inputs(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Inputs, Outcome> {
         Some(e) => Some(e.spec().map_err(unreadable)?),
     };
     let config = run_config(task.budget.as_ref(), exec.is_some()).map_err(unreadable)?;
+    // The checks (H3a): bounded and on the allowlist, in a task that grants
+    // the command runner, or the task file is unusable input (exit 4).
+    let presubmit = task.presubmit.map(PresubmitFile::spec);
+    if let Some(p) = &presubmit {
+        p.check(&task.grants, exec.as_ref())
+            .map_err(|e| unreadable(format!("presubmit: {e}")))?;
+    }
     Ok(Inputs {
         spec: TaskSpec {
             task: TaskText::new(task.task),
             grants: task.grants,
             workspace_public: task.workspace_public,
             exec,
+            presubmit,
         },
         policy,
         profile,
@@ -706,6 +743,9 @@ fn from_refusal(cx: &Cx<'_>, e: &RunRefused) -> Outcome {
     // No conformed sandbox for a task that executes (INV-6): its own exit.
     let code = match e {
         RunRefused::Confinement(_) => exit::CONFINEMENT_REFUSED,
+        // A task whose checks the policy denies is a task and a policy that
+        // do not go together: unusable input, as a malformed section is (H3a).
+        RunRefused::Presubmit(_) => exit::UNREADABLE_INPUT,
         _ => exit::INDETERMINATE,
     };
     let mut o = refused(code, format!("the run did not start: {e}"));
@@ -832,12 +872,56 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
         note!(cx, "possibly environmental: {}", f.observed);
         findings.push(f);
     }
+    // The task's pre-submit checks (H3a): what they did, in words and as an
+    // Info finding, so a run that was accepted with a check still failing is
+    // never read as a plain submit.
+    if let Some(p) = &report.presubmit {
+        let words = presubmit_in_words(p, &report.cause);
+        note!(cx, "pre-submit checks: {words}");
+        findings.extend(info(
+            "harness.presubmit",
+            &format!("run {} attempt {}", report.run, report.attempt),
+            "every pre-submit check passing at the accepted submission",
+            words,
+        ));
+    }
     Ok(Outcome {
         outcome: report.outcome,
         findings,
         chain_head: report.chain_head.map(|d| d.to_string()),
         exit_override: None,
     })
+}
+
+/// What a run's pre-submit checks did, said plainly (H3a): how many
+/// submissions ran them and how many a failing check turned back, and how
+/// the last one ended. A submission accepted with a check still failing, or
+/// with the checks not run, says so.
+fn presubmit_in_words(p: &harness_run::PresubmitReport, cause: &harness_core::StopCause) -> String {
+    use harness_run::PresubmitResult as R;
+    let last = match (p.last, cause) {
+        (None, _) => "the run stopped before it submitted, so no check ran".to_owned(),
+        (Some(R::Passed), _) => "every check passed at the last submission".to_owned(),
+        (Some(R::Failed), harness_core::StopCause::SubmittedChecksFailed) => {
+            "a check still failed at the last submission, which was accepted anyway once the \
+             bound was spent (stop cause submitted_checks_failed)"
+                .to_owned()
+        }
+        (Some(R::Failed), _) => {
+            "a check failed at the last submission, which was turned back; the run then \
+             stopped for another reason"
+                .to_owned()
+        }
+        (Some(R::NotRun), _) => {
+            "a check could not be run at the last submission (declined or unanswered \
+             approval, or no runner), which was accepted; nothing checked it"
+                .to_owned()
+        }
+    };
+    format!(
+        "{} submission(s) ran the checks, {} turned back (the bound is {}); {last}",
+        p.submissions, p.turned_back, p.max_rounds
+    )
 }
 
 /// §7.1: a tool call that timed out, crashed or could not run while the

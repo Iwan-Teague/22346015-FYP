@@ -45,9 +45,11 @@ In scope for reports today, a way to:
 - make a search pattern run away (the regex engine is linear-time and size
   bounded; the glob matcher is linear), or get the parser's text, or any
   model-supplied text, shown to the model as harness text: a harness notice
-  (a budget notice, a repair, a denial) is built from harness words and
-  numbers only, and the checklist's items appear only inside the untrusted
-  result of `harness.task.todo` (H2e);
+  (a budget notice, a repair, a denial, the notice after a submission a
+  pre-submit check turned back) is built from harness words and numbers only
+  (the check's output appears only inside the untrusted, delimited result), and
+  the checklist's items appear only inside the untrusted result of
+  `harness.task.todo` (H2e, H3a);
 - reach a model endpoint that is not loopback;
 - run with a `state_root` on a filesystem not identified as local (INV-35),
   beyond the residuals the design names (the H1e-2c row: a mount placed over the

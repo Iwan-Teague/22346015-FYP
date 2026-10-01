@@ -145,6 +145,10 @@ pub mod code {
     /// A search's regular expression, or a glob pattern, does not compile;
     /// the message is static harness text for the kind of problem (H2e).
     pub const BAD_PATTERN: u16 = 21;
+    /// A submission a failing pre-submit check turned back (H3a): the
+    /// journal code of that submission's result; the model sees the failing
+    /// check's output and a harness notice.
+    pub const PRESUBMIT_REJECTED: u16 = 22;
 }
 
 const READ: &str = "harness.fs.read";

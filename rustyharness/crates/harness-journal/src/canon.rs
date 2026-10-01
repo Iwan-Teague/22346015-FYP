@@ -134,6 +134,7 @@ pub enum EventKind {
     BudgetCharged,
     BudgetNotice,
     SubmitRequested,
+    PresubmitChecked,
     VerificationStarted,
     VerificationFinished,
     CheckReported,
@@ -165,6 +166,7 @@ const KINDS: &[(EventKind, &str)] = &[
     (EventKind::BudgetCharged, "BudgetCharged"),
     (EventKind::BudgetNotice, "BudgetNotice"),
     (EventKind::SubmitRequested, "SubmitRequested"),
+    (EventKind::PresubmitChecked, "PresubmitChecked"),
     (EventKind::VerificationStarted, "VerificationStarted"),
     (EventKind::VerificationFinished, "VerificationFinished"),
     (EventKind::CheckReported, "CheckReported"),
@@ -350,6 +352,31 @@ impl RecordFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // H3a: the new kind and the new stop cause have wire names the reader
+    // parses back, and neither collides with an existing one.
+    #[test]
+    fn the_presubmit_kind_and_stop_cause_have_their_own_wire_names() {
+        assert_eq!(EventKind::PresubmitChecked.as_str(), "PresubmitChecked");
+        assert_eq!(
+            EventKind::parse("PresubmitChecked"),
+            Some(EventKind::PresubmitChecked)
+        );
+        assert!(
+            !EventKind::PresubmitChecked.needs_fsync(),
+            "the result that follows it is the durable one"
+        );
+        let names: std::collections::BTreeSet<&str> = KINDS.iter().map(|(_, n)| *n).collect();
+        assert_eq!(names.len(), KINDS.len(), "every kind has its own name");
+        assert_eq!(
+            crate::writer::stop_cause_name(&harness_core::StopCause::SubmittedChecksFailed),
+            "submitted_checks_failed"
+        );
+        assert_ne!(
+            crate::writer::stop_cause_name(&harness_core::StopCause::Submitted),
+            crate::writer::stop_cause_name(&harness_core::StopCause::SubmittedChecksFailed)
+        );
+    }
 
     #[test]
     fn escape_is_reversible_and_neutralises_viewer_sinks() {

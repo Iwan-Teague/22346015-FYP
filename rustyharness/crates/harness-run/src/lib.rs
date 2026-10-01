@@ -25,6 +25,9 @@
 //!    serves its capability: the read tools, or the edit tools, anchored on
 //!    the run's reads) → journal the result (a verified edit's
 //!    `EditApplied` first, with the tree digest after it) → stop checks.
+//!    A task with pre-submit checks ([`presubmit`], H3a) runs them when the
+//!    model submits, and turns a failing submission back for a bounded
+//!    number of rounds.
 //! 4. **Commit** (§7.1): `RunStopped` durable, then the outcome is released.
 //!
 //! **Every outcome so far is `Indeterminate { NothingChecked }`** (INV-18):
@@ -54,12 +57,14 @@
 
 pub mod approve;
 pub mod driver;
+pub mod presubmit;
 pub mod replay;
 mod sample;
 
 pub use approve::{ApprovalAnswer, Approver, ApproverKind};
 pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
 pub use harness_tools::{ExecLimits, ExecProgram, ExecSpec};
+pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
 pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Resume};
 
 #[cfg(test)]
@@ -67,3 +72,6 @@ mod tests;
 
 #[cfg(test)]
 mod context_tests;
+
+#[cfg(test)]
+mod presubmit_tests;

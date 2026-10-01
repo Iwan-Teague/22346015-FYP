@@ -144,6 +144,7 @@ fn drive(
         grants: vec!["harness.fs.read".into()],
         workspace_public: false,
         exec: None,
+        presubmit: None,
     };
     let policy = UserPolicy::default();
     let (session, tools) = plan(&spec, &reg, &policy, profile, false, false).unwrap();
@@ -201,6 +202,7 @@ fn drive(
         reads_seen: Default::default(),
         todo: None,
         notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
+        presubmit: None,
     };
     let end = lp.drive(&mut w);
     commit(w, &end, None);

@@ -77,6 +77,7 @@ impl Rig {
                 personal_data_granted: false,
                 conformed: false,
                 exec_programs: Vec::new(),
+                read_window: None,
             },
             &reg,
             &UserPolicy::default(),
@@ -184,20 +185,76 @@ fn read_errors_are_typed_statuses() {
 
 #[test]
 fn results_are_cut_at_the_cap_and_digested_whole() {
+    // H2e: a read stops at its window, so the cap is shown on a listing
+    // of long names (400 entries of about 210 bytes).
     let ws = scratch("cap");
-    let line = "x".repeat(1000);
-    let body: String = (0..100).map(|_| format!("{line}\n")).collect();
-    fs::write(ws.join("big.txt"), &body).unwrap();
+    for i in 0..400 {
+        fs::write(ws.join(format!("{i:03}{}", "x".repeat(200))), "").unwrap();
+    }
     let mut r = Rig::new(&ws);
-    let out = r.call("harness.fs.read", json!({"path": "big.txt"}));
+    let out = r.call("harness.fs.list", json!({"path": "."}));
     assert!(out.truncated);
     let shown = out.output.inspect("test").len();
     assert_eq!(shown, RESULT_MAX_BYTES);
     assert_ne!(out.digest, sha256(out.output.inspect("test")));
 }
 
+// H2e: a read of long lines stops at the window's bytes, on a line
+// boundary, and says where to continue; it is never cut mid-line, by the
+// result cap or by the context. A single line longer than the window is
+// shown cut, and says so.
 #[test]
-fn search_is_literal_grouped_per_file_and_capped_at_fifty() {
+fn a_read_stops_at_its_window_bytes_and_says_where_to_continue() {
+    let ws = scratch("window-bytes");
+    let line = "x".repeat(1000);
+    let body: String = (0..100).map(|_| format!("{line}\n")).collect();
+    fs::write(ws.join("big.txt"), &body).unwrap();
+    fs::write(ws.join("one.txt"), format!("{}\n", "y".repeat(40_000))).unwrap();
+    let mut r = Rig::new(&ws);
+    let out = r.call("harness.fs.read", json!({"path": "big.txt"}));
+    assert!(!out.truncated);
+    let t = text(&out);
+    let head = t.lines().next().unwrap();
+    assert!(
+        head.starts_with("big.txt: lines 1-16 of 100 (the read window's 16384 bytes end here; continue with start 17); sha256 "),
+        "{head}"
+    );
+    assert!(t.len() <= 16 * 1024, "{}", t.len());
+    assert_eq!(t.lines().count(), 17);
+    let t = text(&r.call("harness.fs.read", json!({"path": "big.txt", "start": 17})));
+    assert!(t.starts_with("big.txt: lines 17-32 of 100 ("), "{t:.80}");
+    let t = text(&r.call("harness.fs.read", json!({"path": "one.txt"})));
+    assert!(
+        t.starts_with(
+            "one.txt: line 1 of 1, cut: it alone is longer than the read window's 16384 bytes;"
+        ),
+        "{t:.120}"
+    );
+    assert!(t.len() <= 16 * 1024);
+    // A wider window (a profile's max_read_lines) reads more lines and
+    // bytes, and a lines argument above the window reads the window.
+    let mut r = Rig::new(&ws);
+    r.t = ReadTools::new(&ws).unwrap().with_window(40, 40 * 1100);
+    let t = text(&r.call("harness.fs.read", json!({"path": "big.txt", "lines": 2000})));
+    assert!(
+        t.starts_with("big.txt: lines 1-40 of 100; sha256"),
+        "{t:.80}"
+    );
+    let small = scratch("window-lines");
+    let body: String = (1..=250).map(|i| format!("line {i}\n")).collect();
+    fs::write(small.join("a.txt"), &body).unwrap();
+    let mut r = Rig::new(&small);
+    r.t = ReadTools::new(&small).unwrap().with_window(200, 200 * 64);
+    let t = text(&r.call("harness.fs.read", json!({"path": "a.txt"})));
+    assert!(
+        t.starts_with("a.txt: lines 1-200 of 250; sha256"),
+        "{t:.80}"
+    );
+    assert_eq!(r.t.window(), (200, 200 * 64));
+}
+
+#[test]
+fn search_is_literal_grouped_per_file_and_capped() {
     let ws = scratch("search");
     fs::create_dir(ws.join("src")).unwrap();
     fs::write(ws.join("src/a.rs"), "fn main() {}\nlet x = a.*b;\n").unwrap();
@@ -227,7 +284,11 @@ fn search_is_literal_grouped_per_file_and_capped_at_fifty() {
         "harness.fs.search",
         json!({"pattern": "needle", "path": "many.txt"}),
     ));
-    assert!(t.starts_with("50 hit(s) in 1 file(s) for a literal match; more hits not shown"));
+    // H2e: every hit is counted; one file shows at most ten of them.
+    assert!(
+        t.starts_with("80 hit(s) in 1 file(s) for a literal match; 10 shown (at most 50 hits, 10 per file and 60 lines)\nmany.txt (80 hits, 10 shown)\n  1: needle 0\n"),
+        "{t}"
+    );
 }
 
 #[test]

@@ -107,7 +107,7 @@ use harness_model::profile::{Profile, Protocol};
 use harness_model::replay::{payload_bytes, ReplayBackend};
 use harness_model::{Completion, ModelBackend, ModelError, ModelIdentity, ModelRequest};
 use harness_policy::locality::LocalityProbe;
-use harness_policy::{UserPolicy, SUBMIT_ID};
+use harness_policy::{UserPolicy, SUBMIT_ID, TODO_ID};
 use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::{RefusalKind, ToolStatus};
 use serde_json::{Map, Value};
@@ -115,9 +115,9 @@ use serde_json::{Map, Value};
 use crate::approve::{nonce_bytes, Approver, ApproverKind, RecordedApproval};
 use crate::driver::{
     attempt_check, builtin_manifest_sha256, commit, exec_tools, facts_block, header, is_edit,
-    is_exec, limits_fields, new_meter, new_meter_resumed, parse_exec, plan, prepare, Approvals,
-    ExecHeader, HeaderInputs, Loop, NonceSource, Prepared, ReadLog, RecordedEdit, RecordedResult,
-    SandboxRecord, HEADER_INPUT_KEYS,
+    is_exec, limits_fields, new_meter, new_meter_resumed, parse_exec, plan, prepare, todo_for,
+    Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, NonceSource, Prepared, ReadLog,
+    RecordedEdit, RecordedResult, SandboxRecord, HEADER_INPUT_KEYS,
 };
 use crate::sample;
 
@@ -152,6 +152,10 @@ struct Recorded {
     feed: VecDeque<RecordedResult>,
     /// The approvers' recorded answers, in order (H2b).
     approvals: VecDeque<RecordedApproval>,
+    /// The recorded wall-budget notices, by step: (percent, milliseconds
+    /// used) (H2e). The clock is not recomputable, so these are re-fed; the
+    /// loop re-writes each and refuses one it would not write.
+    walls: BTreeMap<u64, (u64, u64)>,
 }
 
 /// A recorded approval answer, in exactly the shape the loop writes: the
@@ -220,6 +224,7 @@ fn recorded(
     let mut nonces = BTreeMap::new();
     let mut feed = VecDeque::new();
     let mut approvals = VecDeque::new();
+    let mut walls = BTreeMap::new();
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
     // `EditApplied` records waiting for their `ToolFinished` (H2b), by the
     // intent they answer, with the record's own seq.
@@ -291,7 +296,12 @@ fn recorded(
                     .ok_or_else(bad)?;
                 let cap = intents.get(&seq).ok_or_else(bad)?.clone();
                 let edit = edits.remove(&seq).map(|(_, e)| e);
-                if cap == SUBMIT_ID {
+                // The sentinel's and the checklist's results are the loop's
+                // own, recomputed, never re-fed (H2e: the checklist).
+                if cap == SUBMIT_ID || cap == TODO_ID {
+                    if edit.is_some() {
+                        return Err(bad());
+                    }
                     continue;
                 }
                 let status = status_of(&r.body).ok_or_else(bad)?;
@@ -358,6 +368,21 @@ fn recorded(
             EventKind::ApprovalGranted | EventKind::ApprovalDenied | EventKind::ApprovalExpired => {
                 approvals.push_back(approval_of(r).ok_or_else(bad)?);
             }
+            // A wall-budget notice (H2e), in exactly the shape the loop
+            // writes, at most one per step; the step notices are recomputed.
+            EventKind::BudgetNotice
+                if r.body.get("key").and_then(Value::as_str) == Some("wall") =>
+            {
+                let n = |k: &str| r.body.get(k).and_then(Value::as_u64);
+                let (Some(percent), Some(used_ms), Some(_)) =
+                    (n("percent"), n("used_ms"), n("limit_ms"))
+                else {
+                    return Err(bad());
+                };
+                if r.body.len() != 4 || walls.insert(r.step, (percent, used_ms)).is_some() {
+                    return Err(bad());
+                }
+            }
             _ => {}
         }
     }
@@ -385,6 +410,7 @@ fn recorded(
         nonces,
         feed,
         approvals,
+        walls,
     })
 }
 
@@ -490,10 +516,11 @@ fn header_mismatch(key: &str) -> &'static str {
         "shell_enabled" | "exec" => "the exec allowlist given differs from the recorded header",
         "context_format" => {
             "another harness build wrote this journal (its context format differs: since H1h the \
-             native protocol shows past actions as tool calls, and since H1i each observation \
-             keeps its own delimiter nonce and the context is append-mostly, so an older \
-             journal's contexts and requests cannot be recomputed; audit it with the build that \
-             wrote it)"
+             native protocol shows past actions as tool calls, since H1i each observation keeps \
+             its own delimiter nonce and the context is append-mostly, and since H2e a turn may \
+             carry a budget notice, is first shown with a cap that holds one whole read, and a \
+             format error's repair message names its fault, so an older journal's contexts and \
+             requests cannot be recomputed; audit it with the build that wrote it)"
         }
         _ => "a header input differs from the recorded header",
     }
@@ -1043,6 +1070,15 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         env: &NOT_SAMPLED,
         pressure: Vec::new(),
         reads_seen: Default::default(),
+        todo: todo_for(&a.spec.grants),
+        // Every wall notice is re-fed (the clock is not replayable), and
+        // measured against the run's own wall budget.
+        notices: BudgetNotices {
+            wall_limit: a.limits.wall,
+            recorded: rec.walls,
+            recorded_through: u64::MAX,
+            wall_announced: 0,
+        },
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -1296,6 +1332,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
     let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
     let rec = recorded(&kept, &blobs, r.profile)
         .map_err(|_| nope("the last attempt's records cannot be replayed"))?;
+    // The last step the catch-up re-feeds (H2e: its wall notices too).
+    let kept_through = kept.records.iter().map(|x| x.step).max().unwrap_or(0);
     // The wall time already spent: what the old attempt carried in (itself
     // a resumed attempt, H1e-2b confirming review NF-1) plus what its own
     // writer measured (its last record's monotonic time).
@@ -1371,6 +1409,15 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
+        todo: todo_for(&r.spec.grants),
+        // The kept steps' wall notices are re-fed; the live steps after them
+        // measure the meter, which carries the wall time already spent.
+        notices: BudgetNotices {
+            wall_limit: r.config.limits.wall,
+            recorded: rec.walls,
+            recorded_through: kept_through,
+            wall_announced: 0,
+        },
     };
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);

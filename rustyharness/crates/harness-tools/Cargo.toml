@@ -20,6 +20,10 @@ harness-policy = { path = "../harness-policy" }
 # The command runner (H2d) starts every command through the sandbox's
 # Confinement seam, with its Conformed witness (design §1.2 edge).
 harness-sandbox = { path = "../harness-sandbox" }
+# `harness.fs.search` with `regex: true` (H2e): linear-time matching, and
+# the parser's typed errors for a bad pattern (workspace Cargo.toml says why).
+regex.workspace = true
+regex-syntax.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 

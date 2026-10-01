@@ -35,12 +35,18 @@ fn spec(grants: &[&str]) -> SessionSpec {
         personal_data_granted: false,
         conformed: false,
         exec_programs: Vec::new(),
+        read_window: None,
     }
 }
 
 fn read_all() -> Session {
     Session::plan(
-        &spec(&["harness.fs.read", "harness.fs.search", "harness.fs.list"]),
+        &spec(&[
+            "harness.fs.read",
+            "harness.fs.search",
+            "harness.fs.list",
+            "harness.fs.glob",
+        ]),
         &builtin_registry(),
         &UserPolicy::default(),
     )
@@ -247,6 +253,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             user_allow: allow_idx,
             fs_tool: false,
             submit: false,
+            todo: false,
             edit: false,
             exec: false,
         },
@@ -258,6 +265,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
         personal_granted: true,
         conformed: false,
         exec_programs: BTreeSet::new(),
+        read_window: None,
     }
 }
 
@@ -512,7 +520,11 @@ fn arguments_outside_the_schema_are_denied() {
     for (cap, args) in [
         ("harness.fs.read", json!({})),
         ("harness.fs.read", json!({"path": "a", "mode": "w"})),
-        ("harness.fs.read", json!({"path": "a", "lines": 101})),
+        // H2e: the schema's hard maximum is the widest window a profile may
+        // set (2000); a run's own window is the tool's to apply.
+        ("harness.fs.read", json!({"path": "a", "lines": 2001})),
+        ("harness.fs.search", json!({"pattern": "x", "context": 6})),
+        ("harness.fs.glob", json!({"path": "a"})),
         ("harness.fs.read", json!({"path": 7})),
         ("harness.fs.search", json!({"path": "a"})),
         ("harness.fs.list", json!("a")),
@@ -1472,4 +1484,218 @@ fn h2d_an_external_execute_capability_stays_out_of_scope() {
     sp.conformed = true;
     let err = plan_over(&[m], &sp, &UserPolicy::default()).unwrap_err();
     assert!(matches!(err, SessionRefused::OutOfScope { .. }), "{err:?}");
+}
+
+// ---- H2e: the checklist, several edits in one file, the glob ------------------
+
+// The checklist is allowed by its own rule after every deny rule and the
+// schema, needs no workspace, and asks nobody: it changes only the run's
+// own list.
+#[test]
+fn h2e_the_checklist_is_allowed_by_its_own_rule() {
+    let r = builtin_registry();
+    let mut sp = spec(&[TODO_ID]);
+    sp.workspace = None;
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    for ok in [
+        json!({}),
+        json!({"items": [{"text": "read the docs", "status": "in_progress"}]}),
+    ] {
+        let c = call(TODO_ID, ok);
+        assert_eq!(
+            s.decide(&c),
+            PolicyDecision::Allow {
+                rule: RuleId::Builtin(TODO_RULE)
+            }
+        );
+        assert_eq!(s.authorize(c).unwrap().rule(), RuleId::Builtin(TODO_RULE));
+    }
+    for bad in [
+        json!({"items": [{"text": "x", "status": "finished"}]}),
+        json!({"items": [{"text": "x"}]}),
+        json!({"items": [{"text": "x", "status": "done", "priority": 1}]}),
+        json!({"list": []}),
+    ] {
+        let d = s.decide(&call(TODO_ID, bad.clone()));
+        assert!(
+            matches!(
+                d,
+                PolicyDecision::Deny {
+                    reason: DenyReason::Args(_),
+                    ..
+                }
+            ),
+            "{bad}: {d:?}"
+        );
+    }
+    // A user deny still wins.
+    let p = UserPolicy::new(&[TODO_ID], &[], &[]).unwrap();
+    let s = Session::plan(&spec(&[TODO_ID]), &r, &p).unwrap();
+    assert!(is_deny(
+        &s.decide(&call(TODO_ID, json!({}))),
+        &DenyReason::UserDenied
+    ));
+    // A user ask asks (and with no approver, denies).
+    let p = UserPolicy::new(&[], &[TODO_ID], &[]).unwrap();
+    let s = Session::plan(&spec(&[TODO_ID]), &r, &p).unwrap();
+    assert!(is_deny(
+        &s.decide(&call(TODO_ID, json!({}))),
+        &DenyReason::NoApprover
+    ));
+}
+
+// Only the built-in checklist, with exactly its labels, is the checklist.
+#[test]
+fn h2e_a_capability_that_merely_looks_like_the_checklist_stays_out_of_scope() {
+    let m = fixture(vec![cap_json(
+        "task.todo",
+        ["write", "public", "own", "none", "own", "none"],
+    )]);
+    let err = plan_over(&[m], &spec(&["fixture.task.todo"]), &UserPolicy::default()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SessionRefused::OutOfScope {
+                what: "a non-read effect class",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+// Several edits in one file are an edit like the others: planned only with
+// a workspace, asked about by default (denied with no approver), allowed by
+// a user allow rule, and their path takes the workspace rule.
+#[test]
+fn h2e_several_edits_in_one_file_take_the_edit_rules() {
+    let multi = |path: &str| {
+        call(
+            "harness.edit.multi",
+            json!({"path": path, "edits": [{"old": "a", "new": "b"}, {"old": "c", "new": "d"}]}),
+        )
+    };
+    let mut sp = spec(&["harness.fs.read", "harness.edit.multi"]);
+    sp.approver_present = true;
+    let s = Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&multi("src/lib.rs")),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+        }
+    );
+    sp.approver_present = false;
+    let s = Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+    assert!(is_deny(
+        &s.decide(&multi("src/lib.rs")),
+        &DenyReason::NoApprover
+    ));
+    let allow = UserPolicy::new(&[], &[], &["harness.edit.multi"]).unwrap();
+    let s = Session::plan(&sp, &builtin_registry(), &allow).unwrap();
+    assert!(matches!(
+        s.decide(&multi("src/lib.rs")),
+        PolicyDecision::Allow { .. }
+    ));
+    for bad in ["../outside.rs", "/etc/passwd", "src/../x", ""] {
+        let d = s.decide(&multi(bad));
+        assert!(
+            matches!(
+                d,
+                PolicyDecision::Deny {
+                    reason: DenyReason::Path(_),
+                    ..
+                }
+            ),
+            "{bad}: {d:?}"
+        );
+    }
+}
+
+// The glob is a read tool: allowed by the default read rule, and its path
+// takes the workspace rule (the pattern is checked by the tool, which only
+// matches strings its confined walk produced).
+#[test]
+fn h2e_the_glob_is_a_read_tool_under_the_workspace_rule() {
+    let s = Session::plan(
+        &spec(&["harness.fs.glob"]),
+        &builtin_registry(),
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    for ok in [
+        json!({"pattern": "**/*.rs"}),
+        json!({"pattern": "*.md", "path": "docs"}),
+        json!({"pattern": "*", "path": "."}),
+    ] {
+        assert_eq!(
+            s.decide(&call("harness.fs.glob", ok)),
+            PolicyDecision::Allow {
+                rule: RuleId::Builtin("allow.default.read")
+            }
+        );
+    }
+    for (path, why) in [
+        ("..", PathRefused::Parent),
+        ("/etc", PathRefused::Absolute),
+        ("", PathRefused::Empty),
+    ] {
+        assert_eq!(
+            s.decide(&call(
+                "harness.fs.glob",
+                json!({"pattern": "*", "path": path})
+            )),
+            PolicyDecision::Deny {
+                reason: DenyReason::Path(why),
+                rule: RuleId::Builtin("deny.path-outside-workspace"),
+            },
+            "{path}"
+        );
+    }
+    let mut sp = spec(&["harness.fs.glob"]);
+    sp.workspace = None;
+    assert_eq!(
+        Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::NoWorkspace("harness.fs.glob".into())
+    );
+}
+
+// The run's read window (H2e): a read's lines above it is denied like an
+// argument outside the schema the model was shown (the driver names the
+// window's bounds); without one, the manifest's maximum (2000) alone.
+#[test]
+fn h2e_a_read_is_held_to_the_runs_window() {
+    let read = |lines: u64| call("harness.fs.read", json!({"path": "a.rs", "lines": lines}));
+    for (window, ok, over) in [
+        (Some(100), 100, 101),
+        (Some(400), 400, 401),
+        (None, 2000, 2001),
+    ] {
+        let mut sp = spec(&["harness.fs.read"]);
+        sp.read_window = window;
+        let s = Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+        assert_eq!(
+            s.decide(&read(ok)),
+            PolicyDecision::Allow {
+                rule: RuleId::Builtin("allow.default.read")
+            },
+            "{window:?}"
+        );
+        let d = s.decide(&read(over));
+        assert!(
+            matches!(
+                &d,
+                PolicyDecision::Deny {
+                    reason: DenyReason::Args(ArgsError { at, .. }),
+                    rule: RuleId::Builtin("deny.args-schema"),
+                } if at == "/lines"
+            ),
+            "{window:?}: {d:?}"
+        );
+        // A read without lines takes the window; nothing to deny.
+        assert!(matches!(
+            s.decide(&call("harness.fs.read", json!({"path": "a.rs"}))),
+            PolicyDecision::Allow { .. }
+        ));
+    }
 }

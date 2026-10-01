@@ -174,13 +174,13 @@ fn a_short_stream_is_shown_whole_and_a_long_one_head_and_tail() {
     let mut out = String::new();
     assert!(excerpt("stderr", long.as_bytes(), false, &mut out));
     assert!(out.starts_with(&format!(
-        "stderr: {} bytes, 100 lines; showing the first 10 and the last 26\nline 1\n",
+        "stderr: {} bytes, 100 lines; showing the first 8 and the last 24, and up to 6 failure-looking lines from the middle\nline 1\n",
         long.len()
     )));
-    assert!(out.contains("line 10\n[... 64 lines not shown ...]\nline 75\n"));
+    assert!(out.contains("line 8\n[... 68 lines not shown ...]\nline 77\n"));
     assert!(out.ends_with("line 100\n"));
-    assert!(!out.contains("line 11\n"));
-    assert!(!out.contains("line 74\n"));
+    assert!(!out.contains("line 9\n"));
+    assert!(!out.contains("line 76\n"));
 
     let wide = format!("{}\n", "é".repeat(300));
     let mut out = String::new();
@@ -287,4 +287,55 @@ fn args_are_read_as_the_schema_says_and_refused_otherwise() {
     ] {
         assert!(args(&bad).is_err(), "{bad}");
     }
+}
+
+// H2f: a stream cut in its middle keeps the first few lines of the middle
+// that look like a failure, with their line numbers, and says what it cut.
+#[test]
+fn a_cut_middle_keeps_its_failure_lines_and_says_what_it_cut() {
+    let mut lines: Vec<String> = (1..=100).map(|i| format!("test t{i} ... ok")).collect();
+    lines[39] = "test parse::bad ... FAILED".into();
+    lines[49] = "thread 'parse::bad' panicked at src/parse.rs:7:9:".into();
+    lines[59] = "error[E0308]: mismatched types".into();
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let mut out = String::new();
+    assert!(excerpt("stdout", body.as_bytes(), false, &mut out));
+    assert!(
+        out.contains("[... 68 lines not shown; the first 3 that look like failures, with their line numbers ...]\n40: test parse::bad ... FAILED\n50: thread 'parse::bad' panicked at src/parse.rs:7:9:\n60: error[E0308]: mismatched types\n[... the rest of the middle is not shown ...]\n"),
+        "{out}"
+    );
+    assert!(out.ends_with("test t100 ... ok\n"));
+    // A plain middle is cut as before, and at most six lines are kept.
+    let plain: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    let mut out = String::new();
+    excerpt("stdout", plain.as_bytes(), false, &mut out);
+    assert!(out.contains("[... 68 lines not shown ...]\n"), "{out}");
+    let many: String = (1..=100).map(|i| format!("error: e{i}\n")).collect();
+    let mut out = String::new();
+    excerpt("stdout", many.as_bytes(), false, &mut out);
+    assert!(out.contains("the first 6 that look like failures"), "{out}");
+    assert!(out.contains("9: error: e9\n") && out.contains("14: error: e14\n"));
+    assert!(!out.contains("15: error: e15\n"), "{out}");
+}
+
+#[test]
+fn failure_lines_from_the_middle_stay_inside_the_context_caps() {
+    // The worst case with the middle's lines: every line a failure-looking
+    // one at the longest, in both streams.
+    let long: String = (0..10_000)
+        .map(|_| format!("error: {}\n", "x".repeat(1000)))
+        .collect();
+    let exit = ConfinedExit {
+        status: ChildStatus::Exited(101),
+        stdout: long.clone().into_bytes(),
+        stdout_truncated: true,
+        stderr: long.into_bytes(),
+        stderr_truncated: true,
+        domain: DomainCleanup::Unconfirmed("x".into()),
+        elapsed: Duration::from_secs(1),
+    };
+    let (text, cut) = render(&exit, &ExecLimits::default(), Duration::from_secs(120));
+    assert!(cut);
+    assert!(text.lines().count() < 100, "{}", text.lines().count());
+    assert!(text.len() < 16 * 1024, "{}", text.len());
 }

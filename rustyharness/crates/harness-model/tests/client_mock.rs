@@ -727,3 +727,25 @@ fn native_tool_history_goes_on_the_wire_as_tool_calls_and_tool_messages() {
     assert_eq!(v["parallel_tool_calls"], serde_json::Value::Bool(false));
     assert_eq!(v["tools"][0]["function"]["name"], "harness_fs_read");
 }
+
+// H2f: a profile's read_timeout_secs decides the client's read timeout; a
+// profile without one leaves the config's.
+#[test]
+fn a_profiles_read_timeout_sets_the_clients_read_timeout() {
+    let m = mock(vec![]);
+    let url = format!("http://127.0.0.1:{}/v1", m.port);
+    let without =
+        OpenAiCompatible::new(&url, Profile::conservative_default("m"), None, config()).unwrap();
+    assert_eq!(without.limits().read_timeout, Duration::from_millis(300));
+    let profile = Profile::parse(
+        br#"{"profile_version":1,"id":"t","model":"m","context_window":8192,
+        "fill_ratio":0.6,"protocol":"text","tool_choice_required_ok":false,
+        "grammar":"none","max_active_tools":5,"edit_format":"replace","recent_turns":4,
+        "read_timeout_secs":240,
+        "sampling":{"temperature":0.2,"top_p":0.95,"max_tokens":1024}}"#,
+    )
+    .unwrap();
+    let with = OpenAiCompatible::new(&url, profile, None, config()).unwrap();
+    assert_eq!(with.limits().read_timeout, Duration::from_secs(240));
+    assert_eq!(with.limits().connect_timeout, Duration::from_millis(500));
+}

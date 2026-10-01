@@ -1,5 +1,6 @@
 //! The built-in read tools, in process (design §4.8, §9 H1): `harness.fs.read`,
-//! `harness.fs.search`, `harness.fs.list`.
+//! `harness.fs.search`, `harness.fs.list` and (H2e) `harness.fs.glob`; the
+//! search and the glob are in [`crate::search`].
 //!
 //! [`ReadTools`] is a [`ToolProvider`], so it runs only a
 //! `Journaled<Authorized<Call>>`: policy allowed the call (its `path` passed
@@ -28,16 +29,20 @@
 //! cooperative (checked before a call and between a walk's entries), so a
 //! read blocked in the kernel is not interrupted (design §11).
 //!
-//! **Bounds.** A read returns at most 100 lines of a text file of at most
-//! [`READ_MAX_BYTES`]; search reports at most [`SEARCH_MAX_HITS`] hits,
-//! grouped per file, skipping files over [`SEARCH_FILE_MAX_BYTES`] and
-//! non-UTF-8 files, and stops after [`WALK_MAX_ENTRIES`] entries; list shows
-//! at most [`LIST_MAX_ENTRIES`] entries to depth ≤ 4. Every result is cut at
+//! **Bounds.** A read returns at most the run's read window of a text file
+//! of at most [`READ_MAX_BYTES`]: [`READ_MAX_LINES`] lines by default, or
+//! the profile's `max_read_lines` (H2e), and at most the window's bytes,
+//! stopping at a line boundary and saying where to continue; search
+//! reports at most [`SEARCH_MAX_HITS`] hits, grouped per file, skipping
+//! files over [`SEARCH_FILE_MAX_BYTES`] and non-UTF-8 files, and stops
+//! after [`WALK_MAX_ENTRIES`] entries; list shows at most
+//! [`LIST_MAX_ENTRIES`] entries to depth ≤ 4. Every result is cut at
 //! [`RESULT_MAX_BYTES`] (`truncated`), and its digest is over the full
 //! output. The per-call deadline is checked before and during every walk.
 //!
-//! **Search is a literal substring match**, not a regular expression: H1
-//! adds no regex crate (a recorded §4.8 deviation).
+//! **Search** matches a literal substring, or with `regex: true` a regular
+//! expression (H2e; before H2e only the literal, a recorded §4.8
+//! deviation): see [`crate::search`].
 //!
 //! Errors are `ToolStatus::Error { code }` with a harness-authored message
 //! as the output (see [`code`]); none is a provider failure.
@@ -59,10 +64,19 @@ use crate::provider::{
 
 /// Largest file `fs.read` reads.
 pub const READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
-/// Default and maximum `fs.read` window, in lines (§4.8).
+/// The default `fs.read` window, in lines (§4.8); a profile may set another
+/// (`max_read_lines`, H2e).
 pub const READ_MAX_LINES: u64 = 100;
-/// Most search hits reported (§4.8).
-pub const SEARCH_MAX_HITS: usize = 50;
+/// The default `fs.read` window, in bytes of the result (the context's
+/// default per-observation cap, so a read is never cut there).
+pub const READ_WINDOW_BYTES: usize = 16 * 1024;
+/// The widest window any profile may set, in lines: the manifest schema's
+/// hard maximum for `lines` (H2e). A run's window is at most this.
+pub const READ_WINDOW_MAX_LINES: u64 = 2000;
+/// Room a read keeps for its first line (the path, the range, the digest)
+/// within the window's bytes.
+const READ_HEAD_ROOM: usize = 256;
+pub use crate::search::SEARCH_MAX_HITS;
 /// Files larger than this are not searched.
 pub const SEARCH_FILE_MAX_BYTES: u64 = 1024 * 1024;
 /// A hit's line is shown up to this many bytes.
@@ -128,17 +142,26 @@ pub mod code {
     /// The command held more processes than its cap, so its sandbox was
     /// swept (FT-5, H2d).
     pub const EXEC_PROCESS_LIMIT: u16 = 20;
+    /// A search's regular expression, or a glob pattern, does not compile;
+    /// the message is static harness text for the kind of problem (H2e).
+    pub const BAD_PATTERN: u16 = 21;
 }
 
 const READ: &str = "harness.fs.read";
 const SEARCH: &str = "harness.fs.search";
 const LIST: &str = "harness.fs.list";
+/// `harness.fs.glob` (H2e).
+pub const GLOB: &str = "harness.fs.glob";
 
 /// The in-process read tools over one workspace.
 #[derive(Debug)]
 pub struct ReadTools {
     ns: ProviderName,
     root: PathBuf,
+    /// The read window: most lines per read (H2e).
+    window_lines: u64,
+    /// The read window: most bytes of a read's result (H2e).
+    window_bytes: usize,
 }
 
 /// Why the workspace root was refused.
@@ -164,7 +187,30 @@ impl ReadTools {
         let root = canonical_root(root)?;
         let ns = ProviderName::new(harness_manifest::BUILTIN_NAMESPACE)
             .map_err(|_| RootRefused::Io(io::Error::other("builtin namespace")))?;
-        Ok(Self { ns, root })
+        Ok(Self {
+            ns,
+            root,
+            window_lines: READ_MAX_LINES,
+            window_bytes: READ_WINDOW_BYTES,
+        })
+    }
+
+    /// The same tools with another read window (H2e: the profile's
+    /// `max_read_lines`, and the bytes the context shows of one
+    /// observation): a read returns at most `lines` lines (at most
+    /// [`READ_WINDOW_MAX_LINES`]) and at most `bytes` bytes, stopping at a
+    /// line boundary. A `lines` argument above the window is read as the
+    /// window (the result's first line says which lines it holds).
+    #[must_use]
+    pub fn with_window(mut self, lines: u64, bytes: usize) -> Self {
+        self.window_lines = lines.clamp(1, READ_WINDOW_MAX_LINES);
+        self.window_bytes = bytes.clamp(READ_HEAD_ROOM * 2, RESULT_MAX_BYTES);
+        self
+    }
+
+    /// The read window: (most lines, most bytes) per read.
+    pub fn window(&self) -> (u64, usize) {
+        (self.window_lines, self.window_bytes)
     }
 
     /// The canonical workspace root.
@@ -197,7 +243,7 @@ pub(crate) fn ok(text: String) -> Out {
     }
 }
 
-fn timeout() -> Out {
+pub(crate) fn timeout() -> Out {
     Out {
         status: ToolStatus::Timeout,
         text: "error: the per-call deadline passed".into(),
@@ -211,7 +257,7 @@ impl ToolProvider for ReadTools {
     }
 
     fn serves(&self, capability: &str) -> bool {
-        matches!(capability, READ | SEARCH | LIST)
+        matches!(capability, READ | SEARCH | LIST | GLOB)
     }
 
     fn invoke(
@@ -221,7 +267,7 @@ impl ToolProvider for ReadTools {
     ) -> Result<ToolResult, ToolError> {
         let c = call.call().call();
         let cap = c.capability.as_str();
-        if !matches!(cap, READ | SEARCH | LIST) {
+        if !matches!(cap, READ | SEARCH | LIST | GLOB) {
             return Ok(refused(cap, RefusalKind::UnknownCapability));
         }
         if Instant::now() >= ctx.deadline {
@@ -230,6 +276,7 @@ impl ToolProvider for ReadTools {
         let out = match cap {
             READ => self.read(&c.args),
             SEARCH => self.search(&c.args, ctx.deadline),
+            GLOB => self.glob(&c.args, ctx.deadline),
             _ => self.list(&c.args, ctx.deadline),
         };
         Ok(finish(cap, out))
@@ -273,7 +320,11 @@ pub(crate) fn finish(cap: &str, out: Out) -> ToolResult {
     }
 }
 
-fn arg_path(args: &Value, key: &str, default: Option<&str>) -> Result<WorkspacePath, Out> {
+pub(crate) fn arg_path(
+    args: &Value,
+    key: &str,
+    default: Option<&str>,
+) -> Result<WorkspacePath, Out> {
     let s = match args.get(key) {
         Some(Value::String(s)) => s.as_str(),
         Some(_) => return Err(err(code::BAD_ARGS, "the path is not a string")),
@@ -285,7 +336,13 @@ fn arg_path(args: &Value, key: &str, default: Option<&str>) -> Result<WorkspaceP
     workspace_path(s).map_err(|e| err(code::PATH_REFUSED, &e.to_string()))
 }
 
-fn arg_u64(args: &Value, key: &str, default: u64, min: u64, max: u64) -> Result<u64, Out> {
+pub(crate) fn arg_u64(
+    args: &Value,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, Out> {
     match args.get(key) {
         None => Ok(default),
         Some(v) => match v.as_u64() {
@@ -373,12 +430,21 @@ pub(crate) fn resolve(
 impl ReadTools {
     /// Resolve a workspace path component by component, refusing a symlink
     /// at any component. Returns the path and its (not followed) metadata.
-    fn resolve(&self, p: &WorkspacePath) -> Result<(PathBuf, Metadata), Out> {
+    pub(crate) fn resolve(&self, p: &WorkspacePath) -> Result<(PathBuf, Metadata), Out> {
         match resolve(&self.root, p) {
             Ok((path, Some(meta))) => Ok((path, meta)),
-            Ok((_, None)) | Err(ResolveErr::NotFound) => {
-                Err(err(code::NOT_FOUND, "no such file or directory"))
-            }
+            // A pattern in a path is the likely mistake (H2e: a local model gave
+            // `path: "src/**"` to two searches and a glob, and got only "no
+            // such file or directory"): say where a pattern goes, in harness
+            // words that never quote the path.
+            Ok((_, None)) | Err(ResolveErr::NotFound) => Err(err(
+                code::NOT_FOUND,
+                if p.as_str().contains(['*', '?', '[', '{']) {
+                    "no such file or directory: a path names one file or directory, not a pattern (a glob goes in the search's include or exclude, or in the glob tool's pattern)"
+                } else {
+                    "no such file or directory"
+                },
+            )),
             Err(ResolveErr::Symlink) => Err(err(
                 code::SYMLINK,
                 "a path component is a symlink; symlinks are never followed",
@@ -396,7 +462,10 @@ impl ReadTools {
     fn try_read(&self, args: &Value) -> Result<Out, Out> {
         let wp = arg_path(args, "path", None)?;
         let start = arg_u64(args, "start", 1, 1, u64::MAX)?;
-        let want = arg_u64(args, "lines", READ_MAX_LINES, 1, READ_MAX_LINES)?;
+        // The schema's hard maximum is the widest window any profile may
+        // set; this run's window is the profile's (H2e).
+        let want = arg_u64(args, "lines", self.window_lines, 1, READ_WINDOW_MAX_LINES)?
+            .min(self.window_lines);
         let (path, meta) = self.resolve(&wp)?;
         if !meta.is_file() {
             return Err(err(code::NOT_A_FILE, "not a regular file"));
@@ -432,129 +501,56 @@ impl ReadTools {
                 &format!("the file has {total} lines; start is past the end"),
             ));
         }
-        let end = start.saturating_add(want - 1).min(total);
-        let mut s = format!(
-            "{}: lines {start}-{end} of {total}; sha256 {digest}\n",
-            shown_path(&wp)
-        );
+        let last = start.saturating_add(want - 1).min(total);
+        // The lines, within the window's bytes (H2e): whole lines only,
+        // stopping before the one that would pass the budget; the first
+        // line is always shown, cut when it alone is over the budget.
+        let budget = self
+            .window_bytes
+            .saturating_sub(READ_HEAD_ROOM + shown_path(&wp).len());
         let skip = usize::try_from(start - 1).unwrap_or(usize::MAX);
-        let take = usize::try_from(end - start + 1).unwrap_or(0);
+        let take = usize::try_from(last - start + 1).unwrap_or(0);
+        let mut body = String::new();
+        let mut end = start;
+        let mut stopped = false;
+        let mut long_first = false;
         for (i, line) in text.lines().skip(skip).take(take).enumerate() {
-            s.push_str(&format!("{}\t{line}\n", start + i as u64));
-        }
-        let mut o = ok(s);
-        o.read = Some(record);
-        Ok(o)
-    }
-
-    fn search(&self, args: &Value, deadline: Instant) -> Out {
-        match self.try_search(args, deadline) {
-            Ok(o) | Err(o) => o,
-        }
-    }
-
-    fn try_search(&self, args: &Value, deadline: Instant) -> Result<Out, Out> {
-        let pattern = match args.get("pattern") {
-            Some(Value::String(p)) if !p.is_empty() => p.clone(),
-            _ => {
-                return Err(err(
-                    code::BAD_ARGS,
-                    "the pattern must be a non-empty string",
-                ))
-            }
-        };
-        let wp = arg_path(args, "path", Some("."))?;
-        let (start, meta) = self.resolve(&wp)?;
-        let mut files: Vec<(String, Vec<(usize, String)>)> = Vec::new();
-        let mut hits = 0usize;
-        let mut more = false;
-        let mut skipped = 0usize;
-        let mut walk = Walk::new(
-            start,
-            wp.as_str().to_owned(),
-            meta,
-            WALK_MAX_DEPTH,
-            WALK_MAX_ENTRIES,
-        )
-        .until(deadline);
-        while let Some(entry) = walk.next_entry() {
-            if Instant::now() >= deadline {
-                return Err(timeout());
-            }
-            let Entry {
-                path, rel, meta, ..
-            } = entry;
-            if !meta.is_file() {
-                continue;
-            }
-            if meta.len() > SEARCH_FILE_MAX_BYTES {
-                skipped += 1;
-                continue;
-            }
-            // Bounded even if the file grew after the size check above
-            // (H1e-2a review F-2).
-            let Some(bytes) = read_bounded(&path, SEARCH_FILE_MAX_BYTES) else {
-                skipped += 1;
-                continue;
-            };
-            let Ok(text) = String::from_utf8(bytes) else {
-                skipped += 1;
-                continue;
-            };
-            let mut in_file = Vec::new();
-            for (n, line) in text.lines().enumerate() {
-                if line.contains(&pattern) {
-                    if hits == SEARCH_MAX_HITS {
-                        more = true;
-                        break;
-                    }
-                    hits += 1;
-                    in_file.push((n + 1, cut(line, SEARCH_LINE_MAX_BYTES)));
+            let n = start + i as u64;
+            let row = format!("{n}\t{line}\n");
+            if body.len() + row.len() > budget {
+                if i == 0 {
+                    long_first = true;
+                    body = format!("{}\n", cut(&row, budget.saturating_sub(4)).trim_end());
+                    end = n;
                 }
-            }
-            if !in_file.is_empty() {
-                files.push((rel, in_file));
-            }
-            if more {
+                stopped = true;
                 break;
             }
+            body.push_str(&row);
+            end = n;
         }
-        if walk.timed_out {
-            return Err(timeout());
-        }
-        let mut s = format!(
-            "{hits} hit(s) in {} file(s) for a literal match{}\n",
-            files.len(),
-            if more {
-                "; more hits not shown (the cap is 50)"
-            } else {
-                ""
-            }
-        );
-        for (rel, lines) in &files {
-            s.push_str(&format!("{rel} ({} hit(s))\n", lines.len()));
-            for (n, line) in lines {
-                s.push_str(&format!("  {n}: {line}\n"));
-            }
-        }
-        if skipped > 0 {
-            s.push_str(&format!(
-                "{skipped} file(s) not searched (larger than 1 MiB, unreadable or not UTF-8)\n"
-            ));
-        }
-        if walk.symlinks > 0 {
-            s.push_str(&format!("{} symlink(s) not followed\n", walk.symlinks));
-        }
-        if walk.stopped {
-            s.push_str("the walk stopped at its entry limit\n");
-        }
-        if walk.unreadable > 0 {
-            s.push_str(&format!(
-                "{} entr(y/ies) could not be read\n",
-                walk.unreadable
-            ));
-        }
-        Ok(ok(s))
+        let head = if long_first {
+            format!(
+                "{}: line {start} of {total}, cut: it alone is longer than the read window's {} bytes; sha256 {digest}\n",
+                shown_path(&wp),
+                self.window_bytes
+            )
+        } else if stopped {
+            format!(
+                "{}: lines {start}-{end} of {total} (the read window's {} bytes end here; continue with start {}); sha256 {digest}\n",
+                shown_path(&wp),
+                self.window_bytes,
+                end + 1
+            )
+        } else {
+            format!(
+                "{}: lines {start}-{end} of {total}; sha256 {digest}\n",
+                shown_path(&wp)
+            )
+        };
+        let mut o = ok(head + &body);
+        o.read = Some(record);
+        Ok(o)
     }
 
     fn list(&self, args: &Value, deadline: Instant) -> Out {
@@ -617,7 +613,7 @@ impl ReadTools {
 
 /// Read at most `max` bytes of `path`; `None` if it is longer (or cannot be
 /// read).
-fn read_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
+pub(crate) fn read_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
@@ -625,7 +621,7 @@ fn read_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
     (u64::try_from(bytes.len()).ok()? <= max).then_some(bytes)
 }
 
-fn shown_path(wp: &WorkspacePath) -> &str {
+pub(crate) fn shown_path(wp: &WorkspacePath) -> &str {
     if wp.as_str().is_empty() {
         "."
     } else {
@@ -633,7 +629,7 @@ fn shown_path(wp: &WorkspacePath) -> &str {
     }
 }
 
-fn cut(line: &str, max: usize) -> String {
+pub(crate) fn cut(line: &str, max: usize) -> String {
     if line.len() <= max {
         return line.to_owned();
     }
@@ -653,12 +649,12 @@ fn io_out(e: io::Error) -> Out {
 }
 
 /// One walked entry.
-struct Entry {
-    path: PathBuf,
-    rel: String,
-    meta: Metadata,
-    depth: usize,
-    symlink: bool,
+pub(crate) struct Entry {
+    pub(crate) path: PathBuf,
+    pub(crate) rel: String,
+    pub(crate) meta: Metadata,
+    pub(crate) depth: usize,
+    pub(crate) symlink: bool,
 }
 
 /// A bounded, deterministic (name-sorted, depth-first) walk that never
@@ -666,20 +662,26 @@ struct Entry {
 /// checked while a directory is being listed, not only between entries, so
 /// a huge directory is never enumerated in full (H1e-2a review F-2). A
 /// directory cut short by the limit makes the walk `stopped`.
-struct Walk {
+pub(crate) struct Walk {
     stack: Vec<Entry>,
     max_depth: usize,
     limit: usize,
     deadline: Option<Instant>,
-    timed_out: bool,
-    unreadable: usize,
+    pub(crate) timed_out: bool,
+    pub(crate) unreadable: usize,
     visited: usize,
-    symlinks: usize,
-    stopped: bool,
+    pub(crate) symlinks: usize,
+    pub(crate) stopped: bool,
 }
 
 impl Walk {
-    fn new(start: PathBuf, rel: String, meta: Metadata, max_depth: usize, limit: usize) -> Self {
+    pub(crate) fn new(
+        start: PathBuf,
+        rel: String,
+        meta: Metadata,
+        max_depth: usize,
+        limit: usize,
+    ) -> Self {
         Self {
             stack: vec![Entry {
                 path: start,
@@ -700,12 +702,19 @@ impl Walk {
     }
 
     /// Stop (with `timed_out`) once `deadline` has passed.
-    fn until(mut self, deadline: Instant) -> Self {
+    pub(crate) fn until(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
     }
 
     fn next_entry(&mut self) -> Option<Entry> {
+        self.next_entry_if(&mut |_| true)
+    }
+
+    /// The next entry. A directory's children are listed only when `enter`
+    /// says so (H2e: search and glob skip `.git` and excluded directories
+    /// without listing them); the directory itself is still returned.
+    pub(crate) fn next_entry_if(&mut self, enter: &mut dyn FnMut(&Entry) -> bool) -> Option<Entry> {
         if self.timed_out {
             return None;
         }
@@ -716,7 +725,7 @@ impl Walk {
             self.stack.clear();
             return None;
         }
-        if e.meta.is_dir() && !e.symlink && e.depth < self.max_depth {
+        if e.meta.is_dir() && !e.symlink && e.depth < self.max_depth && enter(&e) {
             let Ok(rd) = fs::read_dir(&e.path) else {
                 self.unreadable += 1;
                 return Some(e);
@@ -896,6 +905,29 @@ impl WorkspaceTree {
     /// Returns the new tree digest.
     pub fn record_edit(&mut self, path: &WorkspacePath, after: Digest) -> Digest {
         let rel = path.as_str();
+        // A create may have made directories on the way (H2f): each is an
+        // entry of the tree, and one already there is left as it is.
+        let mut prefix = String::new();
+        let comps: Vec<&str> = rel.split('/').collect();
+        for c in comps.iter().take(comps.len().saturating_sub(1)) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(c);
+            let at = self
+                .entries
+                .partition_point(|e| walk_order(&e.rel, &prefix) == std::cmp::Ordering::Less);
+            if self.entries.get(at).is_none_or(|e| e.rel != prefix) {
+                self.entries.insert(
+                    at,
+                    TreeEntry {
+                        rel: prefix.clone(),
+                        kind: b'd',
+                        content: String::new(),
+                    },
+                );
+            }
+        }
         let at = self
             .entries
             .partition_point(|e| walk_order(&e.rel, rel) == std::cmp::Ordering::Less);
@@ -1125,8 +1157,13 @@ mod tests {
             ("z/zz.txt", "last of all\n"),
             ("zz.txt", "after z/\n"),
             ("a/deep/x.rs", "x changed\n"),
+            // Created with the directories it needs (H2f).
+            ("n/m/new.rs", "two new directories\n"),
+            ("n/other.rs", "into one made before\n"),
+            ("a/deep/sub/y.rs", "one new directory in an old one\n"),
         ];
         for (path, text) in edits {
+            fs::create_dir_all(d.join(path).parent().unwrap()).unwrap();
             fs::write(d.join(path), text).unwrap();
             let wp = workspace_path(path).unwrap();
             let got = t.record_edit(&wp, sha256(text.as_bytes()));

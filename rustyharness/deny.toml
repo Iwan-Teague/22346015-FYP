@@ -13,6 +13,11 @@ allow = ["Apache-2.0", "MIT", "Unicode-3.0", "PolyForm-Noncommercial-1.0.0"]
 confidence-threshold = 1.0
 
 [bans]
+# Reviewed third-party crates beyond the serde and sha2 stacks, each also
+# on scripts/ci/purity.sh's reviewed list with its reason:
+#   regex, regex-automata, regex-syntax (H2e): the linear-time regex engine
+#   of `harness.fs.search`; MIT OR Apache-2.0 (allowed above), pure Rust,
+#   no build script, no FFI.
 multiple-versions = "warn"
 wildcards = "deny"
 # Intra-workspace path dependencies carry no version; they are not registry

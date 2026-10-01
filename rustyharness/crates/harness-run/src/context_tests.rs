@@ -199,6 +199,8 @@ fn drive(
         env: &env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
+        todo: None,
+        notices: crate::driver::BudgetNotices::live(cfg.limits.wall),
     };
     let end = lp.drive(&mut w);
     commit(w, &end, None);

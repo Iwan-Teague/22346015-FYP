@@ -741,12 +741,23 @@ done
 awk -F'\t' '$1 == "registry" { print $2 }' "$tmpdir/ws-class" >"$tmpdir/ws-registry-raw" || fail "awk failed (INV-23)"
 sort -u "$tmpdir/ws-registry-raw" >"$tmpdir/ws-registry" || fail "sort failed (INV-23)"
 # The reviewed crates.io crates: the union of the pure crates' allowlists
-# above. None has a process API; a new one needs a review that it has none.
+# above, plus the regex engine below. None has a process API; a new one
+# needs a review that it has none.
+#   regex, regex-automata, regex-syntax (H2e, design row H2e; used by
+#     harness-tools only, for `harness.fs.search` with `regex: true`): the
+#     rust-lang regex crate and its two engine crates, MIT OR Apache-2.0,
+#     pure Rust, no build script, no `links`, no FFI and no process, file or
+#     network API (they compile a pattern and match it against a &str).
+#     Chosen because its matching is linear in pattern x input (finite
+#     automata, no backtracking), so a model-supplied pattern cannot make a
+#     search run away; the harness also bounds the compiled size and the
+#     lazy DFA's cache. `perf-literal` is off, so aho-corasick is not in
+#     the build (memchr already was, through serde_json).
 printf '%s\n' \
     serde serde_core serde_derive proc-macro2 quote syn unicode-ident \
     serde_json itoa ryu memchr zmij thiserror thiserror-impl \
     sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
-    cpufeatures libc >"$tmpdir/allowed-registry-raw"
+    cpufeatures libc regex regex-automata regex-syntax >"$tmpdir/allowed-registry-raw"
 sort -u "$tmpdir/allowed-registry-raw" >"$tmpdir/allowed-registry" || fail "sort failed (INV-23)"
 comm -23 "$tmpdir/ws-registry" "$tmpdir/allowed-registry" >"$tmpdir/ws-unlisted" || fail "comm failed (INV-23)"
 if [ -s "$tmpdir/ws-unlisted" ]; then

@@ -76,9 +76,40 @@ impl HarnessText {
         )))
     }
 
+    /// The denial of a command whose `argv[0]` is not on the task's allowlist,
+    /// naming the programs it does allow (H2f). The names are the task's own
+    /// configuration, not model text; only plain names (letters, digits,
+    /// `.`, `_`, `-`, at most 64 bytes) are shown, at most 20, so nothing
+    /// else can reach the model through it.
+    pub fn exec_denial<'a>(programs: impl IntoIterator<Item = &'a str>) -> Self {
+        let plain = |p: &&str| {
+            !p.is_empty()
+                && p.len() <= 64
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        let names: Vec<&str> = programs.into_iter().filter(plain).take(20).collect();
+        let allowed = if names.is_empty() {
+            "This task allows no program.".to_owned()
+        } else {
+            format!("This task allows: {}.", names.join(", "))
+        };
+        Self::rendered(format!(
+            "Policy denied the call: argv[0] must be the name of a program this task allows (a name, not a path). {allowed} There is no shell. It did not run."
+        ))
+    }
+
     /// The text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// This text, then `next` on its own line: two harness texts are one
+    /// (H2e: a turn's notices, a loop notice and a budget notice, are one
+    /// message).
+    #[must_use]
+    pub fn joined(&self, next: &HarnessText) -> HarnessText {
+        Self::rendered(format!("{}\n{}", self.0, next.0))
     }
 }
 
@@ -218,6 +249,31 @@ impl ToolSpec {
             description: HarnessText::rendered(c.summary().to_owned()),
             parameters: c.input_schema().as_json().clone(),
         }
+    }
+
+    /// The tool as a run with this read window offers it (H2e): for
+    /// `harness.fs.read`, the schema's `lines` maximum is the window (the
+    /// manifest's is the widest any profile may set) and the description
+    /// names it; any other tool is unchanged. Rendered from harness data
+    /// only: the reviewed schema and a number.
+    #[must_use]
+    pub fn with_read_window(mut self, w: profile::ReadWindow) -> Self {
+        if self.id != "harness.fs.read" {
+            return self;
+        }
+        if let Some(lines) = self
+            .parameters
+            .get_mut("properties")
+            .and_then(|p| p.get_mut("lines"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            lines.insert("maximum".into(), serde_json::Value::from(w.lines));
+        }
+        self.description = HarnessText::rendered(format!(
+            "Read a window of lines (at most {}) from a file inside the workspace: start is the first line (1-based), lines how many. Paths are relative to the workspace root",
+            w.lines
+        ));
+        self
     }
 }
 
@@ -459,5 +515,37 @@ mod tests {
         for none in ["flag", "nosuch", "", "lines/0", "LINES"] {
             assert_eq!(text(none), None, "{none:?}");
         }
+    }
+    // H2e: the read tool as a run offers it names the run's window, in its
+    // schema and its description; every other tool is unchanged.
+    #[test]
+    fn the_read_tool_is_offered_with_the_runs_window() {
+        let w = crate::profile::ReadWindow::of_lines(400);
+        let t = read_tool().with_read_window(w);
+        assert_eq!(t.parameters["properties"]["lines"]["maximum"], json!(400));
+        assert_eq!(t.parameters["properties"]["lines"]["minimum"], json!(1));
+        assert!(t.description.as_str().contains("(at most 400)"));
+        assert!(t
+            .description
+            .as_str()
+            .contains("Paths are relative to the workspace root"));
+        // A denial of lines names the window, from the schema offered.
+        assert!(HarnessText::argument_bounds(&t, "lines")
+            .unwrap()
+            .as_str()
+            .contains("an integer from 1 to 400"));
+        let mut other = read_tool();
+        other.id = "harness.fs.list".into();
+        assert_eq!(other.clone().with_read_window(w), other);
+    }
+
+    #[test]
+    fn two_harness_texts_join_on_their_own_lines() {
+        let a = HarnessText::from_static("Notice: loop");
+        let b = HarnessText::from_static("Budget: 25 of 50 steps used.");
+        assert_eq!(
+            a.joined(&b).as_str(),
+            "Notice: loop\nBudget: 25 of 50 steps used."
+        );
     }
 }

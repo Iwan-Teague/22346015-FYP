@@ -183,35 +183,58 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
         [
             "harness.fs.read",
             "harness.fs.search",
+            "harness.fs.glob",
             "harness.fs.list",
             "harness.edit.replace",
             "harness.edit.write",
+            "harness.edit.multi",
             "harness.exec.run",
+            "harness.task.todo",
             "harness.task.submit"
         ]
     );
-    let submit = &m.capabilities()[6];
+    let cap = |id: &str| {
+        m.capabilities()
+            .iter()
+            .find(|c| c.id.as_str() == id)
+            .unwrap()
+    };
+    let submit = cap("harness.task.submit");
     assert_eq!(
         (submit.effect, submit.sensitivity, submit.content),
         (Effect::Write, Sensitivity::Public, Content::Own)
     );
     // The dev-suite judge's finding (a): the tools say where paths start
-    // (a model listed "/" first in 3 of 5 runs), and the list and search
-    // tools name "." as the root.
-    for c in &m.capabilities()[..5] {
+    // (a model listed "/" first in 3 of 5 runs), and the list, search and
+    // glob tools name "." as the root.
+    for id in [
+        "harness.fs.read",
+        "harness.fs.search",
+        "harness.fs.glob",
+        "harness.fs.list",
+        "harness.edit.replace",
+        "harness.edit.write",
+        "harness.edit.multi",
+    ] {
         assert!(
-            c.summary()
+            cap(id)
+                .summary()
                 .contains("Paths are relative to the workspace root"),
-            "{}",
-            c.id
+            "{id}"
         );
     }
-    for c in &m.capabilities()[1..3] {
-        assert!(c.summary().contains(r#""." is the root"#), "{}", c.id);
+    for id in ["harness.fs.search", "harness.fs.glob", "harness.fs.list"] {
+        assert!(cap(id).summary().contains(r#""." is the root"#), "{id}");
     }
     // H2b: the edit tools carry §4.8's labels (write / operational / own /
-    // none), content own, no declared confirmation, and §4.9's schemas.
-    for c in &m.capabilities()[3..5] {
+    // none), content own, no declared confirmation, and §4.9's schemas
+    // (H2e: `harness.edit.multi` too).
+    for id in [
+        "harness.edit.replace",
+        "harness.edit.write",
+        "harness.edit.multi",
+    ] {
+        let c = cap(id);
         assert_eq!(
             (c.effect, c.sensitivity, c.blast_radius, c.egress),
             (
@@ -229,7 +252,7 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
         );
         assert!(c.secrets.is_empty() && c.mcp_name.is_none() && c.schema_sha256.is_none());
     }
-    let replace = &m.capabilities()[3];
+    let replace = cap("harness.edit.replace");
     for ok in [
         json!({"path": "src/lib.rs", "old": "a", "new": "b"}),
         json!({"path": "src/lib.rs", "old": "a", "new": "", "count": 2}),
@@ -243,7 +266,7 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
     ] {
         assert!(replace.input_schema().validate_args(&bad).is_err(), "{bad}");
     }
-    let write = &m.capabilities()[4];
+    let write = cap("harness.edit.write");
     assert!(write
         .input_schema()
         .validate_args(&json!({"path": "new.rs", "content": ""}))
@@ -252,10 +275,29 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
         .input_schema()
         .validate_args(&json!({"path": "new.rs"}))
         .is_err());
+    // H2e: several exact replacements in one file: a list of {old, new},
+    // nothing else in an item or beside it.
+    let multi = cap("harness.edit.multi");
+    for ok in [
+        json!({"path": "a.rs", "edits": [{"old": "x", "new": "y"}]}),
+        json!({"path": "a.rs", "edits": [{"old": "x", "new": "y"}, {"old": "z", "new": ""}]}),
+        json!({"path": "a.rs", "edits": []}),
+    ] {
+        assert!(multi.input_schema().validate_args(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"path": "a.rs"}),
+        json!({"path": "a.rs", "edits": [{"old": "x"}]}),
+        json!({"path": "a.rs", "edits": [{"old": "x", "new": "y", "count": 2}]}),
+        json!({"path": "a.rs", "edits": {"old": "x", "new": "y"}}),
+        json!({"path": "a.rs", "edits": [], "old": "x"}),
+    ] {
+        assert!(multi.input_schema().validate_args(&bad).is_err(), "{bad}");
+    }
     // H2d: the command runner is execute / operational / own / none, its
     // content third-party (compiler and test output quote the workspace),
     // and its schema takes an argv list and an optional cwd, nothing else.
-    let exec = &m.capabilities()[5];
+    let exec = cap("harness.exec.run");
     assert_eq!(
         (
             exec.effect,
@@ -288,11 +330,91 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
     ] {
         assert!(exec.input_schema().validate_args(&bad).is_err(), "{bad}");
     }
-    for c in m.capabilities().iter().take(3) {
+    // H2e: the checklist is write / public / own / none, content own, like
+    // the sentinel; its items are a text and one of three statuses, and it
+    // may be called without items.
+    let todo = cap("harness.task.todo");
+    assert_eq!(
+        (
+            todo.effect,
+            todo.sensitivity,
+            todo.blast_radius,
+            todo.egress,
+            todo.content,
+            todo.confirmation
+        ),
+        (
+            Effect::Write,
+            Sensitivity::Public,
+            BlastRadius::Own,
+            Egress::None,
+            Content::Own,
+            Confirmation::None
+        )
+    );
+    for ok in [
+        json!({}),
+        json!({"items": []}),
+        json!({"items": [{"text": "read", "status": "pending"}, {"text": "fix", "status": "in_progress"}, {"text": "x", "status": "done"}]}),
+    ] {
+        assert!(todo.input_schema().validate_args(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"items": [{"text": "read", "status": "completed"}]}),
+        json!({"items": [{"text": "read"}]}),
+        json!({"items": [{"text": "a".repeat(201), "status": "done"}]}),
+        json!({"items": "read"}),
+        json!({"list": []}),
+    ] {
+        assert!(todo.input_schema().validate_args(&bad).is_err(), "{bad}");
+    }
+    // H2e: the search's new arguments, bounded; the read's lines up to the
+    // widest window any profile may set.
+    let search = cap("harness.fs.search");
+    for ok in [
+        json!({"pattern": "x"}),
+        json!({"pattern": "fn \\w+", "regex": true, "include": "*.rs", "exclude": "target", "context": 5, "path": "src"}),
+    ] {
+        assert!(search.input_schema().validate_args(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"pattern": "x", "context": 6}),
+        json!({"pattern": "x", "regex": "yes"}),
+        json!({"pattern": "x", "include": "a".repeat(257)}),
+        json!({"pattern": "x", "glob": "*.rs"}),
+    ] {
+        assert!(search.input_schema().validate_args(&bad).is_err(), "{bad}");
+    }
+    let read = cap("harness.fs.read");
+    assert!(read
+        .input_schema()
+        .validate_args(&json!({"path": "a", "lines": 2000}))
+        .is_ok());
+    assert!(read
+        .input_schema()
+        .validate_args(&json!({"path": "a", "lines": 2001}))
+        .is_err());
+    let glob = cap("harness.fs.glob");
+    assert!(glob
+        .input_schema()
+        .validate_args(&json!({"pattern": "**/*.rs", "path": "src"}))
+        .is_ok());
+    assert!(glob
+        .input_schema()
+        .validate_args(&json!({"path": "src"}))
+        .is_err());
+    for id in [
+        "harness.fs.read",
+        "harness.fs.search",
+        "harness.fs.glob",
+        "harness.fs.list",
+    ] {
+        let c = cap(id);
         assert_eq!(c.effect, Effect::Read, "{}", c.id);
         assert_eq!(c.sensitivity, Sensitivity::Operational, "{}", c.id);
         assert_eq!(c.blast_radius, BlastRadius::Own, "{}", c.id);
         assert_eq!(c.egress, Egress::None, "{}", c.id);
+        assert_eq!(c.content, Content::ThirdParty, "{}", c.id);
         assert_eq!(c.confirmation, Confirmation::None, "{}", c.id);
         assert!(c.secrets.is_empty() && c.mcp_name.is_none() && c.schema_sha256.is_none());
     }

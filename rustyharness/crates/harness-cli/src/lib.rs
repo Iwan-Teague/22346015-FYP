@@ -456,6 +456,44 @@ struct TaskFile {
     /// include `harness.exec.run`.
     #[serde(default)]
     exec: Option<ExecFile>,
+    /// The run's budgets (§2.1: the task spec declares them; H2e).
+    #[serde(default)]
+    budget: Option<BudgetFile>,
+}
+
+/// A task file's `budget` section (H2e): the step budget and the wall-clock
+/// budget, each optional, the §2.4 default (50 steps, 30 minutes) when
+/// absent. The limits are header inputs (H1g F-1), so an audit or a resume
+/// given another budget is refused by name, and the budget notices (H2e)
+/// count against these limits.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetFile {
+    #[serde(default, deserialize_with = "present")]
+    steps: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    wall_secs: Option<u64>,
+    /// Each command's wall clock (H2f), in a task that grants the runner:
+    /// 1 second to an hour, 120 s when absent. It is a header input
+    /// (`exec_timeout_ms`), so an audit reads it from the journal.
+    #[serde(default, deserialize_with = "present")]
+    exec_secs: Option<u64>,
+}
+
+/// The widest step budget a task may set.
+const BUDGET_MAX_STEPS: u32 = 500;
+/// The longest wall-clock budget a task may set: a day.
+const BUDGET_MAX_WALL_SECS: u64 = 24 * 60 * 60;
+/// The longest wall clock a task may give one command (H2f): an hour.
+const BUDGET_MAX_EXEC_SECS: u64 = 60 * 60;
+
+/// An optional field is absent or a value, never `null`.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 /// A task file's `exec` section (H2d): the allowlist (each program's name
@@ -561,6 +599,8 @@ struct Inputs {
     policy: UserPolicy,
     profile: Profile,
     registry: Registry,
+    /// The budgets and timeouts, the task's budget section applied.
+    config: RunConfig,
 }
 
 fn required<'a>(cx: &Cx<'_>, o: &BTreeMap<&str, &'a str>, k: &str) -> Result<&'a str, Outcome> {
@@ -595,6 +635,7 @@ fn inputs(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Inputs, Outcome> {
         None => None,
         Some(e) => Some(e.spec().map_err(unreadable)?),
     };
+    let config = run_config(task.budget.as_ref(), exec.is_some()).map_err(unreadable)?;
     Ok(Inputs {
         spec: TaskSpec {
             task: TaskText::new(task.task),
@@ -605,14 +646,48 @@ fn inputs(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Inputs, Outcome> {
         policy,
         profile,
         registry,
+        config,
     })
 }
 
-/// The budgets and timeouts of every run and resume this binary starts
-/// (§2.4 defaults). `replay` passes the same limits to the audit, which
-/// requires them to equal the recorded ones (H1 phase-exit review F-1).
-fn run_config() -> RunConfig {
-    RunConfig::defaults(1_000_000)
+/// The budgets and timeouts of a run or resume this binary starts: the
+/// §2.4 defaults, with the task's budget section (H2e) applied. `replay`
+/// passes the same limits to the audit, which requires them to equal the
+/// recorded ones (H1 phase-exit review F-1), so an audit or a resume must
+/// be given the task file the run was given.
+fn run_config(budget: Option<&BudgetFile>, has_exec: bool) -> Result<RunConfig, String> {
+    let mut c = RunConfig::defaults(1_000_000);
+    let Some(b) = budget else { return Ok(c) };
+    if let Some(s) = b.steps {
+        if !(1..=BUDGET_MAX_STEPS).contains(&s) {
+            return Err(format!(
+                "budget: steps must be from 1 to {BUDGET_MAX_STEPS}"
+            ));
+        }
+        c.limits.steps = s;
+    }
+    if let Some(w) = b.wall_secs {
+        if !(1..=BUDGET_MAX_WALL_SECS).contains(&w) {
+            return Err(format!(
+                "budget: wall_secs must be from 1 to {BUDGET_MAX_WALL_SECS}"
+            ));
+        }
+        c.limits.wall = Duration::from_secs(w);
+    }
+    if let Some(x) = b.exec_secs {
+        if !has_exec {
+            return Err(
+                "budget: exec_secs is for a task with an exec section; this task has none".into(),
+            );
+        }
+        if !(1..=BUDGET_MAX_EXEC_SECS).contains(&x) {
+            return Err(format!(
+                "budget: exec_secs must be from 1 to {BUDGET_MAX_EXEC_SECS}"
+            ));
+        }
+        c.exec_call_timeout = Duration::from_secs(x);
+    }
+    Ok(c)
 }
 
 fn builtin_registry() -> Result<Registry, String> {
@@ -663,7 +738,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
                 refused(exit::UNREADABLE_INPUT, format!("endpoint refused: {e}"))
             })?;
     let probe = cx.probe;
-    let config = run_config();
+    let config = &inp.config;
     // The state root's locality first (§2.8): a run that cannot start does
     // not contact the model server. The run checks it again itself.
     let root = std::fs::canonicalize(state_root)
@@ -704,7 +779,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             backend: &client,
             probe,
             env: &SystemEnv,
-            config: &config,
+            config,
             approver,
             confinement: Some(cx.confinement),
         }),
@@ -719,7 +794,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             backend: &client,
             probe,
             env: &SystemEnv,
-            config: &config,
+            config,
             approver,
             confinement: Some(cx.confinement),
         }),
@@ -847,7 +922,6 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
                 .map_err(|_| usage("--anchor is not a sha256 in hex"))?,
         ),
     };
-    let config = run_config();
     let rep = harness_run::audit(Audit {
         state_root: std::path::Path::new(state_root),
         run: &run,
@@ -857,7 +931,7 @@ fn try_replay(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Outcome, Outcome>
         registry: &inp.registry,
         policy: &inp.policy,
         profile: &inp.profile,
-        limits: &config.limits,
+        limits: &inp.config.limits,
     })
     .map_err(|e| {
         note!(cx, "the replay did not start: {e}");

@@ -21,7 +21,8 @@ In scope for reports today, a way to:
 - invoke a capability the task did not grant or user policy denies, get a
   provider other than the built-in one admitted, or cause any workspace write
   through the agent other than a granted edit tool's (on the H2b branch:
-  `harness.edit.replace` and `harness.edit.write`, which run only when user
+  `harness.edit.replace` and `harness.edit.write`, and `harness.edit.multi`
+  since H2e, which run only when user
   policy allows them or an approver said yes to that exact call at that step;
   the submit sentinel `harness.task.submit` only ends the loop, §2.5); make an
   edit run without such a yes (a reused, forged or other-step approval), write
@@ -39,7 +40,14 @@ In scope for reports today, a way to:
   make a resume or an audit run a completed command again;
 - read outside the workspace, beyond the residuals the design names (hard links,
   mount points inside the workspace and the check-then-open window, the
-  design's H1e-2 "Read tools" row);
+  design's H1e-2 "Read tools" row), including through a search's or a glob's
+  pattern or filters (H2e);
+- make a search pattern run away (the regex engine is linear-time and size
+  bounded; the glob matcher is linear), or get the parser's text, or any
+  model-supplied text, shown to the model as harness text: a harness notice
+  (a budget notice, a repair, a denial) is built from harness words and
+  numbers only, and the checklist's items appear only inside the untrusted
+  result of `harness.task.todo` (H2e);
 - reach a model endpoint that is not loopback;
 - run with a `state_root` on a filesystem not identified as local (INV-35),
   beyond the residuals the design names (the H1e-2c row: a mount placed over the

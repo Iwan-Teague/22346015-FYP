@@ -30,7 +30,8 @@ use std::time::Duration;
 
 use gate_outcome::child::{interpret, ChildRun, ExitKind};
 use gate_outcome::{GateId, GateOutcome, IndeterminateKind};
-use harness_policy::locality::{FsQuery, LocalityProbe};
+// A local-APFS answer for any path: the shared testkit probe.
+use harness_testkit::Local;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rustyharness");
 
@@ -166,17 +167,6 @@ struct Output {
 impl Output {
     fn code(&self) -> Option<i32> {
         Some(self.code)
-    }
-}
-
-/// A local-APFS answer for any path: only these tests have it.
-struct Local;
-impl LocalityProbe for Local {
-    fn query(&self, _path: &str) -> FsQuery {
-        FsQuery::MacOs {
-            mnt_local: true,
-            fs_type_name: "apfs".into(),
-        }
     }
 }
 

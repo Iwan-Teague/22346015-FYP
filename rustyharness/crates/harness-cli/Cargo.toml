@@ -30,3 +30,7 @@ harness-run = { path = "../harness-run" }
 harness-sandbox = { path = "../harness-sandbox" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Shared in-process test fixtures (P-03).
+harness-testkit = { path = "../harness-testkit" }

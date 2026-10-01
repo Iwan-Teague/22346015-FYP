@@ -1,0 +1,27 @@
+[package]
+name = "harness-testkit"
+description = "rustyharness dev-only test kit: temporary state-root fixtures, scripted models, audit assertions and an in-process CLI driver for the workspace's own tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The kit stitches the layers together, so it depends on every one of them.
+harness-cli = { path = "../harness-cli" }
+harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+harness-manifest = { path = "../harness-manifest" }
+harness-model = { path = "../harness-model" }
+harness-policy = { path = "../harness-policy" }
+harness-run = { path = "../harness-run" }
+harness-sandbox = { path = "../harness-sandbox" }
+thiserror.workspace = true
+
+[dev-dependencies]
+gate-outcome = { path = "../gate-outcome" }
+serde_json.workspace = true

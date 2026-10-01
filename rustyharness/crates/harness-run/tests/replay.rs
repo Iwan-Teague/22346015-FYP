@@ -15,66 +15,32 @@ use harness_core::environment::{EnvSample, Unmeasured};
 use harness_core::{MeterLimits, RunId, StopCause};
 use harness_journal::canon::{RecordFields, GENESIS};
 use harness_journal::{layout, EventKind, JournalReader};
-use harness_manifest::admission::{Registry, Tier};
-use harness_manifest::{builtin, SemVer, ValidationContext};
 use harness_model::profile::Profile;
-use harness_model::scripted::{text_reply, ScriptedBackend};
-use harness_model::{Completion, ModelError, TaskText};
+use harness_model::scripted::ScriptedBackend;
+use harness_model::{Completion, TaskText};
 use harness_policy::locality::{FsQuery, LocalityProbe};
 use harness_policy::UserPolicy;
 use harness_run::{
     audit, resume, run, Audit, Resume, Run, RunConfig, RunRefused, RunReport, TaskSpec,
 };
+use harness_testkit::{act, run_scripted, submit, Fixture, Local};
 use serde_json::Value;
 
 /// A fixed environment sample (the real probe is harness-sandbox's; these
 /// tests only need the header and records to carry one).
 const FIXED_ENV: EnvSample = EnvSample::unmeasured(Unmeasured::NoSafeApi);
 
-struct Local;
-impl LocalityProbe for Local {
-    fn query(&self, _path: &str) -> FsQuery {
-        FsQuery::MacOs {
-            mnt_local: true,
-            fs_type_name: "apfs".into(),
-        }
-    }
+/// A fixture with the two files and the task every replay here starts from.
+fn fx(name: &str) -> Fixture {
+    let mut fx = Fixture::new(&format!("replay-{name}")).unwrap();
+    fx.write("a.txt", "alpha\n").unwrap();
+    fx.write("b.txt", "beta\n").unwrap();
+    fx.spec = spec(TASK);
+    fx
 }
 
-fn scratch(name: &str) -> (PathBuf, PathBuf) {
-    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("replay-{name}"));
-    let _ = fs::remove_dir_all(&base);
-    let (state, ws) = (base.join("state"), base.join("ws"));
-    fs::create_dir_all(&state).unwrap();
-    fs::create_dir_all(&ws).unwrap();
-    fs::write(ws.join("a.txt"), "alpha\n").unwrap();
-    fs::write(ws.join("b.txt"), "beta\n").unwrap();
-    (state, ws)
-}
-
-fn registry() -> Registry {
-    let ctx = ValidationContext::new(
-        SemVer {
-            major: 0,
-            minor: 0,
-            patch: 1,
-        },
-        &[],
-    )
-    .unwrap();
-    Registry::admit(vec![(builtin::manifest(&ctx).unwrap(), Tier::Builtin)]).unwrap()
-}
-
-fn action(tool: &str, args: &str) -> Result<Completion, ModelError> {
-    Ok(text_reply(&format!(
-        "<action>{{\"tool\":\"{tool}\",\"args\":{args}}}</action>"
-    )))
-}
-fn read(p: &str) -> Result<Completion, ModelError> {
-    action("harness.fs.read", &format!("{{\"path\":\"{p}\"}}"))
-}
-fn submit() -> Result<Completion, ModelError> {
-    action("harness.task.submit", "{\"note\":\"done\"}")
+fn read(p: &str) -> Completion {
+    act("harness.fs.read", &format!("{{\"path\":\"{p}\"}}"))
 }
 
 fn spec(task: &str) -> TaskSpec {
@@ -87,24 +53,8 @@ fn spec(task: &str) -> TaskSpec {
     }
 }
 
-fn go(state: &Path, ws: &Path, replies: Vec<Result<Completion, ModelError>>) -> RunReport {
-    let profile = Profile::conservative_default("m");
-    let backend = ScriptedBackend::new(profile.clone(), replies);
-    run(Run {
-        state_root: state,
-        workspace: ws,
-        spec: &spec("Summarise a.txt and b.txt."),
-        registry: &registry(),
-        policy: &UserPolicy::default(),
-        profile: &profile,
-        backend: &backend,
-        probe: &Local,
-        env: &FIXED_ENV,
-        config: &RunConfig::defaults(1_000_000),
-        approver: None,
-        confinement: None,
-    })
-    .unwrap()
+fn go(fx: &Fixture, replies: Vec<Completion>) -> RunReport {
+    run_scripted(fx, replies).unwrap()
 }
 
 /// The limits every run and resume in this file is given (`go`,
@@ -114,19 +64,19 @@ fn limits() -> MeterLimits {
 }
 
 fn audit_with(
-    state: &Path,
+    fx: &Fixture,
     run: &RunId,
     attempt: Option<u32>,
     task: &str,
     policy: &UserPolicy,
 ) -> harness_run::AuditReport {
     audit(Audit {
-        state_root: state,
+        state_root: fx.state_root(),
         run,
         attempt,
         anchor: None,
         spec: &spec(task),
-        registry: &registry(),
+        registry: &harness_testkit::registry().unwrap(),
         policy,
         profile: &Profile::conservative_default("m"),
         limits: &limits(),
@@ -185,10 +135,10 @@ fn kind_is(k: &'static str) -> impl Fn(&Value) -> bool {
 
 #[test]
 fn inv_20_a_clean_replay_recomputes_every_record_and_matches() {
-    let (state, ws) = scratch("clean");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("clean");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     assert_eq!(r.cause, StopCause::Submitted);
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.divergence, None);
     assert_eq!(
         a.outcome,
@@ -205,28 +155,28 @@ fn inv_20_a_clean_replay_recomputes_every_record_and_matches() {
     let dir = a.replay_dir.unwrap();
     assert_eq!(dir, layout::replay_dir(&r.run_dir, 1));
     // The recorded attempt is untouched; a second audit gets replay-2.
-    let again = audit_with(&state, &r.run, Some(1), TASK, &UserPolicy::default());
+    let again = audit_with(&fx, &r.run, Some(1), TASK, &UserPolicy::default());
     assert_eq!(again.replay_dir.unwrap(), layout::replay_dir(&r.run_dir, 2));
 }
 
 #[test]
 fn inv_20_an_edited_reply_that_breaks_the_chain_is_unreadable() {
-    let (state, ws) = scratch("edited-bytes");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("edited-bytes");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     let p = journal_path(&r, 1);
     let t = fs::read_to_string(&p)
         .unwrap()
         .replacen("a.txt", "b.txt", 1);
     fs::write(&p, t).unwrap();
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("does not verify"));
 }
 
 #[test]
 fn inv_20_a_re_chained_edited_reply_is_caught_by_the_replay() {
-    let (state, ws) = scratch("edited-reply");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("edited-reply");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     // The model's first reply now asks for b.txt; the hashes are re-chained,
     // so the journal verifies. The replay recomputes the parse from the
     // edited reply and the recorded ActionParsed no longer follows.
@@ -239,7 +189,7 @@ fn inv_20_a_re_chained_edited_reply_is_caught_by_the_replay() {
         b["content"]["sha256"] = Value::from(harness_core::sha256(c.as_bytes()).to_string());
     });
     assert!(JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).is_ok());
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     let d = a.divergence.unwrap();
     assert_eq!(d.step, 1);
@@ -248,12 +198,12 @@ fn inv_20_a_re_chained_edited_reply_is_caught_by_the_replay() {
 
 #[test]
 fn inv_20_a_re_chained_edited_policy_decision_is_caught_by_the_replay() {
-    let (state, ws) = scratch("edited-policy");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("edited-policy");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     rechain(&journal_path(&r, 1), kind_is("PolicyDecided"), |b| {
         b["rule"] = Value::from("allow.something-else");
     });
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     let d = a.divergence.unwrap();
     assert_eq!(d.step, 1);
@@ -262,31 +212,25 @@ fn inv_20_a_re_chained_edited_policy_decision_is_caught_by_the_replay() {
 
 #[test]
 fn inv_20_replaying_under_another_policy_or_task_is_refused_at_the_header() {
-    let (state, ws) = scratch("other-inputs");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("other-inputs");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     let deny = UserPolicy::new(&["harness.fs.read"], &[], &[]).unwrap();
-    let a = audit_with(&state, &r.run, None, TASK, &deny);
+    let a = audit_with(&fx, &r.run, None, TASK, &deny);
     assert_eq!(a.outcome, UNREADABLE);
     assert_eq!(a.divergence.as_ref().unwrap().seq, 0);
-    let a = audit_with(
-        &state,
-        &r.run,
-        None,
-        "Another task.",
-        &UserPolicy::default(),
-    );
+    let a = audit_with(&fx, &r.run, None, "Another task.", &UserPolicy::default());
     assert_eq!(a.divergence.unwrap().seq, 0);
 }
 
 #[test]
 fn inv_20_a_journal_from_another_run_is_refused() {
-    let (state, ws) = scratch("other-run");
-    let a_run = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("other-run");
+    let a_run = go(&fx, vec![read("a.txt"), submit()]);
     // A run directory for another id whose attempt-1 is run A's journal:
     // the attempt number fits, the run id does not.
     let other = RunId::new(1, [7; 10]);
     let to = layout::attempt_dir(
-        &layout::run_dir(&fs::canonicalize(&state).unwrap(), &other),
+        &layout::run_dir(&fs::canonicalize(fx.state_root()).unwrap(), &other),
         1,
     );
     fs::create_dir_all(to.join(layout::BLOBS_DIR)).unwrap();
@@ -296,24 +240,24 @@ fn inv_20_a_journal_from_another_run_is_refused() {
         to.join(layout::JOURNAL_FILE),
     )
     .unwrap();
-    let a = audit_with(&state, &other, Some(1), TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &other, Some(1), TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("another run"));
 }
 
 #[test]
 fn inv_20_an_anchor_catches_a_replaced_journal() {
-    let (state, ws) = scratch("anchor");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("anchor");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     let head = r.chain_head.unwrap();
     let with_anchor = |anchor| {
         audit(Audit {
-            state_root: &state,
+            state_root: fx.state_root(),
             run: &r.run,
             attempt: None,
             anchor: Some(anchor),
-            spec: &spec(TASK),
-            registry: &registry(),
+            spec: &fx.spec,
+            registry: &harness_testkit::registry().unwrap(),
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &limits(),
@@ -380,27 +324,27 @@ fn fields(v: &Value, prev: harness_core::Digest, body: Option<Value>) -> RecordF
 }
 
 fn audit_anchored(
-    state: &Path,
+    fx: &Fixture,
     run: &RunId,
     anchor: Option<harness_core::Digest>,
 ) -> harness_run::AuditReport {
-    audit_given(state, run, anchor, &limits())
+    audit_given(fx, run, anchor, &limits())
 }
 
 /// [`audit_anchored`] with the limits the audit is given.
 fn audit_given(
-    state: &Path,
+    fx: &Fixture,
     run: &RunId,
     anchor: Option<harness_core::Digest>,
     limits: &MeterLimits,
 ) -> harness_run::AuditReport {
     audit(Audit {
-        state_root: state,
+        state_root: fx.state_root(),
         run,
         attempt: None,
         anchor,
         spec: &spec(TASK),
-        registry: &registry(),
+        registry: &harness_testkit::registry().unwrap(),
         policy: &UserPolicy::default(),
         profile: &Profile::conservative_default("m"),
         limits,
@@ -410,8 +354,8 @@ fn audit_given(
 
 #[test]
 fn f_1_a_truncated_journal_with_a_forged_wall_stop_is_never_reported_verified() {
-    let (state, ws) = scratch("forged-wall");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("forged-wall");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     let genuine = r.chain_head.unwrap();
     // Keep step 1, drop steps 2-3 and the real stop, forge a wall stop.
     truncate_and_forge_wall_stop(&journal_path(&r, 1), 1);
@@ -419,7 +363,7 @@ fn f_1_a_truncated_journal_with_a_forged_wall_stop_is_never_reported_verified() 
     assert!(v.is_complete(), "the forged journal verifies");
     // Without an anchor: every remaining record matches, but the stop is
     // not recomputable, so the audit does not vouch for the journal.
-    let a = audit_anchored(&state, &r.run, None);
+    let a = audit_anchored(&fx, &r.run, None);
     assert_eq!(a.divergence, None);
     assert!(!a.stop_recomputed);
     assert_eq!(
@@ -427,26 +371,29 @@ fn f_1_a_truncated_journal_with_a_forged_wall_stop_is_never_reported_verified() 
         "a forged wall stop must not pass as verified"
     );
     // With the genuine run's anchor, the truncation is caught outright.
-    let a = audit_anchored(&state, &r.run, Some(genuine));
+    let a = audit_anchored(&fx, &r.run, Some(genuine));
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("anchor"));
 }
 
 #[test]
 fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
-    let (state, ws) = scratch("genuine-wall");
+    let fx = fx("genuine-wall");
     let profile = Profile::conservative_default("m");
     let backend = ScriptedBackend::new(
         profile.clone(),
-        vec![read("a.txt"), read("b.txt"), submit()],
+        vec![read("a.txt"), read("b.txt"), submit()]
+            .into_iter()
+            .map(Ok)
+            .collect(),
     );
     let mut config = RunConfig::defaults(1_000_000);
     config.limits.wall = std::time::Duration::from_nanos(1);
     let r = run(Run {
-        state_root: &state,
-        workspace: &ws,
-        spec: &spec(TASK),
-        registry: &registry(),
+        state_root: fx.state_root(),
+        workspace: fx.workspace(),
+        spec: &fx.spec,
+        registry: &harness_testkit::registry().unwrap(),
         policy: &UserPolicy::default(),
         profile: &profile,
         backend: &backend,
@@ -459,13 +406,13 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
     .unwrap();
     assert_eq!(r.cause, StopCause::Budget(harness_core::BudgetDim::Wall));
     // The audit is given the limits this run was given (review F-1).
-    let a = audit_given(&state, &r.run, None, &config.limits);
+    let a = audit_given(&fx, &r.run, None, &config.limits);
     assert!(!a.stop_recomputed);
     assert_eq!(
         a.outcome, UNREADABLE,
         "without an anchor a wall stop is not verified"
     );
-    let a = audit_given(&state, &r.run, r.chain_head, &config.limits);
+    let a = audit_given(&fx, &r.run, r.chain_head, &config.limits);
     assert!(a.anchored && !a.stop_recomputed);
     assert_eq!(a.divergence, None);
     assert_eq!(
@@ -478,9 +425,9 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
 
 #[test]
 fn f_1_a_recomputed_stop_is_verified_without_an_anchor() {
-    let (state, ws) = scratch("recomputed-stop");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
-    let a = audit_anchored(&state, &r.run, None);
+    let fx = fx("recomputed-stop");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
+    let a = audit_anchored(&fx, &r.run, None);
     assert!(a.stop_recomputed && !a.anchored);
     assert_eq!(
         a.outcome,
@@ -526,39 +473,28 @@ fn crash_in(path: &Path, step: u64, kind: &str) {
 }
 
 fn resume_with(
-    state: &Path,
-    ws: &Path,
+    fx: &Fixture,
     run: &RunId,
-    task: &str,
-    replies: Vec<Result<Completion, ModelError>>,
+    replies: Vec<Completion>,
 ) -> Result<RunReport, RunRefused> {
-    resume_under(
-        state,
-        ws,
-        run,
-        task,
-        &RunConfig::defaults(1_000_000),
-        replies,
-    )
+    resume_under(fx, run, &RunConfig::defaults(1_000_000), replies)
 }
 
 /// [`resume_with`] under the given budgets and timeouts.
 fn resume_under(
-    state: &Path,
-    ws: &Path,
+    fx: &Fixture,
     run: &RunId,
-    task: &str,
     config: &RunConfig,
-    replies: Vec<Result<Completion, ModelError>>,
+    replies: Vec<Completion>,
 ) -> Result<RunReport, RunRefused> {
     let profile = Profile::conservative_default("m");
-    let backend = ScriptedBackend::new(profile.clone(), replies);
+    let backend = ScriptedBackend::new(profile.clone(), replies.into_iter().map(Ok).collect());
     resume(Resume {
-        state_root: state,
+        state_root: fx.state_root(),
         run,
-        workspace: ws,
-        spec: &spec(task),
-        registry: &registry(),
+        workspace: fx.workspace(),
+        spec: &fx.spec,
+        registry: &harness_testkit::registry().unwrap(),
         policy: &UserPolicy::default(),
         profile: &profile,
         backend: &backend,
@@ -572,15 +508,15 @@ fn resume_under(
 
 #[test]
 fn resume_continues_in_a_new_attempt_and_re_runs_the_cut_step_live() {
-    let (state, ws) = scratch("resume");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("resume");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     // Crash in step 2 before its result: its intent survives without a
     // `ToolFinished`, and step 3 and RunStopped do not.
     crash_in(&journal_path(&r, 1), 2, "ToolFinished");
     let before = fs::read(journal_path(&r, 1)).unwrap();
     let old = JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).unwrap();
     // Step 1 is replayed from the journal; step 2 runs again live, then 3.
-    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    let res = resume_with(&fx, &r.run, vec![read("b.txt"), submit()]).unwrap();
     assert_eq!(res.attempt, 2);
     assert_eq!(res.steps, 3, "step 1 replayed, steps 2 and 3 live");
     assert_eq!(res.cause, StopCause::Submitted);
@@ -609,7 +545,7 @@ fn resume_continues_in_a_new_attempt_and_re_runs_the_cut_step_live() {
     };
     assert_eq!(body(&new, 1), body(&old, 1));
     // And the resumed attempt itself audits clean.
-    let a = audit_with(&state, &r.run, Some(2), TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, Some(2), TASK, &UserPolicy::default());
     assert_eq!(a.divergence, None, "{a:?}");
 }
 
@@ -618,12 +554,12 @@ fn resume_continues_in_a_new_attempt_and_re_runs_the_cut_step_live() {
 /// again; only the next step runs live.
 #[test]
 fn resume_re_feeds_a_completed_last_step_and_runs_only_the_next_live() {
-    let (state, ws) = scratch("resume-completed");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("resume-completed");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     // Crash after step 2 finished: its result is durable, step 3 is gone.
     crash_after(&journal_path(&r, 1), 3);
     let old = JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).unwrap();
-    let res = resume_with(&state, &ws, &r.run, TASK, vec![submit()]).unwrap();
+    let res = resume_with(&fx, &r.run, vec![submit()]).unwrap();
     assert_eq!(res.attempt, 2);
     assert_eq!(res.steps, 3, "steps 1 and 2 replayed, step 3 live");
     assert_eq!(res.cause, StopCause::Submitted);
@@ -637,26 +573,28 @@ fn resume_re_feeds_a_completed_last_step_and_runs_only_the_next_live() {
     };
     assert_eq!(body(&new, 1), body(&old, 1));
     assert_eq!(body(&new, 2), body(&old, 2), "step 2 re-fed, not re-run");
-    let a = audit_with(&state, &r.run, Some(2), TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, Some(2), TASK, &UserPolicy::default());
     assert_eq!(a.divergence, None, "{a:?}");
 }
 
 #[test]
 fn resume_refuses_a_stopped_run_a_changed_workspace_and_changed_inputs() {
-    let (state, ws) = scratch("resume-refusals");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
-    let e = resume_with(&state, &ws, &r.run, TASK, vec![]).unwrap_err();
+    let mut fx = fx("resume-refusals");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
+    let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(matches!(e, RunRefused::NotResumable(w) if w.contains("already stopped")));
 
     crash_after(&journal_path(&r, 1), 3);
-    let e = resume_with(&state, &ws, &r.run, "Another task.", vec![]).unwrap_err();
+    let original = std::mem::replace(&mut fx.spec, spec("Another task."));
+    let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(
         matches!(e, RunRefused::NotResumable(w) if w.contains("differ")),
         "{e:?}"
     );
+    fx.spec = original;
 
-    fs::write(ws.join("a.txt"), "changed\n").unwrap();
-    let e = resume_with(&state, &ws, &r.run, TASK, vec![]).unwrap_err();
+    fx.write("a.txt", "changed\n").unwrap();
+    let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(
         matches!(e, RunRefused::NotResumable(w) if w.contains("workspace differs")),
         "{e:?}"
@@ -669,10 +607,9 @@ fn resume_refuses_a_stopped_run_a_changed_workspace_and_changed_inputs() {
 
 #[test]
 fn a_catch_up_that_diverges_makes_the_resumed_run_unreadable() {
-    let (state, ws) = scratch("resume-diverge");
+    let fx = fx("resume-diverge");
     let r = go(
-        &state,
-        &ws,
+        &fx,
         vec![read("a.txt"), read("b.txt"), read("a.txt"), submit()],
     );
     crash_after(&journal_path(&r, 1), 4);
@@ -686,15 +623,15 @@ fn a_catch_up_that_diverges_makes_the_resumed_run_unreadable() {
         b["content"]["inline"] = Value::from(c.clone());
         b["content"]["sha256"] = Value::from(harness_core::sha256(c.as_bytes()).to_string());
     });
-    let res = resume_with(&state, &ws, &r.run, TASK, vec![submit()]).unwrap();
+    let res = resume_with(&fx, &r.run, vec![submit()]).unwrap();
     assert_eq!(res.outcome, UNREADABLE);
     assert_eq!(res.cause, StopCause::ModelUnavailable);
 }
 
 #[test]
 fn a_resumed_attempt_is_charged_the_wall_time_already_spent() {
-    let (state, ws) = scratch("resume-wall");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("resume-wall");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     crash_after(&journal_path(&r, 1), 3);
     // The interrupted attempt's writer had been running for 3 hours (its
     // last record's monotonic time) against the default 30-minute budget.
@@ -716,7 +653,7 @@ fn a_resumed_attempt_is_charged_the_wall_time_already_spent() {
     out.push_str(std::str::from_utf8(&bytes).unwrap());
     out.push('\n');
     fs::write(&path, out).unwrap();
-    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    let res = resume_with(&fx, &r.run, vec![read("b.txt"), submit()]).unwrap();
     assert_eq!(res.attempt, 2);
     assert_eq!(res.cause, StopCause::Budget(harness_core::BudgetDim::Wall));
 }
@@ -746,13 +683,13 @@ fn set_last_mono(path: &Path, ms: u64) {
 /// wall time of BOTH earlier attempts, not only the latest one.
 #[test]
 fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
-    let (state, ws) = scratch("resume-chain");
+    let fx = fx("resume-chain");
     let twenty_min = 20 * 60 * 1000;
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     crash_after(&journal_path(&r, 1), 3);
     set_last_mono(&journal_path(&r, 1), twenty_min);
     // 20 of 30 minutes spent: the first resume runs to its end.
-    let second = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    let second = resume_with(&fx, &r.run, vec![read("b.txt"), submit()]).unwrap();
     assert_eq!(
         (second.attempt, second.cause.clone()),
         (2, StopCause::Submitted)
@@ -766,7 +703,7 @@ fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
     crash_after(&journal_path(&r, 2), 3);
     set_last_mono(&journal_path(&r, 2), twenty_min);
     // 40 of 30 minutes: the second resume must stop on the wall budget at once.
-    let third = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    let third = resume_with(&fx, &r.run, vec![read("b.txt"), submit()]).unwrap();
     assert_eq!(third.attempt, 3);
     let h3 = JournalReader::open(&layout::attempt_dir(&r.run_dir, 3)).unwrap();
     assert_eq!(
@@ -847,10 +784,10 @@ fn inv_20_a_recorded_sample_is_re_fed_exactly() {
     // result, a sample is an input to the replay: a self-consistent edit to
     // one is caught only by an anchor, §7.1.)
     for status in ["timeout", "crashed"] {
-        let (state, ws) = scratch(&format!("env-refed-{status}"));
-        let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+        let fx = fx(&format!("env-refed-{status}"));
+        let r = go(&fx, vec![read("a.txt"), submit()]);
         as_failed(&r, status, Some(pressed_sample()));
-        let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+        let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
         assert_eq!(a.divergence, None, "{status}");
         let recs = replay_records(&a);
         assert_eq!(recs[0]["body"]["environment_source"], "recorded");
@@ -868,11 +805,11 @@ fn inv_20_a_recorded_provider_failure_is_re_fed_with_its_sample() {
     // A provider failure feeds the model a harness notice, not the
     // observation, so the recording is cut after that step (a crash): the
     // audit re-feeds the failure and its sample exactly (confirming NF-6).
-    let (state, ws) = scratch("env-provider-error");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("env-provider-error");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     as_failed(&r, "provider_error", Some(pressed_sample()));
     crash_after(&journal_path(&r, 1), 2);
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.divergence, None, "{a:?}");
     let rec = replay_records(&a)
         .into_iter()
@@ -886,8 +823,8 @@ fn a_cut_intent_is_replayed_as_not_sampled() {
     // An intent a crash cut before its result has no recorded sample; the
     // replay's provider failure for it says so instead of borrowing the
     // header's (confirming NF-1).
-    let (state, ws) = scratch("env-cut-intent");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("env-cut-intent");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     let text = fs::read_to_string(journal_path(&r, 1)).unwrap();
     let cut: String = text
         .lines()
@@ -895,7 +832,7 @@ fn a_cut_intent_is_replayed_as_not_sampled() {
         .map(|l| format!("{l}\n"))
         .collect();
     fs::write(journal_path(&r, 1), cut).unwrap();
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.divergence, None, "{a:?}");
     let rec = replay_records(&a)
         .into_iter()
@@ -909,21 +846,21 @@ fn a_cut_intent_is_replayed_as_not_sampled() {
 
 #[test]
 fn a_read_digest_on_a_failed_result_is_unreadable() {
-    let (state, ws) = scratch("env-read-on-timeout");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("env-read-on-timeout");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     as_failed_keeping(&r, "timeout", Some(pressed_sample()), true);
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
 }
 
 #[test]
 fn a_resume_re_feeds_a_timed_out_catch_up_step_with_its_sample() {
-    let (state, ws) = scratch("env-resume");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("env-resume");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     // Step 1 timed out on a pressed host; the run died in step 2.
     as_failed(&r, "timeout", Some(pressed_sample()));
     crash_after(&journal_path(&r, 1), 3);
-    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    let res = resume_with(&fx, &r.run, vec![read("b.txt"), submit()]).unwrap();
     assert_eq!(res.attempt, 2);
     // The catch-up re-fed step 1 with its recorded sample, which flags it.
     assert_eq!(res.possibly_environmental, vec![1]);
@@ -938,7 +875,7 @@ fn a_resume_re_feeds_a_timed_out_catch_up_step_with_its_sample() {
         Value::Object(step1.body.clone())["environment"],
         pressed_sample()
     );
-    let a = audit_with(&state, &r.run, Some(2), TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, Some(2), TASK, &UserPolicy::default());
     assert_eq!(a.divergence, None, "{a:?}");
 }
 
@@ -958,10 +895,10 @@ fn inv_20_a_missing_misplaced_or_misshapen_sample_is_unreadable() {
         ("on-an-ok-result", "ok", Some(pressed_sample())),
         ("provider-error-without-one", "provider_error", None),
     ] {
-        let (state, ws) = scratch(&format!("env-{name}"));
-        let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+        let fx = fx(&format!("env-{name}"));
+        let r = go(&fx, vec![read("a.txt"), submit()]);
         as_failed(&r, status, env);
-        let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+        let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
         assert_eq!(a.outcome, UNREADABLE, "{name}");
         assert!(
             a.divergence
@@ -975,14 +912,14 @@ fn inv_20_a_missing_misplaced_or_misshapen_sample_is_unreadable() {
 
 #[test]
 fn a_journal_from_another_harness_build_is_named_as_such() {
-    let (state, ws) = scratch("other-build");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("other-build");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     rechain(
         &journal_path(&r, 1),
         |v| v["kind"] == "RunStarted",
         |b| b["builtin_manifest"] = Value::from("0".repeat(64)),
     );
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("another harness build"));
 }
@@ -1041,11 +978,11 @@ fn write_records(path: &Path, records: &[Value], repoint: bool) {
 /// the genuine anchor the cut is caught first.
 #[test]
 fn f_1_a_truncation_forged_through_the_header_limits_is_never_verified() {
-    let (state, ws) = scratch("h1g-w1-limits");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("h1g-w1-limits");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     let genuine_head = r.chain_head.unwrap();
     // Control (W0): untouched, it audits clean without an anchor.
-    let a = audit_anchored(&state, &r.run, None);
+    let a = audit_anchored(&fx, &r.run, None);
     assert!(a.divergence.is_none() && a.stop_recomputed, "{a:?}");
     assert_eq!(a.outcome, NOTHING_CHECKED);
 
@@ -1082,13 +1019,13 @@ fn f_1_a_truncation_forged_through_the_header_limits_is_never_verified() {
     );
 
     for anchor in [None, Some(v.head)] {
-        let a = audit_anchored(&state, &r.run, anchor);
+        let a = audit_anchored(&fx, &r.run, anchor);
         assert_eq!(a.outcome, UNREADABLE, "anchor {anchor:?}");
         let d = a.divergence.unwrap();
         assert_eq!((d.seq, d.step), (0, 0), "{d:?}");
         assert!(d.why.contains("budget limits"), "{d:?}");
     }
-    let a = audit_anchored(&state, &r.run, Some(genuine_head));
+    let a = audit_anchored(&fx, &r.run, Some(genuine_head));
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("anchor"));
 }
@@ -1100,11 +1037,11 @@ fn f_1_a_truncation_forged_through_the_header_limits_is_never_verified() {
 /// given the recorded ones, it resumes.
 #[test]
 fn f_1_an_audit_or_a_resume_given_other_limits_refuses() {
-    let (state, ws) = scratch("h1g-limits");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("h1g-limits");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     let mut other = limits();
     other.steps -= 1;
-    let a = audit_given(&state, &r.run, r.chain_head, &other);
+    let a = audit_given(&fx, &r.run, r.chain_head, &other);
     assert_eq!(a.outcome, UNREADABLE);
     let d = a.divergence.unwrap();
     assert_eq!(d.seq, 0);
@@ -1113,15 +1050,7 @@ fn f_1_an_audit_or_a_resume_given_other_limits_refuses() {
     crash_after(&journal_path(&r, 1), 3);
     let mut config = RunConfig::defaults(1_000_000);
     config.limits.wall *= 2;
-    let e = resume_under(
-        &state,
-        &ws,
-        &r.run,
-        TASK,
-        &config,
-        vec![read("b.txt"), submit()],
-    )
-    .unwrap_err();
+    let e = resume_under(&fx, &r.run, &config, vec![read("b.txt"), submit()]).unwrap_err();
     assert!(
         matches!(e, RunRefused::NotResumable(w) if w.contains("budget limits")),
         "{e:?}"
@@ -1130,7 +1059,7 @@ fn f_1_an_audit_or_a_resume_given_other_limits_refuses() {
         !layout::attempt_dir(&r.run_dir, 2).exists(),
         "nothing was written"
     );
-    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    let res = resume_with(&fx, &r.run, vec![read("b.txt"), submit()]).unwrap();
     assert_eq!((res.attempt, res.cause), (2, StopCause::Submitted));
 }
 
@@ -1142,8 +1071,8 @@ fn f_1_an_audit_or_a_resume_given_other_limits_refuses() {
 /// caught first.
 #[test]
 fn f_1_a_wall_record_the_loop_does_not_write_is_a_divergence() {
-    let (state, ws) = scratch("h1g-w6-wall");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("h1g-w6-wall");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     let path = journal_path(&r, 1);
     let mut recs = lines(&path);
     let at = recs.iter().position(|v| v["kind"] == "RunStopped").unwrap();
@@ -1156,12 +1085,12 @@ fn f_1_a_wall_record_the_loop_does_not_write_is_a_divergence() {
     });
     recs.insert(at, injected);
     write_chained(&path, &recs);
-    let a = audit_anchored(&state, &r.run, None);
+    let a = audit_anchored(&fx, &r.run, None);
     assert_eq!(a.outcome, UNREADABLE);
     let d = a.divergence.unwrap();
     assert_eq!(d.seq, at as u64, "{d:?}");
     assert!(d.why.contains("not one the loop writes"), "{d:?}");
-    let a = audit_anchored(&state, &r.run, r.chain_head);
+    let a = audit_anchored(&fx, &r.run, r.chain_head);
     assert_eq!(a.outcome, UNREADABLE);
     assert!(a.divergence.unwrap().why.contains("anchor"));
 }
@@ -1220,9 +1149,9 @@ fn f_1_wall_records_in_the_loops_shape_are_skipped_and_counted_and_no_others() {
         ),
     ];
     for (i, (what, bodies, refused)) in cases.into_iter().enumerate() {
-        let (state, ws) = scratch(&format!("h1g-wall-shape-{i}"));
-        let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
-        let clean = audit_anchored(&state, &r.run, None);
+        let fx = fx(&format!("h1g-wall-shape-{i}"));
+        let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
+        let clean = audit_anchored(&fx, &r.run, None);
         assert!(
             clean.divergence.is_none() && clean.wall_skipped == 0,
             "{what}"
@@ -1237,7 +1166,7 @@ fn f_1_wall_records_in_the_loops_shape_are_skipped_and_counted_and_no_others() {
             recs.insert(at + k, w);
         }
         write_chained(&path, &recs);
-        let a = audit_anchored(&state, &r.run, None);
+        let a = audit_anchored(&fx, &r.run, None);
         match refused {
             None => {
                 assert_eq!(a.divergence, None, "{what}");
@@ -1264,8 +1193,8 @@ fn f_1_wall_records_in_the_loops_shape_are_skipped_and_counted_and_no_others() {
 /// submit's `SubmitRequested` is pointed at it instead of the intent.
 #[test]
 fn f_1_a_result_pointing_at_a_wall_record_is_a_divergence() {
-    let (state, ws) = scratch("h1g-wall-pointer");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("h1g-wall-pointer");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     let path = journal_path(&r, 1);
     let mut recs = lines(&path);
     let intent = recs
@@ -1279,7 +1208,7 @@ fn f_1_a_result_pointing_at_a_wall_record_is_a_divergence() {
     write_chained(&path, &recs);
     // Control: of the loop's shape and every result pointing at its
     // intent, it is skipped and counted.
-    let a = audit_anchored(&state, &r.run, None);
+    let a = audit_anchored(&fx, &r.run, None);
     assert_eq!(a.divergence, None, "{a:?}");
     assert_eq!(a.wall_skipped, 1);
     let mut recs = lines(&path);
@@ -1290,7 +1219,7 @@ fn f_1_a_result_pointing_at_a_wall_record_is_a_divergence() {
     assert_eq!(recs[s]["body"]["intent_seq"], (intent + 1) as u64);
     recs[s]["body"]["intent_seq"] = Value::from(intent as u64);
     write_records(&path, &recs, false);
-    let a = audit_anchored(&state, &r.run, None);
+    let a = audit_anchored(&fx, &r.run, None);
     assert_eq!(a.outcome, UNREADABLE);
     let d = a.divergence.unwrap();
     assert_eq!(d.seq, s as u64, "{d:?}");
@@ -1304,8 +1233,8 @@ fn f_1_a_result_pointing_at_a_wall_record_is_a_divergence() {
 /// unreadable evidence with the genuine anchor as without one.
 #[test]
 fn f_2_bytes_after_run_stopped_are_refused_even_with_the_genuine_anchor() {
-    let (state, ws) = scratch("h1g-w2-after-stop");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let fx = fx("h1g-w2-after-stop");
+    let r = go(&fx, vec![read("a.txt"), submit()]);
     let head = r.chain_head.unwrap();
     let path = journal_path(&r, 1);
     let mut bytes = fs::read(&path).unwrap();
@@ -1323,7 +1252,7 @@ fn f_2_bytes_after_run_stopped_are_refused_even_with_the_genuine_anchor() {
         "{e:?}"
     );
     for anchor in [Some(head), None] {
-        let a = audit_anchored(&state, &r.run, anchor);
+        let a = audit_anchored(&fx, &r.run, anchor);
         assert_eq!(a.outcome, UNREADABLE, "anchor {anchor:?}");
         assert!(a.divergence.unwrap().why.contains("does not verify"));
     }
@@ -1337,8 +1266,8 @@ fn f_2_bytes_after_run_stopped_are_refused_even_with_the_genuine_anchor() {
 /// stop feeds no later context: an anchor-only residual, row H1e-2b.)
 #[test]
 fn inv_20_a_tampered_tool_result_diverges_at_the_first_context_built_from_it() {
-    let (state, ws) = scratch("h1g-w7-tool-result");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("h1g-w7-tool-result");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     let path = journal_path(&r, 1);
     let mut recs = lines(&path);
     let i = recs
@@ -1358,7 +1287,7 @@ fn inv_20_a_tampered_tool_result_diverges_at_the_first_context_built_from_it() {
         Value::from(harness_core::sha256(raw.as_bytes()).to_string());
     write_chained(&path, &recs);
     assert!(JournalReader::open(&layout::attempt_dir(&r.run_dir, 1)).is_ok());
-    let a = audit_with(&state, &r.run, Some(1), TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, Some(1), TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
     let d = a.divergence.unwrap();
     assert_eq!(
@@ -1382,7 +1311,7 @@ impl LocalityProbe for RefuseAttempts {
                 fs_type_name: "smbfs".into(),
             }
         } else {
-            Local.query(path)
+            harness_testkit::Local.query(path)
         }
     }
 }
@@ -1394,17 +1323,17 @@ impl LocalityProbe for RefuseAttempts {
 /// naming attempt 2 in its header.
 #[test]
 fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
-    let (state, ws) = scratch("w4");
-    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    let fx = fx("w4");
+    let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     crash_after(&journal_path(&r, 1), 3);
     let profile = Profile::conservative_default("m");
     let backend = ScriptedBackend::new(profile.clone(), vec![]);
     let e = resume(Resume {
-        state_root: &state,
+        state_root: fx.state_root(),
         run: &r.run,
-        workspace: &ws,
-        spec: &spec(TASK),
-        registry: &registry(),
+        workspace: fx.workspace(),
+        spec: &fx.spec,
+        registry: &harness_testkit::registry().unwrap(),
         policy: &UserPolicy::default(),
         profile: &profile,
         backend: &backend,
@@ -1419,12 +1348,12 @@ fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
     let left = layout::attempt_dir(&r.run_dir, 2);
     assert!(left.is_dir() && !left.join(layout::JOURNAL_FILE).exists());
 
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    let a = audit_with(&fx, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.attempt, 1, "{a:?}");
     assert_eq!(a.skipped_attempts, vec![2]);
     assert_eq!(a.divergence, None, "{a:?}");
 
-    let again = resume_with(&state, &ws, &r.run, TASK, vec![submit()]).unwrap();
+    let again = resume_with(&fx, &r.run, vec![submit()]).unwrap();
     assert_eq!(again.attempt, 3);
     assert_eq!(again.cause, StopCause::Submitted);
     let h = JournalReader::open(&layout::attempt_dir(&r.run_dir, 3)).unwrap();
@@ -1439,7 +1368,7 @@ fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
         .unwrap()
         .replacen("a.txt", "b.txt", 1);
     fs::write(&bad, t).unwrap();
-    let e = resume_with(&state, &ws, &r.run, TASK, vec![]).unwrap_err();
+    let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(
         matches!(e, RunRefused::NotResumable(w) if w.contains("does not verify")),
         "{e:?}"

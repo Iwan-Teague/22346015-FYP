@@ -864,7 +864,7 @@ pub(crate) fn limits_fields(l: &MeterLimits) -> [(&'static str, u64); 6] {
 /// accepts). rustc reads CRLF sources as LF, so it is the same digest on
 /// every OS.
 pub(crate) fn builtin_manifest_sha256() -> Digest {
-    sha256(builtin::BUILTIN_MANIFEST_JSON.as_bytes())
+    sha256(builtin::builtin_manifest_json().as_bytes())
 }
 
 pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {

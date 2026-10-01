@@ -727,10 +727,19 @@ impl fmt::Display for ApprovalRequest {
         )?;
         let json = serde_json::to_string(&self.args).unwrap_or_else(|_| "?".to_string());
         let total = json.chars().count();
+        // §7.1 display paths, through the ONE terminal-safe escaper
+        // (harness_core::display, P-04): the first APPROVAL_ARGS_SHOWN
+        // characters of the call's JSON, control, bidi and zero-width
+        // characters escaped, on one line. The sha256 line below still
+        // names what was left out.
+        let shown_chars: String = json.chars().take(APPROVAL_ARGS_SHOWN).collect();
         write!(
             f,
             "args: {}",
-            harness_manifest::display_safe(&json, APPROVAL_ARGS_SHOWN)
+            harness_core::display::escape_for_terminal(
+                &shown_chars,
+                harness_core::display::DisplayMode::Line
+            )
         )?;
         if total > APPROVAL_ARGS_SHOWN {
             let call = crate::Call {
@@ -1247,6 +1256,58 @@ mod tests {
             shown.matches('\n').count(),
             3,
             "only the three writeln line breaks"
+        );
+    }
+
+    // P-04: the args render through the ONE terminal-safe escaper
+    // (harness_core::display) instead of the manifest's display_safe.
+    // Golden: the request is unchanged (on this input the two escapers
+    // agree byte for byte), and nothing raw survives.
+    #[test]
+    fn approval_request_display_unchanged() {
+        let cap = m_cap();
+        let class = crate::effective_class(&cap, Confirmation::None);
+        let args = json!({
+            "path": "notes.txt",
+            "note": "line\nbreak",
+            "motive": "\u{1b}[31mred\u{202e}pinned.exe\u{200b}"
+        });
+        let req = ApprovalRequest::new(
+            cap.id().clone(),
+            "reads personal files".into(),
+            class,
+            args.clone(),
+            Confirmation::UserConfirm,
+            1,
+            StepId::new(3),
+        );
+        let shown = req.to_string();
+        // Golden, pinned line for line.
+        #[rustfmt::skip]
+        let expected = r#"approval needed: fixture.p — reads personal files
+step 3, attempt 1: user_confirm
+class: read effect, personal data, the provider's own state, no network egress, own content
+args: {"motive":"\\u001b[31mred\u{202E}pinned.exe\u{200B}","note":"line\\nbreak","path":"notes.txt"}"#;
+        assert_eq!(shown, expected);
+        // The escapes are the ones the old escaper produced (the journal
+        // and JSON spellings still double; the raw bidi and zero-width
+        // characters JSON leaves are `\u{HEX}`-escaped).
+        let json = serde_json::to_string(&args).unwrap_or_default();
+        let taken: String = json.chars().take(APPROVAL_ARGS_SHOWN).collect();
+        let args_at = shown.rfind("args: ").unwrap() + "args: ".len();
+        assert_eq!(
+            &shown[args_at..],
+            harness_manifest::display_safe(&taken, APPROVAL_ARGS_SHOWN),
+        );
+        // Terminal-safe: no raw control, bidi or zero-width character in
+        // the args (the three writeln line breaks are the request's own).
+        assert!(
+            !shown.chars().any(|c| {
+                c != '\n'
+                    && (c.is_control()
+                        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'))
+            }),
+            "{shown:?}"
         );
     }
 

@@ -28,3 +28,5 @@ thiserror.workspace = true
 [dev-dependencies]
 # The sealed JournalFile seam's fault-injecting file, for the INV-33 run test.
 harness-journal = { path = "../harness-journal", features = ["fault-injection"] }
+# Shared in-process test fixtures (P-03).
+harness-testkit = { path = "../harness-testkit" }

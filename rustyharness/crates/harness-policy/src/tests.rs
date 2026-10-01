@@ -1699,3 +1699,127 @@ fn h2e_a_read_is_held_to_the_runs_window() {
         ));
     }
 }
+
+// ---- the built-in registration table (P-02) --------------------------------------
+
+/// The per-tool registration table must decide exactly as the scattered id
+/// constants and prefix checks it replaced: every built-in tool keeps its
+/// default decision, and each of the three user-policy roles moves every
+/// tool with it.
+#[test]
+fn policy_default_table_unchanged() {
+    let ids = [
+        "harness.fs.read",
+        "harness.fs.search",
+        "harness.fs.glob",
+        "harness.fs.list",
+        "harness.edit.replace",
+        "harness.edit.write",
+        "harness.edit.multi",
+        "harness.exec.run",
+        "harness.task.todo",
+        "harness.task.submit",
+    ];
+    let valid_args = [
+        json!({"path": "a.txt"}),
+        json!({"pattern": "x"}),
+        json!({"pattern": "*.rs"}),
+        json!({"path": "."}),
+        json!({"path": "a.txt", "old": "a", "new": "b"}),
+        json!({"path": "a.txt", "content": "x"}),
+        json!({"path": "a.txt", "edits": [{"old": "a", "new": "b"}]}),
+        json!({"argv": ["cargo", "test"]}),
+        json!({}),
+        json!({"note": "done"}),
+    ];
+    let defaults = [
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        },
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        },
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        },
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        },
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+        },
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+        },
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+        },
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+        },
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin(TODO_RULE),
+        },
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.task-submit"),
+        },
+    ];
+    let deny_all = UserPolicy::new(&["harness.*"], &[], &[]).unwrap();
+    let ask_all = UserPolicy::new(&[], &["harness.*"], &[]).unwrap();
+    let allow_all = UserPolicy::new(&[], &[], &["harness.*"]).unwrap();
+    for i in 0..ids.len() {
+        let plan = |policy: &UserPolicy| {
+            let mut sp = spec(&[ids[i]]);
+            sp.approver_present = true;
+            sp.conformed = true;
+            sp.exec_programs = vec!["cargo".to_owned()];
+            Session::plan(&sp, &builtin_registry(), policy).unwrap()
+        };
+        let c = call(ids[i], valid_args[i].clone());
+        assert_eq!(
+            plan(&UserPolicy::default()).decide(&c),
+            defaults[i],
+            "{}",
+            ids[i]
+        );
+        assert_eq!(
+            plan(&deny_all).decide(&c),
+            PolicyDecision::Deny {
+                reason: DenyReason::UserDenied,
+                rule: RuleId::User {
+                    list: RuleList::Deny,
+                    index: 0
+                },
+            },
+            "{}",
+            ids[i]
+        );
+        assert_eq!(
+            plan(&ask_all).decide(&c),
+            PolicyDecision::Ask {
+                tier: Confirmation::UserConfirm,
+                rule: RuleId::User {
+                    list: RuleList::Ask,
+                    index: 0
+                },
+            },
+            "{}",
+            ids[i]
+        );
+        assert_eq!(
+            plan(&allow_all).decide(&c),
+            PolicyDecision::Allow {
+                rule: RuleId::User {
+                    list: RuleList::Allow,
+                    index: 0
+                }
+            },
+            "{}",
+            ids[i]
+        );
+    }
+}

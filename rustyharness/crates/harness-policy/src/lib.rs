@@ -70,9 +70,13 @@ use harness_manifest::{
 use serde_json::Value;
 
 pub mod approval;
+pub mod builtin;
 pub mod locality;
 pub mod path;
 
+pub use builtin::{
+    EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
+};
 pub use path::{workspace_path, PathRefused, WorkspacePath};
 
 // ---------------------------------------------------------------------------
@@ -583,102 +587,6 @@ impl Session {
     }
 }
 
-const FS_PREFIX: &str = "harness.fs.";
-
-/// The built-in read tool, whose `lines` the run's read window bounds.
-const READ_ID: &str = "harness.fs.read";
-
-/// The submit sentinel's id (§2.5, §4.8). Only the compiled-in `harness`
-/// manifest can declare it (the namespace is reserved, §4.3).
-pub const SUBMIT_ID: &str = "harness.task.submit";
-
-/// Whether `c` is the built-in submit sentinel with exactly the labels §4.8
-/// gives it (write / public / own / none, content own, no confirmation). A
-/// manifest that labelled it anything else would not be the sentinel, and
-/// its write class is then out of scope like any other.
-fn is_submit_sentinel(c: &Capability) -> bool {
-    c.id().as_str() == SUBMIT_ID
-        && c.id().provider() == BUILTIN_NAMESPACE
-        && c.effect() == Effect::Write
-        && c.sensitivity() == Sensitivity::Public
-        && c.blast_radius() == BlastRadius::Own
-        && c.egress() == Egress::None
-        && c.content() == Content::Own
-        && c.confirmation() == Confirmation::None
-}
-
-/// The built-in workspace edit tools (§4.8, §4.9; H2b; `harness.edit.multi`
-/// since H2e).
-pub const EDIT_IDS: [&str; 3] = [
-    "harness.edit.replace",
-    "harness.edit.write",
-    "harness.edit.multi",
-];
-
-/// The rule id of the built-in edits' default decision in this build (§5.2,
-/// H2b): an ask, since the workspace is edited in place.
-pub const EDIT_DEFAULT_RULE: &str = "ask.edit.in-place";
-
-/// Whether `c` is a built-in workspace edit with exactly the labels §4.8
-/// gives it (write / operational / own / none, content own, no declared
-/// confirmation). Anything else under those ids would not be the harness's
-/// edit tool, and its write class is then out of scope like any other.
-fn is_builtin_edit(c: &Capability) -> bool {
-    EDIT_IDS.contains(&c.id().as_str())
-        && c.id().provider() == BUILTIN_NAMESPACE
-        && c.effect() == Effect::Write
-        && c.sensitivity() == Sensitivity::Operational
-        && c.blast_radius() == BlastRadius::Own
-        && c.egress() == Egress::None
-        && c.content() == Content::Own
-        && c.confirmation() == Confirmation::None
-}
-
-/// The built-in checklist (H2e): the model's own list of steps, kept in the
-/// run's state and echoed in its result. It touches nothing outside the run.
-pub const TODO_ID: &str = "harness.task.todo";
-
-/// The rule that allows the checklist (H2e), after every deny rule and the
-/// schema, like the sentinel's.
-pub const TODO_RULE: &str = "allow.task-todo";
-
-/// Whether `c` is the built-in checklist with exactly the labels the
-/// manifest gives it (write / public / own / none, content own, no declared
-/// confirmation), like the sentinel. Anything else under that id would not
-/// be the harness's checklist, and its write class is then out of scope.
-fn is_builtin_todo(c: &Capability) -> bool {
-    c.id().as_str() == TODO_ID
-        && c.id().provider() == BUILTIN_NAMESPACE
-        && c.effect() == Effect::Write
-        && c.sensitivity() == Sensitivity::Public
-        && c.blast_radius() == BlastRadius::Own
-        && c.egress() == Egress::None
-        && c.content() == Content::Own
-        && c.confirmation() == Confirmation::None
-}
-
-/// The built-in command runner (§4.8; H2d).
-pub const EXEC_ID: &str = "harness.exec.run";
-
-/// The rule id of the command runner's default decision in this build
-/// (H2d): an ask, like the edits (the workspace is changed in place, with no
-/// snapshot to undo a command).
-pub const EXEC_DEFAULT_RULE: &str = "ask.exec.default";
-
-/// Whether `c` is the built-in command runner with exactly the labels §4.8
-/// gives it (execute / operational / own / none), `content: third_party`
-/// and no declared confirmation.
-fn is_builtin_exec(c: &Capability) -> bool {
-    c.id().as_str() == EXEC_ID
-        && c.id().provider() == BUILTIN_NAMESPACE
-        && c.effect() == Effect::Execute
-        && c.sensitivity() == Sensitivity::Operational
-        && c.blast_radius() == BlastRadius::Own
-        && c.egress() == Egress::None
-        && c.content() == Content::ThirdParty
-        && c.confirmation() == Confirmation::None
-}
-
 /// A grant's resolution (private mirror of `Resolved` without provenance).
 enum Lookup<'a> {
     One(&'a Capability),
@@ -753,19 +661,11 @@ impl Session {
                 capability: id.to_string(),
                 what,
             };
-            if (id.as_str().starts_with(FS_PREFIX)
-                || EDIT_IDS.contains(&id.as_str())
-                || id.as_str() == EXEC_ID)
-                && spec.workspace.is_none()
-            {
+            let reg = builtin::registration(id.as_str());
+            if reg.is_some_and(|t| t.kind.needs_workspace()) && spec.workspace.is_none() {
                 return Err(SessionRefused::NoWorkspace(id.to_string()));
             }
-            if cl.effect != Effect::Read
-                && !is_submit_sentinel(c)
-                && !is_builtin_todo(c)
-                && !is_builtin_edit(c)
-                && !is_builtin_exec(c)
-            {
+            if cl.effect != Effect::Read && !reg.is_some_and(|t| (t.labels)(c)) {
                 return Err(out("a non-read effect class"));
             }
             // INV-6: no execution without a conformed sandbox, refused at
@@ -789,11 +689,11 @@ impl Session {
                     user_ask,
                     user_allow: UserPolicy::first_match(&policy.allow, c.id()),
                     fs_tool: c.id().provider() == BUILTIN_NAMESPACE
-                        && c.id().as_str().starts_with(FS_PREFIX),
-                    submit: is_submit_sentinel(c),
-                    todo: is_builtin_todo(c),
-                    edit: is_builtin_edit(c),
-                    exec: is_builtin_exec(c),
+                        && c.id().as_str().starts_with(builtin::FS_PREFIX),
+                    submit: builtin::is_submit_sentinel(c),
+                    todo: builtin::is_builtin_todo(c),
+                    edit: builtin::is_builtin_edit(c),
+                    exec: builtin::is_builtin_exec(c),
                 },
             );
         }
@@ -875,7 +775,7 @@ impl Session {
         // The run's read window (H2e): the manifest's maximum for `lines` is
         // the widest any profile may set; the window is the maximum the
         // model is shown, and the one policy holds a read to.
-        if a.fs_tool && call.capability == READ_ID {
+        if a.fs_tool && call.capability == builtin::READ_ID {
             let lines = call.args.get("lines").and_then(Value::as_u64);
             if let (Some(max), Some(n)) = (self.read_window, lines) {
                 if n > max {

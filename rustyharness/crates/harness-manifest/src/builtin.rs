@@ -53,237 +53,49 @@
 //! allows it by one named rule (`allow.task-todo`). The number of edits and
 //! items is bounded by the tools (the schema subset has no `maxItems`).
 
+mod edit_multi;
+mod edit_replace;
+mod edit_write;
+mod exec_run;
+mod fs_glob;
+mod fs_list;
+mod fs_read;
+mod fs_search;
+mod head;
+mod tail;
+mod task_submit;
+mod task_todo;
+
 use crate::{parse_with_origin, Manifest, ManifestError, Origin, ValidationContext};
 
-/// The compiled-in manifest text (JSON, manifest v1).
-pub const BUILTIN_MANIFEST_JSON: &str = r#"{
-  "schema_version": 1,
-  "provider": "harness",
-  "provider_version": "0.0.1",
-  "min_harness": "0.0.1",
-  "transport": { "kind": "builtin" },
-  "capabilities": [
-    {
-      "id": "harness.fs.read",
-      "summary": "Read a window of lines from a file inside the workspace: start is the first line (1-based) and lines how many, at most the run's read window (100 lines unless the model profile sets another). Paths are relative to the workspace root",
-      "effect": "read",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "third_party",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "path": { "type": "string", "maxLength": 4096 },
-          "start": { "type": "integer", "minimum": 1 },
-          "lines": { "type": "integer", "minimum": 1, "maximum": 2000 }
-        },
-        "required": ["path"]
-      }
-    },
-    {
-      "id": "harness.fs.search",
-      "summary": "Search the files inside the workspace line by line for a literal text or, with regex true, a regular expression. include and exclude are globs (*.rs, src/**) over paths below path; context adds up to 5 lines around each hit. Paths are relative to the workspace root; \".\" is the root",
-      "effect": "read",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "third_party",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "pattern": { "type": "string", "maxLength": 1024 },
-          "path": { "type": "string", "maxLength": 4096 },
-          "regex": { "type": "boolean" },
-          "include": { "type": "string", "maxLength": 256 },
-          "exclude": { "type": "string", "maxLength": 256 },
-          "context": { "type": "integer", "minimum": 0, "maximum": 5 }
-        },
-        "required": ["pattern"]
-      }
-    },
-    {
-      "id": "harness.fs.glob",
-      "summary": "Find files inside the workspace whose paths below path (default the root) match a glob: * and ? within a name, ** across directories, [abc], {a,b}; a pattern without / matches file names at any depth. Paths are relative to the workspace root; \".\" is the root",
-      "effect": "read",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "third_party",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "pattern": { "type": "string", "maxLength": 256 },
-          "path": { "type": "string", "maxLength": 4096 }
-        },
-        "required": ["pattern"]
-      }
-    },
-    {
-      "id": "harness.fs.list",
-      "summary": "List a directory inside the workspace, bounded in depth and count. Paths are relative to the workspace root; \".\" is the root",
-      "effect": "read",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "third_party",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "path": { "type": "string", "maxLength": 4096 },
-          "depth": { "type": "integer", "minimum": 1, "maximum": 4 }
-        },
-        "required": ["path"]
-      }
-    },
-    {
-      "id": "harness.edit.replace",
-      "summary": "Replace an exact text in a workspace file read in this run with the file-read tool (a search does not count as a read); it must match exactly count times (default 1). Paths are relative to the workspace root",
-      "effect": "write",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "own",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "path": { "type": "string", "maxLength": 4096 },
-          "old": { "type": "string", "maxLength": 65536 },
-          "new": { "type": "string", "maxLength": 65536 },
-          "count": { "type": "integer", "minimum": 1, "maximum": 1000 }
-        },
-        "required": ["path", "old", "new"]
-      }
-    },
-    {
-      "id": "harness.edit.write",
-      "summary": "Create a new workspace file (missing directories on its path are created), or rewrite a whole file of at most 400 lines read in this run with the file-read tool. Paths are relative to the workspace root",
-      "effect": "write",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "own",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "path": { "type": "string", "maxLength": 4096 },
-          "content": { "type": "string", "maxLength": 65536 }
-        },
-        "required": ["path", "content"]
-      }
-    },
-    {
-      "id": "harness.edit.multi",
-      "summary": "Make several exact replacements in one workspace file read in this run with the file-read tool (a search does not count as a read), all or none: edits are applied in order, and each old text must match exactly once in the file as the edits before it left it. Paths are relative to the workspace root",
-      "effect": "write",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "own",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "path": { "type": "string", "maxLength": 4096 },
-          "edits": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "old": { "type": "string", "maxLength": 65536 },
-                "new": { "type": "string", "maxLength": 65536 }
-              },
-              "required": ["old", "new"]
-            }
-          }
-        },
-        "required": ["path", "edits"]
-      }
-    },
-    {
-      "id": "harness.exec.run",
-      "summary": "Run one program the task allows, confined with no network: argv is a list whose first item names the program; cwd is a directory relative to the workspace root (default the root)",
-      "effect": "execute",
-      "sensitivity": "operational",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "third_party",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "argv": { "type": "array", "items": { "type": "string", "maxLength": 4096 } },
-          "cwd": { "type": "string", "maxLength": 4096 }
-        },
-        "required": ["argv"]
-      }
-    },
-    {
-      "id": "harness.task.todo",
-      "summary": "Keep a short checklist of your steps for this task: items replaces the whole list, each item a text and a status (pending, in_progress or done); without items the list is only shown. The result shows the list",
-      "effect": "write",
-      "sensitivity": "public",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "own",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "text": { "type": "string", "maxLength": 200 },
-                "status": { "type": "string", "enum": ["pending", "in_progress", "done"] }
-              },
-              "required": ["text", "status"]
-            }
-          }
-        }
-      }
-    },
-    {
-      "id": "harness.task.submit",
-      "summary": "Submit the task for verification with a short note",
-      "effect": "write",
-      "sensitivity": "public",
-      "blast_radius": "own",
-      "egress": "none",
-      "content": "own",
-      "confirmation": "none",
-      "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "note": { "type": "string", "maxLength": 2000 }
-        },
-        "required": ["note"]
-      }
-    }
-  ]
-}"#;
+/// The built-in manifest text (JSON, manifest v1).
+///
+/// Assembled at runtime from per-capability fragment literals under
+/// `builtin/`, in manifest order; the concatenation is byte-identical to the
+/// former single literal (pinned by
+/// `tests::builtin_manifest_bytes_unchanged`). A new capability is one
+/// fragment module plus one line here. The crate is pure (§1.2: no
+/// compile-time file read, no `static`), so the text is rebuilt per call.
+pub fn builtin_manifest_json() -> String {
+    [
+        head::HEAD,
+        fs_read::FS_READ,
+        fs_search::FS_SEARCH,
+        fs_glob::FS_GLOB,
+        fs_list::FS_LIST,
+        edit_replace::EDIT_REPLACE,
+        edit_write::EDIT_WRITE,
+        edit_multi::EDIT_MULTI,
+        exec_run::EXEC_RUN,
+        task_todo::TASK_TODO,
+        task_submit::TASK_SUBMIT,
+        tail::TAIL,
+    ]
+    .concat()
+}
 
 /// The built-in manifest, validated like any other (plus: it is the only
 /// manifest allowed the `harness` namespace and the `builtin` transport).
 pub fn manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestError> {
-    parse_with_origin(BUILTIN_MANIFEST_JSON.as_bytes(), ctx, Origin::Compiled)
+    parse_with_origin(builtin_manifest_json().as_bytes(), ctx, Origin::Compiled)
 }

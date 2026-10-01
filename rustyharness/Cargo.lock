@@ -74,6 +74,7 @@ dependencies = [
  "harness-policy",
  "harness-run",
  "harness-sandbox",
+ "harness-testkit",
  "serde",
  "serde_json",
 ]
@@ -154,6 +155,7 @@ dependencies = [
  "harness-model",
  "harness-policy",
  "harness-sandbox",
+ "harness-testkit",
  "harness-tools",
  "serde_json",
  "thiserror",
@@ -165,6 +167,23 @@ version = "0.0.1"
 dependencies = [
  "harness-core",
  "harness-policy",
+ "thiserror",
+]
+
+[[package]]
+name = "harness-testkit"
+version = "0.0.1"
+dependencies = [
+ "gate-outcome",
+ "harness-cli",
+ "harness-core",
+ "harness-journal",
+ "harness-manifest",
+ "harness-model",
+ "harness-policy",
+ "harness-run",
+ "harness-sandbox",
+ "serde_json",
  "thiserror",
 ]
 

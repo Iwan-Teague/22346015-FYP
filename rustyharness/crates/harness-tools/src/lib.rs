@@ -31,6 +31,7 @@ pub mod edit;
 pub mod exec;
 pub mod glob;
 pub mod provider;
+pub mod registry;
 pub mod search;
 pub mod todo;
 pub use builtin::{workspace_tree, ReadTools, WorkspaceTree};

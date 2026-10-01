@@ -171,6 +171,16 @@ fn fixture_manifest_validates() {
 
 // ---- built-in manifest ------------------------------------------------------
 
+/// The manifest sha is written into journal headers; a byte of drift would
+/// make old journals read as "another build". Pin the exact bytes.
+#[test]
+fn builtin_manifest_bytes_unchanged() {
+    assert_eq!(
+        harness_core::sha256(builtin::builtin_manifest_json().as_bytes()).to_string(),
+        "7409f4604c8b93b94514fcff8b4bb43d733223c43fe2b7e5ca852baf4b789780"
+    );
+}
+
 #[test]
 fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() {
     let m = builtin::manifest(&ctx()).unwrap();
@@ -433,11 +443,11 @@ fn builtin_manifest_refused_by_an_older_harness() {
 fn builtin_text_is_refused_when_loaded_from_outside() {
     // The same bytes, arriving as an external manifest: reserved namespace.
     assert_eq!(
-        parse_s(builtin::BUILTIN_MANIFEST_JSON),
+        parse_s(&builtin::builtin_manifest_json()),
         Err(ManifestError::ReservedProvider("harness".into()))
     );
     // Renamed to dodge the reserved name, it still cannot claim `builtin`.
-    let renamed = builtin::BUILTIN_MANIFEST_JSON
+    let renamed = builtin::builtin_manifest_json()
         .replace("\"provider\": \"harness\"", "\"provider\": \"imposter\"")
         .replace("\"harness.fs.", "\"imposter.fs.");
     assert_eq!(

@@ -50,6 +50,18 @@ so the history stays readable. What is still open is listed first.
    `gc`. Each needs a design delta, an R6 threat-model update where it touches the
    network, the two-eyes review, and a phase. rustybenchmark needs the first three
    with, or soon after, H2.
+6. **(owner) The macOS process-count bar (FT-5)** (H2c, recorded in H2d). macOS has no
+   per-sandbox process limit without privilege (`RLIMIT_NPROC` is per user), so the
+   Seatbelt backend meets FT-5 with the in-sandbox member-count watchdog, a named
+   weaker bar; `require()` passes and commands run with it **provisionally**. Accept it,
+   or refuse execution on macOS until a dedicated agent uid exists (the H2c report,
+   §8; dropping `Case::Ft5` from the row is the one-line switch). FT-6 (memory,
+   `RLIMIT_AS`) is met at the strong bar either way.
+7. **(owner) The file tools' race in sessions that execute** (H2d). The design puts
+   the built-in file tools behind a confined file-op helper when a session holds an
+   execute grant (§4.8); H2d ships the named interim instead (option (b): the run stops
+   unless the sandbox confirms every process a command started is gone). Building the
+   helper (option (a)) is the design-conformant follow-up; when is yours to decide.
 
 ## Answered by the design
 

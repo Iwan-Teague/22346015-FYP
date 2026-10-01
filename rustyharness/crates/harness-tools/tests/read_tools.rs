@@ -75,6 +75,8 @@ impl Rig {
                 workspace: Some(WorkspaceDecl::default()),
                 approver_present: false,
                 personal_data_granted: false,
+                conformed: false,
+                exec_programs: Vec::new(),
             },
             &reg,
             &UserPolicy::default(),

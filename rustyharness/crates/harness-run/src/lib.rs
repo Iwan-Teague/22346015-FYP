@@ -59,7 +59,11 @@ mod sample;
 
 pub use approve::{ApprovalAnswer, Approver, ApproverKind};
 pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
+pub use harness_tools::{ExecLimits, ExecProgram, ExecSpec};
 pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Resume};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod context_tests;

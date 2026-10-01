@@ -97,6 +97,7 @@ fn spec(task: &str) -> TaskSpec {
         task: TaskText::new(task.into()),
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
+        exec: None,
     }
 }
 
@@ -117,6 +118,7 @@ fn go(state: &Path, ws: &Path, backend: &dyn ModelBackend) -> RunReport {
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
     .unwrap()
 }
@@ -331,7 +333,7 @@ fn f1_a_model_that_copies_its_history_calls_natively_and_submits() {
         .map(|m| m["content"].as_str().unwrap())
         .collect();
     assert_eq!(results.len(), 3);
-    assert!(results[1].contains("result of harness.fs.read:\n") && results[1].contains("alpha"));
+    assert!(results[1].contains("result of harness_fs_read:\n") && results[1].contains("alpha"));
     assert!(results[1].starts_with("<<untrusted "));
     assert!(results[2].contains("beta"));
     // And the run audits clean: every context recomputed and matched.
@@ -501,10 +503,10 @@ fn control_shown_a_past_call_as_text_the_mimic_writes_as_text() {
             Message::Observation {
                 call: "harness.fs.list".into(),
                 body: Untrusted::new("f a.txt\nf b.txt\n".into(), Source::Model),
+                nonce: RenderNonce::new("00112233445566778899aabbccddeeff").unwrap(),
             },
         ],
         tools: tools.clone(),
-        nonce: RenderNonce::new("00112233445566778899aabbccddeeff").unwrap(),
     };
     let c = m.complete(&req, Instant::now()).unwrap();
     assert!(c.tool_calls.is_empty());
@@ -553,6 +555,7 @@ fn a_native_run_resumes_and_its_catch_up_matches_every_recorded_request() {
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
     .unwrap();
     assert_eq!(res.attempt, 2);
@@ -632,16 +635,19 @@ fn an_edited_native_call_diverges_at_the_next_context_built() {
     }
 }
 
-/// The compatibility break of H1h, named (like H1f-3's): a journal whose
-/// header records no context format (every journal written before H1h) or
-/// another one cannot be recomputed by this build, so audit and resume
-/// refuse it at the header, saying why, instead of diverging at its first
-/// native context. Text-protocol journals are refused the same way.
+/// The compatibility breaks of H1h and H1i, named (like H1f-3's): a
+/// journal whose header records no context format (every journal written
+/// before H1h) or another one (rh-context/2: H1h, before H1i's
+/// per-observation nonces and append-mostly context) cannot be recomputed
+/// by this build, so audit and resume refuse it at the header, saying why,
+/// instead of diverging at its first context or request. Text-protocol
+/// journals are refused the same way.
 #[test]
-fn a_journal_from_before_h1h_is_refused_by_name_by_audit_and_resume() {
+fn a_journal_from_before_h1i_is_refused_by_name_by_audit_and_resume() {
     for (case, text_protocol) in [("native", false), ("text", true)] {
-        for recorded in [None, Some("rh-context/1")] {
-            let (state, ws) = scratch(&format!("old-{case}-{}", recorded.is_some()));
+        for recorded in [None, Some("rh-context/1"), Some("rh-context/2")] {
+            let tag = recorded.unwrap_or("none").replace('/', "-");
+            let (state, ws) = scratch(&format!("old-{case}-{tag}"));
             let r = if text_protocol {
                 let p = Profile::conservative_default("m");
                 let b = ScriptedBackend::new(
@@ -662,6 +668,7 @@ fn a_journal_from_before_h1h_is_refused_by_name_by_audit_and_resume() {
                     env: &FIXED_ENV,
                     config: &RunConfig::defaults(1_000_000),
                     approver: None,
+                    confinement: None,
                 })
                 .unwrap()
             } else {
@@ -669,7 +676,7 @@ fn a_journal_from_before_h1h_is_refused_by_name_by_audit_and_resume() {
             };
             assert_eq!(
                 records(&r, 1)[0].body["context_format"],
-                "rh-context/2",
+                "rh-context/3",
                 "this build records its format"
             );
             let path = journal_path(&r, 1);
@@ -725,6 +732,7 @@ fn a_journal_from_before_h1h_is_refused_by_name_by_audit_and_resume() {
                 env: &FIXED_ENV,
                 config: &RunConfig::defaults(1_000_000),
                 approver: None,
+                confinement: None,
             })
             .unwrap_err();
             assert!(

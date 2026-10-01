@@ -139,6 +139,7 @@ fn go(state: &Path, ws: &Path, server: &Hold, config: &RunConfig) -> (RunReport,
             task: TaskText::new("What does a.txt say?".into()),
             grants: vec!["harness.fs.read".into()],
             workspace_public: false,
+            exec: None,
         },
         registry: &registry(),
         policy: &UserPolicy::default(),
@@ -148,6 +149,7 @@ fn go(state: &Path, ws: &Path, server: &Hold, config: &RunConfig) -> (RunReport,
         env: &FIXED_ENV,
         config,
         approver: None,
+        confinement: None,
     })
     .unwrap();
     (r, t.elapsed())

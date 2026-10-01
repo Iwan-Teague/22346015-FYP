@@ -4,9 +4,11 @@
 //! and anything unknown or unreadable is refused; design §2.8, INV-35),
 //! real stdout and stderr, `GATE_OK_FILE` from the environment, and the
 //! terminal as the approver when stdin is a terminal (nobody otherwise, so
-//! every ask is a deny; design §5.2, §5.3). Nothing here, in any build, can
-//! select another probe (H1e-2b review F-2) or another approver; the purity
-//! gate pins this file's shape (§2e).
+//! every ask is a deny; design §5.2, §5.3), and the production confinement
+//! for commands (`harness_sandbox::SystemConfinement`, H2d: asked for a
+//! witness only when a task grants `harness.exec.run`). Nothing here, in
+//! any build, can select another probe (H1e-2b review F-2) or another
+//! approver; the purity gate pins this file's shape (§2e).
 
 #![forbid(unsafe_code)]
 
@@ -26,6 +28,7 @@ fn main() -> ExitCode {
         out: RefCell::new(&mut out),
         err: RefCell::new(&mut err),
         approver: harness_cli::ApproverSource::StdinIfTerminal,
+        confinement: &harness_sandbox::SystemConfinement,
     };
     ExitCode::from(harness_cli::main_with(&cx, &args))
 }

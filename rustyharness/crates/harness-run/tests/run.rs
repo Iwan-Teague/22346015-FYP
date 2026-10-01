@@ -92,6 +92,7 @@ fn go(
                 "harness.fs.list".into(),
             ],
             workspace_public: false,
+            exec: None,
         },
         registry: &registry(),
         policy: &UserPolicy::default(),
@@ -101,6 +102,7 @@ fn go(
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
 }
 
@@ -287,8 +289,9 @@ fn an_unknown_grant_refuses_the_session() {
         workspace: &ws,
         spec: &TaskSpec {
             task: TaskText::new("t".into()),
-            grants: vec!["harness.exec.run".into()],
+            grants: vec!["harness.nope.run".into()],
             workspace_public: false,
+            exec: None,
         },
         registry: &registry(),
         policy: &UserPolicy::default(),
@@ -298,6 +301,7 @@ fn an_unknown_grant_refuses_the_session() {
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000),
         approver: None,
+        confinement: None,
     })
     .unwrap_err();
     assert!(matches!(err, RunRefused::Session(_)), "{err:?}");
@@ -342,6 +346,7 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
             task: TaskText::new("t".into()),
             grants: vec!["harness.fs.read".into(), "harness.task.submit".into()],
             workspace_public: false,
+            exec: None,
         },
         registry: &registry(),
         policy: &UserPolicy::default(),
@@ -351,6 +356,7 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
         approver: None,
+        confinement: None,
     })
     .unwrap();
     assert_eq!(
@@ -377,9 +383,10 @@ fn the_header_records_the_host_the_manifest_and_the_environment() {
     );
     assert_eq!(h["shell_enabled"], false);
     assert_eq!(h["sandbox"]["backend"], "none");
-    // Both are constants in H1, true only while nothing admitted can run
-    // code (H1f-3 review F-10): the day an execute-class capability is
-    // admitted, this fails and the header must derive them instead.
+    // Derived from the session since H2d (they were constants in H1, H1f-3
+    // review F-10): this session holds no command runner, so no sandbox
+    // was required and no shell can be on its exec allowlist. The runner
+    // is the one execute-class built-in.
     let reg = registry();
     let m = match reg.resolve("harness.fs.read") {
         Resolved::One { manifest, .. } => manifest.clone(),
@@ -388,7 +395,9 @@ fn the_header_records_the_host_the_manifest_and_the_environment() {
     assert!(m
         .capabilities()
         .iter()
-        .all(|c| c.effect() < harness_manifest::Effect::Execute));
+        .filter(|c| c.effect() >= harness_manifest::Effect::Execute)
+        .map(|c| c.id().as_str())
+        .eq(["harness.exec.run"]));
     let env = h["environment"].as_object().unwrap();
     assert_eq!(env.len(), 5);
     for (key, v) in env {

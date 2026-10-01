@@ -18,9 +18,21 @@
 //! std's `RandomState` (SipHash keyed from OS randomness) over a counter,
 //! the time and the process id, XORed on Unix with bytes from
 //! `/dev/urandom`. Without the device (Windows) that is not a CSPRNG; what
-//! these values need is uniqueness, and that the model cannot predict the
-//! next turn's nonce, which it cannot without the key. A CSPRNG crate would
-//! be a new dependency for no gain here.
+//! these values need is uniqueness, and that nothing can predict a new
+//! observation's nonce before it is drawn, which it cannot without the key.
+//! A CSPRNG crate would be a new dependency for no gain here.
+//!
+//! **Observation nonces (design row H1i).** How a turn is shown is decided
+//! once, when the turn is first rendered (the step after it), and reused
+//! every time it is shown again, so the history's bytes do not change
+//! between requests and a server's prompt cache keeps them. Its
+//! observation's nonce is drawn then and journaled in that step's
+//! `ModelRequested` (`nonce`, `nonce_step`). The draw refuses a nonce that
+//! another observation carries or any untrusted text of the run contains
+//! (observation bodies, shown replies); a new body or shown reply that
+//! contains a nonce drawn earlier in the run (the model has seen every one
+//! of them) is withheld (`withheld_output_step`, `withheld_reply_step`),
+//! shown as a harness notice, never as data or as the model's words.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -43,12 +55,13 @@ use harness_journal::{Condition, ConditionKind};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::{builtin, Capability, Confirmation};
 use harness_model::context::{
-    self, ContextError, Fact, FactValue, Feedback, ShownCall, Turn, CONTEXT_FORMAT,
+    self, ContextError, Delimiting, Fact, FactValue, Feedback, Renderings, Shown, ShownCall, Turn,
+    CONTEXT_FORMAT,
 };
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
 use harness_model::replay::{replied_event, requested_event};
-use harness_model::wire::{render_request, RenderError};
+use harness_model::wire::{contains_nonce, render_request};
 use harness_model::{
     Completion, HarnessText, ModelBackend, ModelError, ModelRequest, TaskText, ToolSpec,
 };
@@ -57,11 +70,15 @@ use harness_policy::approval::{
 };
 use harness_policy::locality::{self, LocalityProbe, LocalityRefused};
 use harness_policy::{
-    Authorized, Call, DenyReason, PolicyDecision, RuleId, RuleList, Session, SessionRefused,
-    SessionSpec, UserPolicy, WorkspaceDecl, SUBMIT_ID,
+    Authorized, Call, DenyReason, ExecRefused, PolicyDecision, RuleId, RuleList, Session,
+    SessionRefused, SessionSpec, UserPolicy, WorkspaceDecl, EXEC_ID, SUBMIT_ID,
 };
+use harness_sandbox::{Confinement, Conformed, Refused};
 use harness_tools::builtin::{workspace_tree, RootRefused, WorkspaceFacts, WorkspaceTree};
-use harness_tools::{EditTools, InvokeCtx, ReadTools, ToolProvider, ToolStatus};
+use harness_tools::{
+    EditTools, ExecCleanup, ExecEnd, ExecRecord, ExecSetupError, ExecSpec, ExecTools, InvokeCtx,
+    Pinned, ReadTools, ToolProvider, ToolStatus,
+};
 use serde_json::Value;
 
 use crate::approve::{nonce_name, ApprovalAnswer, Approver, RecordedApproval};
@@ -81,6 +98,10 @@ pub struct TaskSpec {
     pub grants: Vec<String>,
     /// The task declared the workspace public (§5.4).
     pub workspace_public: bool,
+    /// The command runner's setup (§4.8, H2d): the exec allowlist and what
+    /// a command needs besides the workspace. Present exactly when the
+    /// grants include `harness.exec.run`.
+    pub exec: Option<ExecSpec>,
 }
 
 /// Budgets and timeouts (§2.4).
@@ -94,6 +115,10 @@ pub struct RunConfig {
     /// Longest a single tool call may take (§2.4: 30 s for non-exec tools;
     /// also capped by the remaining wall budget).
     pub tool_call_timeout: Duration,
+    /// Longest one command of `harness.exec.run` may take (H2d: 120 s;
+    /// also capped by the remaining wall budget). It is the command's wall
+    /// clock in the sandbox.
+    pub exec_call_timeout: Duration,
     /// Longest the pre-start workspace-facts walk may take.
     pub facts_timeout: Duration,
     /// Longest an approver may take to answer (§2.4: 15 min; past it the
@@ -115,6 +140,7 @@ impl RunConfig {
             },
             model_call_timeout: Duration::from_secs(300),
             tool_call_timeout: Duration::from_secs(30),
+            exec_call_timeout: Duration::from_secs(120),
             facts_timeout: Duration::from_secs(120),
             approval_timeout: Duration::from_secs(15 * 60),
         }
@@ -151,6 +177,11 @@ pub struct Run<'a> {
     /// deny (§5.2); the choice is recorded in the journal header
     /// (`approver_present`), and a resume must make the same one.
     pub approver: Option<&'a dyn Approver>,
+    /// Where commands are confined (H2d; the binary passes
+    /// `harness_sandbox::SystemConfinement`). Asked for a witness only when
+    /// the task grants `harness.exec.run`; `None`, or a refusal, refuses such
+    /// a run before anything starts (INV-6: no unconfined fallback).
+    pub confinement: Option<&'a dyn Confinement>,
 }
 
 /// A run that did not start: nothing ran, nothing was journaled
@@ -193,14 +224,33 @@ pub enum RunRefused {
     /// A resume that cannot continue this run (§2.10).
     #[error("cannot resume: {0}")]
     NotResumable(&'static str),
+    /// The task's exec grant and exec section disagree, or no confinement
+    /// was given for an exec grant (H2d).
+    #[error("exec refused: {0}")]
+    ExecGrant(&'static str),
+    /// The command runner's setup is refused (§4.8, H2d).
+    #[error("{0}")]
+    Exec(#[from] ExecSetupError),
+    /// The task grants execution and this host has no conformed sandbox
+    /// (INV-6, §6.1): refused, never run unconfined.
+    #[error("{0}")]
+    Confinement(Refused),
 }
 
 impl RunRefused {
-    /// Nothing ran: `Indeterminate { CouldNotRun }`.
+    /// Nothing ran: `Indeterminate { CouldNotRun }`, or `UnsupportedOs`
+    /// when execution was refused because no backend exists for this OS
+    /// (§6.1).
     pub fn outcome(&self) -> GateOutcome {
-        GateOutcome::Indeterminate {
-            why: IndeterminateKind::CouldNotRun,
-        }
+        let why = match self {
+            RunRefused::Confinement(Refused(u))
+                if u.kind() == harness_sandbox::UnavailableKind::UnsupportedOs =>
+            {
+                IndeterminateKind::UnsupportedOs
+            }
+            _ => IndeterminateKind::CouldNotRun,
+        };
+        GateOutcome::Indeterminate { why }
     }
 }
 
@@ -247,6 +297,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         r.probe,
         r.config,
         r.approver.is_some(),
+        r.confinement,
     )?;
     let facts = pre.facts;
 
@@ -255,6 +306,12 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
     if let Some(s) = run_dir.to_str() {
         locality::check(r.probe, s)?;
     }
+    // The command runner, with the run's scratch directory (H2d).
+    let exec_header = pre
+        .exec
+        .as_ref()
+        .map(|(p, w)| ExecHeader::live(p, w, r.config));
+    let exec_tools = exec_tools(&pre, &run_dir, r.confinement, r.config)?;
     let header = header(&HeaderInputs {
         spec: r.spec,
         registry: r.registry,
@@ -267,6 +324,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         environment: r.env.sample(),
         environment_recorded: false,
         approver_present: r.approver.is_some(),
+        exec: exec_header,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -285,7 +343,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         facts: facts_block(&facts),
         profile: r.profile,
         backend: r.backend,
-        providers: Prepared::providers(pre.read_tools, pre.edit_tools),
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec_tools),
         meter,
         detector: LoopDetector::new(),
         turns: Vec::new(),
@@ -332,18 +390,55 @@ pub(crate) struct Prepared {
     /// The listing the facts were measured over, kept so the tree digest
     /// follows the run's own edits (H2b).
     pub(crate) tree: WorkspaceTree,
+    /// For an exec grant (H2d): the pinned setup and the witness obtained
+    /// before anything was written.
+    pub(crate) exec: Option<(Pinned, Conformed)>,
 }
 
 impl Prepared {
-    /// The built-in providers: the read tools and the edit tools, which
-    /// share the `harness` namespace and split it by verb (H2b).
+    /// The built-in providers: the read tools, the edit tools and, with an
+    /// exec grant, the command runner, which share the `harness` namespace
+    /// and split it by verb (H2b, H2d).
     pub(crate) fn providers<'p>(
         read: ReadTools,
         edit: EditTools,
+        exec: Option<ExecTools<'p>>,
     ) -> Vec<Box<dyn ToolProvider + 'p>> {
-        vec![Box::new(read), Box::new(edit)]
+        let mut v: Vec<Box<dyn ToolProvider + 'p>> = vec![Box::new(read), Box::new(edit)];
+        if let Some(x) = exec {
+            v.push(Box::new(x));
+        }
+        v
     }
 }
+
+/// The command runner of a run with an exec grant (H2d): over the
+/// workspace, with `runs/<run-id>/scratch` as its scratch directory (per
+/// run, so a resumed attempt reuses the build cache; outside the workspace,
+/// so build output is not in the tree digest), under the witness `prepare`
+/// obtained.
+pub(crate) fn exec_tools<'p>(
+    pre: &Prepared,
+    run_dir: &Path,
+    confinement: Option<&'p dyn Confinement>,
+    config: &RunConfig,
+) -> Result<Option<ExecTools<'p>>, RunRefused> {
+    let (Some((pinned, witness)), Some(c)) = (&pre.exec, confinement) else {
+        return Ok(None);
+    };
+    Ok(Some(ExecTools::new(
+        pre.read_tools.root(),
+        pinned.clone(),
+        &run_dir.join(SCRATCH_DIR),
+        c,
+        witness.clone(),
+        config.facts_timeout,
+    )?))
+}
+
+/// The run's scratch directory, under `runs/<run-id>/` (design §2.8; per
+/// run rather than per attempt, H2d).
+pub(crate) const SCRATCH_DIR: &str = "scratch";
 
 /// The pre-start checks shared by `run` and `resume` (§2.1): plan the
 /// session, open the workspace, canonicalise `state_root`, refuse an
@@ -359,8 +454,19 @@ pub(crate) fn prepare(
     probe: &dyn LocalityProbe,
     config: &RunConfig,
     approver_present: bool,
+    confinement: Option<&dyn Confinement>,
 ) -> Result<Prepared, RunRefused> {
-    let (session, tools) = plan(spec, registry, policy, profile, approver_present)?;
+    // The exec grant and its setup agree, and the setup pins (H2d), before
+    // the session is planned with the witness it will need.
+    let pinned = exec_setup(spec)?;
+    let (session, tools) = plan(
+        spec,
+        registry,
+        policy,
+        profile,
+        approver_present,
+        pinned.is_some(),
+    )?;
     let read_tools = ReadTools::new(workspace)?;
     let edit_tools = EditTools::new(workspace)?;
     let ws = read_tools.root().to_path_buf();
@@ -377,6 +483,17 @@ pub(crate) fn prepare(
     locality::check(probe, state_str)?;
     let tree =
         workspace_tree(&ws, Instant::now() + config.facts_timeout).map_err(RunRefused::Facts)?;
+    // INV-6: the witness, last, before anything is written; no confinement,
+    // or a refusal, refuses the run (there is no unconfined fallback).
+    let exec = match pinned {
+        None => None,
+        Some(p) => {
+            let c = confinement.ok_or(RunRefused::ExecGrant(
+                "harness.exec.run is granted but the run was given no confinement",
+            ))?;
+            Some((p, c.require().map_err(RunRefused::Confinement)?))
+        }
+    };
     Ok(Prepared {
         session,
         tools,
@@ -385,7 +502,25 @@ pub(crate) fn prepare(
         state_root,
         facts: tree.facts(),
         tree,
+        exec,
     })
+}
+
+/// The exec setup of a task (H2d): `None` without an exec grant; the pinned
+/// setup with one. A grant without an exec section, or a section without
+/// the grant, is refused.
+pub(crate) fn exec_setup(spec: &TaskSpec) -> Result<Option<Pinned>, RunRefused> {
+    let granted = spec.grants.iter().any(|g| g == EXEC_ID);
+    match (granted, &spec.exec) {
+        (false, None) => Ok(None),
+        (true, None) => Err(RunRefused::ExecGrant(
+            "harness.exec.run is granted but the task has no exec section (its allowlist)",
+        )),
+        (false, Some(_)) => Err(RunRefused::ExecGrant(
+            "the task has an exec section but does not grant harness.exec.run",
+        )),
+        (true, Some(e)) => Ok(Some(Pinned::check(e)?)),
+    }
 }
 
 /// The locality check run on each new attempt directory (§2.8).
@@ -444,13 +579,16 @@ pub(crate) fn new_meter_resumed(
 
 /// Plan the session and the tool definitions (§2.1 "plan session").
 /// `approver_present`: whether anyone answers an ask (§5.2: with nobody,
-/// every ask is a deny).
+/// every ask is a deny). `conformed`: whether the run holds (or, in an
+/// audit, held) a `Conformed` witness (H2d: an exec grant plans only with
+/// one, INV-6).
 pub(crate) fn plan(
     spec: &TaskSpec,
     registry: &Registry,
     policy: &UserPolicy,
     profile: &Profile,
     approver_present: bool,
+    conformed: bool,
 ) -> Result<(Session, Vec<ToolSpec>), RunRefused> {
     let mut grants = spec.grants.clone();
     if !grants.iter().any(|g| g == SUBMIT_ID) {
@@ -464,6 +602,8 @@ pub(crate) fn plan(
             }),
             approver_present,
             personal_data_granted: false,
+            conformed,
+            exec_programs: spec.exec.as_ref().map(ExecSpec::names).unwrap_or_default(),
         },
         registry,
         policy,
@@ -520,6 +660,105 @@ pub(crate) struct HeaderInputs<'a> {
     pub(crate) environment_recorded: bool,
     /// Whether an approver answers asks in this run (§5.2, H2b).
     pub(crate) approver_present: bool,
+    /// The command runner's header fields, with an exec grant (H2d).
+    pub(crate) exec: Option<ExecHeader>,
+}
+
+/// The sandbox a run's commands ran under, as its witness names it (H2d):
+/// the backend, the matrix row, and the exact bars met.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SandboxRecord {
+    backend: &'static str,
+    matrix_row: &'static str,
+    network: &'static str,
+    kill_domain: &'static str,
+    memory: &'static str,
+    processes: &'static str,
+    probe: Digest,
+}
+
+impl SandboxRecord {
+    /// The record of a witness.
+    pub(crate) fn of(w: &Conformed) -> Self {
+        Self {
+            backend: w.backend().name(),
+            matrix_row: w.matrix_row(),
+            network: w.network().name(),
+            kill_domain: w.kill_domain().name(),
+            memory: w.memory().name(),
+            processes: w.processes().name(),
+            probe: *w.probe_digest(),
+        }
+    }
+
+    /// A recorded header's `sandbox` object, when it is one this build
+    /// writes for a witness (an audit re-states it; H2d).
+    pub(crate) fn parse(v: &Value) -> Option<Self> {
+        use harness_sandbox::{
+            BackendKind, KillDomain, MemoryGuard, NetworkMechanism, ProcessGuard,
+        };
+        let o = v.as_object()?;
+        if o.len() != 7 {
+            return None;
+        }
+        let s = |k: &str| o.get(k).and_then(Value::as_str);
+        let row = s("matrix_row")?;
+        Some(Self {
+            backend: BackendKind::from_name(s("backend")?)?.name(),
+            matrix_row: harness_sandbox::conformance::MATRIX
+                .iter()
+                .map(|r| r.id)
+                .find(|id| *id == row)?,
+            network: NetworkMechanism::from_name(s("network")?)?.name(),
+            kill_domain: KillDomain::from_name(s("kill_domain")?)?.name(),
+            memory: MemoryGuard::from_name(s("memory")?)?.name(),
+            processes: ProcessGuard::from_name(s("processes")?)?.name(),
+            probe: s("probe")?.parse().ok()?,
+        })
+    }
+
+    fn trusted(&self) -> Trusted {
+        Trusted::Obj(vec![
+            ("backend", Trusted::Text(self.backend)),
+            ("matrix_row", Trusted::Text(self.matrix_row)),
+            ("network", Trusted::Text(self.network)),
+            ("kill_domain", Trusted::Text(self.kill_domain)),
+            ("memory", Trusted::Text(self.memory)),
+            ("processes", Trusted::Text(self.processes)),
+            ("probe", Trusted::Digest(self.probe)),
+        ])
+    }
+}
+
+/// What the header records about the command runner (H2d).
+#[derive(Debug, Clone)]
+pub(crate) struct ExecHeader {
+    /// The sandbox the commands run under.
+    pub(crate) sandbox: SandboxRecord,
+    /// A shell is on the allowlist (§4.8).
+    pub(crate) shell_enabled: bool,
+    /// The spec's digest ([`ExecSpec::digest`]): a header input.
+    pub(crate) spec: Digest,
+    /// How many programs the allowlist names.
+    pub(crate) programs: u64,
+    /// The pinned programs' content digest, measured at the start.
+    pub(crate) programs_sha256: Digest,
+    /// Each command's wall clock (`RunConfig::exec_call_timeout`).
+    pub(crate) timeout_ms: u64,
+}
+
+impl ExecHeader {
+    /// The header of a live attempt: the pinned setup and the witness.
+    pub(crate) fn live(p: &Pinned, w: &Conformed, config: &RunConfig) -> Self {
+        Self {
+            sandbox: SandboxRecord::of(w),
+            shell_enabled: p.spec().shell_enabled(),
+            spec: p.spec_digest(),
+            programs: p.spec().programs.len() as u64,
+            programs_sha256: p.programs_digest(),
+            timeout_ms: u64::try_from(config.exec_call_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 /// The header keys an audit replay or a resume recomputes from its own
@@ -527,10 +766,12 @@ pub(crate) struct HeaderInputs<'a> {
 /// (H1 phase-exit review F-1): the replay recomputes every budget stop
 /// from the limits, so limits taken from the journal would let a
 /// re-chained edit choose the stop the audit then "recomputes".
-/// `builtin_manifest`, `shell_enabled` (H1f-3) and `context_format` (H1h)
-/// belong to the harness build: a journal another build wrote is refused
-/// by name, never replayed into a mismatch.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 11] = [
+/// `builtin_manifest` (H1f-3) and `context_format` (H1h) belong to the
+/// harness build: a journal another build wrote is refused by name, never
+/// replayed into a mismatch. `shell_enabled` and `exec` (H2d) are the
+/// task's exec allowlist: absent without an exec grant, so a journal
+/// without one reads as before.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 12] = [
     "task",
     "grants",
     "workspace_public",
@@ -542,6 +783,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 11] = [
     "shell_enabled",
     "context_format",
     "limits",
+    "exec",
 ];
 
 /// The header's `limits` object, field by field: the one encoding the
@@ -637,15 +879,23 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
             "builtin_manifest",
             Trusted::Digest(builtin_manifest_sha256()),
         )
-        // No execute-class capability exists in H1, so no shell can be on
-        // any exec allowlist (§4.8) and there is no sandbox backend (§6).
-        .field("shell_enabled", Trusted::Bool(false))
+        // A shell on the exec allowlist (§4.8, H2d); none without one.
+        .field(
+            "shell_enabled",
+            Trusted::Bool(h.exec.as_ref().is_some_and(|e| e.shell_enabled)),
+        )
         // What this build's contexts and requests are (H1h): a replay
         // recomputes them, so it needs the same format.
         .field("context_format", Trusted::Text(CONTEXT_FORMAT))
+        // The sandbox commands run under (H2d): the witness's backend, row
+        // and bars; `none` for a run without an exec grant (no witness was
+        // asked for).
         .field(
             "sandbox",
-            Trusted::Obj(vec![("backend", Trusted::Text("none"))]),
+            match &h.exec {
+                Some(e) => e.sandbox.trusted(),
+                None => Trusted::Obj(vec![("backend", Trusted::Text("none"))]),
+            },
         )
         .field("os", Trusted::Text(std::env::consts::OS))
         .field("arch", Trusted::Text(std::env::consts::ARCH))
@@ -658,6 +908,18 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
                 "measured"
             }),
         );
+    if let Some(e) = &h.exec {
+        hd = hd
+            .field(
+                "exec",
+                Trusted::Obj(vec![
+                    ("spec", Trusted::Digest(e.spec)),
+                    ("programs", Trusted::U64(e.programs)),
+                ]),
+            )
+            .field("exec_programs_sha256", Trusted::Digest(e.programs_sha256))
+            .field("exec_timeout_ms", Trusted::U64(e.timeout_ms));
+    }
     if let Some((attempt, head, carried_ms, skipped)) = &h.resumed_from {
         let mut from = vec![
             ("attempt", Trusted::U64(u64::from(*attempt))),
@@ -738,7 +1000,8 @@ pub(crate) struct Loop<'a> {
     pub(crate) turns: Vec<Turn>,
     pub(crate) config: &'a RunConfig,
     pub(crate) step: u64,
-    /// Where render nonces come from (recorded ones first when replaying).
+    /// Where observation nonces come from (recorded ones first when
+    /// replaying), and every observation's delimiting so far (H1i).
     pub(crate) nonces: NonceSource,
     /// Recorded tool results that stand in for calls (audit replay and a
     /// resume's catch-up); when empty, the providers run.
@@ -803,16 +1066,31 @@ impl<'a> Approvals<'a> {
     }
 }
 
-/// Where render nonces come from: recorded ones in order (so a replayed
-/// request renders byte for byte), then fresh random ones.
+/// Where observation nonces come from, and how every turn so far is shown
+/// (design row H1i). A nonce is drawn when its observation is first
+/// rendered: the one recorded for that observation when replaying (so a
+/// replayed request renders byte for byte), else a fresh random one.
 #[derive(Debug, Default)]
 pub(crate) struct NonceSource {
-    pub(crate) recorded: std::collections::VecDeque<Nonce>,
+    /// Recorded nonces, by the step of the observation each delimits
+    /// (`ModelRequested.nonce_step`): audit replay and a resume's catch-up.
+    pub(crate) recorded: std::collections::BTreeMap<u64, Nonce>,
+    /// How every turn so far is shown, by its step: decided at its first
+    /// render, fixed after.
+    pub(crate) assigned: Renderings,
 }
 
 impl NonceSource {
-    fn next(&mut self) -> Option<Nonce> {
-        self.recorded.pop_front().or_else(new_nonce)
+    fn next(&mut self, step: u64) -> Option<Nonce> {
+        self.recorded.remove(&step).or_else(new_nonce)
+    }
+
+    /// Every nonce drawn so far in this run.
+    fn drawn(&self) -> impl Iterator<Item = &Nonce> {
+        self.assigned.values().filter_map(|s| match &s.output {
+            Some(Delimiting::Nonce(n)) => Some(n),
+            _ => None,
+        })
     }
 }
 
@@ -832,6 +1110,9 @@ pub(crate) struct RecordedResult {
     pub(crate) environment: Option<EnvSample>,
     /// The `EditApplied` recorded before an ok edit's result (H2b).
     pub(crate) edit: Option<RecordedEdit>,
+    /// What a recorded command did, and the tree digest measured after it
+    /// (`None`: not measured), from its `ToolFinished` (H2d).
+    pub(crate) exec: Option<(ExecRecord, Option<Digest>)>,
 }
 
 /// What an `EditApplied` record says an edit did (the path is the call's).
@@ -846,6 +1127,11 @@ pub(crate) struct RecordedEdit {
 /// Whether `tool` is a built-in workspace edit (H2b).
 pub(crate) fn is_edit(tool: &str) -> bool {
     harness_policy::EDIT_IDS.contains(&tool)
+}
+
+/// Whether `tool` is the built-in command runner (H2d).
+pub(crate) fn is_exec(tool: &str) -> bool {
+    tool == EXEC_ID
 }
 
 /// Whether `tool` is a built-in read tool (`harness.fs.*`).
@@ -924,23 +1210,30 @@ impl<'a> Loop<'a> {
         self.meter.charge_step()?;
         self.observe_budgets(w, step)?;
 
-        // 2. Build the context (§2.3).
+        // 2. Build the context (§2.3), once the observation it shows for the
+        // first time has its delimiting (H1i).
+        let first = self.first_render()?;
         let built = match context::build(
             self.profile,
             &self.tools,
             self.task,
             &self.facts,
             &self.turns,
+            &self.nonces.assigned,
         ) {
             Ok(b) => b,
             Err(ContextError::Exhausted { .. }) => return Err(StopCause::ContextExhausted),
-            Err(ContextError::TooManyTools { .. }) => return Err(StopCause::PolicyAbort),
+            Err(ContextError::TooManyTools { .. } | ContextError::Undecided { .. }) => {
+                return Err(StopCause::PolicyAbort)
+            }
         };
         w.append(
             step,
             Event::new(EventKind::ContextBuilt)
                 .field("context", Trusted::Digest(built.digest))
                 .field("recent_turns", Trusted::U64(built.recent as u64))
+                // H1i: whether this build compacted (a prefix-cache break).
+                .field("compacted", Trusted::Bool(built.compacted))
                 .field("estimated_tokens", Trusted::U64(built.estimated_tokens))
                 .field("budget_tokens", Trusted::U64(built.budget_tokens)),
         )
@@ -948,7 +1241,8 @@ impl<'a> Loop<'a> {
 
         // 3. Call the model under the remaining wall budget.
         let (req, rendered) = self.request(built.messages)?;
-        let ev = requested_event(&rendered, &req.nonce).ok_or(StopCause::PolicyAbort)?;
+        let ev = requested_event(&rendered, first.as_ref().map(|(s, d)| (*s, d)))
+            .ok_or(StopCause::PolicyAbort)?;
         w.append(step, ev).map_err(journal)?;
         let request_bytes = rendered.to_string().len() as u64;
         let deadline = Instant::now() + self.config.model_call_timeout.min(self.remaining_wall());
@@ -1117,21 +1411,31 @@ impl<'a> Loop<'a> {
 
         // 8. Execute.
         let intent_seq = journaled.intent_seq();
+        // Per-tool timeouts (H2d): a command gets the exec timeout, every
+        // other tool the tool timeout; both capped by the wall budget left.
+        let timeout = if is_exec(&tool) {
+            self.config.exec_call_timeout
+        } else {
+            self.config.tool_call_timeout
+        };
         let ctx = InvokeCtx {
             step,
-            deadline: Instant::now() + self.config.tool_call_timeout.min(self.remaining_wall()),
+            deadline: Instant::now() + timeout.min(self.remaining_wall()),
             reads: &self.reads,
         };
         let mut fed_environment = None;
         let mut fed_tree = None;
+        let mut fed_exec_tree = None;
         let result = if let Some(rec) = self.feed.pop_front() {
             fed_environment = rec.environment;
             fed_tree = rec.edit.as_ref().map(|e| e.tree);
+            fed_exec_tree = rec.exec.as_ref().map(|(_, t)| *t);
             // Replaying (audit, or a resume catching up): the recorded
             // result of this very call stands in for running it again, an
-            // edit's included: a replay re-feeds what an edit did and never
-            // applies it again (H2b). The intent above is journaled all the
-            // same, so the replayed journal has the recorded shape.
+            // edit's and a command's included: a replay re-feeds what an
+            // edit did and never applies it again (H2b), and never runs a
+            // completed command again (H2d). The intent above is journaled
+            // all the same, so the replayed journal has the recorded shape.
             let path = journaled
                 .call()
                 .call()
@@ -1161,6 +1465,8 @@ impl<'a> Loop<'a> {
         let mut edited = None;
         let mut unverified = false;
         let mut repeated = false;
+        let mut exec_stop = None;
+        let mut exec_changed = false;
         let feedback = match result {
             Ok(res) => {
                 let out = w.untrusted(&res.output).map_err(journal)?;
@@ -1209,6 +1515,32 @@ impl<'a> Loop<'a> {
                     // An edit written but not verified may have changed the
                     // workspace in a way the harness cannot state (H2b).
                     unverified = is_edit(&tool) && code == harness_tools::builtin::code::UNVERIFIED;
+                }
+                // A command that started (H2d): what it did, and the tree
+                // digest after it, measured live or re-fed. Its kill domain
+                // must be confirmed empty or the run stops here, before any
+                // other file operation (option (b), the interim for the
+                // file tools' race); a tree the harness could not measure
+                // stops it too (a fact it cannot state).
+                if let (Some(x), true) = (&res.exec, is_exec(&tool)) {
+                    let tree = match fed_exec_tree {
+                        Some(t) => t,
+                        None => x.workspace.as_ref().map(WorkspaceTree::digest),
+                    };
+                    if let (None, Some(listing)) = (fed_exec_tree, &x.workspace) {
+                        self.workspace = Some(listing.clone());
+                    }
+                    ev = ev.field("exec", exec_fields(x));
+                    if let Some(t) = tree {
+                        ev = ev.field("workspace_tree", Trusted::Digest(t));
+                        exec_changed = t != self.tree;
+                        self.tree = t;
+                    }
+                    exec_stop = match (x.cleanup, tree) {
+                        (ExecCleanup::Unconfirmed, _) => Some(StopCause::SandboxLost),
+                        (_, None) => Some(StopCause::PolicyAbort),
+                        _ => None,
+                    };
                 }
                 // Only an ok result records a read (the reader refuses a read
                 // digest on anything else; confirming review NF-3).
@@ -1283,6 +1615,15 @@ impl<'a> Loop<'a> {
         if unverified {
             return Err(StopCause::PolicyAbort);
         }
+        if let Some(cause) = exec_stop {
+            return Err(cause);
+        }
+        // A command that changed the workspace is progress (§2.6).
+        if exec_changed {
+            self.detector.observe(LoopEvent::WorkspaceChanged {
+                tree_digest: self.tree,
+            });
+        }
         // §2.6: edit churn, and a changed tree is progress.
         if let Some(file) = edited {
             if let LoopSignal::Stop(kind) = self.detector.observe(LoopEvent::EditApplied { file }) {
@@ -1316,27 +1657,90 @@ impl<'a> Loop<'a> {
         Ok(Flow::Continue)
     }
 
-    /// Build the request with a fresh nonce. A body that happens to contain
-    /// the nonce is refused by the renderer; a new nonce is tried (three
-    /// times) before the run stops.
-    fn request(
-        &mut self,
-        mut messages: Vec<harness_model::Message>,
-    ) -> Result<(ModelRequest, Value), StopCause> {
+    /// Decide how the turn this step's request shows for the first time
+    /// (the newest) is shown, and return the decision for the request's
+    /// journal record (design row H1i). Its untrusted text is checked
+    /// against every nonce drawn earlier in the run (all of them, not only
+    /// those still in the context, so the decision does not depend on the
+    /// window; every one has been shown to the model, which could quote it
+    /// or have it echoed into tool output): its observation is withheld if
+    /// the body contains one, its reply if the text the context would show
+    /// of it does. Otherwise its observation gets a new nonce, drawn now,
+    /// at its first render. The decision is fixed from here on.
+    fn first_render(&mut self) -> Result<Option<(u64, Shown)>, StopCause> {
+        let protocol = self.profile.protocol();
+        let (step, reply_withheld, output_withheld) = match self.turns.last() {
+            Some(t) if !self.nonces.assigned.contains_key(&t.step) => {
+                let drawn: Vec<&Nonce> = self.nonces.drawn().collect();
+                let has = |text: &str| drawn.iter().any(|n| contains_nonce(text, n));
+                let reply = context::model_texts(protocol, t).into_iter().any(has);
+                let output = match &t.feedback {
+                    Feedback::Observation { body, .. } => {
+                        Some(has(body.inspect("context: nonce check")))
+                    }
+                    Feedback::Harness(_) => None,
+                };
+                (t.step, reply, output)
+            }
+            _ => return Ok(None),
+        };
+        let output = match output_withheld {
+            None => None,
+            Some(true) => Some(Delimiting::Withheld),
+            Some(false) => Some(Delimiting::Nonce(self.draw(step)?)),
+        };
+        let shown = Shown {
+            output,
+            reply_withheld,
+        };
+        self.nonces.assigned.insert(step, shown.clone());
+        Ok(Some((step, shown)))
+    }
+
+    /// Draw the nonce of the observation of `step`: one that no other
+    /// observation carries and that no untrusted text of this run contains,
+    /// observation bodies and shown replies alike (checked on every turn,
+    /// not only those still shown, so the check does not depend on the
+    /// window). A chance collision is drawn again, three times, before the
+    /// run stops; a replay's recorded nonce that collides is a divergence
+    /// (its redraw is fresh, and the request digest differs).
+    fn draw(&mut self, step: u64) -> Result<Nonce, StopCause> {
+        let protocol = self.profile.protocol();
         for _ in 0..3 {
-            let nonce = self.nonces.next().ok_or(StopCause::PolicyAbort)?;
-            let req = ModelRequest {
-                messages,
-                tools: self.tools.clone(),
-                nonce,
-            };
-            match render_request(&req, self.profile) {
-                Ok(v) => return Ok((req, v)),
-                Err(RenderError::DelimiterCollision) => messages = req.messages,
-                Err(_) => return Err(StopCause::PolicyAbort),
+            let n = self.nonces.next(step).ok_or(StopCause::PolicyAbort)?;
+            let taken = self.nonces.drawn().any(|m| *m == n);
+            let inside = self.turns.iter().any(|t| {
+                let body = match &t.feedback {
+                    Feedback::Observation { body, .. } => {
+                        contains_nonce(body.inspect("context: nonce check"), &n)
+                    }
+                    Feedback::Harness(_) => false,
+                };
+                body || context::model_texts(protocol, t)
+                    .into_iter()
+                    .any(|s| contains_nonce(s, &n))
+            });
+            if !taken && !inside {
+                return Ok(n);
             }
         }
         Err(StopCause::PolicyAbort)
+    }
+
+    /// Render the request. Every observation already carries its nonce
+    /// (H1i), drawn so that no shown body contains any of them; a request
+    /// the renderer refuses anyway (a nonce inside a body, a malformed tool
+    /// sequence) is a harness bug, and the run stops.
+    fn request(
+        &self,
+        messages: Vec<harness_model::Message>,
+    ) -> Result<(ModelRequest, Value), StopCause> {
+        let req = ModelRequest {
+            messages,
+            tools: self.tools.clone(),
+        };
+        let v = render_request(&req, self.profile).map_err(|_| StopCause::PolicyAbort)?;
+        Ok((req, v))
     }
 
     /// §2.2 step 3: an empty, truncated or unusable completion is never a
@@ -1710,6 +2114,11 @@ impl RecordedResult {
             (None, _) => None,
             _ => return Err(unfit()),
         };
+        let exec = match self.exec {
+            Some((x, _)) if is_exec(tool) => Some(x),
+            None => None,
+            Some(_) => return Err(unfit()),
+        };
         Ok(harness_tools::ToolResult {
             status,
             output: Untrusted::new(self.output, Source::Tool(self.capability)),
@@ -1717,8 +2126,98 @@ impl RecordedResult {
             digest: self.digest,
             read,
             edit,
+            exec,
         })
     }
+}
+
+/// A command's journal record (H2d): how it ended (the exit code or the
+/// signal, and the limit that ended it where the harness can tell), whether
+/// its kill domain is confirmed empty (and how many it killed), what it
+/// wrote (bytes kept, whether a stream was cut at the cap), and its wall
+/// time. [`parse_exec`] reads exactly this shape back.
+pub(crate) fn exec_fields(x: &ExecRecord) -> Trusted {
+    let mut f = vec![("end", Trusted::Text(end_name(x.end)))];
+    match x.end {
+        ExecEnd::Exited(c) => f.push(("code", Trusted::I64(i64::from(c)))),
+        ExecEnd::Signaled(n) => f.push(("signal", Trusted::I64(i64::from(n)))),
+        _ => {}
+    }
+    if let Some(g) = x.end.guard() {
+        f.push(("guard", Trusted::Text(g)));
+    }
+    match x.cleanup {
+        ExecCleanup::Confirmed { kills } => {
+            f.push(("cleanup", Trusted::Text("confirmed")));
+            f.push(("kills", Trusted::U64(u64::from(kills))));
+        }
+        ExecCleanup::Unconfirmed => f.push(("cleanup", Trusted::Text("unconfirmed"))),
+    }
+    f.extend([
+        ("stdout_bytes", Trusted::U64(x.stdout_bytes)),
+        ("stderr_bytes", Trusted::U64(x.stderr_bytes)),
+        ("stdout_cut", Trusted::Bool(x.stdout_cut)),
+        ("stderr_cut", Trusted::Bool(x.stderr_cut)),
+        ("elapsed_ms", Trusted::U64(x.elapsed_ms)),
+    ]);
+    Trusted::Obj(f)
+}
+
+fn end_name(e: ExecEnd) -> &'static str {
+    match e {
+        ExecEnd::Exited(_) => "exited",
+        ExecEnd::Signaled(_) => "signaled",
+        ExecEnd::TimedOut => "timed_out",
+        ExecEnd::ProcessLimit => "process_limit",
+        ExecEnd::ExecFailed => "exec_failed",
+        ExecEnd::Unknown => "unknown",
+    }
+}
+
+/// Read back a command record exactly as [`exec_fields`] writes it, or
+/// nothing: every key present exactly when the writer writes it, the guard
+/// the one the end implies. Re-fed with no workspace listing.
+pub(crate) fn parse_exec(v: &Value) -> Option<ExecRecord> {
+    let o = v.as_object()?;
+    let i32_at = |k: &str| o.get(k)?.as_i64().and_then(|n| i32::try_from(n).ok());
+    let end = match o.get("end")?.as_str()? {
+        "exited" => ExecEnd::Exited(i32_at("code")?),
+        "signaled" => ExecEnd::Signaled(i32_at("signal")?),
+        "timed_out" => ExecEnd::TimedOut,
+        "process_limit" => ExecEnd::ProcessLimit,
+        "exec_failed" => ExecEnd::ExecFailed,
+        "unknown" => ExecEnd::Unknown,
+        _ => return None,
+    };
+    let cleanup = match o.get("cleanup")?.as_str()? {
+        "confirmed" => ExecCleanup::Confirmed {
+            kills: u32::try_from(o.get("kills")?.as_u64()?).ok()?,
+        },
+        "unconfirmed" => ExecCleanup::Unconfirmed,
+        _ => return None,
+    };
+    let x = ExecRecord {
+        end,
+        cleanup,
+        stdout_bytes: o.get("stdout_bytes")?.as_u64()?,
+        stderr_bytes: o.get("stderr_bytes")?.as_u64()?,
+        stdout_cut: o.get("stdout_cut")?.as_bool()?,
+        stderr_cut: o.get("stderr_cut")?.as_bool()?,
+        elapsed_ms: o.get("elapsed_ms")?.as_u64()?,
+        workspace: None,
+    };
+    // The exact shape: what the writer would write for this record.
+    let Trusted::Obj(fields) = exec_fields(&x) else {
+        return None;
+    };
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| *k).collect();
+    if o.len() != keys.len() || !keys.iter().all(|k| o.contains_key(*k)) {
+        return None;
+    }
+    if o.get("guard").and_then(Value::as_str) != x.end.guard() {
+        return None;
+    }
+    Some(x)
 }
 
 fn deny_name(r: &DenyReason) -> &'static str {
@@ -1733,6 +2232,10 @@ fn deny_name(r: &DenyReason) -> &'static str {
         DenyReason::UserDenied => "user_denied",
         DenyReason::Args(_) => "args_schema",
         DenyReason::Path(_) => "path_outside_workspace",
+        DenyReason::Exec(ExecRefused::EmptyArgv | ExecRefused::NotAllowlisted) => {
+            "exec_not_allowlisted"
+        }
+        DenyReason::Exec(ExecRefused::TooManyArgs | ExecRefused::Nul) => "exec_argv",
         DenyReason::NoApprover => "no_approver",
         DenyReason::NoRuleMatched => "no_rule_matched",
     }
@@ -1775,6 +2278,16 @@ fn denied_text(d: &PolicyDecision, tools: &[ToolSpec], tool: &str) -> HarnessTex
             reason: DenyReason::NotGranted,
             ..
         } => "Policy denied the call: that tool is not granted in this session.",
+        PolicyDecision::Deny {
+            reason: DenyReason::Exec(ExecRefused::EmptyArgv | ExecRefused::NotAllowlisted),
+            ..
+        } => {
+            "Policy denied the call: argv[0] must be the name of a program this task allows (a name, not a path). There is no shell. It did not run."
+        }
+        PolicyDecision::Deny {
+            reason: DenyReason::Exec(ExecRefused::TooManyArgs | ExecRefused::Nul),
+            ..
+        } => "Policy denied the call: argv has too many items or an item holds a NUL byte. It did not run.",
         PolicyDecision::Deny {
             reason: DenyReason::NoApprover,
             ..

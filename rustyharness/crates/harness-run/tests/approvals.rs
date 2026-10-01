@@ -106,6 +106,7 @@ fn spec() -> TaskSpec {
         task: TaskText::new(TASK.into()),
         grants: vec!["harness.fs.read".into(), "harness.edit.replace".into()],
         workspace_public: false,
+        exec: None,
     }
 }
 
@@ -203,6 +204,7 @@ fn go(
         env: &FIXED_ENV,
         config: cfg,
         approver,
+        confinement: None,
     })
     .unwrap()
 }
@@ -526,6 +528,7 @@ fn resume_with(
         env: &FIXED_ENV,
         config: &config(),
         approver,
+        confinement: None,
     })
 }
 

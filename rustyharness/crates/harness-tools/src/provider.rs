@@ -110,6 +110,82 @@ pub struct ToolResult {
     /// (`EditApplied`), records the after digest as the file's latest read,
     /// and keeps its workspace tree digest current with it.
     pub edit: Option<EditRecord>,
+    /// For a command `harness.exec.run` started (H2d): how it ended,
+    /// whether everything it started is confirmed gone, what it wrote, and
+    /// the workspace re-measured after it. `None` when no command started.
+    pub exec: Option<ExecRecord>,
+}
+
+/// What a command did (H2d). The run journals it with the command's
+/// `ToolFinished`, keeps its tree digest current with `workspace`, and stops
+/// the run when `cleanup` is not confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecRecord {
+    /// How the program ended.
+    pub end: ExecEnd,
+    /// Whether every process the command started is confirmed gone.
+    pub cleanup: ExecCleanup,
+    /// Bytes of stdout kept (at most the output cap).
+    pub stdout_bytes: u64,
+    /// Bytes of stderr kept (at most the output cap).
+    pub stderr_bytes: u64,
+    /// Stdout wrote more than the cap; the rest was dropped.
+    pub stdout_cut: bool,
+    /// Stderr wrote more than the cap; the rest was dropped.
+    pub stderr_cut: bool,
+    /// Wall time from spawn to the end of cleanup, in milliseconds.
+    pub elapsed_ms: u64,
+    /// The workspace measured again after the command (a live call whose
+    /// cleanup was confirmed). `None` when it was not measured: the
+    /// cleanup was not confirmed, the walk failed, or the result was
+    /// re-fed from a journal (which carries the tree digest instead).
+    pub workspace: Option<crate::builtin::WorkspaceTree>,
+}
+
+/// How a command's program ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecEnd {
+    /// It exited with this code.
+    Exited(i32),
+    /// A signal ended it.
+    Signaled(i32),
+    /// Its wall clock (the call's deadline) ran out and it was killed.
+    TimedOut,
+    /// It held more processes than the cap, so its sandbox was swept.
+    ProcessLimit,
+    /// The program could not be started in the sandbox.
+    ExecFailed,
+    /// The sandbox gave no status the harness can trust.
+    Unknown,
+}
+
+impl ExecEnd {
+    /// The limit that ended the command, where the harness can tell: the
+    /// wall clock, the process watchdog, or the CPU-time and file-size
+    /// limits by their signals (SIGXCPU, SIGXFSZ). A process that met its
+    /// memory budget sees an allocation fail and ends as its code decides,
+    /// so that limit is not named.
+    pub fn guard(&self) -> Option<&'static str> {
+        match self {
+            ExecEnd::TimedOut => Some("wall"),
+            ExecEnd::ProcessLimit => Some("processes"),
+            ExecEnd::Signaled(24) => Some("cpu"),
+            ExecEnd::Signaled(25) => Some("file_size"),
+            _ => None,
+        }
+    }
+}
+
+/// Whether everything a command started is gone (its kill domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecCleanup {
+    /// Every process is confirmed gone; this many were killed.
+    Confirmed {
+        /// Processes the sweep killed.
+        kills: u32,
+    },
+    /// Not confirmed: a process may have survived.
+    Unconfirmed,
 }
 
 /// A file read and its content digest (§2.3 "Stale reads").

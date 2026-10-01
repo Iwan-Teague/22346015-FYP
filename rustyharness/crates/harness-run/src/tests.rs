@@ -79,6 +79,7 @@ impl ToolProvider for Spy {
             truncated: false,
             read: None,
             edit: None,
+            exec: None,
         })
     }
 }
@@ -153,9 +154,10 @@ fn drive_full(
         task: TaskText::new("What is in a.txt?".into()),
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
+        exec: None,
     };
     let policy = UserPolicy::default();
-    let (session, tools) = plan(&spec, &reg, &policy, &profile, false).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
     let backend = ScriptedBackend::new(profile.clone(), replies);
     let invoked = Rc::new(Cell::new(0));
     let mut cfg = RunConfig::defaults(1_000_000);
@@ -859,9 +861,10 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         task: TaskText::new("Edit a.txt.".into()),
         grants: vec!["harness.edit.replace".into()],
         workspace_public: false,
+        exec: None,
     };
     let policy = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
-    let (session, tools) = plan(&spec, &reg, &policy, &profile, false).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
     let backend = ScriptedBackend::new(
         profile.clone(),
         vec![
@@ -942,4 +945,110 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         Some(u64::from(harness_tools::builtin::code::UNVERIFIED))
     );
     assert!(!v.records.iter().any(|r| r.kind == EventKind::EditApplied));
+}
+
+// H2d: a command's journal record reads back exactly as the loop wrote it,
+// through the real encoding; anything the loop never writes (an extra or
+// missing key, a guard the end does not imply, a code on a timeout) reads
+// back as nothing, so an audit calls it a divergence.
+#[test]
+fn h2d_a_command_record_reads_back_exactly_and_nothing_else_does() {
+    use crate::driver::{exec_fields, parse_exec};
+    use harness_journal::{Event, Trusted};
+    use harness_tools::{ExecCleanup, ExecEnd, ExecRecord};
+    let ends = [
+        ExecEnd::Exited(0),
+        ExecEnd::Exited(101),
+        ExecEnd::Exited(-1),
+        ExecEnd::Signaled(9),
+        ExecEnd::Signaled(24),
+        ExecEnd::Signaled(25),
+        ExecEnd::TimedOut,
+        ExecEnd::ProcessLimit,
+        ExecEnd::ExecFailed,
+        ExecEnd::Unknown,
+    ];
+    let cleanups = [
+        ExecCleanup::Confirmed { kills: 0 },
+        ExecCleanup::Confirmed { kills: 3 },
+        ExecCleanup::Unconfirmed,
+    ];
+    let file = FaultFile::new(FaultPlan::default());
+    let buf = file.buf.clone();
+    let blobs = MemBlobs::default();
+    let mut w = JournalWriter::start(
+        file,
+        blobs.clone(),
+        Tick(Cell::new(0)),
+        RunId::new(1, [0; 10]),
+        1,
+        Header::new(Ident::of("0.0.1").unwrap()),
+    )
+    .unwrap();
+    let mut written = Vec::new();
+    for end in ends {
+        for cleanup in cleanups {
+            let x = ExecRecord {
+                end,
+                cleanup,
+                stdout_bytes: 12,
+                stderr_bytes: 0,
+                stdout_cut: false,
+                stderr_cut: true,
+                elapsed_ms: 345,
+                workspace: None,
+            };
+            w.append(
+                1,
+                Event::new(EventKind::ToolFinished)
+                    .field("status", Trusted::Text("ok"))
+                    .field("exec", exec_fields(&x)),
+            )
+            .unwrap();
+            written.push(x);
+        }
+    }
+    let v = verify(&buf.borrow().clone(), &blobs).unwrap();
+    let read: Vec<ExecRecord> = v
+        .records
+        .iter()
+        .filter(|r| r.kind == EventKind::ToolFinished)
+        .map(|r| parse_exec(&r.body["exec"]).expect("reads back"))
+        .collect();
+    assert_eq!(read, written);
+    // Shapes the loop never writes.
+    let good = v
+        .records
+        .iter()
+        .find(|r| r.kind == EventKind::ToolFinished)
+        .unwrap()
+        .body["exec"]
+        .clone();
+    let mut extra = good.clone();
+    extra["extra"] = serde_json::json!(1);
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("elapsed_ms");
+    let mut guard = good.clone();
+    guard["guard"] = serde_json::json!("wall");
+    let timed_out = v
+        .records
+        .iter()
+        .find(|r| r.body.get("exec").is_some_and(|e| e["end"] == "timed_out"))
+        .unwrap();
+    let mut coded = timed_out.body["exec"].clone();
+    coded["code"] = serde_json::json!(0);
+    let mut unguarded = timed_out.body["exec"].clone();
+    unguarded.as_object_mut().unwrap().remove("guard");
+    let mut kills_unconfirmed = good.clone();
+    kills_unconfirmed["cleanup"] = serde_json::json!("unconfirmed");
+    for (what, bad) in [
+        ("an extra key", extra),
+        ("a missing key", missing),
+        ("a guard the end does not imply", guard),
+        ("a code on a timeout", coded),
+        ("a timeout without its guard", unguarded),
+        ("kills on an unconfirmed cleanup", kills_unconfirmed),
+    ] {
+        assert!(parse_exec(&bad).is_none(), "{what}: {bad}");
+    }
 }

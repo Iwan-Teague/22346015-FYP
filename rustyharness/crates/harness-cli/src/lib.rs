@@ -14,7 +14,7 @@
 //! | 0 | `Passed`; the `GATE_OK_FILE` marker is written only then, after `RunStopped` is durable and the report line is out |
 //! | 1 | `Failed` |
 //! | 2 | usage error |
-//! | 3 | confinement refused (never in H1: no session may hold an execute grant) |
+//! | 3 | confinement refused: the task grants `harness.exec.run` and this host has no conformed sandbox (INV-6: nothing ran, nothing was journaled) |
 //! | 4 | unreadable input (task spec, policy, profile; a manifest for `manifest check`) |
 //! | 5 | `Indeterminate` (the kind is in the JSON): every H1 run, a refused run (e.g. the locality check), a journal failure, a replay divergence |
 //!
@@ -23,7 +23,11 @@
 //! edits included. An edit asks unless the `--policy` file allows the edit
 //! tools; the binary's approver is the person at the terminal, only when
 //! stdin is a terminal, so an unattended run (a pipe, CI, `< /dev/null`)
-//! has nobody to ask and every ask is a deny (§5.2, §5.3; H2b). Before the
+//! has nobody to ask and every ask is a deny (§5.2, §5.3; H2b). A command
+//! (`harness.exec.run`, H2d) asks the same way unless the policy allows the
+//! runner; it runs only in the conformed sandbox of this host (the binary
+//! passes `harness_sandbox::SystemConfinement`), with the programs the task
+//! file's `exec` section pins. Before the
 //! report line, one line
 //! `chain_head <sha256>` names the journal's final chain head (§7.1
 //! "Anchoring"): keep it to detect a replaced journal later
@@ -94,6 +98,7 @@ mod exit {
     pub const PASSED: u8 = 0;
     pub const FAILED: u8 = 1;
     pub const USAGE: u8 = 2;
+    pub const CONFINEMENT_REFUSED: u8 = 3;
     pub const UNREADABLE_INPUT: u8 = 4;
     pub const INDETERMINATE: u8 = 5;
 }
@@ -117,6 +122,10 @@ pub struct Cx<'a> {
     /// Who answers an ask in `run` and `resume` (§5.3). The shipped binary
     /// passes [`ApproverSource::StdinIfTerminal`].
     pub approver: ApproverSource<'a>,
+    /// Where commands are confined in `run` and `resume` (H2d). The shipped
+    /// binary passes `harness_sandbox::SystemConfinement`; it is asked for a
+    /// witness only when the task grants `harness.exec.run`.
+    pub confinement: &'a dyn harness_sandbox::Confinement,
 }
 
 /// Who answers an ask (§5.3, H2b).
@@ -443,6 +452,75 @@ struct TaskFile {
     grants: Vec<String>,
     #[serde(default)]
     workspace_public: bool,
+    /// The command runner's setup (H2d), required exactly when the grants
+    /// include `harness.exec.run`.
+    #[serde(default)]
+    exec: Option<ExecFile>,
+}
+
+/// A task file's `exec` section (H2d): the allowlist (each program's name
+/// and its absolute, canonical path), the read-only roots the programs
+/// need, the toolchain variables the task declares, and the limits per
+/// command (defaults: 2048 MiB per process, 128 processes, 600 s of CPU
+/// per process, 1024 MiB files, 1024 KiB kept per stream).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecFile {
+    programs: Vec<ProgramFile>,
+    #[serde(default)]
+    read_only: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    limits: LimitsFile,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgramFile {
+    name: String,
+    path: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    memory_mib: Option<u64>,
+    processes: Option<u32>,
+    cpu_secs: Option<u64>,
+    file_size_mib: Option<u64>,
+    output_kib: Option<u64>,
+}
+
+impl ExecFile {
+    fn spec(self) -> Result<harness_run::ExecSpec, String> {
+        let d = harness_run::ExecLimits::default();
+        let bytes = |v: Option<u64>, shift: u32, default: u64, what: &str| match v {
+            None => Ok(default),
+            Some(n) => n
+                .checked_mul(1u64 << shift)
+                .ok_or_else(|| format!("exec limits: {what} is too large")),
+        };
+        Ok(harness_run::ExecSpec {
+            programs: self
+                .programs
+                .into_iter()
+                .map(|p| harness_run::ExecProgram {
+                    name: p.name,
+                    path: p.path.into(),
+                })
+                .collect(),
+            read_only: self.read_only.into_iter().map(PathBuf::from).collect(),
+            env: self.env.into_iter().collect(),
+            limits: harness_run::ExecLimits {
+                memory: bytes(self.limits.memory_mib, 20, d.memory, "memory_mib")?,
+                processes: self.limits.processes.unwrap_or(d.processes),
+                cpu: self.limits.cpu_secs.map_or(d.cpu, Duration::from_secs),
+                file_size: bytes(self.limits.file_size_mib, 20, d.file_size, "file_size_mib")?,
+                output_bytes: bytes(self.limits.output_kib, 10, d.output_bytes, "output_kib")?,
+            },
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -513,11 +591,16 @@ fn inputs(cx: &Cx<'_>, o: &BTreeMap<&str, &str>) -> Result<Inputs, Outcome> {
     let profile = Profile::parse(&read_input(profile_path).map_err(unreadable)?)
         .map_err(|e| unreadable(format!("{profile_path}: {e}")))?;
     let registry = builtin_registry().map_err(unreadable)?;
+    let exec = match task.exec {
+        None => None,
+        Some(e) => Some(e.spec().map_err(unreadable)?),
+    };
     Ok(Inputs {
         spec: TaskSpec {
             task: TaskText::new(task.task),
             grants: task.grants,
             workspace_public: task.workspace_public,
+            exec,
         },
         policy,
         profile,
@@ -545,7 +628,12 @@ fn builtin_registry() -> Result<Registry, String> {
 
 fn from_refusal(cx: &Cx<'_>, e: &RunRefused) -> Outcome {
     note!(cx, "the run did not start: {e}");
-    let mut o = refused(exit::INDETERMINATE, format!("the run did not start: {e}"));
+    // No conformed sandbox for a task that executes (INV-6): its own exit.
+    let code = match e {
+        RunRefused::Confinement(_) => exit::CONFINEMENT_REFUSED,
+        _ => exit::INDETERMINATE,
+    };
+    let mut o = refused(code, format!("the run did not start: {e}"));
     o.outcome = e.outcome();
     o
 }
@@ -618,6 +706,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             env: &SystemEnv,
             config: &config,
             approver,
+            confinement: Some(cx.confinement),
         }),
         Some(id) => harness_run::resume(Resume {
             state_root: std::path::Path::new(state_root),
@@ -632,6 +721,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             env: &SystemEnv,
             config: &config,
             approver,
+            confinement: Some(cx.confinement),
         }),
     }
     .map_err(|e| from_refusal(cx, &e))?;

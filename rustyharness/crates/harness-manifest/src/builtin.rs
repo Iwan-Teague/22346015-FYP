@@ -1,5 +1,5 @@
 //! The built-in manifest (design §4.8): the read tools, the edit tools
-//! (H2b) and the submit sentinel, all in process; no exec.
+//! (H2b), the confined command runner (H2d) and the submit sentinel.
 //!
 //! The built-ins are declared by a `harness` manifest and take the same
 //! validation and policy path as any provider, with no special case beyond
@@ -7,9 +7,10 @@
 //! `harness` namespace and the `builtin` transport.
 //!
 //! It declares the three read tools, the two edit tools
-//! `harness.edit.replace` and `harness.edit.write` (§4.9, H2b) and the
-//! submit sentinel `harness.task.submit` (§2.5, H1e-2). `harness.exec.run`
-//! and `harness.notes.write` arrive with the slices that implement them.
+//! `harness.edit.replace` and `harness.edit.write` (§4.9, H2b), the
+//! command runner `harness.exec.run` (§4.8, H2d) and the submit sentinel
+//! `harness.task.submit` (§2.5, H1e-2). `harness.notes.write` arrives with
+//! the slice that implements it.
 //!
 //! Read tools: read / operational / own / none, as §4.8's table says;
 //! `content` is `third_party` because file contents in a workspace are other
@@ -24,6 +25,13 @@
 //! schemas are §4.9's `{path, old, new, count = 1}` and §4.8's
 //! `{path, content}`; the string caps sit above the 64 KiB action cap
 //! (`harness_model_core::protocol::ACTION_MAX_BYTES`), which binds first.
+//!
+//! The command runner: execute / operational / own / none (§4.8), `content:
+//! third_party` (its output quotes workspace text: compiler messages, test
+//! names), confirmation `none` as declared; the derived floor makes it need
+//! a conformed sandbox (§4.2), and policy asks by default (H2d). Its schema
+//! is `{argv: [string], cwd?: string}`: `argv[0]` names a program on the
+//! task's exec allowlist, never a path the model chooses (§4.8, INV-13).
 //!
 //! The sentinel: write / public / own / none (§4.8), `content: own`. It
 //! changes nothing but the run's phase; policy allows it by one named rule
@@ -139,6 +147,25 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
           "content": { "type": "string", "maxLength": 65536 }
         },
         "required": ["path", "content"]
+      }
+    },
+    {
+      "id": "harness.exec.run",
+      "summary": "Run one program the task allows, confined with no network: argv is a list whose first item names the program; cwd is a directory relative to the workspace root (default the root)",
+      "effect": "execute",
+      "sensitivity": "operational",
+      "blast_radius": "own",
+      "egress": "none",
+      "content": "third_party",
+      "confirmation": "none",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "argv": { "type": "array", "items": { "type": "string", "maxLength": 4096 } },
+          "cwd": { "type": "string", "maxLength": 4096 }
+        },
+        "required": ["argv"]
       }
     },
     {

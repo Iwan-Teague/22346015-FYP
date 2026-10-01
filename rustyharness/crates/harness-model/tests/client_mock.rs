@@ -162,10 +162,10 @@ fn req() -> ModelRequest {
             Message::Observation {
                 call: "harness.fs.read".into(),
                 body: Untrusted::new("file text".into(), Source::Tool("harness.fs.read".into())),
+                nonce: RenderNonce::new("00112233445566778899aabbccddeeff").unwrap(),
             },
         ],
         tools: tools(),
-        nonce: RenderNonce::new("00112233445566778899aabbccddeeff").unwrap(),
     }
 }
 
@@ -210,6 +210,69 @@ fn streamed_reply_over_chunked_encoding_with_the_key_only_in_the_header() {
     assert_eq!(id.api_key_handle.as_deref(), Some("local-llama"));
     assert!(!format!("{id:?}").contains("SECRET"));
     assert!(!format!("{c:?}").contains("SECRET"));
+}
+
+/// H1i: a llama.cpp server's final chunk carries `timings` (its prompt
+/// cache hit `cache_n`, prompt and generation counts and times); through
+/// the real client they reach the completion as the server's claim.
+#[test]
+fn a_servers_timings_reach_the_completion_as_a_claim() {
+    let last = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"cache_n":4096,"prompt_n":210,"prompt_ms":1612.25,"predicted_n":28,"predicted_ms":3520.5}}"#;
+    let body = sse(&[&text_event("ok"), last, "[DONE]"]);
+    let m = mock(vec![Behave::Respond(chunked("text/event-stream", &body))]);
+    let c = client(&m, None).complete(&req(), soon()).unwrap();
+    assert_eq!(
+        c.server_stats.as_ref().map(|s| s.inspect("test").as_str()),
+        Some(
+            r#"{"timings":{"cache_n":4096,"predicted_ms":3520.5,"predicted_n":28,"prompt_ms":1612.25,"prompt_n":210}}"#
+        )
+    );
+}
+
+/// H1i: a profile with `stream_include_usage_ok` asks for usage in the
+/// stream, and llama.cpp's closing usage chunk (empty `choices`, `usage`
+/// and `timings`) reaches the completion through the real client: usage
+/// for the meter, timings as the claim.
+#[test]
+fn a_profile_that_asks_for_stream_usage_gets_it() {
+    let usage = r#"{"choices":[],"usage":{"completion_tokens":2,"prompt_tokens":1400,"total_tokens":1402},"timings":{"cache_n":1024,"prompt_n":376}}"#;
+    let body = sse(&[&text_event("ok"), STOP, usage, "[DONE]"]);
+    let m = mock(vec![Behave::Respond(chunked("text/event-stream", &body))]);
+    let profile = Profile::parse(
+        br#"{"profile_version":1,"id":"u","model":"local-model","context_window":8192,
+        "fill_ratio":0.6,"protocol":"text","tool_choice_required_ok":false,
+        "stream_include_usage_ok":true,"grammar":"none","max_active_tools":5,
+        "edit_format":"replace","recent_turns":4,
+        "sampling":{"temperature":0.2,"top_p":0.95,"max_tokens":1024}}"#,
+    )
+    .unwrap();
+    let c = OpenAiCompatible::new(
+        &format!("http://127.0.0.1:{}/v1", m.port),
+        profile,
+        None,
+        config(),
+    )
+    .unwrap()
+    .complete(&req(), soon())
+    .unwrap();
+    assert_eq!(
+        c.usage,
+        Some(harness_model::ServerUsage {
+            input: 1400,
+            output: 2
+        })
+    );
+    assert_eq!(
+        c.server_stats.as_ref().map(|s| s.inspect("test").as_str()),
+        Some(r#"{"timings":{"cache_n":1024,"prompt_n":376}}"#)
+    );
+    let raw = String::from_utf8(m.requests.lock().unwrap()[0].clone()).unwrap();
+    let (_, sent) = raw.split_once("\r\n\r\n").unwrap();
+    let v: serde_json::Value = serde_json::from_str(sent).unwrap();
+    assert_eq!(
+        v["stream_options"],
+        serde_json::json!({"include_usage": true})
+    );
 }
 
 #[test]
@@ -632,10 +695,10 @@ fn native_tool_history_goes_on_the_wire_as_tool_calls_and_tool_messages() {
                 id: ToolCallId::for_step(1),
                 call: "harness.fs.read".into(),
                 body: Untrusted::new("alpha".into(), Source::Tool("harness.fs.read".into())),
+                nonce: RenderNonce::new(nonce).unwrap(),
             },
         ],
         tools: tools(),
-        nonce: RenderNonce::new(nonce).unwrap(),
     };
     let completion = c.complete(&req, soon()).unwrap();
     let call = completion.tool_calls[0].inspect("test");
@@ -658,7 +721,7 @@ fn native_tool_history_goes_on_the_wire_as_tool_calls_and_tool_messages() {
     assert_eq!(
         v["messages"][3],
         serde_json::json!({"role": "tool", "tool_call_id": "call00001", "content":
-            format!("<<untrusted {nonce}>>\nresult of harness.fs.read:\nalpha\n<</untrusted {nonce}>>")})
+            format!("<<untrusted {nonce}>>\nresult of harness_fs_read:\nalpha\n<</untrusted {nonce}>>")})
     );
     assert_eq!(v["messages"].as_array().unwrap().len(), 4);
     assert_eq!(v["parallel_tool_calls"], serde_json::Value::Bool(false));

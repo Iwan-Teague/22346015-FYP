@@ -494,7 +494,11 @@ impl ReadTools {
             let line = if e.symlink {
                 format!("l {} (symlink, not followed)\n", e.rel)
             } else if e.meta.is_dir() {
-                format!("d {}/\n", e.rel)
+                // No trailing '/': the listing is the model's vocabulary for
+                // the next call's path argument, and the workspace-path rule
+                // refuses a trailing slash (EmptyComponent). Never show the
+                // model a string the policy would refuse.
+                format!("d {}\n", e.rel)
             } else if e.meta.is_file() {
                 format!("f {} {} bytes\n", e.rel, e.meta.len())
             } else {

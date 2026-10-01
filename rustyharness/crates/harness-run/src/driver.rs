@@ -18,9 +18,21 @@
 //! std's `RandomState` (SipHash keyed from OS randomness) over a counter,
 //! the time and the process id, XORed on Unix with bytes from
 //! `/dev/urandom`. Without the device (Windows) that is not a CSPRNG; what
-//! these values need is uniqueness, and that the model cannot predict the
-//! next turn's nonce, which it cannot without the key. A CSPRNG crate would
-//! be a new dependency for no gain here.
+//! these values need is uniqueness, and that nothing can predict a new
+//! observation's nonce before it is drawn, which it cannot without the key.
+//! A CSPRNG crate would be a new dependency for no gain here.
+//!
+//! **Observation nonces (design row H1i).** How a turn is shown is decided
+//! once, when the turn is first rendered (the step after it), and reused
+//! every time it is shown again, so the history's bytes do not change
+//! between requests and a server's prompt cache keeps them. Its
+//! observation's nonce is drawn then and journaled in that step's
+//! `ModelRequested` (`nonce`, `nonce_step`). The draw refuses a nonce that
+//! another observation carries or any untrusted text of the run contains
+//! (observation bodies, shown replies); a new body or shown reply that
+//! contains a nonce drawn earlier in the run (the model has seen every one
+//! of them) is withheld (`withheld_output_step`, `withheld_reply_step`),
+//! shown as a harness notice, never as data or as the model's words.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -42,11 +54,14 @@ use harness_journal::{
 use harness_journal::{Condition, ConditionKind};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::{builtin, Capability};
-use harness_model::context::{self, ContextError, Fact, FactValue, Feedback, Turn};
+use harness_model::context::{
+    self, ContextError, Delimiting, Fact, FactValue, Feedback, Renderings, Shown, ShownCall, Turn,
+    CONTEXT_FORMAT,
+};
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
 use harness_model::replay::{replied_event, requested_event};
-use harness_model::wire::{render_request, RenderError};
+use harness_model::wire::{contains_nonce, render_request};
 use harness_model::{
     Completion, HarnessText, ModelBackend, ModelError, ModelRequest, TaskText, ToolSpec,
 };
@@ -476,7 +491,10 @@ pub(crate) struct HeaderInputs<'a> {
 /// (H1 phase-exit review F-1): the replay recomputes every budget stop
 /// from the limits, so limits taken from the journal would let a
 /// re-chained edit choose the stop the audit then "recomputes".
-pub(crate) const HEADER_INPUT_KEYS: [&str; 10] = [
+/// `builtin_manifest`, `shell_enabled` (H1f-3) and `context_format` (H1h)
+/// belong to the harness build: a journal another build wrote is refused
+/// by name, never replayed into a mismatch.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 11] = [
     "task",
     "grants",
     "workspace_public",
@@ -486,6 +504,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 10] = [
     "checks",
     "builtin_manifest",
     "shell_enabled",
+    "context_format",
     "limits",
 ];
 
@@ -582,6 +601,9 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
         // No execute-class capability exists in H1, so no shell can be on
         // any exec allowlist (§4.8) and there is no sandbox backend (§6).
         .field("shell_enabled", Trusted::Bool(false))
+        // What this build's contexts and requests are (H1h): a replay
+        // recomputes them, so it needs the same format.
+        .field("context_format", Trusted::Text(CONTEXT_FORMAT))
         .field(
             "sandbox",
             Trusted::Obj(vec![("backend", Trusted::Text("none"))]),
@@ -667,7 +689,8 @@ pub(crate) struct Loop<'a> {
     pub(crate) turns: Vec<Turn>,
     pub(crate) config: &'a RunConfig,
     pub(crate) step: u64,
-    /// Where render nonces come from (recorded ones first when replaying).
+    /// Where observation nonces come from (recorded ones first when
+    /// replaying), and every observation's delimiting so far (H1i).
     pub(crate) nonces: NonceSource,
     /// Recorded tool results that stand in for calls (audit replay and a
     /// resume's catch-up); when empty, the providers run.
@@ -680,16 +703,31 @@ pub(crate) struct Loop<'a> {
     pub(crate) pressure: Vec<u64>,
 }
 
-/// Where render nonces come from: recorded ones in order (so a replayed
-/// request renders byte for byte), then fresh random ones.
+/// Where observation nonces come from, and how every turn so far is shown
+/// (design row H1i). A nonce is drawn when its observation is first
+/// rendered: the one recorded for that observation when replaying (so a
+/// replayed request renders byte for byte), else a fresh random one.
 #[derive(Debug, Default)]
 pub(crate) struct NonceSource {
-    pub(crate) recorded: std::collections::VecDeque<Nonce>,
+    /// Recorded nonces, by the step of the observation each delimits
+    /// (`ModelRequested.nonce_step`): audit replay and a resume's catch-up.
+    pub(crate) recorded: std::collections::BTreeMap<u64, Nonce>,
+    /// How every turn so far is shown, by its step: decided at its first
+    /// render, fixed after.
+    pub(crate) assigned: Renderings,
 }
 
 impl NonceSource {
-    fn next(&mut self) -> Option<Nonce> {
-        self.recorded.pop_front().or_else(new_nonce)
+    fn next(&mut self, step: u64) -> Option<Nonce> {
+        self.recorded.remove(&step).or_else(new_nonce)
+    }
+
+    /// Every nonce drawn so far in this run.
+    fn drawn(&self) -> impl Iterator<Item = &Nonce> {
+        self.assigned.values().filter_map(|s| match &s.output {
+            Some(Delimiting::Nonce(n)) => Some(n),
+            _ => None,
+        })
     }
 }
 
@@ -812,23 +850,30 @@ impl<'a> Loop<'a> {
         self.meter.charge_step()?;
         self.observe_budgets(w, step)?;
 
-        // 2. Build the context (§2.3).
+        // 2. Build the context (§2.3), once the observation it shows for the
+        // first time has its delimiting (H1i).
+        let first = self.first_render()?;
         let built = match context::build(
             self.profile,
             &self.tools,
             self.task,
             &self.facts,
             &self.turns,
+            &self.nonces.assigned,
         ) {
             Ok(b) => b,
             Err(ContextError::Exhausted { .. }) => return Err(StopCause::ContextExhausted),
-            Err(ContextError::TooManyTools { .. }) => return Err(StopCause::PolicyAbort),
+            Err(ContextError::TooManyTools { .. } | ContextError::Undecided { .. }) => {
+                return Err(StopCause::PolicyAbort)
+            }
         };
         w.append(
             step,
             Event::new(EventKind::ContextBuilt)
                 .field("context", Trusted::Digest(built.digest))
                 .field("recent_turns", Trusted::U64(built.recent as u64))
+                // H1i: whether this build compacted (a prefix-cache break).
+                .field("compacted", Trusted::Bool(built.compacted))
                 .field("estimated_tokens", Trusted::U64(built.estimated_tokens))
                 .field("budget_tokens", Trusted::U64(built.budget_tokens)),
         )
@@ -836,7 +881,8 @@ impl<'a> Loop<'a> {
 
         // 3. Call the model under the remaining wall budget.
         let (req, rendered) = self.request(built.messages)?;
-        let ev = requested_event(&rendered, &req.nonce).ok_or(StopCause::PolicyAbort)?;
+        let ev = requested_event(&rendered, first.as_ref().map(|(s, d)| (*s, d)))
+            .ok_or(StopCause::PolicyAbort)?;
         w.append(step, ev).map_err(journal)?;
         let request_bytes = rendered.to_string().len() as u64;
         let deadline = Instant::now() + self.config.model_call_timeout.min(self.remaining_wall());
@@ -876,10 +922,13 @@ impl<'a> Loop<'a> {
             Ok(p) => p,
             Err(fe) => {
                 self.feed_stall()?;
+                // No action: the native protocol withholds this reply and
+                // shows only the repair text (H1h; see `context`).
                 self.turns.push(Turn {
                     step,
                     reply,
-                    feedback: Feedback::Harness(fe.repair_message()),
+                    action: None,
+                    feedback: Feedback::Harness(fe.repair_message(self.profile.protocol())),
                     notice: None,
                 });
                 return Ok(Flow::Continue);
@@ -889,6 +938,17 @@ impl<'a> Loop<'a> {
         let capability = self.capability(&tool)?;
         let args = Value::Object(parsed.action.args);
         let args_text = args.to_string();
+        // The action as the native protocol shows it back (H1h): the active
+        // tool's id and the canonical JSON of the arguments policy decides
+        // on, beside the reply's text; never the raw call the server sent.
+        let shown = ShownCall {
+            tool: tool.clone(),
+            arguments: Untrusted::new(args_text.clone(), Source::Model),
+            content: Untrusted::new(
+                completion.content.inspect("context: reply").clone(),
+                Source::Model,
+            ),
+        };
         let args_blob = w
             .untrusted(&Untrusted::new(args_text.clone(), Source::Model))
             .map_err(journal)?;
@@ -942,6 +1002,7 @@ impl<'a> Loop<'a> {
                 self.turns.push(Turn {
                     step,
                     reply,
+                    action: Some(shown),
                     feedback: Feedback::Harness(denied_text(&decision)),
                     notice,
                 });
@@ -1098,6 +1159,7 @@ impl<'a> Loop<'a> {
         self.turns.push(Turn {
             step,
             reply,
+            action: Some(shown),
             feedback,
             notice,
         });
@@ -1109,27 +1171,90 @@ impl<'a> Loop<'a> {
         Ok(Flow::Continue)
     }
 
-    /// Build the request with a fresh nonce. A body that happens to contain
-    /// the nonce is refused by the renderer; a new nonce is tried (three
-    /// times) before the run stops.
-    fn request(
-        &mut self,
-        mut messages: Vec<harness_model::Message>,
-    ) -> Result<(ModelRequest, Value), StopCause> {
+    /// Decide how the turn this step's request shows for the first time
+    /// (the newest) is shown, and return the decision for the request's
+    /// journal record (design row H1i). Its untrusted text is checked
+    /// against every nonce drawn earlier in the run (all of them, not only
+    /// those still in the context, so the decision does not depend on the
+    /// window; every one has been shown to the model, which could quote it
+    /// or have it echoed into tool output): its observation is withheld if
+    /// the body contains one, its reply if the text the context would show
+    /// of it does. Otherwise its observation gets a new nonce, drawn now,
+    /// at its first render. The decision is fixed from here on.
+    fn first_render(&mut self) -> Result<Option<(u64, Shown)>, StopCause> {
+        let protocol = self.profile.protocol();
+        let (step, reply_withheld, output_withheld) = match self.turns.last() {
+            Some(t) if !self.nonces.assigned.contains_key(&t.step) => {
+                let drawn: Vec<&Nonce> = self.nonces.drawn().collect();
+                let has = |text: &str| drawn.iter().any(|n| contains_nonce(text, n));
+                let reply = context::model_texts(protocol, t).into_iter().any(has);
+                let output = match &t.feedback {
+                    Feedback::Observation { body, .. } => {
+                        Some(has(body.inspect("context: nonce check")))
+                    }
+                    Feedback::Harness(_) => None,
+                };
+                (t.step, reply, output)
+            }
+            _ => return Ok(None),
+        };
+        let output = match output_withheld {
+            None => None,
+            Some(true) => Some(Delimiting::Withheld),
+            Some(false) => Some(Delimiting::Nonce(self.draw(step)?)),
+        };
+        let shown = Shown {
+            output,
+            reply_withheld,
+        };
+        self.nonces.assigned.insert(step, shown.clone());
+        Ok(Some((step, shown)))
+    }
+
+    /// Draw the nonce of the observation of `step`: one that no other
+    /// observation carries and that no untrusted text of this run contains,
+    /// observation bodies and shown replies alike (checked on every turn,
+    /// not only those still shown, so the check does not depend on the
+    /// window). A chance collision is drawn again, three times, before the
+    /// run stops; a replay's recorded nonce that collides is a divergence
+    /// (its redraw is fresh, and the request digest differs).
+    fn draw(&mut self, step: u64) -> Result<Nonce, StopCause> {
+        let protocol = self.profile.protocol();
         for _ in 0..3 {
-            let nonce = self.nonces.next().ok_or(StopCause::PolicyAbort)?;
-            let req = ModelRequest {
-                messages,
-                tools: self.tools.clone(),
-                nonce,
-            };
-            match render_request(&req, self.profile) {
-                Ok(v) => return Ok((req, v)),
-                Err(RenderError::DelimiterCollision) => messages = req.messages,
-                Err(_) => return Err(StopCause::PolicyAbort),
+            let n = self.nonces.next(step).ok_or(StopCause::PolicyAbort)?;
+            let taken = self.nonces.drawn().any(|m| *m == n);
+            let inside = self.turns.iter().any(|t| {
+                let body = match &t.feedback {
+                    Feedback::Observation { body, .. } => {
+                        contains_nonce(body.inspect("context: nonce check"), &n)
+                    }
+                    Feedback::Harness(_) => false,
+                };
+                body || context::model_texts(protocol, t)
+                    .into_iter()
+                    .any(|s| contains_nonce(s, &n))
+            });
+            if !taken && !inside {
+                return Ok(n);
             }
         }
         Err(StopCause::PolicyAbort)
+    }
+
+    /// Render the request. Every observation already carries its nonce
+    /// (H1i), drawn so that no shown body contains any of them; a request
+    /// the renderer refuses anyway (a nonce inside a body, a malformed tool
+    /// sequence) is a harness bug, and the run stops.
+    fn request(
+        &self,
+        messages: Vec<harness_model::Message>,
+    ) -> Result<(ModelRequest, Value), StopCause> {
+        let req = ModelRequest {
+            messages,
+            tools: self.tools.clone(),
+        };
+        let v = render_request(&req, self.profile).map_err(|_| StopCause::PolicyAbort)?;
+        Ok((req, v))
     }
 
     /// §2.2 step 3: an empty, truncated or unusable completion is never a
@@ -1144,23 +1269,40 @@ impl<'a> Loop<'a> {
         // The prompt was sent (and possibly processed): charge the
         // conservative estimate for it.
         self.meter.record_tokens(None, request_bytes, 0)?;
-        let text = match e {
-            ModelError::Empty => "The reply was empty. Reply with exactly one action.",
-            ModelError::Truncated(_) => {
+        // Static text per protocol (H1h: the native protocol's names its
+        // own form, like its repair messages).
+        let native = self.profile.protocol() == Protocol::Native;
+        let text = match (e, native) {
+            (ModelError::Empty, false) => "The reply was empty. Reply with exactly one action.",
+            (ModelError::Empty, true) => {
+                "The reply was empty. Call exactly one tool through the function-calling interface."
+            }
+            (ModelError::Truncated(_), false) => {
                 "The reply was cut off. Keep the reasoning short and reply with exactly one action."
             }
-            ModelError::Unusable(_) => {
+            (ModelError::Truncated(_), true) => {
+                "The reply was cut off. Keep the reasoning short and call exactly one tool \
+                 through the function-calling interface."
+            }
+            (ModelError::Unusable(_), false) => {
                 "The reply could not be used. Reply with exactly one action."
             }
-            ModelError::Unavailable(_)
-            | ModelError::RateLimited { .. }
-            | ModelError::ReplayDiverged { .. } => return Err(StopCause::ModelUnavailable),
+            (ModelError::Unusable(_), true) => {
+                "The reply could not be used. Call exactly one tool through the function-calling interface."
+            }
+            (
+                ModelError::Unavailable(_)
+                | ModelError::RateLimited { .. }
+                | ModelError::ReplayDiverged { .. },
+                _,
+            ) => return Err(StopCause::ModelUnavailable),
         };
         self.meter.record_format_error()?;
         self.feed_stall()?;
         self.turns.push(Turn {
             step,
             reply: Untrusted::new(String::new(), Source::Model),
+            action: None,
             feedback: Feedback::Harness(HarnessText::from_static(text)),
             notice: None,
         });
@@ -1224,8 +1366,11 @@ impl<'a> Loop<'a> {
     }
 }
 
-/// The model's reply as it is shown back to it: the content, plus (native
-/// protocol) each tool call. Untrusted, like the reply.
+/// The model's reply as the TEXT protocol shows it back: the content, plus
+/// each native tool call a text-protocol reply carried (a format error),
+/// written out so the model sees what it sent. Untrusted, like the reply.
+/// The native protocol never shows it: a native action is shown as a tool
+/// call (`ShownCall`), and a native reply without one is withheld (H1h).
 fn shown_reply(c: &Completion) -> Untrusted<String> {
     let mut s = c.content.inspect("context: reply").clone();
     for call in &c.tool_calls {
@@ -1345,7 +1490,7 @@ fn denied_text(d: &PolicyDecision) -> HarnessText {
             reason: DenyReason::Path(_),
             ..
         } => {
-            "Policy denied the call: the path must be a normalised relative path inside the workspace (no '..', no leading '/', no '\\\\' or ':')."
+            "Policy denied the call: the path must be a normalised relative path inside the workspace (no '..', no leading or trailing '/', no empty components, no '\\\\' or ':')."
         }
         PolicyDecision::Deny {
             reason: DenyReason::Args(_),

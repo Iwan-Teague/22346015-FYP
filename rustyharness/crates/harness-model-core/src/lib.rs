@@ -68,6 +68,19 @@ impl TaskText {
 }
 
 /// One message in the context (design §1.3, scaffold review F4).
+///
+/// The first four are what the text protocol shows back to the model. The
+/// native protocol shows a past action as the model's own tool call and its
+/// result as the tool's answer ([`Message::ToolCall`], then
+/// [`Message::ToolResult`] or [`Message::ToolNotice`] with the same id), so
+/// the model sees its history in the form it is asked to reply in (design
+/// row H1h).
+///
+/// **Each observation carries its own delimiter nonce (design row H1i).**
+/// It is drawn when the observation is first rendered and reused every time
+/// it is shown again, so a past observation renders to the same bytes in
+/// every later request (the server's prompt cache can keep it), while a new
+/// one still gets a nonce nothing could predict when its output was made.
 #[derive(Debug)]
 pub enum Message {
     /// Harness rules, protocol spec, tool definitions.
@@ -82,7 +95,73 @@ pub enum Message {
         call: String,
         /// Its output.
         body: Untrusted<String>,
+        /// Its delimiter nonce (drawn at its first render, H1i).
+        nonce: RenderNonce,
     },
+    /// Native protocol: a past action, shown as the model's own tool call.
+    /// It is the harness's rendering of the action it parsed and acted on
+    /// (the active tool and the parsed arguments), never the raw reply, so
+    /// a reply that was not exactly one well-formed call has no
+    /// `ToolCall`.
+    ToolCall {
+        /// Harness-made id; the next message answers it.
+        id: ToolCallId,
+        /// The capability id (its wire name is derived when rendering).
+        tool: String,
+        /// The parsed arguments as canonical JSON text: model-chosen values.
+        arguments: Untrusted<String>,
+        /// The text of the reply beside the call (its reasoning).
+        content: Untrusted<String>,
+    },
+    /// Native protocol: the tool output answering the [`Message::ToolCall`]
+    /// with the same id, fed back as data in the tool role.
+    ToolResult {
+        /// The id of the call it answers.
+        id: ToolCallId,
+        /// The capability id that produced it.
+        call: String,
+        /// Its output.
+        body: Untrusted<String>,
+        /// Its delimiter nonce (drawn at its first render, H1i).
+        nonce: RenderNonce,
+    },
+    /// Native protocol: the harness's own answer to a [`Message::ToolCall`]
+    /// that produced no tool output (a policy denial, a provider failure).
+    ToolNotice {
+        /// The id of the call it answers.
+        id: ToolCallId,
+        /// The harness text.
+        text: HarnessText,
+    },
+}
+
+/// The id of a past tool call in the native protocol's history (design row
+/// H1h). Harness-made from the loop step, which runs at most one action, so
+/// no model or server text ever enters an id (the ids a server puts in its
+/// replies are never read), and a replay that rebuilds the same turns
+/// rebuilds the same ids and the same context digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ToolCallId(u64);
+
+impl ToolCallId {
+    /// The id of the call made at loop step `step`.
+    pub fn for_step(step: u64) -> Self {
+        Self(step)
+    }
+
+    /// The loop step.
+    pub fn step(self) -> u64 {
+        self.0
+    }
+
+    /// The wire form: `call` and the step zero-padded to five digits
+    /// (`call00007`). That is nine ASCII letters and digits, a shape strict
+    /// servers accept (some chat templates require exactly nine
+    /// alphanumerics; UNVERIFIED beyond the servers the harness was run
+    /// against), and it stays unique past step 99 999, only longer.
+    pub fn wire(self) -> String {
+        format!("call{:05}", self.0)
+    }
 }
 
 /// A tool as offered to the model: its manifest id, a harness-authored
@@ -111,20 +190,20 @@ impl ToolSpec {
     }
 }
 
-/// The per-turn delimiter nonce (§2.3). It lives in `harness-core` (as
-/// [`harness_core::Nonce`]) because it is one of the few values the journal
-/// may carry as trusted text (NF-C: `TrustedName` is sealed to core types).
+/// An observation's delimiter nonce (§2.3; one per observation since H1i).
+/// It lives in `harness-core` (as [`harness_core::Nonce`]) because it is
+/// one of the few values the journal may carry as trusted text (NF-C:
+/// `TrustedName` is sealed to core types).
 pub use harness_core::Nonce as RenderNonce;
 
-/// One model request.
+/// One model request. Its observations carry their own nonces (H1i); the
+/// request has none of its own.
 #[derive(Debug)]
 pub struct ModelRequest {
     /// The context, in order.
     pub messages: Vec<Message>,
     /// The active tools.
     pub tools: Vec<ToolSpec>,
-    /// This turn's delimiter nonce.
-    pub nonce: RenderNonce,
 }
 
 /// A tool call as the server returned it (native protocol). Untrusted.
@@ -184,6 +263,15 @@ pub struct Completion {
     /// HTTP statuses of failed attempts retried before this success (§3.2:
     /// each attempt is recorded).
     pub retried: Vec<u16>,
+    /// What the server reported about its prompt cache and its timings for
+    /// this reply (design row H1i), as compact JSON text: the numeric
+    /// entries of OpenAI-style `usage.prompt_tokens_details` (such as
+    /// `cached_tokens`) and of llama.cpp's `timings` (such as `cache_n`,
+    /// `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`), under those
+    /// names. Server claims: journaled as untrusted data, for the
+    /// prefill/generation split of RQ2, and never used for a decision.
+    /// `None` when the server reported neither.
+    pub server_stats: Option<Untrusted<String>>,
 }
 
 /// Why a transport attempt did not produce a reply.

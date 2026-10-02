@@ -440,6 +440,14 @@ while IFS= read -r f; do
         crates/harness-core/src/lib.rs|crates/harness-model-core/src/protocol.rs|crates/harness-run/src/driver.rs) ;;
         *) scan "Meter construction" "(^|$nb)Meter::new(_resumed)? ?\(" "$tmpdir/norm" "$f" ;;
     esac
+    # P-38b: a live run MEASURES the child's spend from the child meter
+    # (ChildSpend::measured); the journal re-feed constructor
+    # ChildSpend::recorded is confined to the run driver and the replay
+    # like Meter::new_resumed.
+    case "$f" in
+        crates/harness-core/src/lib.rs|crates/harness-run/src/driver.rs|crates/harness-run/src/driver/*|crates/harness-run/src/replay/*) ;;
+        *) scan "ChildSpend::recorded outside the driver and replay" "(^|$nb)ChildSpend::recorded($nb|\$)" "$tmpdir/norm" "$f" ;;
+    esac
 done <"$tmpdir/all-files"
 if [ -s "$tmpdir/hits" ]; then
     fail "provenance or construction-site fence:

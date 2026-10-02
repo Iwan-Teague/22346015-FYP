@@ -149,8 +149,10 @@ pub(crate) fn recorded(
             EventKind::EditApplied => {
                 // The loop writes one for a verified edit, right before its
                 // result: an edit intent's, with the path as an untrusted
-                // payload, `before` only when the file existed, and the
-                // after and tree digests.
+                // payload, `before` only when the file existed, the after
+                // and tree digests, and the pre/after images' blob digests
+                // (P-22: `before_blob` only when there was a before; the
+                // after-blob is what a `/diff` shows).
                 let seq = r
                     .body
                     .get("intent_seq")
@@ -160,7 +162,13 @@ pub(crate) fn recorded(
                 let shape = r.body.keys().all(|k| {
                     matches!(
                         k.as_str(),
-                        "intent_seq" | "path" | "before" | "after" | "workspace_tree"
+                        "intent_seq"
+                            | "path"
+                            | "before"
+                            | "after"
+                            | "before_blob"
+                            | "after_blob"
+                            | "workspace_tree"
                     )
                 });
                 if !is_edit(cap) || !shape || !r.body.contains_key("path") {
@@ -170,10 +178,42 @@ pub(crate) fn recorded(
                     None => None,
                     Some(_) => Some(digest_at(&r.body, "before").ok_or_else(bad)?),
                 };
+                // A cited image (P-22) is the blob its digest names, and the
+                // bytes must hash to that digest: a blob's name is its
+                // content's SHA-256, so a tampered or missing blob is a
+                // shape the loop does not write.
+                let image = |digest: Digest| -> Option<harness_tools::Image> {
+                    let bytes = blobs.get(&digest.to_string())?;
+                    (harness_core::sha256(&bytes) == digest).then_some(harness_tools::Image {
+                        sha256: digest,
+                        bytes,
+                    })
+                };
+                let cited = |key: &str| digest_at(&r.body, key).ok_or_else(bad);
+                // `before_blob` is present exactly when `before` is, and
+                // names the same bytes the `before` digest is of.
+                let before_image = match r.body.get("before_blob") {
+                    None if before.is_some() => return Err(bad()),
+                    None => None,
+                    Some(_) => {
+                        let d = cited("before_blob")?;
+                        if before != Some(d) {
+                            return Err(bad());
+                        }
+                        Some(image(d).ok_or_else(bad)?)
+                    }
+                };
+                let after = cited("after")?;
+                let after_blob = cited("after_blob")?;
+                if after != after_blob {
+                    return Err(bad());
+                }
                 let e = RecordedEdit {
                     before,
-                    after: digest_at(&r.body, "after").ok_or_else(bad)?,
-                    tree: digest_at(&r.body, "workspace_tree").ok_or_else(bad)?,
+                    after,
+                    tree: cited("workspace_tree")?,
+                    before_image,
+                    after_image: image(after_blob).ok_or_else(bad)?,
                 };
                 if edits.insert(seq, (r.seq, e)).is_some() {
                     return Err(bad());

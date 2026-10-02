@@ -12,6 +12,13 @@
 //! allowlist, adding one is explicit). Everything found is printed to the
 //! user before the run starts (`will allow: cargo -> /path`).
 //!
+//! P-51: each resolved program's dynamic-library dependencies are
+//! resolved too (`exec_libs`, from the program's own load commands), and
+//! their directories join the read-only roots — shown in the same line
+//! (`… ; libs: …`), part of the spec the header records. A dependency
+//! outside every allowed prefix refuses the resolution, so a run cannot
+//! start half-allowed.
+//!
 //! Fail-closed: a PATH entry that is not absolute is refused (a relative
 //! entry would resolve against a moving working directory), the found file
 //! must canonicalise to an existing regular file, a preset must name a
@@ -28,6 +35,7 @@ use std::path::{Path, PathBuf};
 use harness_run::{plain_name, ExecLimits, ExecProgram, ExecSpec, MAX_PROGRAMS};
 
 use crate::config;
+use crate::exec_libs;
 use crate::report::{exit, refused, Outcome};
 use crate::Cx;
 
@@ -105,9 +113,22 @@ pub(crate) fn request(
     }
 }
 
+/// What one resolution produced: the exec section (every program pinned,
+/// the read-only roots the preset names plus the P-51 library roots) and,
+/// per program, the library directories the dependency resolution added,
+/// for the line shown to the user before the run starts.
+#[derive(Debug)]
+pub(crate) struct Resolved {
+    /// The exec section, in the task file's own form.
+    pub(crate) spec: ExecSpec,
+    /// Per program (in `spec.programs`' order): the directories of the
+    /// program's dynamic libraries that were added to `read_only`.
+    pub(crate) libs: Vec<(String, Vec<PathBuf>)>,
+}
+
 /// The exec section these flags describe, resolved now (see the module
 /// text). Every refusal names the flag and the why.
-pub(crate) fn resolve(req: &ExecRequest, path_var: &OsStr) -> Result<ExecSpec, String> {
+pub(crate) fn resolve(req: &ExecRequest, path_var: &OsStr) -> Result<Resolved, String> {
     let mut names: Vec<String> = Vec::new();
     for n in &req.programs {
         if n.is_empty() {
@@ -144,7 +165,7 @@ pub(crate) fn resolve(req: &ExecRequest, path_var: &OsStr) -> Result<ExecSpec, S
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (read_only, env, limits) = match &req.preset {
+    let (mut read_only, env, limits) = match &req.preset {
         None => (Vec::new(), Vec::new(), ExecLimits::default()),
         Some(pn) => {
             let p = preset(pn).ok_or_else(|| {
@@ -169,12 +190,58 @@ pub(crate) fn resolve(req: &ExecRequest, path_var: &OsStr) -> Result<ExecSpec, S
             )
         }
     };
-    Ok(ExecSpec {
-        programs,
-        read_only,
-        env,
-        limits,
+    // P-51: every program's dynamic libraries become read-only roots too,
+    // in the trust base, before anything runs. The preset's roots are
+    // passed in as already-allowed prefixes, so a library inside the
+    // toolchain adds no new root. A dependency outside every allowed
+    // prefix is a refusal: the user adds it, by naming the directory in a
+    // task file's own exec section.
+    let home = exec_libs::home_dir();
+    let mut libs = Vec::new();
+    for p in &programs {
+        let allowed = exec_libs::Allowed {
+            roots: &read_only,
+            home: home.as_deref(),
+        };
+        let lr = exec_libs::resolve(&p.path, &allowed)
+            .map_err(|e| format!("--allow-exec: {}: {e}", p.name))?;
+        for r in &lr.roots {
+            if !read_only.contains(r) {
+                read_only.push(r.clone());
+            }
+        }
+        libs.push((p.name.clone(), lr.roots));
+    }
+    Ok(Resolved {
+        spec: ExecSpec {
+            programs,
+            read_only,
+            env,
+            limits,
+        },
+        libs,
     })
+}
+
+/// The exec section the flags describe, for callers outside the crate
+/// (the integration tests recompute the header's exec input, P-51): the
+/// names as `--allow-exec` would take them, the preset, `--shell`, and
+/// the PATH to resolve against.
+pub fn resolve_names(
+    programs: &[&str],
+    preset: Option<&str>,
+    shell: bool,
+    path_var: &OsStr,
+) -> Result<ExecSpec, String> {
+    resolve(
+        &ExecRequest {
+            programs: programs.iter().map(|s| (*s).to_owned()).collect(),
+            preset: preset.map(str::to_owned),
+            shell,
+        },
+        path_var,
+    )
+    .map(|r| r.spec)
 }
 
 /// The exec section this invocation's flags describe, or `None` when it
@@ -209,17 +276,32 @@ pub(crate) fn section(
         ));
     };
     let spec = resolve(&req, &path).map_err(bad)?;
-    for p in &spec.programs {
-        note!(cx, "will allow: {} -> {}", p.name, p.path.display());
+    for (p, (_, libs)) in spec.spec.programs.iter().zip(&spec.libs) {
+        if libs.is_empty() {
+            note!(cx, "will allow: {} -> {}", p.name, p.path.display());
+        } else {
+            note!(
+                cx,
+                "will allow: {} -> {}; libs: {}",
+                p.name,
+                p.path.display(),
+                libs.iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     if let Some(pn) = &req.preset {
         let roots = spec
+            .spec
             .read_only
             .iter()
             .map(|r| r.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         let env = spec
+            .spec
             .env
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -233,7 +315,7 @@ pub(crate) fn section(
             "--shell: sh is on the allowlist; the header stamps shell_enabled"
         );
     }
-    Ok(Some(spec))
+    Ok(Some(spec.spec))
 }
 
 /// First match of `name` on `path_var`, pinned to its real path: the entry
@@ -299,7 +381,7 @@ fn candidate_names(dir: &Path, name: &str) -> Vec<PathBuf> {
 /// binary's directory, or the toolchain root above it when the binary sits
 /// in a `bin` directory (`…/toolchains/1.88/bin/cargo` pins `…/toolchains/1.88`).
 /// The filesystem root is never a read-only root.
-fn toolchain_root(bin: &Path) -> Result<PathBuf, String> {
+pub(crate) fn toolchain_root(bin: &Path) -> Result<PathBuf, String> {
     let dir = bin
         .parent()
         .ok_or_else(|| format!("--preset: {} has no parent directory", bin.display()))?;
@@ -370,7 +452,8 @@ mod tests {
             &req(&["mytool"], None, false),
             &path_var(&[d.clone(), other.clone()]),
         )
-        .unwrap();
+        .unwrap()
+        .spec;
         assert_eq!(
             spec.programs,
             vec![ExecProgram {
@@ -426,7 +509,8 @@ mod tests {
             &req(&["cargo"], Some("rust"), false),
             &path_var(std::slice::from_ref(&toolchain)),
         )
-        .unwrap();
+        .unwrap()
+        .spec;
         assert_eq!(spec.programs[0].path, cargo);
         // The toolchain root above the binary's `bin` directory, as the
         // filesystem really names it.
@@ -477,7 +561,8 @@ mod tests {
             &req(&["cargo"], Some("rust"), false),
             &path_var(std::slice::from_ref(&toolchain)),
         )
-        .unwrap();
+        .unwrap()
+        .spec;
         assert_eq!(got, want);
         // `--shell` appends `sh`, by name, resolved on the same PATH (the
         // system one here; only the name and absoluteness are asserted).
@@ -490,12 +575,63 @@ mod tests {
             ])
             .unwrap(),
         )
-        .unwrap();
+        .unwrap()
+        .spec;
         assert_eq!(with_shell.programs.len(), 2);
         assert_eq!(with_shell.programs[1].name, "sh");
         assert!(with_shell.programs[1].path.is_absolute());
         assert!(with_shell.shell_enabled());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// P-51, on this machine's own cargo: the `rust` preset's roots now
+    /// include the directories of cargo's dynamic libraries, every one of
+    /// them under an allowed prefix. Skipped, with the reason, where this
+    /// machine has no cargo on its PATH, cargo is not a Mach-O, or it
+    /// links only system libraries (nothing for the preset to add).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preset_rust_includes_cargo_dylib_roots() {
+        let Some(path) = std::env::var_os("PATH") else {
+            eprintln!("skip: PATH is not set");
+            return;
+        };
+        let cargo = match look_up("cargo", &path) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("skip: no cargo on PATH");
+                return;
+            }
+        };
+        let bytes = std::fs::read(&cargo).unwrap();
+        if !harness_core::objfile::is_object(&bytes) {
+            eprintln!("skip: cargo is not a Mach-O on this machine");
+            return;
+        }
+        let resolved = resolve(&req(&["cargo"], Some("rust"), false), &path).unwrap();
+        let spec = resolved.spec;
+        // The preset's own root is first (the toolchain above the binary).
+        let (toolchain, lib_roots) = spec.read_only.split_first().unwrap();
+        assert_eq!(toolchain, &toolchain_root(&cargo).unwrap());
+        if lib_roots.is_empty() {
+            eprintln!("skip: cargo links only system libraries here");
+            return;
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        for r in lib_roots {
+            assert!(r.is_dir(), "{r:?} is not a directory");
+            assert!(
+                r.starts_with("/opt/homebrew")
+                    || r.starts_with("/usr/local")
+                    || r.starts_with("/Library/Developer")
+                    || home.as_ref().is_some_and(|h| r.starts_with(h))
+                    || r.starts_with(toolchain),
+                "{r:?} is outside every allowed prefix"
+            );
+        }
+        // The same directories are in the line shown to the user.
+        let dirs = resolved.libs.iter().flat_map(|(_, ls)| ls.iter()).count();
+        assert_eq!(dirs, lib_roots.len());
     }
 
     #[test]

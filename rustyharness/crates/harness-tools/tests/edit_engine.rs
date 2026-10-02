@@ -19,7 +19,7 @@ use harness_core::sha256;
 use harness_policy::PathRefused;
 use harness_tools::edit::{
     EditEngine, EditError, ReadLog, ReplaceReq, StaleRead, WriteReq, EDIT_MAX_BYTES,
-    WRITE_OVERWRITE_MAX_LINES,
+    PRE_IMAGE_MAX_BYTES, WRITE_OVERWRITE_MAX_LINES,
 };
 
 fn ws(name: &str) -> PathBuf {
@@ -328,17 +328,19 @@ fn overwrites_are_capped_at_400_lines() {
 #[test]
 fn oversize_and_non_utf8_files_are_refused() {
     let (d, e) = engine("bounds");
-    // Over the byte cap by one: refused without a read.
+    // Over the pre-image cap (P-22) by one: refused without a read —
+    // the tighter bound now, since the pre-image store cannot keep
+    // more than 2 MiB of prior bytes.
     file(
         &d.join("big.bin"),
-        "x".repeat(usize::try_from(EDIT_MAX_BYTES).unwrap() + 1),
+        "x".repeat(usize::try_from(PRE_IMAGE_MAX_BYTES).unwrap() + 1),
     );
     let reads = read_of(&d, "big.bin");
     match e.replace(&rep("big.bin", "x", "y"), &reads) {
-        Err(EditError::TooLarge {
+        Err(EditError::PreImageTooLarge {
             len,
-            cap: EDIT_MAX_BYTES,
-        }) => assert_eq!(len, EDIT_MAX_BYTES + 1),
+            cap: PRE_IMAGE_MAX_BYTES,
+        }) => assert_eq!(len, PRE_IMAGE_MAX_BYTES + 1),
         other => panic!("wrong result: {other:?}"),
     }
     // A write body over the cap is refused too.

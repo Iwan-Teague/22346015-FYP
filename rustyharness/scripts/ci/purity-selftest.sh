@@ -525,6 +525,21 @@ expect_refusal "a Meter built in the run crate outside driver.rs" "Meter constru
 fresh
 plant crates/harness-tools/src/zz_plant.rs 'pub fn zz(l: harness_core::MeterLimits, c: Box<dyn harness_core::MonoClock>) -> harness_core::Meter { harness_core::Meter::new_resumed(l, None, c, std::time::Duration::ZERO) }\n'
 expect_refusal "a resumed Meter built outside the driver" "Meter construction"
+# P-38b: a live run measures the child's spend from the child meter; the
+# journal re-feed constructor ChildSpend::recorded is confined to the run
+# driver and the replay, like Meter::new_resumed.
+child_spend_recorded_outside_driver_refused() {
+    fresh
+    plant crates/harness-tools/src/zz_plant.rs 'pub fn zz() -> harness_core::ChildSpend { harness_core::ChildSpend::recorded(1, 2, 3, false, std::time::Duration::ZERO) }\n'
+    expect_refusal "child_spend_recorded_outside_driver_refused (another crate)" "ChildSpend::recorded"
+    fresh
+    plant crates/harness-run/tests/zz_plant.rs 'pub fn zz() -> harness_core::ChildSpend { harness_core::ChildSpend::recorded(1, 2, 3, false, std::time::Duration::ZERO) }\n'
+    expect_refusal "child_spend_recorded_outside_driver_refused (run crate, outside driver and replay)" "ChildSpend::recorded"
+    fresh
+    plant crates/harness-run/src/session.rs 'fn zz() { let _ = harness_core::ChildSpend::recorded(1, 2, 3, false, std::time::Duration::ZERO); }\n'
+    expect_refusal "child_spend_recorded_outside_driver_refused (run crate source outside driver and replay)" "ChildSpend::recorded"
+}
+child_spend_recorded_outside_driver_refused
 
 # H1e-1 review NF-B: literals must not hide code from the code-only scans.
 n3b_case() {

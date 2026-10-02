@@ -33,19 +33,23 @@ pub mod outline;
 pub mod protected;
 pub mod provider;
 pub mod registry;
+pub mod restore;
 pub mod search;
 pub mod todo;
 // The pure glob matcher (H2e, P-08) lives in `harness-core`; re-exported so
 // `crate::glob::Glob` paths and the public `harness_tools::glob` keep working.
 pub use builtin::{workspace_tree, ReadTools, WorkspaceTree};
-pub use edit::{EditEngine, EditTools, MultiReq, ReadLog, Replacement, StaleRead};
+pub use edit::{
+    EditEngine, EditTools, MultiReq, ReadLog, Replacement, StaleRead, PRE_IMAGE_MAX_BYTES,
+};
 pub use exec::{
     plain_name, ExecLimits, ExecProgram, ExecSetupError, ExecSpec, ExecTools, Pinned, MAX_PROGRAMS,
 };
 pub use harness_core::glob;
 pub use outline::OUTLINE_MAX_ENTRIES;
 pub use provider::{
-    EditRecord, ExecCleanup, ExecEnd, ExecRecord, InvokeCtx, ReadRecord, RefusalKind, ToolError,
-    ToolProvider, ToolResult, ToolStatus,
+    EditRecord, ExecCleanup, ExecEnd, ExecRecord, Image, InvokeCtx, ReadRecord, RefusalKind,
+    ToolError, ToolProvider, ToolResult, ToolStatus,
 };
+pub use restore::{restore_file, RestoreError};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};

@@ -13,7 +13,7 @@ use harness_manifest::Capability;
 use harness_policy::EXEC_ID;
 use harness_sandbox::Confinement;
 use harness_tools::protected::overlay_dirs;
-use harness_tools::{ExecCleanup, ExecEnd, ExecRecord, ExecTools, ToolStatus};
+use harness_tools::{ExecCleanup, ExecEnd, ExecRecord, ExecTools, Image, ToolStatus};
 use serde_json::Value;
 
 use super::plan::Prepared;
@@ -123,6 +123,8 @@ impl RecordedResult {
                 path: harness_policy::workspace_path(p).map_err(|_| unfit())?,
                 before: e.before,
                 after: e.after,
+                before_image: e.before_image,
+                after_image: e.after_image,
             }),
             (None, _) => None,
             _ => return Err(unfit()),
@@ -144,13 +146,19 @@ impl RecordedResult {
     }
 }
 
-/// What an `EditApplied` record says an edit did (the path is the call's).
-#[derive(Debug, Clone, Copy)]
+/// What an `EditApplied` record says an edit did (the path is the call's),
+/// with the images its record cites, read back from the blob store (P-22).
+#[derive(Debug, Clone)]
 pub(crate) struct RecordedEdit {
     pub(crate) before: Option<Digest>,
     pub(crate) after: Digest,
     /// The workspace tree digest after the edit.
     pub(crate) tree: Digest,
+    /// The file's bytes before the edit, from the record's `before_blob`
+    /// (`None` for a create, which keeps no pre-image).
+    pub(crate) before_image: Option<Image>,
+    /// The file's bytes after the edit, from the record's `after_blob`.
+    pub(crate) after_image: Image,
 }
 
 /// A command's journal record (H2d): how it ended (the exit code or the

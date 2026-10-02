@@ -63,7 +63,9 @@ mod sample;
 pub mod session;
 
 pub use approve::{ApprovalAnswer, Approver, ApproverKind};
-pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
+pub use driver::{
+    run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec, WorkspaceModeRecord,
+};
 pub use harness_tools::{plain_name, ExecLimits, ExecProgram, ExecSpec, MAX_PROGRAMS};
 pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
 pub use replay::{

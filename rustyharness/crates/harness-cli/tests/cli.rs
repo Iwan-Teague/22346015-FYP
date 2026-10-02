@@ -808,6 +808,117 @@ fn shell_flag_sets_shell_enabled_in_header() {
     );
 }
 
+/// P-51: `--allow-exec cargo --preset rust` derives the read-only roots of
+/// cargo's dynamic libraries, shows them before the run (`… ; libs: …`),
+/// and they are part of the exec spec the journal header records: the
+/// recorded digest is the digest of the spec WITH them, and the audit
+/// matches only when the replay resolves the same libraries. macOS only,
+/// like every run that starts with a command runner here (INV-6); skipped
+/// with a reason where this machine's cargo gives nothing to resolve
+/// (not a Mach-O, or it links only system libraries).
+#[cfg(target_os = "macos")]
+#[test]
+fn header_records_lib_roots() {
+    let Some(path) = std::env::var_os("PATH") else {
+        eprintln!("skip: PATH is not set");
+        return;
+    };
+    let Ok(spec) = harness_cli::resolve_names(&["cargo"], Some("rust"), false, &path) else {
+        eprintln!("skip: no cargo on PATH");
+        return;
+    };
+    let Some((_, lib_roots)) = spec.read_only.split_first() else {
+        eprintln!("skip: no cargo on PATH");
+        return;
+    };
+    if lib_roots.is_empty() {
+        eprintln!("skip: cargo links only system libraries here (or is not a Mach-O)");
+        return;
+    }
+    let fx = fixture("lib-roots-header");
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"Say done.","grants":["harness.task.submit","harness.exec.run"]}"#,
+    )
+    .unwrap();
+    let m = mock(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let flags = ["--allow-exec", "cargo", "--preset", "rust"];
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&flags);
+    let o = cli(&args, true, &fx.marker);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "{err}");
+    // Shown before the run started: the program, then its libraries.
+    assert!(
+        err.contains("will allow: cargo -> ") && err.contains("; libs: "),
+        "{err}"
+    );
+    let id = run_id(&o);
+    let jp = fx
+        .state
+        .join("runs")
+        .join(&id)
+        .join("attempt-1/journal.jsonl");
+    let first = std::fs::read_to_string(jp)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let h: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(h["kind"], "RunStarted");
+    // The header's exec input is the digest of the spec WITH the library
+    // roots (the task text and program are the same, so the roots are the
+    // only thing that can make this digest).
+    assert_eq!(
+        h["body"]["exec"]["spec"],
+        serde_json::json!(spec.digest().to_string()),
+        "{first}"
+    );
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    let rp = |with_flags: bool| {
+        let mut a = vec![
+            "replay",
+            "--run",
+            &id,
+            "--task",
+            fx.task.to_str().unwrap(),
+            "--state-root",
+            fx.state.to_str().unwrap(),
+            "--profile",
+            fx.profile.to_str().unwrap(),
+            "--anchor",
+            &head,
+        ];
+        if with_flags {
+            a.extend_from_slice(&flags);
+        }
+        cli(&a, true, &fx.marker)
+    };
+    // The library resolution is a header input: without the flags the
+    // audit diverges, with them it is clean.
+    let without = rp(false);
+    assert!(
+        String::from_utf8_lossy(&without.stderr).contains("DIVERGED"),
+        "{}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    let with = rp(true);
+    assert!(
+        String::from_utf8_lossy(&with.stderr).contains(REPLAY_MATCHED),
+        "{}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+}
+
 /// INV-6 through the CLI: a task that executes, on a host whose
 /// confinement refuses, exits 3 with an Indeterminate report and writes
 /// nothing; the model server is checked but never asked for a step.

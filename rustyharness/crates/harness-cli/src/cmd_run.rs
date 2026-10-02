@@ -86,9 +86,19 @@ fn try_run(
         }
     };
     let inp = inputs(cx, o, cfg)?;
-    // The workspace (P-07): the flag, else the current directory. A cwd
-    // that cannot be determined is fail-closed (Indeterminate), not a
-    // silent other directory.
+    // The workspace mode (P-52): in-place (the default, unchanged), or a
+    // scratch copy the run sees instead of the original. `worktree` is
+    // refused at the option parser (INV-23: this build has no way to run
+    // `git worktree add`). A copy failure refuses before anything runs.
+    let mode = match crate::workspace_mode::parse_mode(o) {
+        Ok(m) => m,
+        Err(e) => {
+            note!(cx, "{e}\n{}", crate::args::USAGE);
+            return Err(refused(exit::USAGE, e));
+        }
+    }; // The workspace (P-07): the flag, else the current directory. A cwd
+       // that cannot be determined is fail-closed (Indeterminate), not a
+       // silent other directory.
     let workspace: std::borrow::Cow<'_, str> = match crate::config::value(o, cfg, "workspace") {
         Some(w) => std::borrow::Cow::Borrowed(w),
         None => match std::env::current_dir() {
@@ -133,6 +143,18 @@ fn try_run(
                 refused(exit::UNREADABLE_INPUT, format!("endpoint refused: {e}"))
             })?;
     let probe = cx.probe;
+    // The scratch copy (P-52) before anything else talks to the host or
+    // the server; `mut` so the header record can be set on the config.
+    let mut inp = inp;
+    let prep = match crate::workspace_mode::prepare(cx, &mode, &workspace, &state_root) {
+        Ok(p) => p,
+        Err(r) => {
+            note!(cx, "{}", r.why);
+            return Err(refused(r.code, r.why));
+        }
+    };
+    inp.config.workspace_mode = prep.record;
+    let workspace: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(prep.workspace);
     let config = &inp.config;
     // The state root's locality first (§2.8): a run that cannot start does
     // not contact the model server. The run checks it again itself.
@@ -253,6 +275,12 @@ fn try_run(
             "every pre-submit check passing at the accepted submission",
             words,
         ));
+    }
+    // The scratch copy's manifest (P-52), published into the run
+    // directory like the bundle: `apply` binds it to the header's
+    // workspace-mode record. Best effort, never outcome-changing.
+    if let Some(s) = &prep.scratch {
+        crate::workspace_mode::publish_manifest(cx, &report.run_dir, s, &mut findings);
     }
     // The run bundle (P-14, OD-5(d)): copy the resolved inputs into
     // `runs/<id>/inputs/` so `replay --run`/`resume --run` need no other

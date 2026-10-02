@@ -64,6 +64,7 @@ use harness_tools::builtin::RootRefused;
 use harness_tools::{ExecSetupError, ExecSpec};
 
 pub(crate) use approvals::Approvals;
+pub use header::WorkspaceModeRecord;
 pub(crate) use header::{
     builtin_manifest_sha256, header, limits_fields, protected_task_digest, terse_table_sha256,
     ExecHeader, HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
@@ -120,6 +121,11 @@ pub struct RunConfig {
     /// Longest an approver may take to answer (§2.4: 15 min; past it the
     /// request is a deny, §5.3). Not charged to the wall budget.
     pub approval_timeout: Duration,
+    /// The workspace-mode record (P-52): set when the CLI, as trust base,
+    /// copied the workspace to a scratch directory before the run; `None`
+    /// in-place (the default, unchanged). Recorded in the journal header,
+    /// never compared by an audit (see [`WorkspaceModeRecord`]).
+    pub workspace_mode: Option<WorkspaceModeRecord>,
 }
 
 impl RunConfig {
@@ -139,6 +145,7 @@ impl RunConfig {
             exec_call_timeout: Duration::from_secs(120),
             facts_timeout: Duration::from_secs(120),
             approval_timeout: Duration::from_secs(15 * 60),
+            workspace_mode: None,
         }
     }
 }
@@ -337,6 +344,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         approver_present: r.approver.is_some(),
         session: None,
         exec: exec_header,
+        workspace_mode: r.config.workspace_mode.as_ref(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,

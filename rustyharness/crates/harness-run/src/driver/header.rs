@@ -68,6 +68,8 @@ pub(crate) struct HeaderInputs<'a> {
     pub(crate) session: Option<crate::session::TurnLimits>,
     /// The command runner's header fields, with an exec grant (H2d).
     pub(crate) exec: Option<ExecHeader>,
+    /// The workspace-mode record (P-52); `None` in-place (no field).
+    pub(crate) workspace_mode: Option<&'a WorkspaceModeRecord>,
 }
 
 /// The sandbox a run's commands ran under, as its witness names it (H2d):
@@ -133,6 +135,68 @@ impl SandboxRecord {
             ("processes", Trusted::Text(self.processes)),
             ("probe", Trusted::Digest(self.probe)),
         ])
+    }
+}
+
+/// The workspace-mode record (P-52): what the CLI, as trust base, did to
+/// the workspace before the run. The journal records the copy manifest's
+/// digest and each file's content digest, never a host path (`Trusted`
+/// text is compile-time only): the paths travel in the manifest the CLI
+/// writes beside the copy, which this digest binds. Recorded only for a
+/// scratch copy; an in-place run's header has no such field, like a
+/// journal from before P-52. Not a header input an audit compares: it
+/// records host files the replay cannot re-measure — an audit and a
+/// resume re-state the recorded value verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceModeRecord {
+    /// The mode, `scratch` (the only one this build writes).
+    pub mode: &'static str,
+    /// The SHA-256 of the copy manifest's exact bytes.
+    pub manifest: Digest,
+    /// Each file's content digest, in the manifest's order (by path).
+    pub files: Vec<Digest>,
+}
+
+impl WorkspaceModeRecord {
+    /// The record of a scratch copy (P-52).
+    pub fn scratch(manifest: Digest, files: Vec<Digest>) -> Self {
+        Self {
+            mode: "scratch",
+            manifest,
+            files,
+        }
+    }
+
+    pub(crate) fn trusted(&self) -> Trusted {
+        Trusted::Obj(vec![
+            ("mode", Trusted::Text(self.mode)),
+            ("manifest", Trusted::Digest(self.manifest)),
+            (
+                "files",
+                Trusted::List(self.files.iter().map(|d| Trusted::Digest(*d)).collect()),
+            ),
+        ])
+    }
+
+    /// A recorded header's `workspace_mode` object, when it is one this
+    /// build writes (an audit re-states it; like [`SandboxRecord::parse`]).
+    pub(crate) fn parse(v: &Value) -> Option<Self> {
+        let o = v.as_object()?;
+        if o.len() != 3 || o.get("mode")?.as_str()? != "scratch" {
+            return None;
+        }
+        let manifest = o.get("manifest")?.as_str()?.parse().ok()?;
+        let files = o
+            .get("files")?
+            .as_array()?
+            .iter()
+            .map(|f| f.as_str()?.parse().ok())
+            .collect::<Option<Vec<Digest>>>()?;
+        Some(Self {
+            mode: "scratch",
+            manifest,
+            files,
+        })
     }
 }
 
@@ -412,6 +476,12 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
             ));
         }
         hd = hd.field("resumed_from", Trusted::Obj(from));
+    }
+    // The workspace mode (P-52): present only for a scratch copy, so
+    // older journals and in-place runs read as before. Not a header
+    // input: an audit or a resume re-states the recorded value.
+    if let Some(m) = &h.workspace_mode {
+        hd = hd.field("workspace_mode", m.trusted());
     }
     // §3.5: what the server claims, as untrusted payloads, labelled.
     let c = &h.identity.claimed;

@@ -29,6 +29,7 @@ pub mod display;
 pub mod environment;
 pub mod glob;
 pub mod html;
+pub mod objfile;
 pub mod strict_json;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -786,6 +787,207 @@ impl Meter {
     pub fn above_80(&self, dim: BudgetDim) -> bool {
         let (spent, limit) = self.usage(dim);
         limit > 0 && u128::from(spent) * 5 >= u128::from(limit) * 4
+    }
+
+    /// Absorb a child run's spend (the P-38 note §5.2): the child's steps,
+    /// tokens, working wall and derived cost are charged HERE, once, after
+    /// the child commits, so the total model calls under one root run never
+    /// exceed the root's limits and delegation cannot buy budget (INV-D2).
+    /// Steps saturate and latch `Budget(Steps)` past the limit (by the
+    /// carve this can only follow an overshoot, never cause one); tokens
+    /// mark [`Meter::tokens_were_estimated`] when the child's were; cost is
+    /// derived from THIS meter's pricing; the renewal check is the same as
+    /// [`Meter::record_tokens`]. A meter that already latched stays latched.
+    pub fn absorb_child(&mut self, s: &ChildSpend) -> Result<(), StopCause> {
+        if let Some(cause) = self.latched() {
+            return Err(cause);
+        }
+        self.spent_steps = self.spent_steps.saturating_add(s.steps());
+        if self.spent_steps > self.limits.steps {
+            return Err(self.latch(Exhausted {
+                dimension: BudgetDim::Steps,
+                spent: u64::from(self.spent_steps),
+                limit: u64::from(self.limits.steps),
+            }));
+        }
+        let (input, output) = s.tokens();
+        self.tokens_input = self.tokens_input.saturating_add(input);
+        self.tokens_output = self.tokens_output.saturating_add(output);
+        self.tokens_estimated |= s.estimated();
+        if let Some(price) = self.pricing {
+            let cost = input
+                .saturating_mul(price.input_micros_per_token)
+                .saturating_add(output.saturating_mul(price.output_micros_per_token));
+            self.cost_micros = self.cost_micros.saturating_add(cost);
+        }
+        self.elapsed = self.elapsed.saturating_add(s.wall());
+        self.check_renewable_exhaustion()
+    }
+}
+
+/// The budgets carved for a child run (the P-38 note §5.1): always at most
+/// half of what the parent meter has left in each dimension, so delegation
+/// can never buy budget (INV-D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carve {
+    /// The child's step limit.
+    pub steps: u32,
+    /// The child's token limit (input + output).
+    pub tokens: u64,
+    /// The child's working-wall limit (it excludes its approval waits
+    /// exactly as the parent excludes its own).
+    pub wall: Duration,
+}
+
+/// Why a carve refused (the P-38 note §5.1): a dimension would fall below
+/// its minimum, so no child starts (the note's admission §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarveRefused {
+    /// The steps left would carve fewer than [`CHILD_STEPS_MIN`] after the
+    /// parent keeps its own.
+    Steps {
+        /// Steps the carve could give.
+        have: u32,
+        /// The minimum a child needs.
+        need: u32,
+    },
+    /// Half the tokens left is below `min_tokens` (the child profile's
+    /// context budget).
+    Tokens {
+        /// Tokens the carve could give.
+        have: u64,
+        /// The minimum a child needs.
+        need: u64,
+    },
+}
+
+impl fmt::Display for CarveRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CarveRefused::Steps { have, need } => {
+                write!(f, "only {have} carveable steps, a helper needs {need}")
+            }
+            CarveRefused::Tokens { have, need } => {
+                write!(f, "only {have} carveable tokens, a helper needs {need}")
+            }
+        }
+    }
+}
+
+/// Child steps when the parent can afford the default (the P-38 note §5.1,
+/// OQ-9).
+pub const CHILD_STEPS_DEFAULT: u32 = 15;
+/// Below this a helper cannot hold its tools, template and one observation;
+/// the carve refuses and no child starts.
+pub const CHILD_STEPS_MIN: u32 = 3;
+/// Child token cap (the P-38 note §5.1, OQ-9).
+pub const CHILD_TOKENS_MAX: u64 = 200_000;
+/// Child wall cap: ten minutes (the P-38 note §5.1, OQ-9).
+pub const CHILD_WALL_MAX: Duration = Duration::from_secs(600);
+
+/// The deterministic budget carve (the P-38 note §5.1). `steps_left` is
+/// read AFTER the delegate step's own [`Meter::charge_step`], so the `- 1`
+/// always leaves the parent at least one step to use the report with;
+/// `min_tokens` is the child profile's context budget. Wall never refuses
+/// (the note's §4): it is the one input an audit cannot recompute, so it
+/// must not gate admission; a child admitted with little wall left simply
+/// stops on its own wall budget. Pure: same inputs, same carve, always.
+pub fn carve(
+    steps_left: u32,
+    tokens_left: u64,
+    wall_left: Duration,
+    min_tokens: u64,
+) -> Result<Carve, CarveRefused> {
+    let steps = CHILD_STEPS_DEFAULT.min(steps_left.saturating_sub(1) / 2);
+    if steps < CHILD_STEPS_MIN {
+        return Err(CarveRefused::Steps {
+            have: steps,
+            need: CHILD_STEPS_MIN,
+        });
+    }
+    let tokens = CHILD_TOKENS_MAX.min(tokens_left / 2);
+    if tokens < min_tokens {
+        return Err(CarveRefused::Tokens {
+            have: tokens,
+            need: min_tokens,
+        });
+    }
+    let wall = CHILD_WALL_MAX.min(wall_left / 2);
+    Ok(Carve {
+        steps,
+        tokens,
+        wall,
+    })
+}
+
+/// A child run's spend (the P-38 note §5.2), absorbed into the parent
+/// [`Meter`] after the child commits. Spend is never asserted by a caller:
+/// it is measured from the child's own meter in a live run
+/// ([`ChildSpend::measured`]) or re-fed from the parent's journal in an
+/// audit or resume ([`ChildSpend::recorded`], confined by the purity gate
+/// to the run driver and the replay, like `Meter::new_resumed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildSpend {
+    steps: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    estimated: bool,
+    wall: Duration,
+}
+
+impl ChildSpend {
+    /// The child meter's own measured spend: the only constructor a live
+    /// run uses.
+    pub fn measured(child: &Meter) -> Self {
+        let (tokens_in, tokens_out) = child.tokens_spent();
+        Self {
+            steps: child.steps_spent(),
+            tokens_in,
+            tokens_out,
+            estimated: child.tokens_were_estimated(),
+            wall: child.elapsed(),
+        }
+    }
+
+    /// The spend as the parent journal recorded it, for the audit and
+    /// resume re-feed; the child's own audit vouches for the numbers (the
+    /// P-38 note §14).
+    pub fn recorded(
+        steps: u32,
+        tokens_in: u64,
+        tokens_out: u64,
+        estimated: bool,
+        wall: Duration,
+    ) -> Self {
+        Self {
+            steps,
+            tokens_in,
+            tokens_out,
+            estimated,
+            wall,
+        }
+    }
+
+    /// Steps the child took.
+    pub fn steps(&self) -> u32 {
+        self.steps
+    }
+
+    /// (input, output) tokens the child spent.
+    pub fn tokens(&self) -> (u64, u64) {
+        (self.tokens_in, self.tokens_out)
+    }
+
+    /// Whether any child token figure was an estimate rather than
+    /// server-reported.
+    pub fn estimated(&self) -> bool {
+        self.estimated
+    }
+
+    /// Working wall time the child charged (its approval waits excluded by
+    /// its own pause).
+    pub fn wall(&self) -> Duration {
+        self.wall
     }
 }
 
@@ -1956,5 +2158,294 @@ mod tests {
             d.observe(edit("src/lib.rs")),
             LoopSignal::Stop(LoopKind::EditChurn)
         );
+    }
+
+    // --- P-38b: the budget carve and child-spend absorption (note §5) ---
+
+    fn child_meter(clock: ManualClock) -> Meter {
+        Meter::new(
+            MeterLimits {
+                steps: 50,
+                tokens: u64::MAX,
+                wall: Duration::MAX,
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+            Box::new(clock),
+        )
+    }
+
+    // Note §5.1: exactly half of what is left per dimension, capped by the
+    // constants.
+    #[test]
+    fn carve_halves_remaining_and_caps() {
+        // Below every cap: half of each remainder.
+        let c = carve(11, 1_000, Duration::from_secs(100), 400).unwrap();
+        assert_eq!(c.steps, 5, "min(15, (11-1)/2)");
+        assert_eq!(c.tokens, 500, "min(200_000, 1_000/2)");
+        assert_eq!(c.wall, Duration::from_secs(50), "min(600 s, 100 s/2)");
+        // Above the caps: the constants bound the carve.
+        let capped = carve(500, 1_000_000, Duration::from_secs(10 * 60 * 60), 1).unwrap();
+        assert_eq!(capped.steps, CHILD_STEPS_DEFAULT);
+        assert_eq!(capped.tokens, CHILD_TOKENS_MAX);
+        assert_eq!(capped.wall, CHILD_WALL_MAX);
+    }
+
+    // Note §5.1: the numerator is steps_left - 1, so the parent always
+    // keeps its own step plus half of what it gave away.
+    #[test]
+    fn carve_keeps_one_parent_step() {
+        let c = carve(8, u64::MAX, Duration::MAX, 1).unwrap();
+        assert_eq!(c.steps, 3, "(8-1)/2, not 8/2 = 4");
+        // The smallest carveable remainder: 2*CHILD_STEPS_MIN + 1 steps
+        // left, of which the parent keeps more than it gave.
+        let min = carve(2 * CHILD_STEPS_MIN + 1, u64::MAX, Duration::MAX, 1).unwrap();
+        assert_eq!(min.steps, CHILD_STEPS_MIN);
+        assert!(2 * CHILD_STEPS_MIN + 1 - min.steps >= 1);
+        // One step left: the parent keeps it and nothing is carveable.
+        assert_eq!(
+            carve(1, u64::MAX, Duration::MAX, 1),
+            Err(CarveRefused::Steps {
+                have: 0,
+                need: CHILD_STEPS_MIN
+            })
+        );
+    }
+
+    #[test]
+    fn carve_refuses_below_step_minimum() {
+        // (6-1)/2 = 2 < CHILD_STEPS_MIN: no child starts.
+        assert_eq!(
+            carve(6, u64::MAX, Duration::MAX, 1),
+            Err(CarveRefused::Steps {
+                have: 2,
+                need: CHILD_STEPS_MIN
+            })
+        );
+        // The boundary: (7-1)/2 = 3 is exactly the minimum.
+        assert!(carve(7, u64::MAX, Duration::MAX, 1).is_ok());
+    }
+
+    #[test]
+    fn carve_refuses_below_token_minimum() {
+        // min_tokens is the child profile's context budget: 1_199/2 = 599
+        // is too little; exactly 600 is enough.
+        assert_eq!(
+            carve(50, 1_199, Duration::MAX, 600),
+            Err(CarveRefused::Tokens {
+                have: 599,
+                need: 600
+            })
+        );
+        assert!(carve(50, 1_200, Duration::MAX, 600).is_ok());
+    }
+
+    // Note §4: wall is deliberately not an admission criterion (an audit
+    // cannot recompute it), so a zero remainder never refuses.
+    #[test]
+    fn carve_wall_never_refuses() {
+        let c = carve(50, u64::MAX, Duration::ZERO, 1).unwrap();
+        assert_eq!(
+            c.wall,
+            Duration::ZERO,
+            "zero wall carves zero, refuses nothing"
+        );
+        // Odd remainders round down at the nanosecond (Duration division);
+        // the cap holds.
+        assert_eq!(
+            carve(50, u64::MAX, Duration::from_secs(601), 1)
+                .unwrap()
+                .wall,
+            Duration::from_millis(300_500)
+        );
+        assert_eq!(
+            carve(50, u64::MAX, Duration::MAX, 1).unwrap().wall,
+            CHILD_WALL_MAX
+        );
+    }
+
+    // Pure: same inputs, same carve, no clock or randomness involved.
+    #[test]
+    fn carve_is_deterministic() {
+        let a = carve(40, 80_000, Duration::from_secs(1_234), 2_000);
+        let b = carve(40, 80_000, Duration::from_secs(1_234), 2_000);
+        assert_eq!(a, b);
+        assert_eq!(
+            a.unwrap(),
+            Carve {
+                steps: CHILD_STEPS_DEFAULT,
+                tokens: 40_000,
+                wall: CHILD_WALL_MAX,
+            }
+        );
+    }
+
+    // Note §5.2: the child's measured steps, tokens, wall and derived cost
+    // are charged to the parent meter once, after the child commits.
+    #[test]
+    fn absorb_child_charges_steps_tokens_wall_and_cost() {
+        let pricing = Pricing {
+            input_micros_per_token: 5,
+            output_micros_per_token: 7,
+        };
+        let mut parent = meter(
+            MeterLimits {
+                steps: 10,
+                tokens: 1_000,
+                wall: Duration::from_secs(60),
+                cost_micros: 10_000,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            Some(pricing),
+        );
+        parent.charge_step().unwrap(); // the delegate step itself
+        let clock = ManualClock::default();
+        let mut child = child_meter(clock.clone());
+        for _ in 0..3 {
+            child.charge_step().unwrap();
+        }
+        child
+            .record_tokens(
+                Some(TokenUsage {
+                    input: 40,
+                    output: 60,
+                }),
+                0,
+                0,
+            )
+            .unwrap();
+        clock.advance(Duration::from_secs(7));
+        child.tick_wall().unwrap();
+        let spend = ChildSpend::measured(&child);
+        parent.absorb_child(&spend).unwrap();
+        assert_eq!(parent.steps_spent(), 4, "the parent's step + the child's 3");
+        assert_eq!(parent.tokens_spent(), (40, 60));
+        assert_eq!(parent.elapsed(), Duration::from_secs(7));
+        assert_eq!(
+            parent.cost_spent(),
+            40 * 5 + 60 * 7,
+            "derived, not asserted"
+        );
+        assert!(!parent.tokens_were_estimated(), "the child's were reported");
+    }
+
+    // INV-D2/INV-14: an absorbed spend that passes a limit latches the SAME
+    // typed cause as any other charge, with meter-measured spend.
+    #[test]
+    fn absorb_child_latches_typed_cause() {
+        // Steps: the parent kept one step; the child's absorbed steps pass
+        // the limit.
+        let mut parent = meter(
+            MeterLimits {
+                steps: 5,
+                tokens: u64::MAX,
+                wall: Duration::MAX,
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        for _ in 0..4 {
+            parent.charge_step().unwrap();
+        }
+        assert_eq!(
+            parent.absorb_child(&ChildSpend::recorded(3, 0, 0, false, Duration::ZERO)),
+            Err(StopCause::Budget(BudgetDim::Steps))
+        );
+        assert_eq!(
+            parent.first_exhaustion(),
+            Some(&Exhausted {
+                dimension: BudgetDim::Steps,
+                spent: 7,
+                limit: 5,
+            })
+        );
+        // Latched: every later charge of any kind returns the same cause.
+        assert_eq!(
+            parent.charge_step(),
+            Err(StopCause::Budget(BudgetDim::Steps))
+        );
+        // Tokens: an overshooting child spend latches Budget(Tokens).
+        let mut parent = meter(limits(100, u64::MAX), None);
+        assert_eq!(
+            parent.absorb_child(&ChildSpend::recorded(1, 60, 60, false, Duration::ZERO)),
+            Err(StopCause::Budget(BudgetDim::Tokens))
+        );
+        // Wall: likewise.
+        let mut parent = meter(
+            MeterLimits {
+                steps: 50,
+                tokens: u64::MAX,
+                wall: Duration::from_secs(10),
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        assert_eq!(
+            parent.absorb_child(&ChildSpend::recorded(
+                1,
+                0,
+                0,
+                false,
+                Duration::from_secs(11)
+            )),
+            Err(StopCause::Budget(BudgetDim::Wall))
+        );
+    }
+
+    // A child whose tokens were estimated marks the parent (sticky, like
+    // the meter's own estimate flag); reported child tokens never do.
+    #[test]
+    fn absorb_child_marks_estimated_tokens() {
+        let mut parent = meter(limits(u64::MAX, u64::MAX), None);
+        assert!(parent
+            .absorb_child(&ChildSpend::recorded(1, 10, 10, true, Duration::ZERO))
+            .is_ok());
+        assert!(parent.tokens_were_estimated());
+        let mut parent = meter(limits(u64::MAX, u64::MAX), None);
+        assert!(parent
+            .absorb_child(&ChildSpend::recorded(1, 10, 10, false, Duration::ZERO))
+            .is_ok());
+        assert!(!parent.tokens_were_estimated());
+    }
+
+    // `measured` is the only constructor a live run uses: it reads the
+    // child meter, it asserts nothing.
+    #[test]
+    fn child_spend_measured_reads_the_child_meter() {
+        let clock = ManualClock::default();
+        let mut child = child_meter(clock.clone());
+        child.charge_step().unwrap();
+        child.charge_step().unwrap();
+        child
+            .record_tokens(
+                Some(TokenUsage {
+                    input: 40,
+                    output: 25,
+                }),
+                0,
+                0,
+            )
+            .unwrap();
+        clock.advance(Duration::from_secs(9));
+        child.tick_wall().unwrap();
+        let s = ChildSpend::measured(&child);
+        assert_eq!(s.steps(), 2);
+        assert_eq!(s.tokens(), (40, 25));
+        assert_eq!(s.wall(), Duration::from_secs(9));
+        assert!(!s.estimated());
+        // A child whose server omitted usage measures its own estimates,
+        // flag included.
+        let mut child = child_meter(ManualClock::default());
+        child.record_tokens(None, 300, 900).unwrap();
+        let e = ChildSpend::measured(&child);
+        assert!(e.estimated());
+        assert_eq!(e.tokens(), (100, 300));
     }
 }

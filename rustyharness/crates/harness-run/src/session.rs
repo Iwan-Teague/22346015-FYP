@@ -393,6 +393,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         approver_present: s.approver.is_some(),
         session: Some(s.config.turn),
         exec: exec_header,
+        workspace_mode: s.config.run.workspace_mode.as_ref(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,

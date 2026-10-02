@@ -203,6 +203,8 @@ fn cli_with(probe: &dyn LocalityProbe, args: &[&str], marker: &Path) -> Output {
             out: RefCell::new(&mut out),
             err: RefCell::new(&mut err),
             approver: harness_cli::ApproverSource::None,
+            input: harness_cli::InputSource::Given(&[]),
+            backend: harness_cli::BackendSource::BuiltIn,
             confinement: &harness_sandbox::SystemConfinement,
         };
         harness_cli::main_with(&cx, args)

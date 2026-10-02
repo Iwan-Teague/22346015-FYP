@@ -591,7 +591,9 @@ read -r capture_got _ <"$tmpdir/capture-sha" || fail "could not read the digest 
     fail "INV-23: $spawn_file is not the reviewed version (sha256 $capture_got, pinned $capture_sha256): the one spawn site changes only with this gate; review the change, then update capture_sha256 in scripts/ci/purity.sh"
 
 # The confined spawn, pinned. Update only with a review of the change.
-confine_spawn_sha256=dc11658754fb7edab5d1b88ed04895aeeb1b044123ff9d9ed19054d449fedb4a
+# P-41: the frame's lim line carries a bounded, optional sweep deadline
+# (1-30 s, default the reviewed 3 s) and the sweep grace scales with it.
+confine_spawn_sha256=47e355ba9a54d280ca33de184f923546992b6ef9de5ccf8083598b4e29c431a3
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum <"$confine_file" >"$tmpdir/confine-sha" || fail "sha256sum failed on $confine_file"
 else

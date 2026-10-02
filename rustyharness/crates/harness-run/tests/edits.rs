@@ -678,7 +678,7 @@ fn h2b_a_kill_between_an_edit_and_its_result_refuses_the_resume() {
         crash_in(&r, 2, cut_before);
         let e = resume_edits(&state, &ws, &r.run, vec![tag(), submit()]).unwrap_err();
         assert!(
-            matches!(e, harness_run::RunRefused::NotResumable(w) if w.contains("workspace differs")),
+            matches!(e, harness_run::RunRefused::NotResumable(ref w) if w.contains("workspace differs")),
             "{cut_before}: {e:?}"
         );
         assert!(!layout::attempt_dir(&r.run_dir, 2).exists(), "{cut_before}");

@@ -44,6 +44,19 @@
 //! - **the workspace.** Audit mode re-feeds tool output; it never reads the
 //!   workspace. The workspace facts come from the recorded header.
 //!
+//! **Sessions (P-17).** [`audit_session`] re-drives a session attempt the
+//! same way, with the session loop instead of the batch one: the recorded
+//! `UserTurn`s are re-fed in exactly what the clock cannot recompute (the
+//! text, the facts the turn was measured with, its wall time) and each
+//! `InputEnded` by its reason, while everything else is recomputed and
+//! compared — the turn boundaries (`TurnEnded`), the per-turn allowances
+//! and notices, whether the workspace changed between turns, the shown
+//! decisions. Where the recorded inputs run out (an attempt a crash cut),
+//! the replay stops `Cancelled` and only the recorded prefix is compared.
+//! A session journal's records in a batch audit are a divergence ("not a
+//! shape the loop writes"), and the batch audit refuses a session journal
+//! at its header's `mode`.
+//!
 //! **Resume** ([`resume`]) continues an attempt that has no `RunStopped`
 //! (a crash or a kill) in a NEW attempt directory: the old journal is only
 //! read, never appended to, poisoned or not. Its header records the attempt
@@ -93,6 +106,6 @@ pub(crate) mod compare;
 pub(crate) mod feed;
 pub(crate) mod resume;
 
-pub use audit::{audit, Audit, AuditRefused, AuditReport};
+pub use audit::{audit, audit_session, Audit, AuditRefused, AuditReport};
 pub use compare::Divergence;
-pub use resume::{resume, Resume};
+pub use resume::{resume, resume_session, Resume, ResumeSession};

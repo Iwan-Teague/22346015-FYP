@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use gate_outcome::GateId;
 
 use crate::args::{options, USAGE};
+use crate::cmd_doctor::doctor;
 use crate::cmd_events::events;
 use crate::cmd_gc::gc;
 use crate::cmd_manifest::manifest_check;
@@ -22,7 +23,7 @@ const DEFAULT_GATE: &str = "rustyharness.run";
 
 /// The options that are flags, not `--key value` pairs (P-11; P-12 added
 /// `no-default-denies`).
-const VALUELESS: &[&str] = &["shell", "no-default-denies"];
+pub(crate) const VALUELESS: &[&str] = &["shell", "no-default-denies"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verb {
@@ -49,6 +50,7 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
                 3
             }
         },
+        ["doctor", rest @ ..] => doctor(cx, rest),
         ["manifest", "check", path] => manifest_check(cx, path),
         ["run", rest @ ..] => gate_child(cx, rest, Verb::Run),
         ["resume", rest @ ..] => gate_child(cx, rest, Verb::Resume),
@@ -58,6 +60,7 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
         ["profile", "init", rest @ ..] => profile_init(cx, rest),
         ["sessions", rest @ ..] => sessions(cx, rest),
         ["gc", rest @ ..] => gc(cx, rest),
+        ["chat", rest @ ..] => crate::cmd_chat::chat(cx, rest),
         _ => {
             note!(cx, "{USAGE}");
             exit::USAGE

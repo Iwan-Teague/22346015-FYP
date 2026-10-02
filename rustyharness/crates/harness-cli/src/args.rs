@@ -6,6 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const USAGE: &str = "usage:
   rustyharness version
   rustyharness sandbox             report confinement (refuses to run anything without it)
+  rustyharness doctor [--endpoint <url>] [--state-root <dir>]
+                                   one PASS/WARN/FAIL line per check (sandbox, state root,
+                                   config, endpoint, profile, presets, terminal) and a fix;
+                                   exit 0 when no FAIL
   rustyharness manifest check <file.json>   exit 0 valid (valid is not admitted), 1 refused, 4 unreadable
   rustyharness run    --task <task.json> --workspace <dir> --state-root <dir>
                        --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
@@ -23,6 +27,10 @@ pub(crate) const USAGE: &str = "usage:
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
   rustyharness sessions [--state-root <dir>] [--run <run-id>]
   rustyharness gc --run <run-id> | --older-than <N>d   [--state-root <dir>]
+  rustyharness chat   --task <task.json> --profile <profile.json> [--endpoint <url>]
+                        [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
+                        [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
+                        [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json
@@ -120,6 +128,10 @@ mod tests {
             "usage:
   rustyharness version
   rustyharness sandbox             report confinement (refuses to run anything without it)
+  rustyharness doctor [--endpoint <url>] [--state-root <dir>]
+                                   one PASS/WARN/FAIL line per check (sandbox, state root,
+                                   config, endpoint, profile, presets, terminal) and a fix;
+                                   exit 0 when no FAIL
   rustyharness manifest check <file.json>   exit 0 valid (valid is not admitted), 1 refused, 4 unreadable
   rustyharness run    --task <task.json> --workspace <dir> --state-root <dir>
                        --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
@@ -137,6 +149,10 @@ mod tests {
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
   rustyharness sessions [--state-root <dir>] [--run <run-id>]
   rustyharness gc --run <run-id> | --older-than <N>d   [--state-root <dir>]
+  rustyharness chat   --task <task.json> --profile <profile.json> [--endpoint <url>]
+                        [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
+                        [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
+                        [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json

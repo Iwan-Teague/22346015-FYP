@@ -217,9 +217,10 @@ pub enum RunRefused {
     /// The journal header is not durable (§2.5).
     #[error("{0}")]
     Start(#[from] StartError),
-    /// A resume that cannot continue this run (§2.10).
+    /// A resume that cannot continue this run (§2.10). A session's stop
+    /// names the recorded cause (P-17), so the message may be owned.
     #[error("cannot resume: {0}")]
-    NotResumable(&'static str),
+    NotResumable(std::borrow::Cow<'static, str>),
     /// The task's exec grant and exec section disagree, or no confinement
     /// was given for an exec grant (H2d).
     #[error("exec refused: {0}")]

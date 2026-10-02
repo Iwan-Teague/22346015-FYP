@@ -550,7 +550,7 @@ fn a_resume_re_feeds_recorded_approvals_and_asks_live_only_after() {
     let none = Capture::new(vec![]);
     let e = resume_with(&state, &ws, &r.run, &none, None).unwrap_err();
     assert!(
-        matches!(e, RunRefused::NotResumable(w) if w.contains("approver")),
+        matches!(e, RunRefused::NotResumable(ref w) if w.contains("approver")),
         "{e:?}"
     );
     assert!(!layout::attempt_dir(&r.run_dir, 2).exists());

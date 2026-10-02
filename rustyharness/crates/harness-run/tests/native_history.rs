@@ -746,7 +746,7 @@ fn a_journal_from_before_h1i_is_refused_by_name_by_audit_and_resume() {
             })
             .unwrap_err();
             assert!(
-                matches!(e, RunRefused::NotResumable(w) if w.contains("context format")),
+                matches!(e, RunRefused::NotResumable(ref w) if w.contains("context format")),
                 "{case} {recorded:?}: {e:?}"
             );
             assert!(!layout::attempt_dir(&r.run_dir, 2).exists());

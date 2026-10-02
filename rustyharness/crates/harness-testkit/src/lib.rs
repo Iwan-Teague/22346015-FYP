@@ -42,8 +42,8 @@ use harness_model::{Completion, TaskText};
 use harness_policy::locality::{FsQuery, LocalityProbe};
 use harness_policy::UserPolicy;
 use harness_run::{
-    audit, run, ApprovalAnswer, Approver, ApproverKind, Audit, Run, RunConfig, RunRefused,
-    RunReport, TaskSpec,
+    audit, audit_session, run, ApprovalAnswer, Approver, ApproverKind, Audit, Run, RunConfig,
+    RunRefused, RunReport, SessionConfig, SessionReport, TaskSpec,
 };
 
 /// The token budget every scripted run is given. An audit must be given
@@ -321,6 +321,75 @@ pub fn assert_audit_clean_policy(
     Ok(())
 }
 
+/// [`assert_audit_clean`] for a session run (P-20): the same three
+/// requirements — no divergence, the recorded stop recomputed, and the
+/// chain head anchored — checked by the session audit
+/// (`audit_session`), which replays the session's turns against its own
+/// header (`mode: session`, the `/6` context format, the run's limits
+/// with the meter's `format_errors` replaced by "never", and the
+/// configured turn limits). The audit is given the fixture's spec, the
+/// default policy and profile, the defaults' session config, and the
+/// report's chain head as the anchor.
+pub fn assert_session_audit_clean(fx: &Fixture, report: &SessionReport) -> Result<(), String> {
+    assert_session_audit_clean_with(
+        fx,
+        &UserPolicy::default(),
+        &Profile::conservative_default("m"),
+        report,
+        &SessionConfig::defaults(TOKEN_BUDGET),
+        None,
+    )
+}
+
+/// [`assert_session_audit_clean`] with explicit everything: a
+/// caller-chosen policy and profile (the run's own, whose digests the
+/// header carries), the session config the run (or its resume) was
+/// given — its limits and turn limits are the header's — and the
+/// attempt to audit (`None` for the recorded one, `Some(2)` for a
+/// resumed attempt).
+pub fn assert_session_audit_clean_with(
+    fx: &Fixture,
+    policy: &UserPolicy,
+    profile: &Profile,
+    report: &SessionReport,
+    config: &SessionConfig,
+    attempt: Option<u32>,
+) -> Result<(), String> {
+    let mut limits = config.run.limits.clone();
+    limits.format_errors = u32::MAX;
+    let reg = registry().map_err(|e| format!("registry: {e}"))?;
+    let a = audit_session(
+        Audit {
+            state_root: fx.state_root(),
+            run: &report.run.run,
+            attempt,
+            anchor: report.run.chain_head,
+            spec: &fx.spec,
+            registry: &reg,
+            policy,
+            profile,
+            limits: &limits,
+        },
+        &config.turn,
+    )
+    .map_err(|e| format!("session audit refused: {e}"))?;
+    if let Some(d) = &a.divergence {
+        return Err(format!(
+            "the replay diverged at seq {} (step {}): {}",
+            d.seq, d.step, d.why
+        ));
+    }
+    if !a.stop_recomputed {
+        return Err(
+            "the recorded stop was not recomputed (a wall stop or an uncommitted attempt)".into(),
+        );
+    }
+    if report.run.chain_head.is_some() && !a.anchored {
+        return Err("the run's chain head did not anchor the journal".into());
+    }
+    Ok(())
+}
+
 /// The event kinds of the run's reported attempt, in journal order.
 pub fn journal_kinds(report: &RunReport) -> io::Result<Vec<EventKind>> {
     let dir = layout::attempt_dir(&report.run_dir, report.attempt);
@@ -374,6 +443,7 @@ pub fn cli(fx: &Fixture, args: &[&str], stdin_lines: &[&str]) -> (u8, String, St
     let approver = LineApprover {
         lines: RefCell::new(stdin_lines.iter().map(|s| (*s).to_owned()).collect()),
     };
+    let no_input: Vec<String> = Vec::new();
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = {
@@ -384,6 +454,86 @@ pub fn cli(fx: &Fixture, args: &[&str], stdin_lines: &[&str]) -> (u8, String, St
             err: RefCell::new(&mut err),
             approver: harness_cli::ApproverSource::Given(&approver),
             confinement: &harness_sandbox::SystemConfinement,
+            input: harness_cli::InputSource::Given(&no_input),
+            backend: harness_cli::BackendSource::BuiltIn,
+        };
+        harness_cli::main_with(&cx, args)
+    };
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+/// Run one `chat` invocation in process (P-18): the model replies are
+/// handed to a scripted backend, the REPL reads `input_lines` in order
+/// (end of input when they run out), and an ask is answered from
+/// `approver_lines` (`y`/`yes` approves, anything else declines, no line
+/// left is no answer — nobody is at a terminal here). Everything else is
+/// as [`cli`].
+pub fn chat_cli(
+    fx: &Fixture,
+    args: &[&str],
+    input_lines: &[&str],
+    replies: Vec<Completion>,
+    approver_lines: &[&str],
+) -> (u8, String, String) {
+    let approver = LineApprover {
+        lines: RefCell::new(approver_lines.iter().map(|s| (*s).to_owned()).collect()),
+    };
+    let input: Vec<String> = input_lines.iter().map(|s| (*s).to_owned()).collect();
+    let backend = ScriptedBackend::new(
+        Profile::conservative_default("m"),
+        replies.into_iter().map(Ok).collect(),
+    );
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = {
+        let cx = harness_cli::Cx {
+            probe: &Local,
+            gate_ok_file: Some(fx.base.join("gate-ok")),
+            out: RefCell::new(&mut out),
+            err: RefCell::new(&mut err),
+            approver: harness_cli::ApproverSource::Given(&approver),
+            confinement: &harness_sandbox::SystemConfinement,
+            input: harness_cli::InputSource::Given(&input),
+            backend: harness_cli::BackendSource::Given(&backend),
+        };
+        harness_cli::main_with(&cx, args)
+    };
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+/// [`chat_cli`] with nobody to answer an ask (the piped-stdin case): every
+/// ask is a deny (§5.2), whatever lines are left.
+pub fn chat_cli_unattended(
+    fx: &Fixture,
+    args: &[&str],
+    input_lines: &[&str],
+    replies: Vec<Completion>,
+) -> (u8, String, String) {
+    let input: Vec<String> = input_lines.iter().map(|s| (*s).to_owned()).collect();
+    let backend = ScriptedBackend::new(
+        Profile::conservative_default("m"),
+        replies.into_iter().map(Ok).collect(),
+    );
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = {
+        let cx = harness_cli::Cx {
+            probe: &Local,
+            gate_ok_file: Some(fx.base.join("gate-ok")),
+            out: RefCell::new(&mut out),
+            err: RefCell::new(&mut err),
+            approver: harness_cli::ApproverSource::None,
+            confinement: &harness_sandbox::SystemConfinement,
+            input: harness_cli::InputSource::Given(&input),
+            backend: harness_cli::BackendSource::Given(&backend),
         };
         harness_cli::main_with(&cx, args)
     };

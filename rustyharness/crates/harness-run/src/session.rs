@@ -38,8 +38,10 @@ use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::UserPolicy;
 use harness_sandbox::Confinement;
 use harness_tools::builtin::workspace_tree;
+use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::ReadLog;
 use serde_json::{Map, Value};
+use std::collections::VecDeque;
 
 use crate::approve::Approver;
 use crate::driver::step::{journal, Flow, TurnEnd, UserState};
@@ -141,6 +143,47 @@ pub trait UserInput {
     fn next(&self, deadline: Instant) -> UserInputEvent;
 }
 
+/// One recorded input (P-17 §6): a `UserTurn`'s re-fed parts, or an
+/// `InputEnded`. The parts the loop recomputes (the turn's number, whether
+/// the workspace changed, the shown decision, the allowance) are carried
+/// by nothing here: the replay recomputes and compares them.
+pub(crate) enum RecordedInput {
+    /// A recorded `UserTurn`: the message, the facts it was measured with
+    /// (its tree, file and oversize counts), and the wall time the loop
+    /// had used when it was journaled (the clock is never recomputable).
+    Message {
+        text: String,
+        facts: WorkspaceFacts,
+        wall_used_ms: u64,
+    },
+    /// A recorded `InputEnded`: its reason is re-fed; its turn number is
+    /// recomputed.
+    End(InputEnd),
+}
+
+/// The name a recorded `InputEnded` carries, back to the enum: anything
+/// else is not a record this loop writes.
+pub(crate) fn parse_input_end(reason: &str) -> Option<InputEnd> {
+    match reason {
+        "eof" => Some(InputEnd::Eof),
+        "exit" => Some(InputEnd::Exit),
+        "timeout" => Some(InputEnd::Timeout),
+        _ => None,
+    }
+}
+
+/// Where a session loop's turns come from: live (P-05), a replay's
+/// recorded inputs (an audit, P-17 §6), or a resume's catch-up — recorded
+/// inputs first, then the live source (P-17 §7).
+pub(crate) enum SessionInputs<'x> {
+    Live(&'x dyn UserInput),
+    Replay(VecDeque<RecordedInput>),
+    Resume {
+        recorded: VecDeque<RecordedInput>,
+        live: &'x dyn UserInput,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // The UI drain.
 // ---------------------------------------------------------------------------
@@ -220,7 +263,7 @@ impl SessionConfig {
 
 /// The limits a session config may use, checked before anything is written
 /// (P-05 §4): a refusal here is `RunRefused::TurnLimits`, nothing ran.
-fn check_turn_limits(config: &SessionConfig) -> Result<(), RunRefused> {
+pub(crate) fn check_turn_limits(config: &SessionConfig) -> Result<(), RunRefused> {
     if config.run.limits.steps == 0 || config.run.limits.steps > 5000 {
         return Err(RunRefused::TurnLimits(
             "the run step limit must be between 1 and 5000",
@@ -248,7 +291,7 @@ fn check_turn_limits(config: &SessionConfig) -> Result<(), RunRefused> {
 /// dimension off (the meter never latches it; the turn limit governs,
 /// P-05 §4). The header records these, so an audit or a resume recomputes
 /// them from the same config.
-fn session_limits(config: &SessionConfig) -> harness_core::MeterLimits {
+pub(crate) fn session_limits(config: &SessionConfig) -> harness_core::MeterLimits {
     let mut limits = config.run.limits.clone();
     limits.format_errors = u32::MAX;
     limits
@@ -410,7 +453,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
             sink: s.sink,
         }),
     });
-    let end = lp.drive_session(&mut w, s.input, s.config.input_timeout);
+    let end = lp.drive_session(&mut w, SessionInputs::Live(s.input), s.config.input_timeout);
     let turns = lp.user.as_ref().map_or(0, |u| u.turn.saturating_sub(1));
     let released = commit(w, &end, None);
     Ok(SessionReport {
@@ -447,13 +490,36 @@ impl<'a> Loop<'a> {
     /// Run user turns until the session stops (P-05 §12): input, turn,
     /// input, turn… Each iteration is one of: a stop the meter or the
     /// carved step budget already decided, the input's end, or one user
-    /// turn.
+    /// turn. The inputs are live (P-05), recorded (an audit's replay,
+    /// P-17 §6), or a resume's (recorded catch-up first, then live, P-17
+    /// §7); recorded inputs are consumed only BETWEEN turns, never inside
+    /// one, so a resume's mid-turn catch-up runs the interrupted turn's
+    /// steps live without asking for input.
     pub(crate) fn drive_session<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
-        input: &dyn UserInput,
+        inputs: SessionInputs<'_>,
         input_timeout: Duration,
     ) -> End {
+        let (mut recorded, live): (VecDeque<RecordedInput>, Option<&dyn UserInput>) = match inputs {
+            SessionInputs::Live(input) => (VecDeque::new(), Some(input)),
+            SessionInputs::Replay(recorded) => (recorded, None),
+            SessionInputs::Resume { recorded, live } => (recorded, Some(live)),
+        };
+        // What the next input is: a live event, or one recorded input. A
+        // replay whose recorded inputs are gone stops as cancelled (P-17
+        // §6): nothing was journaled for a next turn, so there is no
+        // `InputEnded` to write and no record after it to compare.
+        enum Next {
+            Live(UserInputEvent),
+            Message {
+                text: String,
+                facts: WorkspaceFacts,
+                wall_used_ms: u64,
+            },
+            End(InputEnd),
+            Spent,
+        }
         loop {
             self.ui_drain(w);
             // A latched budget (tokens, wall, cost) stops the session.
@@ -474,8 +540,10 @@ impl<'a> Loop<'a> {
             // (P-05 §4, INV-41), like an approval wait (§2.4). The pause
             // guard lives exactly as long as the wait (it ends the pause on
             // drop), so the wait sits in its own block, and the End is
-            // built from values read before the meter is borrowed.
-            let event = {
+            // built from values read before the meter is borrowed. A
+            // replay's recorded input needs no wait (the clock is not
+            // real), but sits under the same paused meter.
+            let next = {
                 let at_step = self.step;
                 let pause = match self.meter.pause_wall() {
                     Ok(pause) => pause,
@@ -487,16 +555,45 @@ impl<'a> Loop<'a> {
                         }
                     }
                 };
-                let deadline = Instant::now() + input_timeout;
-                let event = input.next(deadline);
+                let next = if recorded.is_empty() {
+                    match live {
+                        Some(input) => {
+                            let deadline = Instant::now() + input_timeout;
+                            Next::Live(input.next(deadline))
+                        }
+                        None => Next::Spent,
+                    }
+                } else {
+                    match recorded.pop_front() {
+                        Some(RecordedInput::Message {
+                            text,
+                            facts,
+                            wall_used_ms,
+                        }) => Next::Message {
+                            text,
+                            facts,
+                            wall_used_ms,
+                        },
+                        Some(RecordedInput::End(reason)) => Next::End(reason),
+                        None => Next::Spent,
+                    }
+                };
                 drop(pause);
-                event
+                next
             };
 
-            let message = match event {
-                UserInputEvent::End(reason) => {
-                    // P-05 §1.1: the input's end is journaled, then the run
-                    // stops with cause `session_ended`.
+            let message = match next {
+                Next::Spent => {
+                    return End {
+                        cause: StopCause::Cancelled,
+                        step: self.step,
+                        deliverable,
+                    }
+                }
+                // P-05 §1.1: the input's end is journaled, then the run
+                // stops with cause `session_ended`. A replay re-feeds the
+                // recorded reason; the turn count is recomputed.
+                Next::End(reason) | Next::Live(UserInputEvent::End(reason)) => {
                     let turn = self.turns_journaled();
                     let ev = Event::new(EventKind::InputEnded)
                         .field("reason", Trusted::Text(reason.name()))
@@ -514,16 +611,34 @@ impl<'a> Loop<'a> {
                         deliverable,
                     };
                 }
-                UserInputEvent::Message(m) => m,
+                Next::Live(UserInputEvent::Message(m)) => {
+                    match self.begin_user_turn(
+                        w,
+                        m.as_str(),
+                        u32::try_from(remaining).unwrap_or(u32::MAX),
+                    ) {
+                        Err(cause) => return self.session_end(cause),
+                        Ok(turn) => turn,
+                    }
+                }
+                Next::Message {
+                    text,
+                    facts,
+                    wall_used_ms,
+                } => {
+                    // P-17 §6: a replayed turn re-feeds the recorded
+                    // measurement and the recorded wall time; everything
+                    // else about the turn is recomputed, to be compared.
+                    let remaining = u32::try_from(remaining).unwrap_or(u32::MAX);
+                    match self.open_user_turn(w, &text, facts, wall_used_ms, remaining) {
+                        Err(cause) => return self.session_end(cause),
+                        Ok(turn) => turn,
+                    }
+                }
             };
 
-            match self.begin_user_turn(
-                w,
-                message.as_str(),
-                u32::try_from(remaining).unwrap_or(u32::MAX),
-            ) {
-                Err(cause) => return self.session_end(cause),
-                Ok(TurnStart::Refused) => {
+            match message {
+                TurnStart::Refused => {
                     // P-05 §2.3: a refused input journaled its `UserTurn`
                     // (shown: withheld | over_share) and ends its turn at
                     // once: no model call, no steps.
@@ -536,7 +651,7 @@ impl<'a> Loop<'a> {
                     }
                     continue;
                 }
-                Ok(TurnStart::Shown) => {}
+                TurnStart::Shown => {}
             }
 
             // The turn's steps (P-05 §3): until a step ends the turn, the
@@ -596,8 +711,7 @@ impl<'a> Loop<'a> {
         }
     }
 
-    /// Measure the workspace, decide whether the message is shown, journal
-    /// the `UserTurn` record and set the turn up (P-05 §2.3, §5, §9). The
+    /// Measure the workspace, then open the turn (P-05 §2.3, §5, §9). The
     /// measurement happens BEFORE anything is journaled for the message,
     /// so the record's facts are the turn's starting facts (INV-39).
     fn begin_user_turn<F: JournalFile, B: BlobSink, K: Clock>(
@@ -606,10 +720,6 @@ impl<'a> Loop<'a> {
         text: &str,
         remaining: u32,
     ) -> Result<TurnStart, StopCause> {
-        let (turn_no, limits, before) = match &self.user {
-            Some(u) => (u.turn, u.limits, u.users.len()),
-            None => return Err(StopCause::PolicyAbort),
-        };
         // 1. The workspace now (P-05 §5): a live run measures; a failure
         // stops the session with nothing journaled for this message.
         // (An audit re-feeds the recorded measurement, P-17.)
@@ -619,6 +729,31 @@ impl<'a> Loop<'a> {
         let deadline = Instant::now() + self.config.facts_timeout;
         let listing = workspace_tree(&root, deadline).map_err(|_| StopCause::PolicyAbort)?;
         let measured = listing.facts();
+        let wall_used_ms = u64::try_from(self.meter.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let started = self.open_user_turn(w, text, measured, wall_used_ms, remaining)?;
+        // The loop's state moves to the measured listing (P-05 §5); a
+        // replayed turn has no listing of its own (the replay never
+        // touches the workspace).
+        self.workspace = Some(listing);
+        Ok(started)
+    }
+
+    /// Open a turn from facts already in hand — measured live
+    /// ([`Self::begin_user_turn`]) or re-fed from the journal (a replay,
+    /// P-17 §6): decide whether the message is shown, journal the
+    /// `UserTurn` record and set the turn up.
+    fn open_user_turn<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+        text: &str,
+        measured: WorkspaceFacts,
+        wall_used_ms: u64,
+        remaining: u32,
+    ) -> Result<TurnStart, StopCause> {
+        let (turn_no, limits, before) = match &self.user {
+            Some(u) => (u.turn, u.limits, u.users.len()),
+            None => return Err(StopCause::PolicyAbort),
+        };
         let old_tree = self.tree;
         let external_change = measured.tree != old_tree;
 
@@ -645,7 +780,6 @@ impl<'a> Loop<'a> {
         // 3. Journal the turn: its input, its allowance and the facts it
         // starts from (P-05 §1.1). The clock fact is re-fed by an audit,
         // never recomputed.
-        let wall_used_ms = u64::try_from(self.meter.elapsed().as_millis()).unwrap_or(u64::MAX);
         let allowance = u64::from(limits.steps).min(u64::from(remaining));
         let blob = w
             .untrusted(&Untrusted::new(text.to_owned(), Source::User))
@@ -662,9 +796,8 @@ impl<'a> Loop<'a> {
             .field("workspace_tree", Trusted::Digest(measured.tree));
         w.append(self.step, ev).map_err(journal)?;
 
-        // 4. The loop's state moves to the measured facts (P-05 §5).
+        // 4. The loop's state moves to the recorded facts (P-05 §5).
         self.tree = measured.tree;
-        self.workspace = Some(listing);
         let u = self.user.as_mut().ok_or(StopCause::PolicyAbort)?;
         u.turn += 1;
         u.allowance = allowance;

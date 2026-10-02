@@ -47,9 +47,17 @@
 //! valid manifest is not an admitted one.
 //!
 //! The verb implementations live in their own modules (`cmd_run`,
-//! `cmd_replay`, `cmd_profile`, `cmd_manifest`), with the option parsing
-//! (`args`), the input readers (`inputs`), the approver (`approver`), the
-//! gate-child ending (`report`) and the dispatch (`dispatch`) beside them.
+//! `cmd_replay`, `cmd_profile`, `cmd_manifest`, `cmd_chat`), with the option
+//! parsing (`args`), the input readers (`inputs`), the approver
+//! (`approver`), the gate-child ending (`report`) and the dispatch
+//! (`dispatch`) beside them.
+//!
+//! `chat` (slice P-18) is the interactive line REPL: it is a gate child
+//! (the last stdout line is the session's `GateReport`), streams every
+//! model and tool word through the display sanitizer, and ends every
+//! session `Indeterminate { NothingChecked }` (exit 5) until H3. Its
+//! REPL machinery lives in `repl` (input, slash commands, the terminal
+//! approver over one shared stdin feed) and `render` (the event sink).
 //!
 //! `events` (slice P-15) is not a gate child either: it projects an
 //! attempt's journal to stdout as newline-delimited JSON — a schema line,
@@ -84,6 +92,8 @@ macro_rules! say {
 mod approver;
 mod args;
 mod bundle;
+mod cmd_chat;
+mod cmd_doctor;
 mod cmd_events;
 mod cmd_gc;
 mod cmd_manifest;
@@ -95,11 +105,14 @@ mod config;
 mod dispatch;
 mod exec_presets;
 mod inputs;
+mod render;
+mod repl;
 mod report;
 mod usage;
 
 pub use approver::{ApproverSource, TerminalApprover};
 pub use dispatch::main_with;
+pub use repl::{BackendSource, InputSource};
 
 /// Where the CLI writes, and what it is given from outside: the locality
 /// probe and the `GATE_OK_FILE` marker path. The shipped binary
@@ -124,6 +137,15 @@ pub struct Cx<'a> {
     /// binary passes `harness_sandbox::SystemConfinement`; it is asked for a
     /// witness only when the task grants `harness.exec.run`.
     pub confinement: &'a dyn harness_sandbox::Confinement,
+    /// Where the `chat` REPL's lines come from (P-18). The shipped binary
+    /// reads this process's stdin; tests inject lines. Every other verb
+    /// ignores it.
+    pub input: InputSource<'a>,
+    /// The model backend `chat` talks to (P-18). `BuiltIn` means the verb
+    /// builds one itself from `--endpoint` (the shipped binary); tests
+    /// inject a scripted one. Every other verb builds its own backend and
+    /// ignores this.
+    pub backend: BackendSource<'a>,
 }
 
 impl Cx<'_> {

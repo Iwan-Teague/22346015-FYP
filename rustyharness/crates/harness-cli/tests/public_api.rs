@@ -32,6 +32,8 @@ fn cli_public_api_unchanged() {
         out: RefCell::new(&mut out),
         err: RefCell::new(&mut err),
         approver: ApproverSource::Given(&Yes),
+        input: harness_cli::InputSource::Given(&[]),
+        backend: harness_cli::BackendSource::BuiltIn,
         confinement: &harness_sandbox::SystemConfinement,
     };
     let dispatch: fn(&Cx<'_>, &[&str]) -> u8 = main_with;

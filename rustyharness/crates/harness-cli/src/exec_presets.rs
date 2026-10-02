@@ -241,7 +241,7 @@ pub(crate) fn section(
 /// refused when the search reaches it (a relative entry would resolve
 /// against a working directory this run does not control); a broken or
 /// escaping symlink is refused with it.
-fn look_up(name: &str, path_var: &OsStr) -> Result<PathBuf, String> {
+pub(crate) fn look_up(name: &str, path_var: &OsStr) -> Result<PathBuf, String> {
     for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;

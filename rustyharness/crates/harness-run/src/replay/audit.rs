@@ -21,12 +21,14 @@ use harness_model::ModelBackend;
 use harness_policy::UserPolicy;
 use serde_json::Value;
 
+use crate::driver::step::UserState;
 use crate::driver::{
     commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ExecHeader,
     HeaderInputs, Loop, LoopInit, NonceSource, ReadLog, SandboxRecord,
 };
 use crate::presubmit::PresubmitState;
 use crate::sample;
+use crate::session::{SessionInputs, TurnLimits};
 use crate::{RunConfig, RunRefused, TaskSpec};
 
 use super::compare::{check_header, compare, diverge, expected_inputs, Divergence};
@@ -179,6 +181,20 @@ fn recorded_outcome(v: &Verified) -> GateOutcome {
 
 /// Replay a recorded attempt and compare (see the module docs).
 pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
+    audit_inner(a, None)
+}
+
+/// Replay a recorded session attempt and compare (P-17 §6): the re-drive
+/// re-feeds each recorded `UserTurn` (its text, facts and wall time) and
+/// each `InputEnded` (its reason), recomputes everything else — the turn
+/// boundaries, the per-turn allowances, whether the workspace changed —
+/// and stops `Cancelled` where the recorded inputs run out. `turn` must be
+/// the session's recorded turn limits, which the header check enforces.
+pub fn audit_session(a: Audit<'_>, turn: &TurnLimits) -> Result<AuditReport, AuditRefused> {
+    audit_inner(a, Some(turn))
+}
+
+fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, AuditRefused> {
     let run_dir = run_dir_of(a.state_root, a.run).map_err(AuditRefused::NoRun)?;
     // By default the latest attempt with a durable header: a start that
     // failed before its header is skipped, and named (H1 phase-exit review
@@ -240,7 +256,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     };
     if let Err(d) = check_header(
         head,
-        &expected_inputs(a.spec, a.registry, a.policy, a.profile, a.limits, None),
+        &expected_inputs(a.spec, a.registry, a.policy, a.profile, a.limits, turn),
     ) {
         return Ok(failed(d, None));
     }
@@ -337,7 +353,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         environment,
         environment_recorded: true,
         approver_present,
-        session: None,
+        session: turn.copied(),
         exec: exec_header,
     })
     .map_err(AuditRefused::Plan)?;
@@ -395,9 +411,30 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&a.spec.presubmit),
-        user: None,
+        // A session replay opens turns (P-17 §6): the re-fed texts build
+        // the users' share of the context, and each turn's budgets are
+        // recomputed from the recorded turn limits. It measures nothing
+        // and waits for nobody (root and sink stay unset); a refused
+        // replayed turn is the recorded one's shape to match.
+        user: turn.map(|t| UserState {
+            limits: *t,
+            turn: 1,
+            allowance: 0,
+            used: 0,
+            users: Vec::new(),
+            deliverable: None,
+            root: None,
+            blobs: replay_dir.join(layout::BLOBS_DIR),
+            sink: None,
+        }),
     });
-    let end = lp.drive(&mut w);
+    let end = match turn {
+        None => lp.drive(&mut w),
+        // The replayed session consumes the recorded inputs; when they
+        // run out it stops `Cancelled` with no `InputEnded` (P-17 §6),
+        // which only a prefix of an uncommitted journal compares against.
+        Some(_) => lp.drive_session(&mut w, SessionInputs::Replay(rec.inputs), Duration::ZERO),
+    };
     let released = commit(w, &end, None);
     if released.error.is_some() {
         return Ok(failed(

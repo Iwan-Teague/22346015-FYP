@@ -339,7 +339,7 @@ Card fields: **Why** | **Crates** | **Tests** (named, `cargo test`) | **Deps** |
 #### Wave 5
 
 **P-21 Real-model smoke + mini coding benchmark (ignored tests, scheduled W7 but cards here)**
-- Why: scripted models cannot reveal prompt/format problems. (a) `harness-cli/tests/chat_live.rs` `#[ignore]`: env `RUSTYHARNESS_EXIT_ENDPOINT/MODEL`, drives `chat` over piped stdin through two turns on a fixture repo, asserts the answer, a verified edit, clean audit, anchored replay; both protocols. (b) `scripts/dev/mini-bench.sh` + 10 fixture tasks (`fixtures/bench/*/task.json + repo + expected check command`): runs each with presubmit checks, records pass/fail/steps/tokens/format-errors to a TSV keyed by (harness version, profile sha) so regressions are visible (design R1 §8 #15). Not a gate; run before releases and nightly on a local model.
+- Why: scripted models cannot reveal prompt/format problems. (a) `harness-cli/tests/chat_live.rs` `#[ignore]`: env `RUSTYHARNESS_EXIT_ENDPOINT/MODEL`, drives `chat` over piped stdin through two turns on a fixture repo, asserts the answer, a verified edit, clean audit, anchored replay; both protocols. (b) a Rust dev binary `crates/harness-minibench` (workspace member, publish=false, no Python or shell logic; the project is Rust only) + 10 fixture tasks (`fixtures/bench/*/task.json + repo + expected check command`): runs each with presubmit checks, records pass/fail/steps/tokens/format-errors to a TSV keyed by (harness version, profile sha) so regressions are visible (design R1 §8 #15). Not a gate; run before releases and nightly on a local model.
 - Crates: harness-cli tests, scripts, fixtures.
 - Tests: `chat_live_native_two_turns`, `chat_live_text_two_turns` (ignored); mini-bench self-test with the scripted backend (`minibench_scripted_all_pass`) runs in gates.
 - Deps: P-18 (+P-22 for edit-verify cases later). Parallel: yes. Risk: low. ARCH: no.
@@ -520,3 +520,67 @@ Suggested definition of done for any slice: card tests green + `sh scripts/ci/ga
 2. Start P-05 (ARCH) in W1 with the reasoning model; get the owner's OK on the session model before W2 starts. Meanwhile P-06/P-07/P-08 proceed.
 3. Ask the owner Q-4, Q-7, Q-10, Q-11 early (they shape P-18/P-23/P-30 wording but each has a safe default, so nothing waits on them).
 4. Before declaring M1, run P-21a on the local Qwen/GLM profiles used in earlier phases; record in the FYP log.
+
+---
+
+### Added during execution (extras)
+
+**P-41 Seatbelt live-probe robustness**
+- Why: under machine load the macOS sandbox startup probes fail spuriously (`LiveProbeFailed ... mem-applied Signaled(5)`, and `live probe sweep ... Unconfirmed("processes of the domain would not die within the sweep deadline (3 s)")`), refusing execution and failing gate runs for no real reason. Fail-closed must stay: a probe that truly fails must still refuse. Make the probes robust, not weaker: (1) the sweep deadline scales (3 s base, retried once with 3x on `Unconfirmed` timeouts, never on a definite negative result such as a process that survived after a *confirmed* kill attempt); (2) a probe that is killed by a signal before it reports is re-run once, and a second identical failure is final; (3) the witness records the attempt count and the deadline used, so an audit can see a retried probe; (4) never retry a probe whose result was an escape (a negative security observation).
+- Crates: harness-sandbox only (`confine_spawn.rs` / probe code; mind the pinned SHA of spawn files in scripts/ci/purity.sh: if the pin must be updated, update it in the same commit and say so loudly in the slice note).
+- Tests: `probe_retries_unconfirmed_timeout_once`, `probe_retry_never_masks_an_escape` (a fixture where the sandbox is deliberately weakened must still be refused), `probe_second_failure_is_final`, `witness_records_attempts_and_deadline`, plus the existing conformance suite unchanged.
+- Deps: none. Parallel: yes (sandbox crate only). Risk: medium (security-relevant: fail-closed). ARCH: no.
+
+**P-43 `rustyharness doctor`**
+- Why: parity with `opencode doctor`-style self-diagnosis and a far better first-run experience. New verb `doctor [--endpoint URL] [--state-root DIR]` printing one line per check with PASS/WARN/FAIL and a one-sentence fix: platform and sandbox witness (macOS Seatbelt conformance or "refuses: reason"), state root exists/local/0700, user config readable and strict-valid (P-07 config), endpoint reachable and `/v1/models` listing, a profile exists and its stamp is valid, toolchain programs for the presets found (P-11), terminal is a TTY. Exit code 0 when no FAIL. Output is sanitised (P-04); no network calls except to the given loopback endpoint.
+- Crates: harness-cli (new `cmd_doctor.rs`, one dispatch line, usage text).
+- Tests: `doctor_all_pass_with_mock_server`, `doctor_fails_without_state_root_and_says_how`, `doctor_warns_on_non_tty`, `doctor_reports_unreachable_endpoint`, `doctor_output_has_no_raw_escapes`, `doctor_exit_code_follows_fail`.
+- Deps: P-07, P-11, P-04. Parallel: small cli hotspot (dispatch/args), keep the diff tiny. Risk: low. ARCH: no.
+
+---
+
+### Added from the Odysseus review (2026-10-02)
+
+Odysseus (PewDiePie's self-hosted AI workspace) offers web search/fetch/deep research, persistent memory, skills, MCP, approval gates, model comparison and scheduled tasks. Already planned here: web airlock (P-39), skills and instructions (P-30), MCP client (P-37), approvals (P-23). New cards below. Deliberately not taken: email/calendar/document editor, a web UI/PWA, Docker, and a headless browser (deferred: large attack surface; revisit after the airlock is proven; owner decision).
+
+**P-44 Pure HTML-to-text extractor (readability-lite)**
+- Why: the fetch half of web research without a browser. A pure function `harness_core::html::to_text(&[u8], limits) -> Extracted {title, text, links, truncated}`: tolerant tokenizer (no regex crate), drops script/style/nav/aside/footer/form/iframe/svg and comments, keeps headings/paragraphs/lists/code/pre/table cells as plain text with markers, resolves nothing and fetches nothing, bounded input (e.g. 2 MiB) and bounded output with a visible `[N bytes cut]`, output passed through the terminal sanitiser (P-04), links returned as data (never followed). Fuzz-style tests on malformed HTML. Foundation for P-39/P-46; fully offline, so safe to build now.
+- Crates: harness-core (pure; no I/O names, no clock).
+- Tests: `extracts_title_and_paragraphs`, `drops_script_style_and_comments`, `prompt_injection_text_is_kept_as_plain_text_not_interpreted`, `malformed_unclosed_tags_do_not_panic`, `deeply_nested_input_is_bounded`, `huge_input_is_truncated_with_marker`, `output_has_no_control_or_bidi_characters`, `links_are_data_only`, `deterministic_digest`, purity gate passes.
+- Deps: P-04. Parallel: yes. Risk: low. ARCH: no.
+
+**P-46 Deep research mode (`rustyharness research "<question>"`)**
+- Why: Odysseus's Deep Research, with evidence. A research session (no workspace grant, so the trifecta rule passes) runs a fixed loop under the P-39 airlock: plan queries, search (SearXNG-compatible endpoint the user runs, or the airlock's fetcher), fetch top-N pages, extract with P-44, then write a cited report. Every query, every fetch (URL, status, content digest) and every cited passage is journaled; the report's citations are checked against the journaled digests (a citation of text that was not fetched is flagged "phantom citation"). Output is stored as a quarantined note under the state dir; importing it into a coding session is a separate explicit user action (P-39 rule).
+- Crates: harness-run, harness-tools (provider from P-39), harness-cli.
+- Tests: `research_session_has_no_workspace_grant`, `every_fetch_journaled_with_digest`, `phantom_citation_flagged`, `report_quarantined_until_import`, `research_replay_audits_clean`, `budget_stops_research`.
+- Deps: P-39 (ARCH note first), P-44, P-18. Risk: medium-high. ARCH: via P-39.
+
+**P-47 Memory provider seam and the rustylife add-on**
+- Why: persistent memory without building a second memory system. The owner is building rustylife (an encrypted on-device tree of the user's information, an "Obsidian second brain" with hybrid local search, per-subtree scopes and information-flow labels). The harness must not hold app-specific code (OD-2) and must stay standalone, so: a generic, off-by-default **memory provider seam** (tools `memory.search {query, scope?}`, `memory.read {id}`, `memory.propose {path, text}`), and rustylife is the first provider, shipped as an optional H5 add-on (`adapters/rustylife/` manifest plus a thin provider process that calls the rustylife store/CLI; never a harness core dependency). Rules: (a) the user unlocks the store in the trust base (the key never reaches the harness or the model, secrets boundary, INV-27); (b) each session names a rustylife `Scope` (subtree grant); the provider can only read inside it; (c) rustylife's information-flow labels map to the harness sensitivity labels: anything labelled personal makes the session `personal`, so a hosted model is refused (Q2 default) and the trifecta rule applies (private + untrusted + exfil never combine); (d) retrieved text is `Untrusted` and delimited; (e) writes are proposals only: `memory.propose` journals a pending note the user approves/rejects out of band, never auto-saved; (f) every read is journaled (ids and digests, not content) so a session shows exactly which memories influenced it; (g) default profile for small local models: top-k with a token cap.
+- Crates: harness-manifest/policy (a `memory` capability class, label mapping), harness-tools (seam only), adapters/rustylife (new, feature-gated; the only place rustylife is named), harness-cli (`--memory rustylife --memory-scope <node ids>`).
+- Tests (design-note refines): `memory_off_by_default`, `memory_read_outside_scope_refused`, `personal_label_blocks_hosted_profile`, `memory_text_untrusted_and_delimited`, `propose_never_writes_without_approval`, `reads_journaled_without_content`, `key_never_in_journal_or_context`, `default_build_has_no_rustylife_dependency` (purity), add-on on/off matrix (INV-32).
+- Deps: P-23, P-31 (sensitivity), P-08; needs a rustylife read API contract from the rustylife side (search/get_node/scope) which is the owner's project. Risk: high (privacy). ARCH: **yes** (design note first; owner confirms the rustylife contract).
+
+**P-48 `rustyharness compare` (blind side-by-side runs)**
+- Why: Odysseus's model comparison, but with evidence and without grading by the harness (OD-3). Runs the same task (same workspace snapshot, policy, budgets) on 2 to 4 profiles/endpoints one after another (endpoint concurrency 1), each from a fresh scratch copy; writes a comparison report with arms labelled A/B/C in random-but-recorded order, and per arm: steps, tokens, wall, format errors, tool counts, final diff, pre-submit check result (a fact, not a score), chain head. The user picks a winner (recorded in the report); the label to model map is revealed only after. All arms replayable.
+- Crates: harness-cli (`cmd_compare.rs`), harness-run (scratch copy helper).
+- Tests: `compare_runs_each_arm_in_fresh_copy`, `compare_labels_hide_model_until_reveal`, `compare_report_lists_facts_not_scores`, `compare_each_arm_audits_clean`, `compare_refuses_one_arm`.
+- Deps: P-18, P-21, P-22 (diff). Risk: low-medium. ARCH: no.
+
+**P-49 Scheduled unattended runs (`rustyharness schedule`)**
+- Why: scheduled agent tasks. `schedule add --name N --task task.json [--daily HH:MM|--every Nh]` writes a user-level launchd plist (macOS) or systemd user timer (Linux) that runs `rustyharness run` with the saved bundle; installing/removing is a config change, so the command prints the exact file and asks the user to confirm (never silent). Unattended means no approver: every Ask is denied (benchmark-mode semantics), a task must carry budgets, and results are `sessions` entries with an `events` stream. `schedule list/remove/run-now`.
+- Crates: harness-cli (`cmd_schedule.rs`), no new deps.
+- Tests: `schedule_add_prints_plist_and_requires_confirmation`, `schedule_refuses_task_without_budgets`, `schedule_run_denies_every_ask`, `schedule_remove_deletes_only_its_own_file`, `schedule_list_shows_next_run`, `plist_has_no_secrets`.
+- Deps: P-14, P-18. Risk: low-medium. ARCH: no.
+
+**Deferred (owner decision):** headless browser tool (JS-rendered pages). Large dependency and attack surface; the airlock plus P-44 covers static pages. Revisit after P-39 ships.
+
+---
+
+### Found by the first real-model run (2026-10-02)
+
+**P-51 Exec presets: read-only roots for the program's dynamic-library dependencies**
+- Why: live run of the new build with Qwen3-4B on a failing Rust crate: the model made the right edit (`a - b` to `a + b`), but the pre-submit `cargo test` failed inside the Seatbelt sandbox with a dyld error (missing `libgit2`): homebrew's `cargo` links dylibs from other Cellar directories that the `rust` preset (P-11) did not whitelist (`read-only: /opt/homebrew/Cellar/rust/1.97.0` only). The harness correctly failed closed (`submitted_checks_failed`), but it made a correct agent look wrong and wasted budget. Fix at the source, in the trust base: when `--allow-exec` resolves a program, also resolve its dynamic dependencies and add their directories as read-only roots, shown to the user before the run ("will allow: cargo -> /path; libs: ...") and recorded in the header's exec section. Pure Rust: parse the Mach-O load commands (`LC_LOAD_DYLIB`, `@rpath`/`@loader_path` expansion with the binary's rpaths, one level of transitive deps, depth and count bounded) and the ELF `DT_NEEDED` on Linux; no `otool`/`ldd` subprocess; system paths (`/usr/lib`, `/System`) are already readable; anything that resolves outside an allowed prefix list (home dir, `/opt/homebrew`, `/usr/local`, the toolchain dir) is listed and refused unless the user adds it. `doctor` gains a check that runs `<program> --version` through the confinement witness for every preset program and says exactly which path the sandbox blocked.
+- Crates: harness-cli (`exec_presets.rs`, `cmd_doctor.rs`), a new pure module for the object-file parser (harness-core or harness-tools; no I/O in a pure crate: the file read stays in the CLI).
+- Tests: `macho_load_commands_parsed_from_fixture_bytes`, `rpath_and_loader_path_expanded`, `transitive_depth_is_bounded`, `deps_outside_allowed_prefixes_listed_and_refused`, `preset_rust_includes_cargo_dylib_roots` (this machine: skipped with reason if cargo is not a Mach-O), `header_records_lib_roots`, `doctor_flags_a_program_that_cannot_run_in_the_sandbox`, `malformed_object_file_is_refused_not_panicked`.
+- Deps: P-11, P-43. Risk: medium (parser of untrusted-ish binaries: bounded, no unsafe, fuzz-style tests). ARCH: no.

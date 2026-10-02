@@ -583,13 +583,13 @@ fn resume_refuses_a_stopped_run_a_changed_workspace_and_changed_inputs() {
     let mut fx = fx("resume-refusals");
     let r = go(&fx, vec![read("a.txt"), read("b.txt"), submit()]);
     let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
-    assert!(matches!(e, RunRefused::NotResumable(w) if w.contains("already stopped")));
+    assert!(matches!(e, RunRefused::NotResumable(ref w) if w.contains("already stopped")));
 
     crash_after(&journal_path(&r, 1), 3);
     let original = std::mem::replace(&mut fx.spec, spec("Another task."));
     let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(
-        matches!(e, RunRefused::NotResumable(w) if w.contains("differ")),
+        matches!(e, RunRefused::NotResumable(ref w) if w.contains("differ")),
         "{e:?}"
     );
     fx.spec = original;
@@ -597,7 +597,7 @@ fn resume_refuses_a_stopped_run_a_changed_workspace_and_changed_inputs() {
     fx.write("a.txt", "changed\n").unwrap();
     let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(
-        matches!(e, RunRefused::NotResumable(w) if w.contains("workspace differs")),
+        matches!(e, RunRefused::NotResumable(ref w) if w.contains("workspace differs")),
         "{e:?}"
     );
     assert!(
@@ -1053,7 +1053,7 @@ fn f_1_an_audit_or_a_resume_given_other_limits_refuses() {
     config.limits.wall *= 2;
     let e = resume_under(&fx, &r.run, &config, vec![read("b.txt"), submit()]).unwrap_err();
     assert!(
-        matches!(e, RunRefused::NotResumable(w) if w.contains("budget limits")),
+        matches!(e, RunRefused::NotResumable(ref w) if w.contains("budget limits")),
         "{e:?}"
     );
     assert!(
@@ -1371,7 +1371,7 @@ fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
     fs::write(&bad, t).unwrap();
     let e = resume_with(&fx, &r.run, vec![]).unwrap_err();
     assert!(
-        matches!(e, RunRefused::NotResumable(w) if w.contains("does not verify")),
+        matches!(e, RunRefused::NotResumable(ref w) if w.contains("does not verify")),
         "{e:?}"
     );
 }

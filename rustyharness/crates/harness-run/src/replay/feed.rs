@@ -16,6 +16,7 @@ use super::compare::{diverge, Divergence};
 use crate::approve::{nonce_bytes, ApproverKind, RecordedApproval};
 use crate::driver::{is_edit, is_exec, parse_exec, RecordedEdit, RecordedResult};
 use crate::sample;
+use crate::session::{parse_input_end, RecordedInput};
 
 /// The replay inputs recorded in a journal.
 pub(crate) struct Recorded {
@@ -29,6 +30,11 @@ pub(crate) struct Recorded {
     /// used) (H2e). The clock is not recomputable, so these are re-fed; the
     /// loop re-writes each and refuses one it would not write.
     pub(crate) walls: BTreeMap<u64, (u64, u64)>,
+    /// The session's recorded inputs, in order (P-17 §6): each `UserTurn`'s
+    /// re-fed text, facts and wall time, and each `InputEnded`'s reason.
+    /// The turn boundaries (`TurnEnded`) are re-fed by nothing: the replay
+    /// recomputes them. Empty for a batch journal.
+    pub(crate) inputs: VecDeque<RecordedInput>,
 }
 
 /// A recorded approval answer, in exactly the shape the loop writes: the
@@ -94,10 +100,22 @@ pub(crate) fn recorded(
 ) -> Result<Recorded, Divergence> {
     let backend = ReplayBackend::from_journal(v, blobs, profile.clone())
         .map_err(|_| diverge(0, 0, "the model records cannot be replayed"))?;
+    // Only a session journal holds session records (`UserTurn`, `TurnEnded`,
+    // `InputEnded`); in any other, they are not records this loop writes.
+    let session = v
+        .records
+        .first()
+        .and_then(|h| h.body.get("mode").and_then(Value::as_str))
+        == Some("session");
     let mut nonces = BTreeMap::new();
     let mut feed = VecDeque::new();
     let mut approvals = VecDeque::new();
     let mut walls = BTreeMap::new();
+    let mut inputs = VecDeque::new();
+    // The last `UserTurn`'s wall time: a later one's cannot be smaller
+    // (P-17 §6) — the clock only moves forward, and an audit re-feeds this
+    // rather than recomputing it, so the order is checked here.
+    let mut last_turn_wall: Option<u64> = None;
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
     // `EditApplied` records waiting for their `ToolFinished` (H2b), by the
     // intent they answer, with the record's own seq.
@@ -256,6 +274,101 @@ pub(crate) fn recorded(
                     return Err(bad());
                 }
             }
+            // A session record in a journal that claims no session: not a
+            // shape this loop writes (P-17 §6; the batch audit refuses a
+            // session journal at its header's `mode` first, so this guards
+            // the headerless case).
+            EventKind::UserTurn | EventKind::TurnEnded | EventKind::InputEnded if !session => {
+                return Err(bad())
+            }
+            // P-17 §6: a `UserTurn` is re-fed in exactly its re-fed parts —
+            // the text, the facts it was measured with, and its wall time —
+            // in exactly the shape the loop writes (nine fields). Everything
+            // else about the turn (its number, the shown decision, whether
+            // the workspace changed, its allowance) is recomputed.
+            EventKind::UserTurn => {
+                let shape = r.body.len() == 9
+                    && [
+                        "external_change",
+                        "shown",
+                        "text",
+                        "turn",
+                        "turn_steps",
+                        "wall_used_ms",
+                        "workspace_files",
+                        "workspace_oversize",
+                        "workspace_tree",
+                    ]
+                    .iter()
+                    .all(|k| r.body.contains_key(*k));
+                if !shape {
+                    return Err(bad());
+                }
+                // The text payload names the user as its source: anything
+                // else is not a `UserTurn` this loop writes.
+                let source_kind = r
+                    .body
+                    .get("text")
+                    .and_then(|t| t.get("source"))
+                    .and_then(|s| s.get("kind"))
+                    .and_then(Value::as_str);
+                if source_kind != Some("user") {
+                    return Err(bad());
+                }
+                let bytes = payload_bytes(r.body.get("text").ok_or_else(bad)?, blobs, r.seq)
+                    .map_err(|_| bad())?;
+                let text = String::from_utf8(bytes).map_err(|_| bad())?;
+                let n = |k: &str| r.body.get(k).and_then(Value::as_u64);
+                let (Some(wall_used_ms), Some(files), Some(oversize)) = (
+                    n("wall_used_ms"),
+                    n("workspace_files"),
+                    n("workspace_oversize"),
+                ) else {
+                    return Err(bad());
+                };
+                if last_turn_wall.is_some_and(|prev| wall_used_ms < prev) {
+                    return Err(diverge(
+                        r.seq,
+                        r.step,
+                        "a user turn's wall time is before the last one's",
+                    ));
+                }
+                last_turn_wall = Some(wall_used_ms);
+                let facts = WorkspaceFacts {
+                    tree: digest_at(&r.body, "workspace_tree").ok_or_else(bad)?,
+                    files,
+                    oversize,
+                };
+                inputs.push_back(RecordedInput::Message {
+                    text,
+                    facts,
+                    wall_used_ms,
+                });
+            }
+            // An `InputEnded` is re-fed by its reason; its turn number is
+            // recomputed, and exactly the two fields are written.
+            EventKind::InputEnded => {
+                if r.body.len() != 2 || !r.body.contains_key("turn") {
+                    return Err(bad());
+                }
+                let reason = r
+                    .body
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .and_then(parse_input_end)
+                    .ok_or_else(bad)?;
+                inputs.push_back(RecordedInput::End(reason));
+            }
+            // A turn boundary is the loop's own: recomputed, never re-fed.
+            EventKind::TurnEnded => {}
+            // A record no slice owns yet is not a shape this loop writes
+            // (P-17 §6).
+            EventKind::ModeChanged
+            | EventKind::RuleGranted
+            | EventKind::Restored
+            | EventKind::InstructionsLoaded
+            | EventKind::ForkedFrom
+            | EventKind::ChildRun => return Err(bad()),
             _ => {}
         }
     }
@@ -284,6 +397,7 @@ pub(crate) fn recorded(
         feed,
         approvals,
         walls,
+        inputs,
     })
 }
 

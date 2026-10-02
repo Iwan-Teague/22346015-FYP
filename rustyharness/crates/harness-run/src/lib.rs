@@ -66,7 +66,10 @@ pub use approve::{ApprovalAnswer, Approver, ApproverKind};
 pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
 pub use harness_tools::{plain_name, ExecLimits, ExecProgram, ExecSpec, MAX_PROGRAMS};
 pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
-pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Resume};
+pub use replay::{
+    audit, audit_session, resume, resume_session, Audit, AuditRefused, AuditReport, Divergence,
+    Resume, ResumeSession,
+};
 pub use session::{
     run_session, EventSink, InputEnd, SessionConfig, SessionReport, SessionRun, TurnLimits,
     UiEvent, UserInput, UserInputEvent, UserMessage, UserMessageRefused,

@@ -188,6 +188,8 @@ fn cli(args: &[&str], local: bool, marker: &Path) -> Output {
                 out: RefCell::new(&mut out),
                 err: RefCell::new(&mut err),
                 approver: harness_cli::ApproverSource::None,
+                input: harness_cli::InputSource::Given(&[]),
+                backend: harness_cli::BackendSource::BuiltIn,
                 confinement: &harness_sandbox::SystemConfinement,
             };
             harness_cli::main_with(&cx, args)
@@ -631,6 +633,8 @@ fn an_approver_given_to_the_cli_approves_an_edit() {
             out: RefCell::new(&mut out),
             err: RefCell::new(&mut err),
             approver: harness_cli::ApproverSource::Given(&Yes),
+            input: harness_cli::InputSource::Given(&[]),
+            backend: harness_cli::BackendSource::BuiltIn,
             confinement: &harness_sandbox::SystemConfinement,
         };
         harness_cli::main_with(&cx, &run_args(&fx, &ep))
@@ -847,6 +851,8 @@ fn a_task_that_executes_without_confinement_exits_3_and_writes_nothing() {
             out: RefCell::new(&mut out),
             err: RefCell::new(&mut err),
             approver: harness_cli::ApproverSource::None,
+            input: harness_cli::InputSource::Given(&[]),
+            backend: harness_cli::BackendSource::BuiltIn,
             confinement: &refuse,
         };
         harness_cli::main_with(&cx, &args)
@@ -2484,6 +2490,8 @@ fn events_follow_sees_new_records() {
             out: RefCell::new(&mut sink),
             err: RefCell::new(&mut sink_err),
             approver: harness_cli::ApproverSource::None,
+            input: harness_cli::InputSource::Given(&[]),
+            backend: harness_cli::BackendSource::BuiltIn,
             confinement: &harness_sandbox::SystemConfinement,
         };
         harness_cli::main_with(&cx, &borrowed)

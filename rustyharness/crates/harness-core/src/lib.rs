@@ -2,8 +2,9 @@
 //!
 //! The types here are the harness's pure core (design §1.2): untrusted data,
 //! run ids and nonces, the one SHA-256 function, the strict JSON reader, the
-//! pure glob matcher (P-08), the run meter and loop detection, and the
-//! environment-sample vocabulary.
+//! pure glob matcher (P-08), the run meter and loop detection, the
+//! environment-sample vocabulary, and the pure HTML-to-text extractor
+//! (P-44).
 //!
 //! The gate-layer outcome type lives in the sibling `gate-outcome` crate
 //! (`GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`); this
@@ -27,6 +28,7 @@ pub mod diff;
 pub mod display;
 pub mod environment;
 pub mod glob;
+pub mod html;
 pub mod strict_json;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

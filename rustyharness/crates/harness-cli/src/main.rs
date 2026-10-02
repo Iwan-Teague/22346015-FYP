@@ -29,6 +29,8 @@ fn main() -> ExitCode {
         err: RefCell::new(&mut err),
         approver: harness_cli::ApproverSource::StdinIfTerminal,
         confinement: &harness_sandbox::SystemConfinement,
+        input: harness_cli::InputSource::Stdin,
+        backend: harness_cli::BackendSource::BuiltIn,
     };
     ExitCode::from(harness_cli::main_with(&cx, &args))
 }

@@ -26,10 +26,11 @@
 //! own, and the kernel delivers it only to processes of the same sandbox
 //! instance, because the profile allows `signal` only with `(target
 //! same-sandbox)` (measured: E4, and the review's M-6). Passes repeat
-//! until one kills nothing, for at most 3 s by the stub's clock. Passes
-//! back off from 5 ms to 50 ms, so on a loaded host, where killed processes
-//! are slow to exit, the sweep still converges well inside `SWEEP_GRACE`.
-//! A `setsid` or double-forked
+//! until one kills nothing, for at most the sweep deadline of the frame
+//! (3 s unless the caller asks for more; the stub bounds it, P-41).
+//! Passes back off from 5 ms to 50 ms, so on a loaded host, where killed
+//! processes are slow to exit, the sweep still converges well inside the
+//! sweep grace. A `setsid` or double-forked
 //! descendant cannot leave the sandbox instance, so it is swept too (E8).
 //!
 //! **Memory guard (FT-6, H2c).** When the spec sets a memory budget, the
@@ -102,9 +103,15 @@ use std::time::{Duration, Instant};
 
 use crate::spec::{ChildStatus, ConfinedExit, DomainCleanup, Validated};
 
-/// How long the stub may take to sweep after the deadline or the program's
-/// exit before the harness kills it and reports the domain unconfirmed.
-pub const SWEEP_GRACE: Duration = Duration::from_secs(5);
+/// The sweep deadline a call asks for unless it says otherwise: the stub
+/// sweeps for at most this long (P-41: the live probe's one retry of a
+/// timeout asks for triple; the stub bounds whatever the frame says to
+/// 1-30 s, so a frame cannot ask for a zero or unbounded sweep).
+pub const SWEEP_DEADLINE: Duration = Duration::from_secs(3);
+/// How much time the stub gets ON TOP of its sweep deadline before the
+/// harness kills it and reports the domain unconfirmed (the kill scan's
+/// own pace; the base deadline's grace is 3 s + 2 s = 5 s, as reviewed).
+const SWEEP_GRACE_MARGIN: Duration = Duration::from_secs(2);
 /// How long the readers may take to reach end of file after the stub ended.
 pub const READ_GRACE: Duration = Duration::from_secs(2);
 /// Bytes of stderr's end kept to find the stub's report.
@@ -121,7 +128,7 @@ sub rl{my($l,$ch)=('');while(1){my $n=sysread($c,$ch,1);return undef unless $n;r
 sub rn{my $n=shift;my $b='';while(length($b)<$n){my $r=sysread($c,$b,$n-length($b),length($b));return undef unless $r;}return $b}
 sub item{my $n=rl();return undef unless defined $n && $n=~/^[0-9]{1,8}$/;return rn($n) if $n>0;return ''}
 my $m=rl(); exit 91 unless defined $m && $m eq 'rh-stub/1';
-my $li=rl(); exit 91 unless defined $li && $li=~/^lim ([0-9]{1,12}) ([0-9]{1,15}) ([0-9]{1,15}) ([0-9]{1,6})$/; my ($cpu,$fs,$mem,$np)=($1,$2,$3,$4);
+my $li=rl(); exit 91 unless defined $li && $li=~/^lim ([0-9]{1,12}) ([0-9]{1,15}) ([0-9]{1,15}) ([0-9]{1,6})( ([0-9]{1,2}))?$/; my ($cpu,$fs,$mem,$np)=($1,$2,$3,$4); my $sw=defined($6)?$6:3; exit 91 if $sw<1 || $sw>30;
 my $ac=rl(); exit 91 unless defined $ac && $ac=~/^[1-9][0-9]{0,5}$/;
 my @a; for(1..$ac){my $x=item(); exit 91 unless defined $x; push @a,$x}
 my $ec=rl(); exit 91 unless defined $ec && $ec=~/^[0-9]{1,6}$/;
@@ -140,7 +147,7 @@ close $ew;
 my $st=-1; my $why='exit'; my $poll=0;
 while(1){ my $w=waitpid($pid,1); if($w==$pid){$st=$?;last} my $rin='';vec($rin,fileno($c),1)=1; my $n=select(my $ro=$rin,undef,undef,0.02); if($n>0){$why='stop';last} if($np>0 && ++$poll>=12){$poll=0; my $mc=0; for my $q (2..99999){$mc++ if kill(0,$q)} if($mc-1>$np){$why='procs';last}} }
 my ($k,$res)=(0,'unconverged');
-my $t0=time; PASS: for my $p (1..1000){ my $hit=kill(0,$pp); my $en=$!+0; if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS} my $n=0; for my $q (2..99999){next if $q==$$; $n++ if kill('KILL',$q)} 1 while waitpid(-1,1)>0; $k+=$n; if($n==0){$res='confirmed';last PASS} last PASS if time-$t0>=3; my $w=0.005*$p; $w=0.05 if $w>0.05; select(undef,undef,undef,$w) }
+my $t0=time; PASS: for my $p (1..1000){ my $hit=kill(0,$pp); my $en=$!+0; if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS} my $n=0; for my $q (2..99999){next if $q==$$; $n++ if kill('KILL',$q)} 1 while waitpid(-1,1)>0; $k+=$n; if($n==0){$res='confirmed';last PASS} last PASS if time-$t0>=$sw; my $w=0.005*$p; $w=0.05 if $w>0.05; select(undef,undef,undef,$w) }
 my $ef=''; if($res eq 'confirmed'){sysread($er,$ef,1)}
 my $ex = $ef eq 'E' ? 'failed' : $ef eq 'L' ? 'limit' : 'ok';
 if($st==-1){$st=-2}
@@ -165,6 +172,7 @@ pub(crate) struct Running {
     err_done: mpsc::Receiver<()>,
     started: Instant,
     deadline: Instant,
+    sweep: Duration,
     cleanup_dir: Option<PathBuf>,
 }
 
@@ -204,19 +212,22 @@ fn reader(
     Ok((buf, rx))
 }
 
-fn frame(v: &Validated) -> Vec<u8> {
+fn frame(v: &Validated, sweep: Duration) -> Vec<u8> {
     let cpu = v
         .limits
         .cpu
         .map_or(0, |c| c.as_secs() + u64::from(c.subsec_nanos() > 0));
     let fs = v.limits.file_size.unwrap_or(0);
-    // The memory budget (RLIMIT_AS growth, FT-6) and the process cap (the
-    // watchdog threshold, FT-5); 0 means "no limit" for each. `validate`
-    // bounds both to what this line accepts (spec::MAX_MEMORY, MAX_PROCESSES).
+    // The memory budget (RLIMIT_AS growth, FT-6), the process cap (the
+    // watchdog threshold, FT-5) and the sweep deadline (P-41): 0 means "no
+    // limit" for the first two; the deadline is clamped to what the stub
+    // accepts. `validate` bounds both limits to what this line accepts
+    // (spec::MAX_MEMORY, MAX_PROCESSES); the stub bounds the deadline again.
     let mem = v.limits.memory.unwrap_or(0);
     let procs = v.limits.processes.unwrap_or(0);
+    let sweep = sweep.as_secs().clamp(1, 30);
     let mut h = format!(
-        "rh-stub/1\nlim {cpu} {fs} {mem} {procs}\n{}\n",
+        "rh-stub/1\nlim {cpu} {fs} {mem} {procs} {sweep}\n{}\n",
         v.argv.len()
     )
     .into_bytes();
@@ -232,11 +243,13 @@ fn frame(v: &Validated) -> Vec<u8> {
     h
 }
 
-/// Start `v` under the profile at `profile`. `cleanup_dir` is removed when
-/// the call has ended.
+/// Start `v` under the profile at `profile`. The stub sweeps for at most
+/// `sweep` when the call ends (bounded, P-41). `cleanup_dir` is removed
+/// when the call has ended.
 pub(crate) fn spawn(
     profile: &Path,
     v: &Validated,
+    sweep: Duration,
     cleanup_dir: Option<PathBuf>,
 ) -> std::io::Result<Running> {
     let started = Instant::now();
@@ -266,7 +279,9 @@ pub(crate) fn spawn(
         }
     };
     // A stub that already died gives EPIPE here; the wait reports it.
-    let _ = stdin.write_all(&frame(v)).and_then(|()| stdin.flush());
+    let _ = stdin
+        .write_all(&frame(v, sweep))
+        .and_then(|()| stdin.flush());
     Ok(Running {
         child: Some(child),
         stdin: Some(stdin),
@@ -276,6 +291,7 @@ pub(crate) fn spawn(
         err_done,
         started,
         deadline: started + v.limits.wall,
+        sweep,
         cleanup_dir,
     })
 }
@@ -354,6 +370,13 @@ pub(crate) fn parse_report(tail: &[u8]) -> Option<(Report, usize)> {
 }
 
 impl Running {
+    /// How long the stub may take to finish its sweep once the call ended:
+    /// the deadline it was given plus a fixed margin (P-41: the grace
+    /// scales, so a retried probe's longer sweep is not cut short).
+    fn grace(&self) -> Duration {
+        self.sweep + SWEEP_GRACE_MARGIN
+    }
+
     /// Wait for the call to end (program exit or deadline), let the stub
     /// sweep, and collect what it left.
     pub(crate) fn wait(mut self) -> ConfinedExit {
@@ -376,7 +399,7 @@ impl Running {
             timed_out = Instant::now() >= self.deadline;
             // Close the control pipe: the stub stops the program and sweeps.
             drop(self.stdin.take());
-            let until = Instant::now() + SWEEP_GRACE;
+            let until = Instant::now() + self.grace();
             while stub.is_none() && Instant::now() < until {
                 match child.try_wait() {
                     Ok(Some(s)) => stub = Some(s),
@@ -459,8 +482,11 @@ impl Running {
                         check failed mid-run (canary)"
                         .to_string(),
                     ("unconverged", _) => {
-                        "processes of the domain would not die within the sweep deadline (3 s)"
-                            .to_string()
+                        format!(
+                            "processes of the domain would not die within the sweep \
+                             deadline ({} s)",
+                            self.sweep.as_secs()
+                        )
                     }
                     (other, _) => format!(
                         "the domain stub reported {other} (exit {:?})",
@@ -531,7 +557,7 @@ impl Drop for Running {
         drop(self.stdin.take());
         if let Some(mut child) = self.child.take() {
             let pgid = child.id();
-            let until = Instant::now() + SWEEP_GRACE;
+            let until = Instant::now() + self.grace();
             loop {
                 match child.try_wait() {
                     // Match wait()'s post-reap kill: if members may remain
@@ -595,6 +621,19 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_deadline_rides_the_frame_and_the_stub_bounds_it() {
+        // The deadline is an optional fifth field of the lim line (absent
+        // means the reviewed 3 s), and the stub refuses anything outside
+        // 1-30 s, so a frame can ask for neither a zero nor an unbounded
+        // sweep (P-41).
+        assert!(STUB.contains(r#"([0-9]{1,6})( ([0-9]{1,2}))?$"#));
+        assert!(STUB.contains(r#"$sw=defined($6)?$6:3"#));
+        assert!(STUB.contains(r#"exit 91 if $sw<1 || $sw>30"#));
+        // The sweep runs to the frame's deadline, not a hardcoded 3 s.
+        assert!(STUB.contains("last PASS if time-$t0>=$sw"));
+    }
+
+    #[test]
     fn the_stub_has_no_double_quote_so_the_program_scan_reads_three_programs() {
         // The purity gate reads the confined spawn's absolute-path program
         // literals; the stub must add no double quote of its own (the memory
@@ -612,11 +651,31 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_carries_cpu_file_size_memory_and_process_caps() {
+    fn the_frame_carries_cpu_file_size_memory_process_caps_and_sweep() {
         // Only argv/env/limits reach the frame; cwd and roots do not, and no
         // absolute-path literal is used here (the purity gate reads this
         // file's program literals).
-        let v = Validated {
+        let f = String::from_utf8(frame(&limits_spec(), Duration::from_secs(9))).unwrap();
+        assert!(
+            f.starts_with("rh-stub/1\nlim 2 4096 1073741824 64 9\n"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn the_frame_sweep_is_clamped_into_the_stub_s_bound() {
+        // The stub refuses 0 or anything above 30 s; the frame builder
+        // clamps, so the harness can never send an unbounded sweep (P-41).
+        for (ask, want) in [(0, 1), (1, 1), (30, 30), (100, 30)] {
+            let f = String::from_utf8(frame(&limits_spec(), Duration::from_secs(ask))).unwrap();
+            let lim = f.lines().nth(1).unwrap();
+            assert!(lim.ends_with(&format!(" {want}")), "{lim:?}");
+        }
+    }
+
+    /// A validated spec with every limit set, for the frame tests.
+    fn limits_spec() -> Validated {
+        Validated {
             argv: vec![b"p".to_vec()],
             env: vec![],
             cwd: String::new(),
@@ -631,11 +690,6 @@ mod tests {
                 processes: Some(64),
                 output_bytes: 1024,
             },
-        };
-        let f = String::from_utf8(frame(&v)).unwrap();
-        assert!(
-            f.starts_with("rh-stub/1\nlim 2 4096 1073741824 64\n"),
-            "{f:?}"
-        );
+        }
     }
 }

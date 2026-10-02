@@ -6,6 +6,12 @@
 //! row's case set; [`crate::require`], the production entry point, demands
 //! [`H2_EXIT_CASES`] in full, so a backend whose row is partial can be
 //! exercised by its conformance tests but gates no execution.
+//!
+//! The web airlock (§5.3) adds the proxy-profile cases; a research session
+//! that fetches demands `AIRLOCK_CASES` in its witness's covers (INV-46).
+//! They are deliberately not part of [`H2_EXIT_CASES`] or the matrix row:
+//! plain execution must not demand proxy-profile behaviour, only the
+//! airlock's spawn path does.
 
 use crate::{BackendKind, KillDomain, MemoryGuard, NetworkMechanism, ProcessGuard};
 
@@ -61,6 +67,18 @@ pub enum Case {
     /// workspace is refused, so path-based rules cannot be sidestepped by
     /// aliasing an outside file under a workspace path (review LOW-4).
     HardLink,
+    /// FT-13 under the proxy profile: a direct connect to a routable
+    /// address fails while the granted pump port connects (the positive
+    /// control; §5.3).
+    Ft13P,
+    /// FT-15 under the proxy profile: no resolver is reachable, even with
+    /// one loopback port granted.
+    Ft15P,
+    /// FT-19: a connect to any other loopback port fails, including one
+    /// with a listener standing in for the model server (§6.5).
+    Ft19,
+    /// FT-20: no bind and no listen, even under the proxy profile.
+    Ft20,
 }
 
 impl Case {
@@ -89,6 +107,10 @@ impl Case {
             Case::NoBind => "D31-no-bind",
             Case::NestedSandbox => "nested-sandbox",
             Case::HardLink => "hard-link",
+            Case::Ft13P => "FT-13-proxy",
+            Case::Ft15P => "FT-15-proxy",
+            Case::Ft19 => "FT-19",
+            Case::Ft20 => "FT-20",
         }
     }
 }
@@ -119,6 +141,38 @@ pub const H2_EXIT_CASES: &[Case] = &[
     Case::NoBind,
     Case::NestedSandbox,
     Case::HardLink,
+];
+
+/// What the airlock's fetcher must have witnessed before a research session
+/// may fetch (§5.3, INV-46): the whole H2 exit set plus the proxy-profile
+/// cases. Spelled out (not computed) because a `const` slice cannot
+/// concatenate.
+pub const AIRLOCK_CASES: &[Case] = &[
+    Case::Ft1,
+    Case::Ft2,
+    Case::Ft3,
+    Case::Ft4,
+    Case::Ft5,
+    Case::Ft6,
+    Case::Ft7,
+    Case::Ft8,
+    Case::Ft9,
+    Case::Ft10,
+    Case::Ft11,
+    Case::Ft12,
+    Case::Ft13,
+    Case::Ft15,
+    Case::Ft16,
+    Case::Ft16Setsid,
+    Case::Ft17,
+    Case::Ft18,
+    Case::NoBind,
+    Case::NestedSandbox,
+    Case::HardLink,
+    Case::Ft13P,
+    Case::Ft15P,
+    Case::Ft19,
+    Case::Ft20,
 ];
 
 /// One committed row of the pass matrix.
@@ -214,5 +268,26 @@ mod tests {
         assert_eq!(r.processes, ProcessGuard::MemberCountWatchdog);
         assert!(row(BackendKind::Linux, "linux").is_none());
         assert!(row(BackendKind::AppContainer, "windows").is_none());
+    }
+
+    #[test]
+    fn airlock_cases_are_the_h2_set_plus_the_proxy_cases() {
+        // The airlock set is a strict superset of the H2 exit set ...
+        assert!(missing(AIRLOCK_CASES, H2_EXIT_CASES).is_empty());
+        // ... and exactly the H2 set plus the four proxy-profile cases.
+        let extra = missing(H2_EXIT_CASES, AIRLOCK_CASES);
+        assert_eq!(
+            extra,
+            vec![Case::Ft13P, Case::Ft15P, Case::Ft19, Case::Ft20]
+        );
+        assert_eq!(Case::Ft13P.id(), "FT-13-proxy");
+        assert_eq!(Case::Ft15P.id(), "FT-15-proxy");
+        assert_eq!(Case::Ft19.id(), "FT-19");
+        assert_eq!(Case::Ft20.id(), "FT-20");
+        // Plain execution must not demand proxy behaviour: the matrix row
+        // still covers only the H2 exit set.
+        let r = row(BackendKind::Seatbelt, "macos").unwrap();
+        assert!(missing(r.cases, AIRLOCK_CASES).len() == 4);
+        assert!(!r.cases.contains(&Case::Ft13P));
     }
 }

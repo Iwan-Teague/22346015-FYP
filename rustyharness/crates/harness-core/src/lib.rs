@@ -253,6 +253,10 @@ pub enum Source {
     /// the session loop constructs it (P-13), and only for a user turn's
     /// text.
     User,
+    /// Fetched over the network (P-39, the web airlock): the URL the bytes
+    /// came from. The URL is outside text, so it is carried as untrusted
+    /// data and escaped wherever it is recorded.
+    Web(String),
 }
 
 impl<T> Untrusted<T> {

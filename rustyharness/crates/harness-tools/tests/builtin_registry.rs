@@ -1,5 +1,5 @@
 //! The built-in dispatch table (P-02): the manifest, the policy
-//! registration table and the tools dispatch table must list the same eleven
+//! registration table and the tools dispatch table must list the same twelve
 //! tools in the same order, and the workspace-constructed entries must
 //! build a provider that serves its id over a real workspace root.
 
@@ -37,15 +37,15 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// All three tables agree: eleven tools, manifest order. A new built-in
+/// All three tables agree: twelve tools, manifest order. A new built-in
 /// registers in all three or the run cannot dispatch what it grants.
 #[test]
-fn builtin_registry_lists_eleven_tools_in_order() {
+fn builtin_registry_lists_twelve_tools_in_order() {
     let m = manifest_builtin::manifest(&ctx()).unwrap();
     let manifest_ids: Vec<&str> = m.capabilities().iter().map(|c| c.id().as_str()).collect();
     let policy_ids: Vec<&str> = policy_builtin::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
     let tool_ids: Vec<&str> = registry::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
-    assert_eq!(manifest_ids.len(), 11);
+    assert_eq!(manifest_ids.len(), 12);
     assert_eq!(policy_ids, manifest_ids);
     assert_eq!(tool_ids, manifest_ids);
 
@@ -68,6 +68,10 @@ fn builtin_registry_lists_eleven_tools_in_order() {
     ));
     assert!(matches!(
         registry::entry("harness.task.todo").map(|t| &t.ctor),
+        Some(ProviderCtor::RunLoop)
+    ));
+    assert!(matches!(
+        registry::entry("harness.task.delegate").map(|t| &t.ctor),
         Some(ProviderCtor::RunLoop)
     ));
     assert!(matches!(

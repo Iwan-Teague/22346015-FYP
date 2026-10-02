@@ -204,6 +204,10 @@ pub(crate) fn source_value(s: &Source) -> Value {
         Source::User => {
             m.insert("kind", Value::from("user"));
         }
+        Source::Web(url) => {
+            m.insert("kind", Value::from("web"));
+            m.insert("url", Value::from(escape(url)));
+        }
     }
     Value::Object(m.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
 }

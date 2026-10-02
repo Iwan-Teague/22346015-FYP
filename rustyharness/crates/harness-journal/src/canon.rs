@@ -14,6 +14,7 @@
 //! duplicated key, reordered keys, extra whitespace or a re-escaped string
 //! are all refused, not normalised.
 
+use core::net::IpAddr;
 use std::fmt;
 
 use harness_core::{sha256_parts, Digest};
@@ -133,6 +134,36 @@ impl fmt::Display for Ident {
 ///   `input_refused`), `steps` (U64), `turn` (U64).
 /// - `InputEnded` (fsynced; the user's input ended the session):
 ///   `reason` (Text `eof` | `exit` | `timeout`), `turn` (U64).
+///
+/// **Web airlock kinds (P-39c, hotspot H-E: defined once, here).** The
+/// `Egress` name was reserved with the first wave and is fsynced (§4.5:
+/// appended before any bytes are forwarded); the two research-note kinds
+/// (§6, §7) are fsynced because a resume reads notes from the journal's
+/// evidence, not from a hand-wave. Their canonical bodies
+/// ([`check_canonical_body`] enforces exactly these keys and shapes; the
+/// writer refuses anything else before a byte is written):
+///
+/// - `Egress` (fsynced; one per attempted fetch or search, allow or
+///   refuse): `decision` (Text `allow` | `refuse:<reason>`, reason in the
+///   closed set `non-global-address`, `no-address`, `dns-timeout`,
+///   `budget`, `host-not-allowlisted`, `downgrade`), `host` (Text, the
+///   lowercase DNS name or IP literal the request targeted, §8),
+///   `hop` (U64, 0-based redirect hop), `ip` (null | Text IP address |
+///   `delegated` in user-proxy mode), `mode` (Text `direct` |
+///   `user-proxy` | `search-endpoint`), `port` (U64 ≤ 65535),
+///   `purpose` (Text `fetch` | `search`), `resolved` (list of Text IP
+///   addresses, the resolver answer in the order it is re-fed by audit),
+///   `url` (UntrustedBlob with `source: {"kind":"model"}` per §4.5, the
+///   model-supplied URL in its typed home).
+/// - `NoteSaved` (fsynced; §6, one per research note written under
+///   `<state_root>/research/notes/`): `bytes` (U64), `note` (Text, the
+///   note's 64-hex SHA-256 id), `sources` (U64, count), `turn` (U64).
+/// - `NoteImported` (fsynced; §7, a note promoted back into context):
+///   `bytes` (UntrustedBlob, the file's bytes in their typed home),
+///   `confirm` (Text `typed-id-prefix`, exact — INV-50), `note` (Text,
+///   the note's 64-hex id), `path` (UntrustedBlob, the note's path),
+///   `sha256` (Text, the payload's digest).
+///
 /// - Reserved: `ModeChanged` (P-28), `RuleGranted` (P-23), `Restored`
 ///   (P-22/P-26), `InstructionsLoaded` (P-30), `ForkedFrom` (P-32),
 ///   `ChildRun` (P-38). No code writes them in this wave.
@@ -177,6 +208,8 @@ pub enum EventKind {
     InstructionsLoaded,
     ForkedFrom,
     ChildRun,
+    NoteSaved,
+    NoteImported,
 }
 
 const KINDS: &[(EventKind, &str)] = &[
@@ -218,6 +251,8 @@ const KINDS: &[(EventKind, &str)] = &[
     (EventKind::InstructionsLoaded, "InstructionsLoaded"),
     (EventKind::ForkedFrom, "ForkedFrom"),
     (EventKind::ChildRun, "ChildRun"),
+    (EventKind::NoteSaved, "NoteSaved"),
+    (EventKind::NoteImported, "NoteImported"),
 ];
 
 impl EventKind {
@@ -239,8 +274,11 @@ impl EventKind {
     /// `append_intent`) and result (`ToolFinished`), `Egress` (appended
     /// before forwarding), the verification events and `RunStopped`. The
     /// session kinds (P-05/P-10) are all fsynced: they are inputs or turn
-    /// boundaries, and resume keys on them (decided now so owners never
-    /// touch `canon.rs` again).
+    /// boundaries, and resume keys on them. The web airlock kinds (P-39c)
+    /// are fsynced for the same reason: `Egress` is appended before any
+    /// bytes are forwarded (§4.5), and the research notes (§6, §7) are
+    /// evidence a resume reads back. Decided once, here, so owners never
+    /// touch `canon.rs` again.
     pub fn needs_fsync(self) -> bool {
         matches!(
             self,
@@ -261,8 +299,231 @@ impl EventKind {
                 | EventKind::InstructionsLoaded
                 | EventKind::ForkedFrom
                 | EventKind::ChildRun
+                | EventKind::NoteSaved
+                | EventKind::NoteImported
         )
     }
+}
+
+/// The canonical body fields of the web airlock kinds (P-39c, design
+/// §4.5, §6, §7), sorted like the wire (every body's keys are sorted on
+/// the record line). `None` for kinds whose bodies their owning slices
+/// still define: the writer polices only what is defined here, so nothing
+/// written before P-39c changes shape.
+pub fn canonical_body_keys(kind: EventKind) -> Option<&'static [&'static str]> {
+    match kind {
+        EventKind::Egress => Some(&[
+            "decision", "hop", "host", "ip", "mode", "port", "purpose", "resolved", "url",
+        ]),
+        EventKind::NoteSaved => Some(&["bytes", "note", "sources", "turn"]),
+        EventKind::NoteImported => Some(&["bytes", "confirm", "note", "path", "sha256"]),
+        _ => None,
+    }
+}
+
+/// Refusal reasons an `Egress` record may carry (§4.5). Closed.
+const EGRESS_REFUSALS: &[&str] = &[
+    "non-global-address",
+    "no-address",
+    "dns-timeout",
+    "budget",
+    "host-not-allowlisted",
+    "downgrade",
+];
+
+/// `allow`, or `refuse:` plus a reason from the closed set.
+fn check_egress_decision(s: &str) -> Result<(), &'static str> {
+    if s == "allow" {
+        return Ok(());
+    }
+    let refused = s
+        .strip_prefix("refuse:")
+        .ok_or("Egress: \"decision\" is \"allow\" or \"refuse:<reason>\"")?;
+    if EGRESS_REFUSALS.contains(&refused) {
+        Ok(())
+    } else {
+        Err("Egress: unknown \"refuse:\" reason")
+    }
+}
+
+/// A lowercase DNS name (labels of `[a-z0-9-]`, 1..=63 bytes each, no
+/// leading or trailing hyphen, no empty label, ≤ 253 bytes) — or an IP
+/// literal (§8's search-endpoint mode addresses the resolver by IP). A
+/// shape backstop only: the authoritative host check is the airlock's
+/// (P-39a), which the `Egress` record merely evidences.
+fn is_egress_host(s: &str) -> bool {
+    if s.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// A field that must be an IP address in text form.
+fn as_ip(s: &str) -> Result<(), &'static str> {
+    if s.parse::<IpAddr>().is_ok() {
+        Ok(())
+    } else {
+        Err("expected an IP address")
+    }
+}
+
+/// A field that must be a digest in text form (64 lowercase hex).
+fn as_digest_str(s: &str) -> Result<(), &'static str> {
+    if s.parse::<Digest>().is_ok() {
+        Ok(())
+    } else {
+        Err("expected a 64-hex digest")
+    }
+}
+
+/// An untrusted payload home: a JSON object carrying the reserved
+/// `"untrusted": true` marker (the reader's `check_blob` does the deep
+/// check against the blob store; this is the body's shape).
+fn is_untrusted_home(o: &Map<String, Value>) -> bool {
+    o.get(crate::event::UNTRUSTED_KEY) == Some(&Value::Bool(true))
+}
+
+/// Check a body against its kind's canonical field list
+/// ([`canonical_body_keys`]): exactly those keys, and each value in the
+/// shape §4.5/§6/§7 give it. Kinds with no list yet are accepted
+/// unchanged. The writer calls this before anything is written and
+/// refuses a mismatch the way it refuses any other malformed event (a
+/// harness bug, not an I/O failure); the reader does not re-check it, so
+/// journals written before this check existed still verify.
+pub fn check_canonical_body(
+    kind: EventKind,
+    body: &Map<String, Value>,
+) -> Result<(), &'static str> {
+    let keys = match canonical_body_keys(kind) {
+        Some(keys) => keys,
+        None => return Ok(()),
+    };
+    if body.len() != keys.len() || keys.iter().any(|k| !body.contains_key(*k)) {
+        return Err("body is not exactly the kind's canonical fields");
+    }
+    match kind {
+        EventKind::Egress => {
+            check_egress_decision(
+                body.get("decision")
+                    .and_then(Value::as_str)
+                    .ok_or("Egress: \"decision\" must be text")?,
+            )?;
+            match body.get("host").and_then(Value::as_str) {
+                Some(h) if is_egress_host(h) => {}
+                _ => return Err("Egress: \"host\" is not a lowercase DNS name or IP literal"),
+            }
+            // `hop` is a 0-based redirect counter: the airlock's hop budget
+            // (P-39a) bounds it, the record only carries it.
+            body.get("hop")
+                .and_then(Value::as_u64)
+                .ok_or("Egress: \"hop\" must be a u64")?;
+            match body.get("ip") {
+                Some(Value::Null) => {}
+                Some(Value::String(s)) if s == "delegated" => {}
+                Some(Value::String(s)) => as_ip(s)
+                    .map_err(|_| "Egress: \"ip\" is null, an IP address, or \"delegated\"")?,
+                _ => return Err("Egress: \"ip\" is null, an IP address, or \"delegated\""),
+            }
+            match body.get("mode").and_then(Value::as_str) {
+                Some("direct" | "user-proxy" | "search-endpoint") => {}
+                _ => return Err("Egress: unknown \"mode\""),
+            }
+            if body
+                .get("port")
+                .and_then(Value::as_u64)
+                .ok_or("Egress: \"port\" must be a u64")?
+                > 65535
+            {
+                return Err("Egress: \"port\" is above 65535");
+            }
+            match body.get("purpose").and_then(Value::as_str) {
+                Some("fetch" | "search") => {}
+                _ => return Err("Egress: unknown \"purpose\""),
+            }
+            match body.get("resolved") {
+                Some(Value::Array(addrs)) => {
+                    for addr in addrs {
+                        as_ip(
+                            addr.as_str()
+                                .ok_or("Egress: every entry of \"resolved\" must be text")?,
+                        )
+                        .map_err(|_| "Egress: \"resolved\" holds IP addresses")?;
+                    }
+                }
+                _ => return Err("Egress: \"resolved\" must be a list"),
+            }
+            // §4.5: the URL came from the model, so its payload home says so.
+            let url = body
+                .get("url")
+                .and_then(Value::as_object)
+                .ok_or("Egress: \"url\" must be an untrusted payload home")?;
+            let source_is_model = url
+                .get("source")
+                .and_then(Value::as_object)
+                .and_then(|s| s.get("kind"))
+                .and_then(Value::as_str)
+                == Some("model");
+            if !is_untrusted_home(url) || !source_is_model {
+                return Err("Egress: \"url\" must be a model-source untrusted payload home");
+            }
+        }
+        EventKind::NoteSaved => {
+            body.get("bytes")
+                .and_then(Value::as_u64)
+                .ok_or("NoteSaved: \"bytes\" must be a u64")?;
+            as_digest_str(
+                body.get("note")
+                    .and_then(Value::as_str)
+                    .ok_or("NoteSaved: \"note\" must be text")?,
+            )
+            .map_err(|_| "NoteSaved: \"note\" must be a 64-hex digest")?;
+            body.get("sources")
+                .and_then(Value::as_u64)
+                .ok_or("NoteSaved: \"sources\" must be a u64")?;
+            body.get("turn")
+                .and_then(Value::as_u64)
+                .ok_or("NoteSaved: \"turn\" must be a u64")?;
+        }
+        EventKind::NoteImported => {
+            // §7: the file's bytes and its path go to their typed homes.
+            for key in ["bytes", "path"] {
+                let ok = body
+                    .get(key)
+                    .and_then(Value::as_object)
+                    .map(is_untrusted_home)
+                    .unwrap_or(false);
+                if !ok {
+                    return Err("NoteImported: \"bytes\" and \"path\" are untrusted payload homes");
+                }
+            }
+            if body.get("confirm").and_then(Value::as_str) != Some("typed-id-prefix") {
+                return Err("NoteImported: \"confirm\" is exactly \"typed-id-prefix\" (INV-50)");
+            }
+            as_digest_str(
+                body.get("note")
+                    .and_then(Value::as_str)
+                    .ok_or("NoteImported: \"note\" must be text")?,
+            )
+            .map_err(|_| "NoteImported: \"note\" must be a 64-hex digest")?;
+            as_digest_str(
+                body.get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or("NoteImported: \"sha256\" must be text")?,
+            )
+            .map_err(|_| "NoteImported: \"sha256\" must be a 64-hex digest")?;
+        }
+        _ => return Ok(()),
+    }
+    Ok(())
 }
 
 /// Zero-width, bidi-control, invisible-letter and tag code points. Escaped
@@ -552,5 +813,185 @@ mod tests {
         for ok in ["run-01", "harness.fs.read", "0.0.1", "userns_disabled"] {
             assert!(Ident::new(ok).is_some(), "{ok:?}");
         }
+    }
+
+    // P-39c (§4.5): `Egress` is appended before any bytes are forwarded,
+    // so it must be durable whether the decision is allow or refuse.
+    #[test]
+    fn egress_is_fsynced() {
+        assert!(EventKind::Egress.needs_fsync());
+    }
+
+    fn body(v: serde_json::Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    fn hex_of(what: &[u8]) -> String {
+        sha256_parts(&[what]).to_string()
+    }
+
+    fn egress_body() -> serde_json::Value {
+        serde_json::json!({
+            "decision": "allow",
+            "host": "example.com",
+            "hop": 0,
+            "ip": null,
+            "mode": "direct",
+            "port": 443,
+            "purpose": "fetch",
+            "resolved": ["93.184.216.34"],
+            "url": {
+                "untrusted": true,
+                "source": {"kind": "model"},
+                "sha256": hex_of(b"https://example.com/doc"),
+                "len": 22,
+                "inline": "https://example.com/doc"
+            }
+        })
+    }
+
+    // P-39c: the web airlock kinds carry exactly the §4.5/§6/§7 fields, in
+    // shapes the design gives them; anything else is refused before a byte
+    // is written, and kinds without a defined list are untouched.
+    #[test]
+    fn web_airlock_bodies_are_shape_checked() {
+        let keys = canonical_body_keys(EventKind::Egress).unwrap();
+        assert_eq!(keys.len(), 9);
+        assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "sorted, like the wire"
+        );
+        assert_eq!(canonical_body_keys(EventKind::NoteSaved).unwrap().len(), 4);
+        assert_eq!(
+            canonical_body_keys(EventKind::NoteImported).unwrap().len(),
+            5
+        );
+        assert_eq!(canonical_body_keys(EventKind::ModelReplied), None);
+
+        assert_eq!(
+            check_canonical_body(EventKind::Egress, &body(egress_body())),
+            Ok(())
+        );
+        // Every refusal reason names itself; user-proxy answers "delegated"
+        // instead of an address; the search endpoint is addressed by IP.
+        for reason in EGRESS_REFUSALS {
+            let mut m = egress_body();
+            m["decision"] = Value::from(format!("refuse:{reason}"));
+            m["ip"] = Value::from("delegated");
+            m["mode"] = Value::from("user-proxy");
+            assert_eq!(
+                check_canonical_body(EventKind::Egress, &body(m)),
+                Ok(()),
+                "{reason}"
+            );
+        }
+        let mut endpoint = egress_body();
+        endpoint["host"] = Value::from("127.0.0.1");
+        endpoint["mode"] = Value::from("search-endpoint");
+        endpoint["purpose"] = Value::from("search");
+        endpoint["resolved"] = Value::Array(vec![]);
+        assert_eq!(
+            check_canonical_body(EventKind::Egress, &body(endpoint)),
+            Ok(())
+        );
+
+        let mut extra = egress_body();
+        extra["extra"] = Value::from(1);
+        assert!(check_canonical_body(EventKind::Egress, &body(extra)).is_err());
+        let mut missing = egress_body();
+        missing.as_object_mut().unwrap().remove("resolved");
+        assert!(check_canonical_body(EventKind::Egress, &body(missing)).is_err());
+        let bad: &[(&str, Value)] = &[
+            ("decision", "refuse:because".into()),
+            ("decision", "ALLOW".into()),
+            ("host", "EXAMPLE.com".into()),
+            ("host", "under_score.example".into()),
+            ("host", "-lead.example".into()),
+            ("host", "example.com.".into()),
+            ("host", "a..b".into()),
+            ("ip", "999.0.0.1".into()),
+            ("ip", "delegated ".into()),
+            ("ip", true.into()),
+            ("mode", "tunnel".into()),
+            ("port", 65536.into()),
+            ("purpose", "crawl".into()),
+        ];
+        for (key, v) in bad {
+            let mut m = egress_body();
+            m[*key] = v.clone();
+            assert!(
+                check_canonical_body(EventKind::Egress, &body(m)).is_err(),
+                "{key} = {v}"
+            );
+        }
+        let mut resolved_text = egress_body();
+        resolved_text["resolved"] = Value::from("93.184.216.34");
+        assert!(check_canonical_body(EventKind::Egress, &body(resolved_text)).is_err());
+        let mut resolved_bad = egress_body();
+        resolved_bad["resolved"] = serde_json::json!(["not-an-ip"]);
+        assert!(check_canonical_body(EventKind::Egress, &body(resolved_bad)).is_err());
+        let mut url_user = egress_body();
+        url_user["url"]["source"] = serde_json::json!({"kind": "user"});
+        assert!(check_canonical_body(EventKind::Egress, &body(url_user)).is_err());
+        let mut url_plain = egress_body();
+        url_plain["url"] = Value::from("https://example.com/doc");
+        assert!(check_canonical_body(EventKind::Egress, &body(url_plain)).is_err());
+
+        let note = hex_of(b"note-1 body");
+        let saved = serde_json::json!({
+            "bytes": 2048u64,
+            "note": note,
+            "sources": 2u64,
+            "turn": 4u64,
+        });
+        assert_eq!(
+            check_canonical_body(EventKind::NoteSaved, &body(saved.clone())),
+            Ok(())
+        );
+        let mut note_bad = saved.clone();
+        note_bad["note"] = Value::from("not-a-digest");
+        assert!(check_canonical_body(EventKind::NoteSaved, &body(note_bad)).is_err());
+        let mut saved_extra = saved;
+        saved_extra["turn"] = Value::from(-1);
+        assert!(check_canonical_body(EventKind::NoteSaved, &body(saved_extra)).is_err());
+
+        let imported = serde_json::json!({
+            "bytes": {
+                "untrusted": true,
+                "source": {"kind": "workspace", "path": "research/notes"},
+                "sha256": hex_of(b"note body"),
+                "len": 9,
+                "inline": "note body"
+            },
+            "confirm": "typed-id-prefix",
+            "note": note,
+            "path": {
+                "untrusted": true,
+                "source": {"kind": "workspace", "path": "research/notes"},
+                "sha256": hex_of(b"some-id/note.md"),
+                "len": 15,
+                "inline": "some-id/note.md"
+            },
+            "sha256": hex_of(b"note body"),
+        });
+        assert_eq!(
+            check_canonical_body(EventKind::NoteImported, &body(imported.clone())),
+            Ok(())
+        );
+        let mut confirm_bad = imported.clone();
+        confirm_bad["confirm"] = Value::from("yes");
+        assert!(check_canonical_body(EventKind::NoteImported, &body(confirm_bad)).is_err());
+        let mut path_plain = imported;
+        path_plain["path"] = Value::from("some-id/note.md");
+        assert!(check_canonical_body(EventKind::NoteImported, &body(path_plain)).is_err());
+
+        // Kinds with no defined list are policed by their owners, not here.
+        assert_eq!(
+            check_canonical_body(
+                EventKind::ContextBuilt,
+                &body(serde_json::json!({"anything": true}))
+            ),
+            Ok(())
+        );
     }
 }

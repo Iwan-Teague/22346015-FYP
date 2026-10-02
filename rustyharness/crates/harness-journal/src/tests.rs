@@ -1321,29 +1321,258 @@ fn new_event_kinds_round_trip_canonical() {
     assert_eq!(r.syncs.get(), 5);
 }
 
+/// A canonical `Egress` body (P-39c, §4.5): the allow path, with the
+/// model-supplied URL in its payload home and the resolver answer in
+/// order.
+fn egress_event(url: UntrustedBlob) -> Event {
+    Event::new(EventKind::Egress)
+        .field("decision", Trusted::Text("allow"))
+        .field("host", Trusted::Text("example.com"))
+        .field("hop", Trusted::U64(0))
+        .field("ip", Trusted::Text("93.184.216.34"))
+        .field("mode", Trusted::Text("direct"))
+        .field("port", Trusted::U64(443))
+        .field("purpose", Trusted::Text("fetch"))
+        .field(
+            "resolved",
+            Trusted::List(vec![
+                Trusted::Text("93.184.216.34"),
+                Trusted::Text("2606:2800:220:1:248:1893:25c8:1946"),
+            ]),
+        )
+        .field("url", Trusted::Untrusted(url))
+}
+
+/// P-39c (§4.5): a canonical `Egress` body round trips through the writer
+/// and the verifying reader carrying exactly the §4.5 fields, sorted on
+/// the wire; the verified body is the body that was appended.
+#[test]
+fn egress_body_round_trips_canonical() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let url = w
+        .untrusted(&Untrusted::new(
+            "https://example.com/doc".to_owned(),
+            Source::Model,
+        ))
+        .unwrap();
+    let ev = egress_event(url);
+    let expected = ev.body().unwrap();
+    w.append(3, ev).unwrap();
+    let b = bytes(&r);
+    let v = verify(&b, &r.blobs).unwrap();
+    let rec = v.records.last().unwrap();
+    assert_eq!(rec.kind, EventKind::Egress);
+    assert_eq!(rec.body, expected, "the verified body is the appended one");
+    // Exactly the §4.5 fields; the reader only accepts the line because it
+    // is the canonical encoding, so the keys are sorted on the wire.
+    let keys: Vec<&str> = rec.body.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        crate::canon::canonical_body_keys(EventKind::Egress).unwrap()
+    );
+    assert_eq!(
+        crate::canon::check_canonical_body(EventKind::Egress, &rec.body),
+        Ok(())
+    );
+    // The URL's payload home says where it came from (§4.5: the model).
+    let url_home = rec.body.get("url").unwrap();
+    assert_eq!(
+        url_home.get("source"),
+        Some(&serde_json::json!({"kind": "model"}))
+    );
+    assert_eq!(
+        url_home.get("inline"),
+        Some(&Value::from("https://example.com/doc"))
+    );
+    assert_eq!(
+        rec.body.get("resolved"),
+        Some(&serde_json::json!([
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946"
+        ]))
+    );
+}
+
+/// P-39c: an `Egress` body with a key outside the §4.5 list is refused
+/// before anything is written. The writer is NOT poisoned (a malformed
+/// event is a harness bug, not an I/O failure) and lawful records still
+/// append after the refusal.
+#[test]
+fn egress_body_with_extra_key_refused() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let url = w
+        .untrusted(&Untrusted::new(
+            "https://example.com/doc".to_owned(),
+            Source::Model,
+        ))
+        .unwrap();
+    let before = bytes(&r);
+    let err = w
+        .append(
+            3,
+            egress_event(url.clone()).field("extra", Trusted::Bool(true)),
+        )
+        .unwrap_err();
+    assert!(matches!(err, JournalError::InvalidEvent(_)), "{err:?}");
+    assert!(!w.is_poisoned());
+    assert_eq!(bytes(&r), before, "the refused record touched the file");
+    w.append(3, egress_event(url)).unwrap();
+    let v = verify(&bytes(&r), &r.blobs).unwrap();
+    assert_eq!(v.records.last().unwrap().kind, EventKind::Egress);
+}
+
+/// P-39c (§6, §7): the research-note kinds round trip, each append is
+/// fsynced before it returns (a resume reads its notes back from the
+/// journal), and the imported note's bytes ride in their typed home.
+#[test]
+fn note_kinds_round_trip_and_fsynced() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    assert!(EventKind::NoteSaved.needs_fsync());
+    assert!(EventKind::NoteImported.needs_fsync());
+    let syncs = r.syncs.get();
+    w.append(
+        3,
+        Event::new(EventKind::NoteSaved)
+            .field("bytes", Trusted::U64(2048))
+            .field("note", Trusted::Digest(sha256(b"note-1")))
+            .field("sources", Trusted::U64(2))
+            .field("turn", Trusted::U64(4)),
+    )
+    .unwrap();
+    assert_eq!(r.syncs.get(), syncs + 1, "NoteSaved is fsynced");
+    let payload = "note body".to_owned();
+    let bytes_home = w
+        .untrusted(&Untrusted::new(
+            payload.clone(),
+            Source::Workspace("research/notes/note-1/note.md".into()),
+        ))
+        .unwrap();
+    let path_home = w
+        .untrusted(&Untrusted::new(
+            "note-1/note.md".to_owned(),
+            Source::Workspace("research/notes".into()),
+        ))
+        .unwrap();
+    w.append(
+        4,
+        Event::new(EventKind::NoteImported)
+            .field("bytes", Trusted::Untrusted(bytes_home))
+            .field("confirm", Trusted::Text("typed-id-prefix"))
+            .field("note", Trusted::Digest(sha256(b"note-1")))
+            .field("path", Trusted::Untrusted(path_home))
+            .field("sha256", Trusted::Digest(sha256(payload.as_bytes()))),
+    )
+    .unwrap();
+    assert_eq!(r.syncs.get(), syncs + 2, "NoteImported is fsynced");
+    let v = verify(&bytes(&r), &r.blobs).unwrap();
+    let kinds: Vec<EventKind> = v.records.iter().map(|x| x.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::RunStarted,
+            EventKind::NoteSaved,
+            EventKind::NoteImported
+        ]
+    );
+    let saved = &v.records[1].body;
+    assert_eq!(saved.len(), 4, "exactly the §6 fields");
+    assert_eq!(
+        crate::canon::check_canonical_body(EventKind::NoteSaved, saved),
+        Ok(())
+    );
+    assert_eq!(
+        saved.get("note"),
+        Some(&Value::from(sha256(b"note-1").to_string()))
+    );
+    let imported = &v.records[2].body;
+    assert_eq!(imported.len(), 5, "exactly the §7 fields");
+    assert_eq!(
+        crate::canon::check_canonical_body(EventKind::NoteImported, imported),
+        Ok(())
+    );
+    assert_eq!(
+        imported.get("bytes").unwrap().get("inline"),
+        Some(&Value::from(payload.as_str()))
+    );
+    assert_eq!(
+        imported.get("sha256"),
+        Some(&Value::from(sha256(payload.as_bytes()).to_string()))
+    );
+    assert_eq!(
+        imported.get("confirm"),
+        Some(&Value::from("typed-id-prefix"))
+    );
+}
+
+/// P-39c: a `Source::Web` payload home verifies — the reader accepts the
+/// new provenance — and the URL is escaped like every other runtime text
+/// in a record: ESC and bidi controls are neutralised on the wire, and
+/// `unescape` gives the original back.
+#[test]
+fn source_web_escaped_in_journal() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let url = "https://evil.example/p\u{1b}[31m\u{202e}x";
+    let page = w
+        .untrusted(&Untrusted::new(
+            "page".to_owned(),
+            Source::Web(url.to_owned()),
+        ))
+        .unwrap();
+    w.append(
+        1,
+        Event::new(EventKind::ModelReplied).field("content", Trusted::Untrusted(page)),
+    )
+    .unwrap();
+    let b = bytes(&r);
+    let v = verify(&b, &r.blobs).unwrap();
+    let source = v.records[1]
+        .body
+        .get("content")
+        .unwrap()
+        .get("source")
+        .unwrap();
+    let wire_url = source.get("url").and_then(Value::as_str).unwrap();
+    assert_eq!(wire_url, "https://evil.example/p\\u{1B}[31m\\u{202E}x");
+    assert_eq!(crate::canon::unescape(wire_url).as_deref(), Some(url));
+    let text = String::from_utf8(b).unwrap();
+    assert!(!text.contains('\u{1b}'), "raw ESC in the journal");
+    assert!(
+        !text.contains('\u{202e}'),
+        "raw bidi override in the journal"
+    );
+}
+
 /// The reader's closed set stays closed: a canonical, correctly re-chained
-/// record with an unknown kind is refused by name (P-10 adds nine kinds,
-/// nothing else).
+/// record with an unknown kind is refused by name (P-10 added nine kinds,
+/// P-39c added two, and nothing else).
 #[test]
 fn unknown_kind_still_refused() {
     let (r, b, _) = session_journal();
     let ls = lines(&b);
     let v = verify(&b, &r.blobs).unwrap();
-    let mut forged: serde_json::Map<String, Value> = serde_json::from_slice(&ls[2]).unwrap();
-    forged.insert("kind".into(), Value::from("ModeChangedLater"));
-    let (l2, _) = recompute_hash(
-        Value::Object(forged).to_string().as_bytes(),
-        &v.records[1].hash,
-    );
-    let mut ls2 = ls.clone();
-    ls2[2] = l2;
-    assert_eq!(
-        verify(&join(&ls2[..3]), &r.blobs).unwrap_err(),
-        Broken {
-            record: 2,
-            why: BreakKind::UnknownKind
-        }
-    );
+    for name in ["ModeChangedLater", "NoteSavedX", "NoteImportedX"] {
+        let mut forged: serde_json::Map<String, Value> = serde_json::from_slice(&ls[2]).unwrap();
+        forged.insert("kind".into(), Value::from(name));
+        let (l2, _) = recompute_hash(
+            Value::Object(forged).to_string().as_bytes(),
+            &v.records[1].hash,
+        );
+        let mut ls2 = ls.clone();
+        ls2[2] = l2;
+        assert_eq!(
+            verify(&join(&ls2[..3]), &r.blobs).unwrap_err(),
+            Broken {
+                record: 2,
+                why: BreakKind::UnknownKind
+            },
+            "{name}"
+        );
+        assert_eq!(EventKind::parse(name), None, "{name}");
+    }
 }
 
 /// A user-source payload verifies: the reader recomputes the payload's
@@ -1408,8 +1637,9 @@ fn user_source_with_extra_field_refused() {
 }
 
 /// A journal written by the build before P-10 (bytes pinned from the
-/// pre-change build's `good_journal`) still verifies, kinds and all: the
-/// batch journal shape is unchanged.
+/// pre-change build's `good_journal`; every kind in it predates P-39c
+/// too) still verifies, kinds and all: adding the web airlock kinds (P-39c)
+/// changed no existing encoding.
 #[test]
 fn old_journal_still_reads() {
     const FIXTURE: [&str; 6] = [

@@ -157,6 +157,12 @@ pub mod code {
     /// The outline tool was pointed at a file whose extension names no
     /// language it knows (P-24).
     pub const NO_OUTLINE: u16 = 24;
+    /// The MCP server's `isError` result (P-37f): the call completed at the
+    /// transport, and the server reported a tool-level failure.
+    pub const MCP_TOOL_ERROR: u16 = 25;
+    /// The MCP server answered with a JSON-RPC error object, or the line a
+    /// response was expected on does not classify as one (P-37f).
+    pub const MCP_RPC_ERROR: u16 = 26;
 }
 
 const READ: &str = "harness.fs.read";

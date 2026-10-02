@@ -25,6 +25,11 @@
 //!   `argv[0]` must name a program on the task's exec allowlist and its
 //!   `cwd` stay in the workspace (INV-13), and it asks by default (rule
 //!   [`EXEC_DEFAULT_RULE`]) unless a user allow rule allows it.
+//! - [`Session::plan_child`] (P-38): the parent's planning plus the
+//!   child-scope refusal — only the built-in fs tools and the submit
+//!   sentinel plan into a helper run, and a delegate's label must cover
+//!   what its child scope could read — so a delegate call can never start
+//!   a run that reads past the session's own trifecta label.
 //! - [`Session::decide`]: the §5.1 order — deny rules (first match wins,
 //!   cannot be overridden), then ask rules, then allow rules, then DENY by
 //!   default. Every decision carries the id of the rule that produced it.
@@ -78,8 +83,8 @@ pub mod path;
 pub mod web;
 
 pub use builtin::{
-    EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, GLOB_ID, LIST_ID, OUTLINE_ID, READ_ID,
-    SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
+    CHILD_ELIGIBLE, DELEGATE_ID, EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, GLOB_ID,
+    LIST_ID, OUTLINE_ID, READ_ID, SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
 };
 pub use denies::{default_denies, overlay_default_denies, DEFAULT_DENY_GLOBS};
 pub use matcher::Matcher;
@@ -772,6 +777,17 @@ pub enum SessionRefused {
         /// What.
         what: &'static str,
     },
+    /// A granted delegate whose child scope could read above the delegate's
+    /// own sensitivity (P-38, D12): the session's trifecta label would not
+    /// cover what a helper run reads (§9).
+    #[error(
+        "capability {0}: a helper run could read above the delegate's own sensitivity; refused"
+    )]
+    DelegateScope(String),
+    /// A grant a child run may not hold (P-38, D11): only the built-in fs
+    /// tools and the submit sentinel plan into a child.
+    #[error("capability {0} may not be granted to a helper run; refused")]
+    ChildScope(String),
 }
 
 /// Compute the trifecta labels over an active set plus the workspace
@@ -838,6 +854,10 @@ struct Active {
     /// The built-in checklist (`harness.task.todo`, H2e): allowed by its
     /// named rule after every deny rule and the schema.
     todo: bool,
+    /// The built-in delegate (`harness.task.delegate`, P-38): a read-class
+    /// call that starts one read-only helper run, granted only explicitly;
+    /// its label must cover the child scope (checked at planning).
+    delegate: bool,
     /// A built-in workspace edit (`harness.edit.*`, §4.8, H2b): its `path`
     /// must stay in the workspace, and it is allowed only by a user allow
     /// rule or an approval (see [`Session::decide`]).
@@ -966,24 +986,44 @@ impl Session {
         }
 
         let mut active = BTreeMap::new();
-        for (c, (_, class, user_ask)) in resolved.iter().zip(classes) {
+        for (c, (_, class, user_ask)) in resolved.iter().zip(&classes) {
             active.insert(
                 c.id().clone(),
                 Active {
-                    class,
+                    class: *class,
                     schema: c.input_schema().clone(),
                     user_deny: UserPolicy::candidates(&policy.deny, c.id()),
-                    user_ask,
+                    user_ask: user_ask.clone(),
                     user_allow: UserPolicy::candidates(&policy.allow, c.id()),
                     fs_tool: c.id().provider() == BUILTIN_NAMESPACE
                         && c.id().as_str().starts_with(builtin::FS_PREFIX),
                     submit: builtin::is_submit_sentinel(c),
                     todo: builtin::is_builtin_todo(c),
+                    delegate: builtin::is_builtin_delegate(c),
                     edit: builtin::is_builtin_edit(c),
                     exec: builtin::is_builtin_exec(c),
                 },
             );
         }
+
+        // D12 (P-38 §9): a delegate's static label must cover what its
+        // helper can read. The child scope (§2.2) is the parent's grants
+        // under the eligible read ids, so a grant there that could read
+        // above the delegate's own sensitivity would let a child read past
+        // the label the trifecta saw, without any journaled raise. Planning
+        // refuses it at session start. In this build every eligible tool is
+        // operational, so this never fires on a real manifest; `plan_with`
+        // over a fixture exercises it.
+        if let Some((delegated, d)) = active.iter().find(|(_, a)| a.delegate) {
+            for (g, (_, (_, child, _))) in spec.grants.iter().zip(resolved.iter().zip(&classes)) {
+                if builtin::CHILD_ELIGIBLE.contains(&g.as_str())
+                    && child.sensitivity > d.class.sensitivity
+                {
+                    return Err(SessionRefused::DelegateScope(delegated.to_string()));
+                }
+            }
+        }
+
         Ok(Self {
             active,
             quarantined: BTreeSet::new(),
@@ -993,6 +1033,29 @@ impl Session {
             exec_programs: spec.exec_programs.iter().cloned().collect(),
             read_window: spec.read_window,
         })
+    }
+
+    /// Plan a helper run's session (P-38 §11): the parent's planning plus
+    /// one refusal — a grant whose registration is not a built-in fs tool
+    /// or the submit sentinel is refused as [`SessionRefused::ChildScope`]
+    /// — so a child holds only the read-only explorer set. A provider
+    /// capability has no registration and is refused like the rest: the
+    /// depth limit is not a table the child could grow into.
+    pub fn plan_child(
+        spec: &SessionSpec,
+        registry: &Registry,
+        policy: &UserPolicy,
+    ) -> Result<Self, SessionRefused> {
+        let child = Self::plan(spec, registry, policy)?;
+        for g in &spec.grants {
+            if !matches!(
+                builtin::registration(g).map(|t| t.kind),
+                Some(builtin::ToolKind::Fs) | Some(builtin::ToolKind::Submit)
+            ) {
+                return Err(SessionRefused::ChildScope(g.clone()));
+            }
+        }
+        Ok(child)
     }
 
     /// Quarantine a capability for the rest of the session (H4 wires this to

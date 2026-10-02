@@ -145,6 +145,9 @@ impl Seatbelt {
             home: self.home.as_deref(),
             private_dir: &dir,
             enforce: ENFORCE,
+            // The Seatbelt profile can express the loopback-only proxy
+            // allow (§5.3; spelling measured on this host).
+            proxy: true,
         };
         let v = match spec::validate(spec, &cx) {
             Ok(v) => v,
@@ -154,7 +157,13 @@ impl Seatbelt {
             }
         };
         let profile = dir.join("profile.sb");
-        let text = match crate::profile::render(&v) {
+        // The port of a proxy grant validate just accepted (§5.3); with no
+        // grant, None renders the deny-all form byte-identically.
+        let proxy_port = match spec.network {
+            Network::Proxy { port } => Some(port),
+            Network::None => None,
+        };
+        let text = match crate::profile::render(&v, proxy_port) {
             Ok(t) => t,
             Err(e) => {
                 // A validated spec never yields an unsafe path; treat a guard

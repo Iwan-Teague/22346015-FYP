@@ -353,7 +353,8 @@ rust_files "$tmpdir/pure-files" crates/gate-outcome crates/harness-core \
 for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs \
     crates/harness-manifest/src/lib.rs crates/harness-policy/src/lib.rs \
     crates/harness-model-core/src/lib.rs crates/harness-model-core/src/wire.rs \
-    crates/harness-mcp/src/lib.rs crates/harness-mcp/src/wire.rs; do
+    crates/harness-mcp/src/lib.rs crates/harness-mcp/src/wire.rs \
+    crates/harness-mcp/src/render.rs; do
     grep -qxF "$must" "$tmpdir/pure-files" || fail "pure-content scan would miss $must"
 done
 : >"$tmpdir/hits"

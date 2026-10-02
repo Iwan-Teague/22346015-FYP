@@ -177,7 +177,7 @@ fn fixture_manifest_validates() {
 fn builtin_manifest_bytes_unchanged() {
     assert_eq!(
         harness_core::sha256(builtin::builtin_manifest_json().as_bytes()).to_string(),
-        "c16d6a80a24043ce0813de9f2619d8bc3bcd49ea8d8f0d4f7b198ab81fda7d38"
+        "d8a0ea17341e2490dcc4b8cef984a8bdcaa95eedcb136ffa9603f294e5223a30"
     );
 }
 
@@ -234,6 +234,7 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "harness.edit.multi",
             "harness.exec.run",
             "harness.task.todo",
+            "harness.task.delegate",
             "harness.task.submit"
         ]
     );
@@ -467,6 +468,54 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
         assert_eq!(c.content, Content::ThirdParty, "{}", c.id);
         assert_eq!(c.confirmation, Confirmation::None, "{}", c.id);
         assert!(c.secrets.is_empty() && c.mcp_name.is_none() && c.schema_sha256.is_none());
+    }
+}
+
+/// P-38: the delegate capability is labelled a read like the fs tools, with
+/// `content: third_party` (the report and everything a helper reads is
+/// other people's text by default), and its schema takes exactly one
+/// `task` string of at most 2000 characters.
+#[test]
+fn delegate_manifest_fragment_has_read_labels() {
+    let m = builtin::manifest(&ctx()).unwrap();
+    let d = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id.as_str() == "harness.task.delegate")
+        .unwrap();
+    assert_eq!(
+        (
+            d.effect,
+            d.sensitivity,
+            d.blast_radius,
+            d.egress,
+            d.content,
+            d.confirmation
+        ),
+        (
+            Effect::Read,
+            Sensitivity::Operational,
+            BlastRadius::Own,
+            Egress::None,
+            Content::ThirdParty,
+            Confirmation::None
+        )
+    );
+    assert!(d.secrets.is_empty() && d.mcp_name.is_none() && d.schema_sha256.is_none());
+    for ok in [
+        json!({"task": "find the entry point"}),
+        json!({"task": "a".repeat(2000)}),
+    ] {
+        assert!(d.input_schema().validate_args(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        json!({"task": "a".repeat(2001)}),
+        json!({"task": "x", "steps": 3}),
+        json!({}),
+        json!({"task": 1}),
+        json!({"task": ["x"]}),
+    ] {
+        assert!(d.input_schema().validate_args(&bad).is_err(), "{bad}");
     }
 }
 

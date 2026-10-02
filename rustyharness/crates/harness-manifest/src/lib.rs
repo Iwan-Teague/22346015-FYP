@@ -41,6 +41,7 @@ use serde_json::Value;
 
 pub mod admission;
 pub mod builtin;
+pub mod pins;
 pub mod schema;
 use harness_core::strict_json;
 

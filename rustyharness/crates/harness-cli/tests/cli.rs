@@ -1407,9 +1407,10 @@ fn inv_1_manifest_check_is_the_v1_admission_parser() {
         out.contains("started only inside a conformed sandbox"),
         "{out}"
     );
-    // Valid is not admitted: external providers are H4 (§4.4).
-    assert!(out.contains("this build would refuse it"), "{out}");
-    assert!(out.contains("arrives in H4"), "{out}");
+    // P-37a lifted the gate for (pinned, mcp-stdio): the example declares
+    // an MCP protocol version this build speaks, so pinning its exact
+    // bytes admits it (§6.3).
+    assert!(out.contains("this build would admit it"), "{out}");
 
     let text = std::fs::read_to_string(&example).unwrap();
     let write = |name: &str, body: &str| {

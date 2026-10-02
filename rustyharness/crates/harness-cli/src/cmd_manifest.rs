@@ -110,7 +110,9 @@ pub(crate) fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
         );
     }
     // What admission would say if the user pinned exactly these bytes: the
-    // same code a run uses. In H1 it always refuses (pinning is H4).
+    // same code a run uses. Since P-37a a pinned mcp-stdio manifest admits
+    // when an MCP protocol version is in common (§6.3); everything else
+    // still refuses.
     let admission = harness_manifest::Sha256Pin::parse_hex(&digest.to_string())
         .ok_or_else(|| "the manifest digest is not a pin".to_owned())
         .and_then(|pin| {

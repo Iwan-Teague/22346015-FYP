@@ -299,9 +299,14 @@ pub(crate) fn plan(
     for g in &grants {
         // Planning resolved every grant to exactly one capability.
         if let Resolved::One { capability, .. } = registry.resolve(g) {
-            // The read tool as this run offers it: its window (H2e).
+            // The read tool as this run offers it: its window (H2e); then
+            // the tool docs the profile asks for (P-53: a terse-docs
+            // profile's one-sentence fixed table, argument names kept;
+            // schema untouched).
             tools.push(
-                ToolSpec::from_capability(capability).with_read_window(profile.read_window()),
+                ToolSpec::from_capability(capability)
+                    .with_read_window(profile.read_window())
+                    .with_tool_docs(profile.tool_docs()),
             );
         }
     }

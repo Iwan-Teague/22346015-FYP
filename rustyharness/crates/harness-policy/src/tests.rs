@@ -2446,3 +2446,50 @@ fn default_denies_cover_the_documented_globs() {
     // The defaults are not the library default: the digest differs.
     assert_ne!(p.digest(), UserPolicy::default().digest());
 }
+
+// ---- fuzz-style robustness (P-54) ----------------------------------------------
+//
+// The policy file path is two parsers of untrusted bytes: the strict JSON
+// reader, then `UserPolicy::from_json`. Whatever the file contains, the load
+// must answer with a typed error (or a policy) — never a panic, never a
+// half-understood file. The inputs come from `harness_testkit::mutator`,
+// whose seeded xorshift generator makes every case reproducible from the
+// seed named in the loop (base + case).
+
+use harness_testkit::mutator::{self, XorShift64};
+
+/// The mutated-policy loop, at whatever case count the caller asks for.
+fn fuzz_policy_over_mutated_files(cases: usize) {
+    // A valid v2 file: v1 selector strings and one object rule with a
+    // `path_glob` matcher (examples omitted: they are optional).
+    let seed = r#"{"deny":["harness.exec.run"],"ask":[{"capability":"harness.edit.replace","match":{"path_glob":"src/**"}}],"allow":["harness.fs.read"]}"#;
+    for case in 0..cases {
+        let mut rng = XorShift64::new(0x5400_00C0_0000 + case as u64);
+        let m = mutator::mutate(seed.as_bytes(), &mut rng, 24);
+        // A file that is not strict JSON is a typed refusal before any
+        // rule is read; one that is, is either a policy or a typed
+        // PolicyConfigError. Never a panic.
+        if let Ok(v) = harness_core::strict_json::parse(&m) {
+            let _ = UserPolicy::from_json(&v);
+        }
+        // Pure garbage too, not only mutations of a valid file.
+        let len = rng.below(400);
+        let g = mutator::garbage(&mut rng, len);
+        if let Ok(v) = harness_core::strict_json::parse(&g) {
+            let _ = UserPolicy::from_json(&v);
+        }
+    }
+}
+
+#[test]
+fn fuzz_policy_parser_never_panics() {
+    fuzz_policy_over_mutated_files(mutator::case_count(2_000));
+}
+
+/// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+/// drives the case count up.
+#[test]
+#[ignore]
+fn fuzz_policy_long_cases() {
+    fuzz_policy_over_mutated_files(mutator::case_count(50_000));
+}

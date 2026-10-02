@@ -1,0 +1,11 @@
+harness	profile_sha	task	pass	steps	tokens	format_errors	cause
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	01-hello-answer	pass	2	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	02-codename-note	pass	2	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	03-fix-constant	pass	3	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	04-append-readme	pass	3	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	05-exec-built	pass	2	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	06-exec-repo-script	pass	2	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	07-count-lines	pass	2	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	08-sort-names	pass	2	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	09-fix-typo-docs	pass	5	0	0	Submitted
+0.0.1	a1b873a7382c2dce573665c98c50429f88b670727a31abf7dabe6419e225579a	10-two-file-report	pass	2	0	0	Submitted

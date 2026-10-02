@@ -65,8 +65,8 @@ use harness_tools::{ExecSetupError, ExecSpec};
 
 pub(crate) use approvals::Approvals;
 pub(crate) use header::{
-    builtin_manifest_sha256, header, limits_fields, protected_task_digest, ExecHeader,
-    HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
+    builtin_manifest_sha256, header, limits_fields, protected_task_digest, terse_table_sha256,
+    ExecHeader, HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
 };
 pub(crate) use plan::{attempt_check, create_run, loop_facts, plan, prepare, todo_for, Prepared};
 pub(crate) use step::{BudgetNotices, Loop, LoopInit, NonceSource};

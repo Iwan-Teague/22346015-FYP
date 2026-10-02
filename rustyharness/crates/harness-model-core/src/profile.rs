@@ -9,7 +9,11 @@
 //!   build has none (N-7: "a hosted run without a price table refuses to
 //!   start" belongs with the `hosted` feature);
 //! - `tool_choice_required_ok: true` with the text protocol is refused as
-//!   meaningless, and so is `parallel_tool_calls_false_ok: true`.
+//!   meaningless, and so is `parallel_tool_calls_false_ok: true`;
+//! - `parallel_tool_calls: true` (P-53) is refused with the text protocol
+//!   as meaningless (the text protocol is exactly one action by
+//!   definition) and with `parallel_tool_calls_false_ok` as
+//!   contradictory (that flag already asks the server for one call).
 //!
 //! **Optional fields within version 1.** `parallel_tool_calls_false_ok`
 //! (design row H1h), `stream_include_usage_ok` (row H1i) and
@@ -20,7 +24,9 @@
 //! still has the same content digest (each joins the digest only when it is
 //! on), so its `profile check` stamp stays valid. An
 //! older harness refuses a profile that sets one (unknown fields are
-//! refused), so no build silently ignores it.
+//! refused), so no build silently ignores it. The same is true of P-53's
+//! `tool_docs` (`full` by default; `terse` joins the digest) and
+//! `parallel_tool_calls` (`false` by default; `true` joins the digest).
 //!
 //! An unknown model gets [`Profile::conservative_default`]. A profile runs
 //! whether or not `profile check` stamped it; `profile_validated` is
@@ -60,6 +66,19 @@ pub enum EditFormat {
     Replace,
     /// Whole-file write.
     Whole,
+}
+
+/// How tool declarations describe the tools (P-53).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDocs {
+    /// The manifest summary (the default).
+    #[default]
+    Full,
+    /// The terse fixed table (`harness_manifest::builtin::terse_summary`):
+    /// one sentence per tool plus its argument names, for small local
+    /// models that read shorter declarations better.
+    Terse,
 }
 
 /// Sampling defaults.
@@ -113,7 +132,11 @@ struct ProfileWire {
     #[serde(default)]
     parallel_tool_calls_false_ok: bool,
     #[serde(default)]
+    parallel_tool_calls: bool,
+    #[serde(default)]
     stream_include_usage_ok: bool,
+    #[serde(default)]
+    tool_docs: ToolDocs,
     #[serde(default)]
     max_read_lines: Option<u64>,
     #[serde(default)]
@@ -142,7 +165,9 @@ pub struct Profile {
     protocol: Protocol,
     tool_choice_required_ok: bool,
     parallel_tool_calls_false_ok: bool,
+    parallel_tool_calls: bool,
     stream_include_usage_ok: bool,
+    tool_docs: ToolDocs,
     max_read_lines: Option<u64>,
     read_timeout_secs: Option<u64>,
     max_active_tools: u32,
@@ -328,6 +353,17 @@ impl Profile {
         if w.parallel_tool_calls_false_ok && w.protocol == Protocol::Text {
             return Err(f("parallel_tool_calls_false_ok"));
         }
+        // P-53: parallel calls are a native-protocol shape (the text
+        // protocol is exactly one action by definition), and they make no
+        // sense next to a flag that asks the server for one call per reply.
+        if w.parallel_tool_calls {
+            if w.protocol == Protocol::Text {
+                return Err(f("parallel_tool_calls"));
+            }
+            if w.parallel_tool_calls_false_ok {
+                return Err(f("parallel_tool_calls"));
+            }
+        }
         if let Some(t) = w.read_timeout_secs {
             if !(READ_TIMEOUT_MIN_SECS..=READ_TIMEOUT_MAX_SECS).contains(&t) {
                 return Err(f("read_timeout_secs"));
@@ -360,7 +396,9 @@ impl Profile {
             protocol: w.protocol,
             tool_choice_required_ok: w.tool_choice_required_ok,
             parallel_tool_calls_false_ok: w.parallel_tool_calls_false_ok,
+            parallel_tool_calls: w.parallel_tool_calls,
             stream_include_usage_ok: w.stream_include_usage_ok,
+            tool_docs: w.tool_docs,
             max_read_lines: w.max_read_lines,
             read_timeout_secs: w.read_timeout_secs,
             max_active_tools: w.max_active_tools,
@@ -384,7 +422,9 @@ impl Profile {
             protocol: Protocol::Text,
             tool_choice_required_ok: false,
             parallel_tool_calls_false_ok: false,
+            parallel_tool_calls: false,
             stream_include_usage_ok: false,
+            tool_docs: ToolDocs::Full,
             max_read_lines: None,
             read_timeout_secs: None,
             max_active_tools: 5,
@@ -433,6 +473,22 @@ impl Profile {
     /// one-action rule to its format error and repair message.
     pub fn parallel_tool_calls_false_ok(&self) -> bool {
         self.parallel_tool_calls_false_ok
+    }
+    /// Whether the model may make several tool calls in one assistant turn
+    /// (P-53). Off by default: a second call is a format error with the
+    /// usual repair message. On (native protocol only), the first call of a
+    /// multi-call reply runs and the rest are dropped with a notice. The
+    /// text protocol is exactly-one-action by definition, and
+    /// [`Profile::parallel_tool_calls_false_ok`] already asks the server
+    /// for one call, so either combination is refused at parse time.
+    pub fn parallel_tool_calls(&self) -> bool {
+        self.parallel_tool_calls
+    }
+    /// How tool declarations describe the tools (P-53): the manifest
+    /// summary, or the terse fixed table. Full by default, so every profile
+    /// written before P-53 renders exactly as it did.
+    pub fn tool_docs(&self) -> ToolDocs {
+        self.tool_docs
     }
     /// Whether the request asks for usage in the stream,
     /// `stream_options: {"include_usage": true}` (design row H1i). llama.cpp
@@ -545,6 +601,15 @@ impl Profile {
         if let (Some(n), Some(o)) = (self.read_timeout_secs, v.as_object_mut()) {
             o.insert("read_timeout_secs".into(), serde_json::Value::from(n));
         }
+        // And for P-53's tool docs: only when terse, so every profile
+        // written before P-53 keeps its digest and its stamp.
+        if let (ToolDocs::Terse, Some(o)) = (self.tool_docs, v.as_object_mut()) {
+            o.insert("tool_docs".into(), serde_json::Value::from("terse"));
+        }
+        // And for P-53's parallel calls: only when opted in.
+        if let (true, Some(o)) = (self.parallel_tool_calls, v.as_object_mut()) {
+            o.insert("parallel_tool_calls".into(), serde_json::Value::Bool(true));
+        }
         sha256(v.to_string().as_bytes())
     }
 
@@ -561,6 +626,18 @@ impl Profile {
     /// SHA-256 of the profile file, when loaded from one.
     pub fn sha256(&self) -> Option<Digest> {
         self.sha256
+    }
+
+    /// The profile with `tool_docs` set (P-53): what `profile init` writes
+    /// for a local small model without hand-editing. Unstamped content: the
+    /// file digest is dropped, and any stamp a profile carried would no
+    /// longer match the content (`validated` recomputes over the content),
+    /// which is honest for a profile that was just changed.
+    #[must_use]
+    pub fn with_tool_docs(mut self, docs: ToolDocs) -> Self {
+        self.tool_docs = docs;
+        self.sha256 = None;
+        self
     }
 }
 
@@ -711,6 +788,33 @@ mod tests {
             Profile::parse(text_ptc.as_bytes()),
             Err(ProfileError::Field("parallel_tool_calls_false_ok"))
         );
+        // P-53: parallel calls are a native-protocol shape, and they
+        // contradict the flag that asks the server for one call per reply.
+        let text_pc = with("parallel_tool_calls", "true");
+        assert_eq!(
+            Profile::parse(text_pc.as_bytes()),
+            Err(ProfileError::Field("parallel_tool_calls"))
+        );
+        let both = {
+            let mut o: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&with("protocol", "\"native\"")).unwrap();
+            o.insert("parallel_tool_calls".into(), true.into());
+            o.insert("parallel_tool_calls_false_ok".into(), true.into());
+            serde_json::Value::Object(o).to_string()
+        };
+        assert_eq!(
+            Profile::parse(both.as_bytes()),
+            Err(ProfileError::Field("parallel_tool_calls"))
+        );
+        for v in ["null", "\"yes\"", "1"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("parallel_tool_calls", v).as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{v}"
+            );
+        }
         for v in ["null", "\"yes\"", "1"] {
             assert!(
                 matches!(
@@ -985,6 +1089,66 @@ mod tests {
         );
         assert_eq!(ReadWindow::of_lines(5).lines, READ_WINDOW_MIN_LINES);
         assert_eq!(ReadWindow::of_lines(9999).lines, READ_WINDOW_MAX_LINES);
+    }
+
+    // P-53: the tool docs. Full by default, so every profile written
+    // before P-53 keeps the digest pinned above (and its stamp); terse is
+    // content, round-trips through parse, agrees with the builder `profile
+    // init` uses, and a stamp made for full content does not validate a
+    // terse profile.
+    #[test]
+    fn profile_stamp_changes_with_tool_docs() {
+        const GOOD_CONTENT: &str =
+            "b8bf6a5e7b6c3f107548dc8cb096d84b2900f8e0846e474845521be5f8fcfb6f";
+        let p = Profile::parse(GOOD.as_bytes()).unwrap();
+        assert_eq!(p.tool_docs(), ToolDocs::Full);
+        assert_eq!(p.content_sha256().to_string(), GOOD_CONTENT);
+        assert_eq!(
+            Profile::conservative_default("m").tool_docs(),
+            ToolDocs::Full
+        );
+
+        // Terse is content; an explicit "full" is the absent default.
+        let terse_json = with("tool_docs", "\"terse\"");
+        let terse = Profile::parse(terse_json.as_bytes()).unwrap();
+        assert_eq!(terse.tool_docs(), ToolDocs::Terse);
+        assert_ne!(terse.content_sha256(), p.content_sha256());
+        assert_eq!(
+            Profile::parse(with("tool_docs", "\"full\"").as_bytes())
+                .unwrap()
+                .content_sha256(),
+            p.content_sha256()
+        );
+        // The builder `profile init` uses agrees with the parsed file, and
+        // setting Full changes nothing.
+        assert_eq!(
+            p.clone().with_tool_docs(ToolDocs::Terse).content_sha256(),
+            terse.content_sha256()
+        );
+        assert_eq!(
+            p.clone().with_tool_docs(ToolDocs::Full).content_sha256(),
+            p.content_sha256()
+        );
+        // A stamp made without terse does not validate the terse profile.
+        let st = p.stamp_for(&sha256(b"report"));
+        let mut o: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&terse_json).unwrap();
+        o.insert(
+            "validated".into(),
+            serde_json::from_str(&stamp_json(&st)).unwrap(),
+        );
+        let stamped = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
+        assert!(!stamped.validated());
+        assert_eq!(stamped.stamp_sha256(), None);
+        for v in ["null", "\"short\"", "1"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("tool_docs", v).as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{v}"
+            );
+        }
     }
 
     #[test]

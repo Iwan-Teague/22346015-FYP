@@ -181,6 +181,39 @@ fn builtin_manifest_bytes_unchanged() {
     );
 }
 
+/// P-53: the terse table has an entry for every built-in capability, and
+/// none for anything outside it (a provider capability keeps its summary).
+#[test]
+fn terse_table_covers_every_builtin_tool() {
+    let m = builtin::manifest(&ctx()).unwrap();
+    for c in m.capabilities() {
+        assert!(
+            builtin::terse_summary(c.id.as_str()).is_some(),
+            "no terse doc for {}",
+            c.id
+        );
+    }
+    assert_eq!(builtin::terse_summary("fixture.cap"), None);
+    assert_eq!(builtin::terse_summary("harness.fs.nothing"), None);
+}
+
+/// P-53: a terse doc is shorter than the manifest summary and still names
+/// every argument the capability's schema declares.
+#[test]
+fn terse_docs_are_shorter_and_keep_arg_names() {
+    let m = builtin::manifest(&ctx()).unwrap();
+    for c in m.capabilities() {
+        let terse = builtin::terse_summary(c.id.as_str()).unwrap();
+        assert!(terse.len() < c.summary().len(), "{}", c.id);
+        let props = c.input_schema().as_json()["properties"]
+            .as_object()
+            .unwrap();
+        for name in props.keys() {
+            assert!(terse.contains(name.as_str()), "{} misses {name}", c.id);
+        }
+    }
+}
+
 #[test]
 fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() {
     let m = builtin::manifest(&ctx()).unwrap();
@@ -1156,4 +1189,41 @@ fn null_check_runs_after_version_and_reserved_name_checks() {
     let mut m = fixture();
     cap0(&mut m)["limits"] = Value::Null;
     assert!(matches!(parse_v(&m), Err(ManifestError::NullValue(_))));
+}
+
+// ---- fuzz-style robustness (P-54) ----------------------------------------------
+//
+// `Manifest::parse` is a parser of untrusted bytes (a provider's manifest
+// file): whatever the bytes are, the answer is a manifest or a typed
+// ManifestError — never a panic, never a half-admitted manifest. The inputs
+// come from `harness_testkit::mutator`, whose seeded xorshift generator
+// makes every case reproducible from the seed named in the loop (base + case).
+
+use harness_testkit::mutator::{self, XorShift64};
+
+/// The mutated-manifest loop, at whatever case count the caller asks for.
+fn fuzz_manifest_over_mutated_files(cases: usize) {
+    let seed = builtin::builtin_manifest_json();
+    for case in 0..cases {
+        let mut rng = XorShift64::new(0x5400_00D0_0000 + case as u64);
+        let m = mutator::mutate(seed.as_bytes(), &mut rng, 24);
+        let _ = Manifest::parse(&m, &ctx());
+        // Pure garbage too, not only mutations of a valid manifest.
+        let len = rng.below(700);
+        let g = mutator::garbage(&mut rng, len);
+        let _ = Manifest::parse(&g, &ctx());
+    }
+}
+
+#[test]
+fn fuzz_manifest_parser_never_panics() {
+    fuzz_manifest_over_mutated_files(mutator::case_count(2_000));
+}
+
+/// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+/// drives the case count up.
+#[test]
+#[ignore]
+fn fuzz_manifest_long_cases() {
+    fuzz_manifest_over_mutated_files(mutator::case_count(50_000));
 }

@@ -1506,3 +1506,65 @@ fn tap_has_nothing_after_poison() {
     assert!(w.drain_tap().is_empty());
     let _ = r;
 }
+
+// ---- fuzz-style robustness (P-54) ----------------------------------------------
+//
+// The reader/verifier is a parser of untrusted bytes: whatever a crash, an
+// edit or an attacker left in the attempt file, `verify` must answer with a
+// typed verdict — never a panic, never an unbounded computation. The inputs
+// come from `harness_testkit::mutator`, whose seeded xorshift generator makes
+// every case reproducible from the seed named in the loop (seed base + case).
+
+use harness_testkit::mutator::{self, XorShift64};
+
+/// The mutated-valid-log loop, at whatever case count the caller asks for.
+fn fuzz_reader_over_mutated_logs(cases: usize) {
+    let (r, b, _) = good_journal();
+    for case in 0..cases {
+        let mut rng = XorShift64::new(0x5400_0000_0001 + case as u64);
+        let m = mutator::mutate(&b, &mut rng, 24);
+        // Either verdict is fine; the test is that there IS one, typed,
+        // with the mutated bytes still bounded by len + 24.
+        if let Ok(v) = verify(&m, &r.blobs) {
+            assert!(v.records.len() * 2 <= m.len() + 2, "case {case}");
+        }
+        // And the same mutation is reproducible: re-derive and re-verify.
+        let mut rng2 = XorShift64::new(0x5400_0000_0001 + case as u64);
+        let m2 = mutator::mutate(&b, &mut rng2, 24);
+        assert_eq!(m, m2, "case {case}");
+    }
+}
+
+#[test]
+fn fuzz_journal_reader_mutated_valid_log_never_panics() {
+    fuzz_reader_over_mutated_logs(mutator::case_count(2_000));
+}
+
+/// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set drives
+/// the case count up.
+#[test]
+#[ignore]
+fn fuzz_journal_long_cases() {
+    fuzz_reader_over_mutated_logs(mutator::case_count(50_000));
+}
+
+#[test]
+fn fuzz_journal_truncation_at_every_byte_is_typed_error() {
+    let (r, b, _) = good_journal();
+    // No bytes at all is a typed refusal (no header), not a panic.
+    assert!(verify(&[], &r.blobs).is_err());
+    // Every proper prefix verifies to a typed verdict, and never claims to
+    // be a complete, committed journal: a cut either tears the final line
+    // (torn tail) or loses the RunStopped record — a wholesale truncation
+    // can only ever look incomplete, never valid-and-done.
+    for i in 0..b.len() {
+        if let Ok(v) = verify(&b[..i], &r.blobs) {
+            assert!(!v.is_complete(), "prefix {i} of {} complete?", b.len());
+        }
+    }
+    // A prefix that cuts only the final newline keeps every record and
+    // reports the torn last line (its start offset, after the last `\n`).
+    let v = verify(&b[..b.len() - 1], &r.blobs).unwrap();
+    assert!(v.torn_tail.is_some());
+    assert!(!v.is_complete());
+}

@@ -102,3 +102,65 @@ pub fn builtin_manifest_json() -> String {
 pub fn manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestError> {
     parse_with_origin(builtin_manifest_json().as_bytes(), ctx, Origin::Compiled)
 }
+
+/// The terse tool docs (P-53): one fixed sentence per built-in capability,
+/// naming each of its arguments, for profiles with `tool_docs: "terse"`
+/// (small local models read shorter tool declarations better). The table is
+/// fixed: entries are shorter than the manifest summaries and name every
+/// argument the schema has (both pinned by tests). A capability without an
+/// entry here keeps its full summary, so a provider capability is untouched.
+const TERSE_TABLE: [(&str, &str); 11] = [
+    (
+        "harness.fs.read",
+        "Read a window of lines from a file: path, start (the first line, 1-based), lines (at most the run's read window)",
+    ),
+    (
+        "harness.fs.search",
+        "Search files line by line for pattern (a regex when regex is true): path, include and exclude globs, context lines",
+    ),
+    ("harness.fs.glob", "Find files whose paths match the glob pattern, below path"),
+    ("harness.fs.list", "List a directory: path, depth"),
+    ("harness.fs.outline", "Outline a file or directory's symbols: path, kind"),
+    (
+        "harness.edit.replace",
+        "Replace old with new in path, matching exactly count times (default 1)",
+    ),
+    ("harness.edit.write", "Create a new file or rewrite a whole file: path, content"),
+    (
+        "harness.edit.multi",
+        "Make several exact replacements in one file, all or none: path, edits (each old and new)",
+    ),
+    (
+        "harness.exec.run",
+        "Run one allowed program with no network: argv (the first item names it), cwd",
+    ),
+    (
+        "harness.task.todo",
+        "Keep your checklist: items replaces the list, each item a text and a status; without items it is only shown",
+    ),
+    ("harness.task.submit", "Submit the task for verification: note"),
+];
+
+/// The terse sentence for a built-in capability id, or `None` (keep the
+/// manifest summary) when the id is unknown to the table.
+pub fn terse_summary(id: &str) -> Option<&'static str> {
+    TERSE_TABLE
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, doc)| *doc)
+}
+
+/// The terse table in a canonical text form, one `id\tterse` line per
+/// entry in table order: what the run header's `tool_docs` digest is taken
+/// over, so a journal from a build whose table differs is refused by name
+/// (the same rule the `builtin_manifest` digest follows).
+pub fn terse_table_text() -> String {
+    let mut s = String::new();
+    for (id, doc) in TERSE_TABLE {
+        s.push_str(id);
+        s.push('\t');
+        s.push_str(doc);
+        s.push('\n');
+    }
+    s
+}

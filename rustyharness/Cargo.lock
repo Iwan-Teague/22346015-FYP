@@ -84,6 +84,7 @@ name = "harness-core"
 version = "0.0.1"
 dependencies = [
  "gate-outcome",
+ "harness-testkit",
  "serde",
  "serde_json",
  "sha2",
@@ -96,6 +97,7 @@ dependencies = [
  "gate-outcome",
  "harness-core",
  "harness-manifest",
+ "harness-testkit",
  "serde_json",
  "thiserror",
 ]
@@ -105,6 +107,7 @@ name = "harness-manifest"
 version = "0.0.1"
 dependencies = [
  "harness-core",
+ "harness-testkit",
  "serde",
  "serde_json",
  "thiserror",
@@ -156,6 +159,7 @@ version = "0.0.1"
 dependencies = [
  "harness-core",
  "harness-manifest",
+ "harness-testkit",
  "serde_json",
  "thiserror",
 ]

@@ -7,7 +7,7 @@ use harness_core::MeterLimits;
 use harness_journal::{EventKind, Record};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_model::context::{CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
-use harness_model::profile::{Profile, Protocol};
+use harness_model::profile::{Profile, Protocol, ToolDocs};
 use harness_policy::{UserPolicy, SUBMIT_ID};
 use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
 use serde_json::{Map, Value};
@@ -81,6 +81,14 @@ pub(crate) fn expected_inputs(
         "builtin_manifest".into(),
         Value::from(builtin_manifest_sha256().to_string()),
     );
+    // P-53: the terse table's digest, when the profile asks for terse
+    // tool docs; no key without it, as the header writes it.
+    if profile.tool_docs() == ToolDocs::Terse {
+        m.insert(
+            "tool_docs".into(),
+            Value::from(crate::driver::terse_table_sha256().to_string()),
+        );
+    }
     // The exec allowlist (H2d): whether a shell is on it, and the spec's
     // digest; no `exec` key without one, as the header writes it.
     m.insert(

@@ -320,4 +320,40 @@ mod tests {
             assert!(UserConfig::parse(bad.as_bytes()).is_err(), "{bad}");
         }
     }
+
+    // ---- fuzz-style robustness (P-54) -----------------------------------
+    //
+    // `UserConfig::parse` is a parser of untrusted bytes (whatever the
+    // user's config file contains): the answer is a config or a typed
+    // refusal — never a panic. The inputs come from
+    // `harness_testkit::mutator`, whose seeded xorshift generator makes
+    // every case reproducible from the seed named in the loop (base + case).
+
+    use harness_testkit::mutator::{self, XorShift64};
+
+    fn fuzz_config_cases(cases: usize) {
+        let seed = br#"{"endpoint":"http://127.0.0.1:1/v1","profile":"/abs/p.json","policy":"/abs/q.json","state_root":"/abs/s","approver":"terminal","exec_programs":["ls","git"]}"#;
+        for case in 0..cases {
+            let mut rng = XorShift64::new(0x5400_00F0_0000 + case as u64);
+            let m = mutator::mutate(seed, &mut rng, 24);
+            let _ = UserConfig::parse(&m);
+            // Pure garbage too, not only mutations of a valid file.
+            let len = rng.below(300);
+            let g = mutator::garbage(&mut rng, len);
+            let _ = UserConfig::parse(&g);
+        }
+    }
+
+    #[test]
+    fn fuzz_config_parser_never_panics() {
+        fuzz_config_cases(mutator::case_count(2_000));
+    }
+
+    /// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+    /// drives the case count up.
+    #[test]
+    #[ignore]
+    fn fuzz_config_long_cases() {
+        fuzz_config_cases(mutator::case_count(50_000));
+    }
 }

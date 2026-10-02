@@ -343,12 +343,17 @@ nb='[^A-Za-z0-9_]'
 # `path` is in the list (review F-2): std::path::Path does filesystem I/O
 # through methods (exists, canonicalize, read_dir, ...) that never name
 # std::fs, so the pure crates may not import std::path at all.
+# P-37c adds the MCP wire codec (crates/harness-mcp): bytes are fed in and
+# values come out, so the full facility list applies to it as-is. P-37f
+# adds the MCP response renderer to this list.
 facility='(fs|net|process|env|io|os|thread|path)'
 rust_files "$tmpdir/pure-files" crates/gate-outcome crates/harness-core \
-    crates/harness-manifest crates/harness-policy crates/harness-model-core
+    crates/harness-manifest crates/harness-policy crates/harness-model-core \
+    crates/harness-mcp
 for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs \
     crates/harness-manifest/src/lib.rs crates/harness-policy/src/lib.rs \
-    crates/harness-model-core/src/lib.rs crates/harness-model-core/src/wire.rs; do
+    crates/harness-model-core/src/lib.rs crates/harness-model-core/src/wire.rs \
+    crates/harness-mcp/src/lib.rs crates/harness-mcp/src/wire.rs; do
     grep -qxF "$must" "$tmpdir/pure-files" || fail "pure-content scan would miss $must"
 done
 : >"$tmpdir/hits"

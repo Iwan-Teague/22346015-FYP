@@ -1,0 +1,19 @@
+[package]
+name = "harness-mcp"
+description = "rustyharness MCP stdio client: the pure wire codec (frames, classification, encoders) now; the client, provider and confined connector in later P-37 slices."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The shared strict JSON reader (harness_core::strict_json, INV-22).
+harness-core = { path = "../harness-core" }
+# Pure-crate-adjacent allowlist (scripts/ci/purity.sh §5): serde_json,
+# thiserror only from crates.io, both already reviewed there.
+serde_json.workspace = true
+thiserror.workspace = true

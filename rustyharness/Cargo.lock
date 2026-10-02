@@ -114,6 +114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-mcp"
+version = "0.0.1"
+dependencies = [
+ "harness-core",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-minibench"
 version = "0.0.1"
 dependencies = [

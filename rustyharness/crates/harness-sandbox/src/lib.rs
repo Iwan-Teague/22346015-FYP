@@ -46,6 +46,7 @@ mod capture;
 mod confine_spawn;
 pub mod conformance;
 pub mod environment;
+pub mod fileop;
 pub mod linux;
 pub mod locality;
 pub mod profile;

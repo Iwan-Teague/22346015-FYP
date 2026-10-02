@@ -108,6 +108,7 @@ fn spec() -> TaskSpec {
         workspace_public: false,
         exec: None,
         presubmit: None,
+        protected: Vec::new(),
     }
 }
 

@@ -7,7 +7,8 @@
 //! `harness` namespace and the `builtin` transport.
 //!
 //! It declares the read tools (`harness.fs.read`, `harness.fs.search`,
-//! `harness.fs.list` and, since H2e, `harness.fs.glob`), the two edit tools
+//! `harness.fs.list`, `harness.fs.glob` and, since P-24,
+//! `harness.fs.outline`), the two edit tools
 //! `harness.edit.replace` and `harness.edit.write` (§4.9, H2b), the
 //! command runner `harness.exec.run` (§4.8, H2d) and the submit sentinel
 //! `harness.task.submit` (§2.5, H1e-2). `harness.notes.write` arrives with
@@ -59,6 +60,7 @@ mod edit_write;
 mod exec_run;
 mod fs_glob;
 mod fs_list;
+mod fs_outline;
 mod fs_read;
 mod fs_search;
 mod head;
@@ -83,6 +85,7 @@ pub fn builtin_manifest_json() -> String {
         fs_search::FS_SEARCH,
         fs_glob::FS_GLOB,
         fs_list::FS_LIST,
+        fs_outline::FS_OUTLINE,
         edit_replace::EDIT_REPLACE,
         edit_write::EDIT_WRITE,
         edit_multi::EDIT_MULTI,

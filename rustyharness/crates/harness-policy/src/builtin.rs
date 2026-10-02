@@ -19,6 +19,19 @@ pub(crate) const FS_PREFIX: &str = "harness.fs.";
 /// The built-in read tool, whose `lines` the run's read window bounds.
 pub const READ_ID: &str = "harness.fs.read";
 
+/// The built-in workspace search tool (§4.8).
+pub const SEARCH_ID: &str = "harness.fs.search";
+
+/// The built-in glob tool (§4.8).
+pub const GLOB_ID: &str = "harness.fs.glob";
+
+/// The built-in list tool (§4.8).
+pub const LIST_ID: &str = "harness.fs.list";
+
+/// The built-in outline tool (P-24): repo-map-lite symbol extraction, in
+/// the read class like the other `harness.fs.*` tools.
+pub const OUTLINE_ID: &str = "harness.fs.outline";
+
 /// The submit sentinel's id (§2.5, §4.8). Only the compiled-in `harness`
 /// manifest can declare it (the namespace is reserved, §4.3).
 pub const SUBMIT_ID: &str = "harness.task.submit";
@@ -178,6 +191,11 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
     },
     BuiltinTool {
         id: "harness.fs.list",
+        kind: ToolKind::Fs,
+        labels: no_labels,
+    },
+    BuiltinTool {
+        id: "harness.fs.outline",
         kind: ToolKind::Fs,
         labels: no_labels,
     },

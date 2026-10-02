@@ -83,11 +83,14 @@ macro_rules! say {
 
 mod approver;
 mod args;
+mod bundle;
 mod cmd_events;
+mod cmd_gc;
 mod cmd_manifest;
 mod cmd_profile;
 mod cmd_replay;
 mod cmd_run;
+mod cmd_sessions;
 mod config;
 mod dispatch;
 mod exec_presets;

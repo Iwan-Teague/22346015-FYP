@@ -267,6 +267,7 @@ fn spec_of(commands: &[&[&str]], max_rounds: u32) -> TaskSpec {
         grants: vec!["harness.fs.read".into(), EXEC_ID.into()],
         workspace_public: false,
         exec: Some(exec_spec()),
+        protected: Vec::new(),
         presubmit: Some(PresubmitSpec {
             commands: commands
                 .iter()
@@ -403,6 +404,7 @@ fn drive(s: Setup<'_>) -> Done {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
+        user: None,
     });
     let end = lp.drive(&mut w);
     let report = lp.presubmit.as_ref().map(PresubmitState::report);
@@ -1025,6 +1027,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&spec.presubmit),
+        user: None,
     });
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::SubmittedChecksFailed);

@@ -26,6 +26,7 @@ fn edit_spec(task: &str) -> harness_run::TaskSpec {
         workspace_public: false,
         exec: None,
         presubmit: None,
+        protected: Vec::new(),
     }
 }
 

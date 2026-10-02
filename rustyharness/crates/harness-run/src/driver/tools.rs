@@ -12,6 +12,7 @@ use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::Capability;
 use harness_policy::EXEC_ID;
 use harness_sandbox::Confinement;
+use harness_tools::protected::overlay_dirs;
 use harness_tools::{ExecCleanup, ExecEnd, ExecRecord, ExecTools, ToolStatus};
 use serde_json::Value;
 
@@ -37,14 +38,18 @@ pub(crate) fn exec_tools<'p>(
     let (Some((pinned, witness)), Some(c)) = (&pre.exec, confinement) else {
         return Ok(None);
     };
-    Ok(Some(ExecTools::new(
-        pre.read_tools.root(),
-        pinned.clone(),
-        &run_dir.join(SCRATCH_DIR),
-        c,
-        witness.clone(),
-        config.facts_timeout,
-    )?))
+    let sources: Vec<String> = pre.protected.patterns().map(str::to_owned).collect();
+    Ok(Some(
+        ExecTools::new(
+            pre.read_tools.root(),
+            pinned.clone(),
+            &run_dir.join(SCRATCH_DIR),
+            c,
+            witness.clone(),
+            config.facts_timeout,
+        )?
+        .with_protected_dirs(overlay_dirs(pre.read_tools.root(), &sources)),
+    ))
 }
 
 /// Whether `tool` is a built-in workspace edit (H2b).
@@ -61,7 +66,11 @@ pub(crate) fn is_exec(tool: &str) -> bool {
 pub(crate) fn is_read(tool: &str) -> bool {
     matches!(
         tool,
-        "harness.fs.read" | "harness.fs.search" | "harness.fs.list" | "harness.fs.glob"
+        "harness.fs.read"
+            | "harness.fs.search"
+            | "harness.fs.list"
+            | "harness.fs.glob"
+            | "harness.fs.outline"
     )
 }
 

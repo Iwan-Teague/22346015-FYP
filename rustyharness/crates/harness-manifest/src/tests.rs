@@ -177,7 +177,7 @@ fn fixture_manifest_validates() {
 fn builtin_manifest_bytes_unchanged() {
     assert_eq!(
         harness_core::sha256(builtin::builtin_manifest_json().as_bytes()).to_string(),
-        "7409f4604c8b93b94514fcff8b4bb43d733223c43fe2b7e5ca852baf4b789780"
+        "c16d6a80a24043ce0813de9f2619d8bc3bcd49ea8d8f0d4f7b198ab81fda7d38"
     );
 }
 
@@ -195,6 +195,7 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "harness.fs.search",
             "harness.fs.glob",
             "harness.fs.list",
+            "harness.fs.outline",
             "harness.edit.replace",
             "harness.edit.write",
             "harness.edit.multi",
@@ -222,6 +223,7 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
         "harness.fs.search",
         "harness.fs.glob",
         "harness.fs.list",
+        "harness.fs.outline",
         "harness.edit.replace",
         "harness.edit.write",
         "harness.edit.multi",
@@ -233,7 +235,12 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "{id}"
         );
     }
-    for id in ["harness.fs.search", "harness.fs.glob", "harness.fs.list"] {
+    for id in [
+        "harness.fs.search",
+        "harness.fs.glob",
+        "harness.fs.list",
+        "harness.fs.outline",
+    ] {
         assert!(cap(id).summary().contains(r#""." is the root"#), "{id}");
     }
     // H2b: the edit tools carry §4.8's labels (write / operational / own /

@@ -70,6 +70,10 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         ctor: ProviderCtor::Workspace(read_tools),
     },
     BuiltinTool {
+        id: "harness.fs.outline",
+        ctor: ProviderCtor::Workspace(read_tools),
+    },
+    BuiltinTool {
         id: "harness.edit.replace",
         ctor: ProviderCtor::Workspace(edit_tools),
     },

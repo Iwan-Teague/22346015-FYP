@@ -104,6 +104,7 @@ fn spec_with(grants: &[&str], exec: Option<ExecSpec>) -> TaskSpec {
         workspace_public: false,
         exec,
         presubmit: None,
+        protected: Vec::new(),
     }
 }
 

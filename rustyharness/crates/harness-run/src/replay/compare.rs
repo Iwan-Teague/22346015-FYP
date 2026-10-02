@@ -6,12 +6,15 @@ use std::borrow::Cow;
 use harness_core::MeterLimits;
 use harness_journal::{EventKind, Record};
 use harness_manifest::admission::{Registry, Resolved};
-use harness_model::context::CONTEXT_FORMAT;
+use harness_model::context::{CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol};
 use harness_policy::{UserPolicy, SUBMIT_ID};
+use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
 use serde_json::{Map, Value};
 
-use crate::driver::{builtin_manifest_sha256, limits_fields, TaskSpec, HEADER_INPUT_KEYS};
+use crate::driver::{
+    builtin_manifest_sha256, limits_fields, protected_task_digest, TaskSpec, HEADER_INPUT_KEYS,
+};
 
 /// Where a journal and the replay first disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,13 +33,16 @@ pub(crate) fn diverge(seq: u64, step: u64, why: &'static str) -> Divergence {
 
 /// The header values an audit or a resume recomputes from its own inputs
 /// (task grants, workspace declaration, protocol, profile, policy, number
-/// of checks, budget limits), as the header writes them.
+/// of checks, budget limits), as the header writes them. `session` is the
+/// session's turn limits (P-05 §1.4); `None` recomputes a batch header,
+/// which carries neither `mode` nor `turn_limits`.
 pub(crate) fn expected_inputs(
     spec: &TaskSpec,
     registry: &Registry,
     policy: &UserPolicy,
     profile: &Profile,
     limits: &MeterLimits,
+    session: Option<&crate::session::TurnLimits>,
 ) -> Map<String, Value> {
     let mut grants: Vec<Value> = Vec::new();
     let mut names: Vec<&str> = spec.grants.iter().map(String::as_str).collect();
@@ -81,6 +87,27 @@ pub(crate) fn expected_inputs(
         "shell_enabled".into(),
         Value::Bool(spec.exec.as_ref().is_some_and(|e| e.shell_enabled())),
     );
+    // The protected paths (P-29), as the header writes them: the task's
+    // declared globs as a digest, and this build's defaults listed.
+    m.insert(
+        "protected".into(),
+        Value::Object({
+            let mut o = Map::new();
+            o.insert(
+                "task".into(),
+                Value::from(protected_task_digest(&spec.protected).to_string()),
+            );
+            o.insert(
+                "deny_default".into(),
+                Value::Array(DEFAULT_DENY.iter().map(|g| Value::from(*g)).collect()),
+            );
+            o.insert(
+                "ask_default".into(),
+                Value::Array(DEFAULT_ASK.iter().map(|g| Value::from(*g)).collect()),
+            );
+            o
+        }),
+    );
     if let Some(e) = &spec.exec {
         let mut o = Map::new();
         o.insert("spec".into(), Value::from(e.digest().to_string()));
@@ -91,7 +118,13 @@ pub(crate) fn expected_inputs(
     if let Some(p) = &spec.presubmit {
         m.insert("presubmit".into(), p.header_value());
     }
-    m.insert("context_format".into(), Value::from(CONTEXT_FORMAT));
+    m.insert(
+        "context_format".into(),
+        Value::from(match session {
+            Some(_) => SESSION_CONTEXT_FORMAT,
+            None => CONTEXT_FORMAT,
+        }),
+    );
     m.insert(
         "limits".into(),
         Value::Object(
@@ -101,6 +134,23 @@ pub(crate) fn expected_inputs(
                 .collect(),
         ),
     );
+    // P-05 §1.4: a session's mode and turn limits; no key without them,
+    // as the header writes it, so a batch header compares as before.
+    if let Some(t) = session {
+        m.insert("mode".into(), Value::from("session"));
+        m.insert(
+            "turn_limits".into(),
+            Value::Object(
+                [
+                    ("steps", u64::from(t.steps)),
+                    ("format_errors", u64::from(t.format_errors)),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), Value::from(v)))
+                .collect(),
+            ),
+        );
+    }
     m
 }
 
@@ -136,6 +186,12 @@ fn header_mismatch(key: &str) -> &'static str {
         }
         "shell_enabled" | "exec" => "the exec allowlist given differs from the recorded header",
         "presubmit" => "the pre-submit checks given differ from the recorded header",
+        "protected" => {
+            "the protected-path lists (task-declared or this build's defaults) differ from the \
+             recorded header"
+        }
+        "mode" => "the run's mode (batch or session) differs from the recorded header",
+        "turn_limits" => "the turn limits given differ from the recorded header",
         "context_format" => {
             "another harness build wrote this journal (its context format differs: since H1h the \
              native protocol shows past actions as tool calls, since H1i each observation keeps \

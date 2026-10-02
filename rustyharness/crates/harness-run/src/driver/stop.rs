@@ -116,6 +116,11 @@ impl<'a> Loop<'a> {
                 .field("stop", Trusted::Bool(true)),
         )
         .map_err(journal)?;
+        // P-05 §3: in a session a detected loop ends the TURN (the record
+        // says the same thing either way); a batch run stops.
+        if self.user.is_some() {
+            return Ok(Flow::EndTurn(super::step::TurnEnd::Loop(kind)));
+        }
         Ok(Flow::Stop(StopCause::Loop(kind), None))
     }
 }

@@ -38,6 +38,23 @@ struct PathGlob {
 }
 
 impl Matcher {
+    /// Build a matcher whose only condition is `path_glob`: the pattern
+    /// the harness itself writes (P-29 protected-path ask rules). A pattern
+    /// the glob compiler refuses is refused here too — the same rule as
+    /// [`Matcher::parse`]'s `path_glob` key.
+    pub fn path_glob(pattern: &str) -> Result<Matcher, PolicyConfigError> {
+        let glob = harness_core::glob::Glob::new(pattern)
+            .map_err(|e| bad_matcher(&format!("path_glob refused: {}", e.message())))?;
+        Ok(Matcher {
+            path_glob: Some(PathGlob {
+                source: pattern.to_owned(),
+                glob,
+            }),
+            argv_prefix: None,
+            argv_not_prefix: None,
+        })
+    }
+
     /// Parse the value of a rule's `"match"` key (must be an object, and
     /// not empty: a `match` that says nothing is an authoring mistake the
     /// §5.1 order cannot disambiguate). Unknown keys are refused.
@@ -121,6 +138,18 @@ impl Matcher {
             }
         }
         true
+    }
+
+    /// The compiled glob when this matcher is exactly one `path_glob`
+    /// (no argv conditions): lets tools reuse an already-decided deny rule
+    /// as a skip predicate over paths (P-12). A matcher with any argv
+    /// condition returns `None` — it is not a pure path predicate.
+    pub fn path_only_glob(&self) -> Option<&harness_core::glob::Glob> {
+        if self.argv_prefix.is_none() && self.argv_not_prefix.is_none() {
+            self.path_glob.as_ref().map(|pg| &pg.glob)
+        } else {
+            None
+        }
     }
 
     /// The matcher's canonical JSON text (sorted keys): what the policy

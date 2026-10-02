@@ -1720,6 +1720,7 @@ fn policy_default_table_unchanged() {
         "harness.fs.search",
         "harness.fs.glob",
         "harness.fs.list",
+        "harness.fs.outline",
         "harness.edit.replace",
         "harness.edit.write",
         "harness.edit.multi",
@@ -1732,6 +1733,7 @@ fn policy_default_table_unchanged() {
         json!({"pattern": "x"}),
         json!({"pattern": "*.rs"}),
         json!({"path": "."}),
+        json!({"path": "."}),
         json!({"path": "a.txt", "old": "a", "new": "b"}),
         json!({"path": "a.txt", "content": "x"}),
         json!({"path": "a.txt", "edits": [{"old": "a", "new": "b"}]}),
@@ -1740,6 +1742,9 @@ fn policy_default_table_unchanged() {
         json!({"note": "done"}),
     ];
     let defaults = [
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        },
         PolicyDecision::Allow {
             rule: RuleId::Builtin("allow.default.read"),
         },
@@ -1832,6 +1837,33 @@ fn policy_default_table_unchanged() {
 }
 
 // ---- P-08: policy argument matchers ---------------------------------------------
+
+/// The outline tool (P-24) is a read-class built-in like `list`: planned
+/// alone under the default policy it decides allow through the default read
+/// rule, and the registration table and the compiled-in registry agree on
+/// the tool count (every table id resolves).
+#[test]
+fn tool_count_policy_default_read_allow() {
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 11);
+    let reg = builtin_registry();
+    for t in crate::builtin::BUILTIN_TOOLS {
+        assert!(
+            matches!(
+                reg.resolve(t.id),
+                harness_manifest::admission::Resolved::One { .. }
+            ),
+            "{}",
+            t.id
+        );
+    }
+    let s = Session::plan(&spec(&[OUTLINE_ID]), &reg, &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call(OUTLINE_ID, json!({"path": "."}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        }
+    );
+}
 
 /// A v2 policy file straight from parsed JSON (what the CLI hands over).
 fn policy_json(v: Value) -> UserPolicy {
@@ -2218,4 +2250,199 @@ fn v2_policy_files_fail_closed_on_bad_shapes() {
         UserPolicy::from_json(&dup),
         Err(PolicyConfigError::Ambiguous(_))
     ));
+}
+
+// ---- P-29 protected-path floor: the constructors the driver uses ---------------
+
+#[test]
+fn path_glob_ctor_builds_and_refuses_bad_globs() {
+    let m = Matcher::path_glob("Cargo.lock").unwrap();
+    assert!(m.matches(&json!({"path": "Cargo.lock"})));
+    assert!(!m.matches(&json!({"path": "src/lib.rs"})));
+    assert!(Matcher::path_glob("[[nope").is_err());
+}
+
+#[test]
+fn push_ask_appends_then_refuses_any_duplicate_key() {
+    let mut p = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
+    let rule = |pat: &str| Rule {
+        selector: Selector::parse("harness.edit.replace").unwrap(),
+        matcher: Some(Matcher::path_glob(pat).unwrap()),
+    };
+    p.push_ask(rule("Cargo.lock")).unwrap();
+    assert_eq!(p.ask.len(), 1);
+    // Same key twice in ask, and the same key in deny/allow: all ambiguous.
+    assert!(p.push_ask(rule("Cargo.lock")).is_err());
+    // A bare rule whose key exactly matches an existing deny rule: ambiguous.
+    let mut q = UserPolicy::new(&["harness.edit.replace"], &[], &[]).unwrap();
+    assert!(q
+        .push_ask(Rule {
+            selector: Selector::parse("harness.edit.replace").unwrap(),
+            matcher: None,
+        })
+        .is_err());
+    // A different pattern is a different key: fine.
+    p.push_ask(rule(".github/**")).unwrap();
+    assert_eq!(p.ask.len(), 2);
+}
+
+// ---- P-12: the sensitive-path default denies ------------------------------------
+// ---- P-12: the sensitive-path default denies ------------------------------------
+
+/// The default deny list denies read, search, glob, list and the edits on
+/// the documented globs, and every denial names its rule (§5.1: a decision
+/// carries the id of the rule that produced it).
+#[test]
+fn denied_decision_has_rule_id() {
+    let p = default_denies().unwrap();
+    let s = Session::plan(
+        &spec(&["harness.fs.read", "harness.edit.replace"]),
+        &builtin_registry(),
+        &p,
+    )
+    .unwrap();
+    // read .env: the read list's first glob is `.env`, so deny index 0.
+    assert_eq!(
+        s.decide(&call("harness.fs.read", json!({"path": ".env"}))),
+        PolicyDecision::Deny {
+            reason: DenyReason::UserDenied,
+            rule: RuleId::User {
+                list: RuleList::Deny,
+                index: 0
+            }
+        }
+    );
+    // A name pattern matches at any depth.
+    assert!(is_deny(
+        &s.decide(&call(
+            "harness.fs.read",
+            json!({"path": "deploy/.env.prod"})
+        )),
+        &DenyReason::UserDenied
+    ));
+    // A non-denied read is untouched: the default allow (no rule of ours).
+    let ok = s.decide(&call("harness.fs.read", json!({"path": "a.txt"})));
+    assert!(matches!(ok, PolicyDecision::Allow { .. }), "{ok:?}");
+    // The edits are covered too: edit.replace's rules start at 5 × 10.
+    assert_eq!(
+        s.decide(&call(
+            "harness.edit.replace",
+            json!({"path": ".env", "old": "A", "new": "B"})
+        )),
+        PolicyDecision::Deny {
+            reason: DenyReason::UserDenied,
+            rule: RuleId::User {
+                list: RuleList::Deny,
+                index: 50
+            }
+        }
+    );
+}
+
+/// The CLI's overlay refuses a `--policy` that already names one of the
+/// default rules (the duplicate-rule precedent); without the overlay the
+/// same file loads.
+#[test]
+fn overlay_refuses_a_duplicate_default_rule() {
+    let file = json!({
+        "deny": [{"capability": "harness.fs.read", "match": {"path_glob": ".env"}}]
+    });
+    let p = UserPolicy::from_json(&file).unwrap();
+    assert!(matches!(
+        overlay_default_denies(p),
+        Err(PolicyConfigError::Ambiguous(key)) if key.contains("harness.fs.read")
+    ));
+    // The user's own deny works alone (the --no-default-denies reading).
+    assert!(UserPolicy::from_json(&file).is_ok());
+    // Overlaying the empty policy gives the defaults, appended after
+    // whatever was there (nothing), and the digest names the union.
+    let bare = overlay_default_denies(UserPolicy::default()).unwrap();
+    assert_eq!(bare.digest(), default_denies().unwrap().digest());
+}
+
+/// `denied_globs` keeps the surfacing read tools' own `path_glob` denies
+/// only: an edit-only rule or an argv-conditioned rule is not a skip
+/// predicate for search, glob or list.
+#[test]
+fn denied_globs_from_read_only_deny() {
+    let p = UserPolicy::from_json(&json!({
+        "deny": [
+            {"capability": "harness.fs.read", "match": {"path_glob": ".env*"}},
+            {"capability": "harness.edit.write", "match": {"path_glob": ".env*"}},
+            {"capability": "harness.fs.search", "match": {"argv_prefix": ["git"]}}
+        ]
+    }))
+    .unwrap();
+    let globs = p.denied_globs();
+    assert_eq!(globs.len(), 1, "{globs:?}");
+    assert!(globs[0].matches(".env"));
+    assert!(globs[0].matches("sub/.env.local"));
+    assert!(!globs[0].matches("a.txt"));
+    assert!(UserPolicy::default().denied_globs().is_empty());
+}
+
+/// The defaults are the documented globs × the documented capabilities, in
+/// the stable order (rule indices and the digest must not drift), and the
+/// list is not the empty library default (OD-2).
+#[test]
+fn default_denies_cover_the_documented_globs() {
+    let p = default_denies().unwrap();
+    assert_eq!(p.deny.len(), 8 * DEFAULT_DENY_GLOBS.len());
+    // Per capability: 10 globs each, capability-major order.
+    for (cap, base) in [
+        ("harness.fs.read", 0),
+        ("harness.fs.search", 10),
+        ("harness.fs.glob", 20),
+        ("harness.fs.list", 30),
+        ("harness.fs.outline", 40),
+        ("harness.edit.replace", 50),
+        ("harness.edit.write", 60),
+        ("harness.edit.multi", 70),
+    ] {
+        let mut grants = vec![cap];
+        if cap != "harness.fs.read" {
+            grants.push("harness.fs.read");
+        }
+        let s = Session::plan(&spec(&grants), &builtin_registry(), &p).unwrap();
+        let first = s.decide(&call(
+            cap,
+            if cap.starts_with("harness.edit") {
+                json!({"path": DEFAULT_DENY_GLOBS[0], "old": "a", "new": "b"})
+            } else {
+                json!({"path": DEFAULT_DENY_GLOBS[0]})
+            },
+        ));
+        assert_eq!(
+            first,
+            PolicyDecision::Deny {
+                reason: DenyReason::UserDenied,
+                rule: RuleId::User {
+                    list: RuleList::Deny,
+                    index: base
+                }
+            },
+            "{cap} first glob"
+        );
+        let last = s.decide(&call(
+            cap,
+            if cap.starts_with("harness.edit") {
+                json!({"path": DEFAULT_DENY_GLOBS[9], "old": "a", "new": "b"})
+            } else {
+                json!({"path": DEFAULT_DENY_GLOBS[9]})
+            },
+        ));
+        assert_eq!(
+            last,
+            PolicyDecision::Deny {
+                reason: DenyReason::UserDenied,
+                rule: RuleId::User {
+                    list: RuleList::Deny,
+                    index: base + 9
+                }
+            },
+            "{cap} last glob"
+        );
+    }
+    // The defaults are not the library default: the digest differs.
+    assert_ne!(p.digest(), UserPolicy::default().digest());
 }

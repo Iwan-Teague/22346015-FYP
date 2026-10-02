@@ -15,10 +15,12 @@ use harness_model::profile::Profile;
 use harness_model::ToolSpec;
 use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::{
-    PolicyDecision, Session, SessionSpec, UserPolicy, WorkspaceDecl, EXEC_ID, SUBMIT_ID, TODO_ID,
+    Matcher, PolicyDecision, Rule, Selector, Session, SessionSpec, UserPolicy, WorkspaceDecl,
+    EXEC_ID, SUBMIT_ID, TODO_ID,
 };
 use harness_sandbox::{Confinement, Conformed};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
+use harness_tools::protected::{Protected, ProtectedError, DEFAULT_ASK};
 use harness_tools::{EditTools, ExecSpec, ExecTools, Pinned, ReadTools, TodoList, ToolProvider};
 
 use super::{new_run_id, RunConfig, RunRefused, TaskSpec};
@@ -38,6 +40,9 @@ pub(crate) struct Prepared {
     /// For an exec grant (H2d): the pinned setup and the witness obtained
     /// before anything was written.
     pub(crate) exec: Option<(Pinned, Conformed)>,
+    /// The merged protected-path deny sources (P-29): the build's
+    /// [`DEFAULT_DENY`] plus the task's declared list, compiled.
+    pub(crate) protected: Protected,
 }
 
 impl Prepared {
@@ -87,11 +92,21 @@ pub(crate) fn prepare(
     // The read window is the profile's (H2e): what a read returns, and what
     // the context shows of one observation.
     let window = profile.read_window();
-    let read_tools = ReadTools::new(workspace)?.with_window(
-        window.lines,
-        usize::try_from(window.bytes).unwrap_or(usize::MAX),
+    let read_tools = ReadTools::new(workspace)?
+        .with_window(
+            window.lines,
+            usize::try_from(window.bytes).unwrap_or(usize::MAX),
+        )
+        // P-12: the policy's own deny globs for the surfacing read
+        // tools (empty unless the policy names such rules), so search,
+        // glob and list skip denied paths and say how many. A library
+        // embedder passes an empty default policy and gets no skips
+        // (OD-2); the CLI overlays its default deny list.
+        .with_denied(policy.denied_globs());
+    let edit_tools = EditTools::new(workspace)?.with_protected(
+        Protected::new(&spec.protected)
+            .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
     );
-    let edit_tools = EditTools::new(workspace)?;
     let ws = read_tools.root().to_path_buf();
     let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
     if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
@@ -126,7 +141,43 @@ pub(crate) fn prepare(
         facts: tree.facts(),
         tree,
         exec,
+        protected: Protected::new(&spec.protected)
+            .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
     })
+}
+
+/// The capabilities the ask floor covers (P-29): every edit cap, the only
+/// write path a model has today.
+const EDIT_CAPS: [&str; 3] = [
+    "harness.edit.replace",
+    "harness.edit.write",
+    "harness.edit.multi",
+];
+
+/// The P-29 ask floor: [`DEFAULT_ASK`] globs over every edit cap, appended
+/// to the user's own ask rules. Runs against the returned policy, so a live
+/// run, a resume and an audit replay all decide with the same floor; a
+/// floor rule the user policy already states exactly is refused (fail
+/// closed, not silently doubled).
+pub(crate) fn protected_policy(user: &UserPolicy) -> Result<UserPolicy, RunRefused> {
+    let refused = |what: &'static str| RunRefused::Protected(what);
+    let mut p = user.clone();
+    for glob in DEFAULT_ASK {
+        for cap in EDIT_CAPS {
+            let rule =
+                Rule {
+                    selector: Selector::parse(cap)
+                        .map_err(|_| refused("an edit selector of this build is not a selector"))?,
+                    matcher: Some(Matcher::path_glob(glob).map_err(|_| {
+                        refused("a protected-path glob of this build is not a glob")
+                    })?),
+                };
+            p.push_ask(rule).map_err(|_| {
+                refused("the user policy already states a protected-path ask rule verbatim")
+            })?;
+        }
+    }
+    Ok(p)
 }
 
 /// The exec setup of a task (H2d): `None` without an exec grant; the pinned
@@ -211,6 +262,9 @@ pub(crate) fn plan(
     if !grants.iter().any(|g| g == SUBMIT_ID) {
         grants.push(SUBMIT_ID.to_owned());
     }
+    // The P-29 ask floor (Cargo.lock, .github/**): decided with here, so a
+    // live run, a resume and an audit replay all ask about the same edits.
+    let policy = protected_policy(policy)?;
     let session = Session::plan(
         &SessionSpec {
             grants: grants.clone(),
@@ -225,7 +279,7 @@ pub(crate) fn plan(
             read_window: Some(profile.read_window().lines),
         },
         registry,
-        policy,
+        &policy,
     )?;
     // Pre-submit checks (H3a): bounded and on the allowlist, and none of them
     // denied by policy (a pure decision, the same the model's own command

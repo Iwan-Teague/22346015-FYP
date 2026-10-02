@@ -149,6 +149,7 @@ fn drive(
         workspace_public: false,
         exec: None,
         presubmit: None,
+        protected: Vec::new(),
     };
     let policy = UserPolicy::default();
     let (session, tools) = plan(&spec, &reg, &policy, profile, false, false).unwrap();
@@ -207,6 +208,7 @@ fn drive(
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        user: None,
     });
     let end = lp.drive(&mut w);
     commit(w, &end, None);

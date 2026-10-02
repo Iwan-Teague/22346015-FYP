@@ -738,3 +738,129 @@ fn h2f_filters_that_match_nothing_are_told() {
     );
     assert!(t.starts_with("1 hit(s) in 1 file(s)"), "{t}");
 }
+
+// ---- P-12: policy-denied paths are skipped, and the count is said ----------------
+
+/// A rig planned under the CLI's default deny policy, whose tools carry the
+/// policy's own compiled globs (the run driver's wiring, P-12).
+fn denied_rig(ws: &Path) -> Rig {
+    let ctx = ValidationContext::new(
+        SemVer {
+            major: 0,
+            minor: 0,
+            patch: 1,
+        },
+        &[],
+    )
+    .unwrap();
+    let reg = Registry::admit(vec![(builtin::manifest(&ctx).unwrap(), Tier::Builtin)]).unwrap();
+    let policy = harness_policy::default_denies().unwrap();
+    let globs = policy.denied_globs();
+    let s = Session::plan(
+        &SessionSpec {
+            grants: vec![
+                "harness.fs.read".into(),
+                "harness.fs.search".into(),
+                "harness.fs.glob".into(),
+                "harness.fs.list".into(),
+                "harness.task.submit".into(),
+            ],
+            workspace: Some(WorkspaceDecl::default()),
+            approver_present: false,
+            personal_data_granted: false,
+            conformed: false,
+            exec_programs: Vec::new(),
+            read_window: None,
+        },
+        &reg,
+        &policy,
+    )
+    .unwrap();
+    let w = JournalWriter::start(
+        FaultFile::new(FaultPlan::default()),
+        MemBlobs::default(),
+        Tick(Cell::new(0)),
+        RunId::new(1, [0; 10]),
+        1,
+        Header::new(Ident::of("0.0.1").unwrap()),
+    )
+    .unwrap();
+    Rig {
+        w,
+        s,
+        t: ReadTools::new(ws).unwrap().with_denied(globs),
+        step: 0,
+    }
+}
+
+fn denied_ws(name: &str) -> PathBuf {
+    let ws = scratch(name);
+    fs::write(ws.join(".env"), "SECRET=1\nneedle\n").unwrap();
+    fs::write(ws.join(".env.local"), "SECRET=2\n").unwrap();
+    fs::create_dir(ws.join("keys")).unwrap();
+    fs::write(ws.join("keys/server.pem"), "needle in pem\n").unwrap();
+    fs::write(ws.join("keys/server.key"), "raw key material\n").unwrap();
+    fs::write(ws.join("a.txt"), "needle here\n").unwrap();
+    fs::create_dir(ws.join("sub")).unwrap();
+    fs::write(ws.join("sub/b.txt"), "another needle\n").unwrap();
+    fs::write(ws.join("sub/c.txt"), "nothing\n").unwrap();
+    ws
+}
+
+#[test]
+fn search_skips_denied_files_and_counts_them() {
+    let ws = denied_ws("denied-search");
+    let mut r = denied_rig(&ws);
+    let t = search(&mut r, json!({"pattern": "needle"}));
+    assert!(
+        t.starts_with("2 hit(s) in 2 file(s) for a literal match\n"),
+        "{t}"
+    );
+    assert!(t.contains("a.txt (1 hit(s))\n"), "{t}");
+    assert!(t.contains("sub/b.txt (1 hit(s))\n"), "{t}");
+    // The denied files are neither searched nor named, and the count says
+    // so (never silently: the model can tell denied from absent).
+    assert!(!t.contains(".env"), "{t}");
+    assert!(!t.contains("SECRET"), "{t}");
+    assert!(!t.contains("server.pem"), "{t}");
+    assert!(!t.contains("server.key"), "{t}");
+    assert_eq!(
+        t.lines().last(),
+        Some("4 path(s) skipped (denied by policy)")
+    );
+}
+
+#[test]
+fn glob_and_list_hide_denied_but_report_count() {
+    let ws = denied_ws("denied-glob-list");
+    let mut r = denied_rig(&ws);
+    let out = r.call("harness.fs.glob", json!({"pattern": "**"}));
+    assert_eq!(out.status, ToolStatus::Ok, "{}", text(&out));
+    let t = text(&out);
+    assert!(t.starts_with("3 file(s) match under .\n"), "{t}");
+    assert!(t.contains("a.txt ("), "{t}");
+    assert!(t.contains("sub/b.txt ("), "{t}");
+    assert!(t.contains("sub/c.txt ("), "{t}");
+    assert!(!t.contains(".env"), "{t}");
+    assert!(!t.contains("server.pem"), "{t}");
+    assert!(t.contains("4 path(s) skipped (denied by policy)"), "{t}");
+
+    // The listing hides the denied entries too, says how many were skipped,
+    // and its count reflects what is shown, not what is on disk.
+    let out = r.call("harness.fs.list", json!({"path": ".", "depth": 2}));
+    assert_eq!(out.status, ToolStatus::Ok, "{}", text(&out));
+    let t = text(&out);
+    assert!(t.starts_with("5 entr(y/ies) under .\n"), "{t}");
+    assert!(t.contains("f a.txt "), "{t}");
+    assert!(t.contains("d keys\n"), "{t}");
+    assert!(t.contains("d sub\n"), "{t}");
+    assert!(t.contains("f sub/b.txt "), "{t}");
+    assert!(t.contains("f sub/c.txt "), "{t}");
+    assert!(!t.contains(".env"), "{t}");
+    assert!(!t.contains("server.pem"), "{t}");
+    assert!(!t.contains("server.key"), "{t}");
+    assert_eq!(
+        t.lines().last(),
+        Some("4 path(s) skipped (denied by policy)")
+    );
+}

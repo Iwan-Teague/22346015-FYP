@@ -446,6 +446,37 @@ fn ft9_protected_paths_are_read_only() {
     assert!(!git.join("new").exists());
 }
 
+/// P-29: `.git` inside the workspace is a read-only overlay for a sandboxed
+/// command, the way the exec tools fill `ConfinedSpec.protected`: a shell
+/// append into `.git/config` fails and the file is byte-unchanged, while
+/// the unconfined control shows the same append works.
+#[test]
+fn exec_cannot_write_dot_git() {
+    let t = Tree::new("p29-git");
+    let git = t.ws.join(".git");
+    std::fs::create_dir_all(&git).unwrap();
+    let config = git.join("config");
+    std::fs::write(&config, "orig\n").unwrap();
+    let script = "print qq{APPENDED\\n} if open(my $f, q{>>}, $ARGV[0]); print $f qq{tampered\\n}";
+    let target = config.to_str().unwrap();
+    // The control: unconfined, the shell appends. Rewind the file after.
+    let ctl = control(script, &[target]);
+    assert!(
+        ctl.status.success() && String::from_utf8_lossy(&ctl.stdout).contains("APPENDED"),
+        "the control shows the append works unconfined"
+    );
+    std::fs::write(&config, "orig\n").unwrap();
+    let mut s = t.spec(&["/bin/sh", "-c", script, target]);
+    s.protected = vec![git.clone()];
+    let e = run(&s);
+    confirmed(&e);
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "orig\n",
+        ".git/config is byte-unchanged"
+    );
+}
+
 /// FT-10: a state_root-shaped directory (journal, config) outside the
 /// grants is neither readable nor listable nor writable.
 #[test]

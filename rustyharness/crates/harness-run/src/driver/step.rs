@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use gate_outcome::Digest;
 use harness_core::environment::EnvProbe;
 use harness_core::{
-    sha256, BudgetDim, LoopDetector, LoopEvent, LoopSignal, Meter, Nonce, Source, StopCause,
-    TokenUsage, Untrusted,
+    sha256, BudgetDim, LoopDetector, LoopEvent, LoopKind, LoopSignal, Meter, Nonce, Source,
+    StopCause, TokenUsage, Untrusted,
 };
 use harness_journal::{
     BlobSink, Clock, Condition, ConditionKind, Event, EventKind, Ident, JournalError, JournalFile,
@@ -16,8 +16,9 @@ use harness_journal::{
 };
 use harness_manifest::admission::Registry;
 use harness_model::context::{
-    self, budget_notice, step_notice, valid_wall_notice, wall_threshold, BudgetNotice,
-    ContextError, Delimiting, Fact, Feedback, Renderings, Shown, ShownCall, Turn,
+    self, budget_notice, budget_notice_session, step_notice, valid_wall_notice, wall_threshold,
+    BudgetNotice, ContextError, Delimiting, Fact, Feedback, Renderings, Shown, ShownCall, Turn,
+    UserEntry, SUBMIT_ACCEPTED_FAILING_TEXT, SUBMIT_ACCEPTED_TEXT,
 };
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
@@ -94,6 +95,36 @@ pub(crate) struct Loop<'a> {
     /// The task's pre-submit checks and what they did so far (H3a); `None`
     /// for a task without any: a submission is then accepted at once.
     pub(crate) presubmit: Option<PresubmitState>,
+    /// The interactive session's state (P-05); `None` in a batch run, an
+    /// audit and a resume's catch-up, which take every batch path unchanged.
+    pub(crate) user: Option<UserState<'a>>,
+}
+
+/// The interactive session's state on the loop (P-05): the current turn's
+/// budget, the users shown so far, and where the UI drain sends records.
+pub(crate) struct UserState<'a> {
+    /// The session's turn limits (validated before anything was written).
+    pub(crate) limits: crate::session::TurnLimits,
+    /// 1-based number of the current user turn (the count of `UserTurn`
+    /// records so far).
+    pub(crate) turn: u64,
+    /// This turn's step allowance: the lesser of the turn limit and the
+    /// steps the session budget has left (P-05 §4).
+    pub(crate) allowance: u64,
+    /// Steps taken this turn so far (counted by the session loop).
+    pub(crate) used: u64,
+    /// The users shown to the model so far, in order (a refused input is
+    /// never here).
+    pub(crate) users: Vec<UserEntry>,
+    /// SHA-256 of the last accepted submission's note, once one is accepted.
+    pub(crate) deliverable: Option<Digest>,
+    /// The workspace root, for the external-change measurement at each turn
+    /// start (P-05 §5); `None` where there is no live workspace to measure.
+    pub(crate) root: Option<std::path::PathBuf>,
+    /// The attempt's blobs directory, for the UI drain's events.
+    pub(crate) blobs: std::path::PathBuf,
+    /// Where journaled records are shown; `None` means drain and drop.
+    pub(crate) sink: Option<&'a dyn crate::session::EventSink>,
 }
 
 /// The loop's starting state, field for field, in one place. Every mode
@@ -126,6 +157,7 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) todo: Option<TodoList>,
     pub(crate) notices: BudgetNotices,
     pub(crate) presubmit: Option<PresubmitState>,
+    pub(crate) user: Option<UserState<'a>>,
 }
 
 impl<'a> Loop<'a> {
@@ -156,6 +188,7 @@ impl<'a> Loop<'a> {
             todo,
             notices,
             presubmit,
+            user,
         } = init;
         Loop {
             session,
@@ -183,6 +216,7 @@ impl<'a> Loop<'a> {
             todo,
             notices,
             presubmit,
+            user,
         }
     }
 }
@@ -237,7 +271,7 @@ impl NonceSource {
     }
 
     /// Every nonce drawn so far in this run.
-    fn drawn(&self) -> impl Iterator<Item = &Nonce> {
+    pub(crate) fn drawn(&self) -> impl Iterator<Item = &Nonce> {
         self.assigned.values().filter_map(|s| match &s.output {
             Some(Delimiting::Nonce(n)) => Some(n),
             _ => None,
@@ -249,6 +283,48 @@ impl NonceSource {
 pub(crate) enum Flow {
     Continue,
     Stop(StopCause, Option<Digest>),
+    /// The user turn ended (P-05 §3); the session goes on to its next
+    /// input. Never returned by a batch loop.
+    EndTurn(TurnEnd),
+}
+
+/// Why a user turn ended, as the `TurnEnded` journal record names it
+/// (P-05 §1.1, §3).
+pub(crate) enum TurnEnd {
+    Answered,
+    Submitted,
+    SubmittedChecksFailed,
+    TurnSteps,
+    FormatErrors,
+    Loop(LoopKind),
+    ModelUnavailable,
+}
+
+impl TurnEnd {
+    /// The `reason` text the `TurnEnded` record carries.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            TurnEnd::Answered => "answered",
+            TurnEnd::Submitted => "submitted",
+            TurnEnd::SubmittedChecksFailed => "submitted_checks_failed",
+            TurnEnd::TurnSteps => "turn_steps",
+            TurnEnd::FormatErrors => "format_errors",
+            TurnEnd::Loop(kind) => match kind {
+                LoopKind::Repeat => "loop:repeat",
+                LoopKind::EditChurn => "loop:edit_churn",
+                LoopKind::NoProgress => "loop:no_progress",
+                LoopKind::Denied => "loop:denied",
+            },
+            TurnEnd::ModelUnavailable => "model_unavailable",
+        }
+    }
+
+    /// The notice the model sees with the next request, when the turn ended
+    /// for a reason worth naming (`turn_end_text`); joined into the last
+    /// step's turn, which that request shows first (P-05 §3).
+    pub(crate) fn notice(&self) -> Option<HarnessText> {
+        harness_model::context::turn_end_text(self.name())
+    }
 }
 
 pub(crate) fn journal(e: JournalError) -> StopCause {
@@ -295,7 +371,7 @@ impl<'a> Loop<'a> {
 
     /// One step, then (when the run goes on) the budget notices it earned,
     /// joined to its turn (H2e).
-    fn step<F: JournalFile, B: BlobSink, K: Clock>(
+    pub(crate) fn step<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
     ) -> Result<Flow, StopCause> {
@@ -321,7 +397,14 @@ impl<'a> Loop<'a> {
         step: u64,
     ) -> Result<(), StopCause> {
         let mut due: Vec<BudgetNotice> = Vec::new();
-        if let Some(n) = step_notice(step, u64::from(self.config.limits.steps)) {
+        // In a session the step notices measure the TURN's budget against
+        // this turn's allowance (P-05 §4); a batch run measures the run's
+        // steps against the run limit, unchanged.
+        let (used, limit) = match &self.user {
+            Some(u) => (u.used, u.allowance),
+            None => (step, u64::from(self.config.limits.steps)),
+        };
+        if let Some(n) = step_notice(used, limit) {
             let (key, used, limit) = match n {
                 BudgetNotice::LastStep { used, limit } => ("last_step", used, limit),
                 BudgetNotice::Steps { used, limit } => ("steps", used, limit),
@@ -386,7 +469,12 @@ impl<'a> Loop<'a> {
             _ => return Err(StopCause::PolicyAbort),
         };
         for (i, n) in due.into_iter().enumerate() {
-            let text = budget_notice(protocol, n, if i == last { open } else { None });
+            let open = if i == last { open } else { None };
+            let text = if self.user.is_some() {
+                budget_notice_session(protocol, n, open)
+            } else {
+                budget_notice(protocol, n, open)
+            };
             turn.notice = Some(match turn.notice.take() {
                 Some(prev) => prev.joined(&text),
                 None => text,
@@ -408,33 +496,49 @@ impl<'a> Loop<'a> {
         self.observe_budgets(w, step)?;
 
         // 2. Build the context (§2.3), once the observation it shows for the
-        // first time has its delimiting (H1i).
+        // first time has its delimiting (H1i). A session build keeps every
+        // user's turn in the window and reserves the users' share of the
+        // budget for them (P-05 §2.3).
         let first = self.first_render()?;
-        let built = match context::build(
-            self.profile,
-            &self.tools,
-            self.task,
-            &self.facts,
-            &self.turns,
-            &self.nonces.assigned,
-        ) {
+        let built = match &self.user {
+            Some(u) => context::build_session(
+                self.profile,
+                &self.tools,
+                self.task,
+                &self.facts,
+                &self.turns,
+                &u.users,
+                &self.nonces.assigned,
+            ),
+            None => context::build(
+                self.profile,
+                &self.tools,
+                self.task,
+                &self.facts,
+                &self.turns,
+                &self.nonces.assigned,
+            ),
+        };
+        let built = match built {
             Ok(b) => b,
             Err(ContextError::Exhausted { .. }) => return Err(StopCause::ContextExhausted),
             Err(ContextError::TooManyTools { .. } | ContextError::Undecided { .. }) => {
                 return Err(StopCause::PolicyAbort)
             }
         };
-        w.append(
-            step,
-            Event::new(EventKind::ContextBuilt)
-                .field("context", Trusted::Digest(built.digest))
-                .field("recent_turns", Trusted::U64(built.recent as u64))
-                // H1i: whether this build compacted (a prefix-cache break).
-                .field("compacted", Trusted::Bool(built.compacted))
-                .field("estimated_tokens", Trusted::U64(built.estimated_tokens))
-                .field("budget_tokens", Trusted::U64(built.budget_tokens)),
-        )
-        .map_err(journal)?;
+        let users_dropped = built.users_dropped;
+        let mut ev = Event::new(EventKind::ContextBuilt)
+            .field("context", Trusted::Digest(built.digest))
+            .field("recent_turns", Trusted::U64(built.recent as u64))
+            // H1i: whether this build compacted (a prefix-cache break).
+            .field("compacted", Trusted::Bool(built.compacted))
+            .field("estimated_tokens", Trusted::U64(built.estimated_tokens))
+            .field("budget_tokens", Trusted::U64(built.budget_tokens));
+        if self.user.is_some() {
+            // P-05 §1.1: only a session's ContextBuilt carries this.
+            ev = ev.field("users_dropped", Trusted::U64(users_dropped));
+        }
+        w.append(step, ev).map_err(journal)?;
 
         // 3. Call the model under the remaining wall budget.
         let (req, rendered) = self.request(built.messages)?;
@@ -466,6 +570,29 @@ impl<'a> Loop<'a> {
 
         // 4. Parse exactly one action.
         let parsed = parse_reply(&completion, self.profile.protocol(), &self.tools);
+        // P-05 §3: in a session, a plain-text answer (a `no_action` parse
+        // error with no tool call and non-whitespace text) is the turn's
+        // answer, not a format error: no `FormatError` record, no account
+        // charge; the format-error streak is cleared. Both protocols.
+        if let (Err(FormatError::NoAction), true) = (&parsed, self.user.is_some()) {
+            if completion.tool_calls.is_empty()
+                && !completion
+                    .content
+                    .inspect("context: reply")
+                    .trim()
+                    .is_empty()
+            {
+                self.meter.record_format_ok();
+                self.turns.push(Turn {
+                    step,
+                    reply: shown_reply(&completion),
+                    action: None,
+                    feedback: Feedback::Answer,
+                    notice: None,
+                });
+                return Ok(Flow::EndTurn(TurnEnd::Answered));
+            }
+        }
         if let Err(fe) = &parsed {
             w.append(
                 step,
@@ -478,7 +605,10 @@ impl<'a> Loop<'a> {
         let parsed = match parsed {
             Ok(p) => p,
             Err(fe) => {
-                self.feed_stall()?;
+                let stalled = self.feed_stall()?;
+                if let Some(kind) = stalled {
+                    return Ok(Flow::EndTurn(TurnEnd::Loop(kind)));
+                }
                 // No action: the native protocol withholds this reply and
                 // shows only the repair text (H1h; see `context`).
                 self.turns.push(Turn {
@@ -488,6 +618,13 @@ impl<'a> Loop<'a> {
                     feedback: Feedback::Harness(fe.repair_message(self.profile.protocol())),
                     notice: None,
                 });
+                // P-05 §3: a turn's run of format errors ends the TURN, not
+                // the session (the meter's own limit is off in a session).
+                if let Some(u) = &self.user {
+                    if self.meter.consecutive_format_errors() >= u.limits.format_errors {
+                        return Ok(Flow::EndTurn(TurnEnd::FormatErrors));
+                    }
+                }
                 return Ok(Flow::Continue);
             }
         };
@@ -662,12 +799,40 @@ impl<'a> Loop<'a> {
             .map_err(journal)?;
             // Accepted with a check that still fails (the bound is spent):
             // its own stop cause, never a plain submit.
-            let cause = match round {
+            let failed = matches!(
+                round,
                 Some(Round {
                     result: PresubmitResult::Failed,
                     ..
-                }) => StopCause::SubmittedChecksFailed,
-                _ => StopCause::Submitted,
+                })
+            );
+            // P-05 §3: in a session a submission ends the TURN, not the run;
+            // the turn says so (the harness text the next request shows),
+            // the note's digest becomes the session's deliverable, and the
+            // submit sentinel stays granted for later turns.
+            if let Some(u) = self.user.as_mut() {
+                u.deliverable = Some(digest);
+                self.turns.push(Turn {
+                    step,
+                    reply,
+                    action: Some(shown),
+                    feedback: Feedback::Harness(HarnessText::from_static(if failed {
+                        SUBMIT_ACCEPTED_FAILING_TEXT
+                    } else {
+                        SUBMIT_ACCEPTED_TEXT
+                    })),
+                    notice,
+                });
+                return Ok(Flow::EndTurn(if failed {
+                    TurnEnd::SubmittedChecksFailed
+                } else {
+                    TurnEnd::Submitted
+                }));
+            }
+            let cause = if failed {
+                StopCause::SubmittedChecksFailed
+            } else {
+                StopCause::Submitted
             };
             return Ok(Flow::Stop(cause, Some(digest)));
         }
@@ -719,6 +884,10 @@ impl<'a> Loop<'a> {
             self.observe_budgets(w, step)?;
             return Ok(Flow::Continue);
         }
+
+        // P-05 §8: the sink has seen the intent (and every record before
+        // it) before a provider runs.
+        self.ui_drain(w);
 
         // 8. Execute.
         let intent_seq = journaled.intent_seq();
@@ -1017,6 +1186,16 @@ impl<'a> Loop<'a> {
     /// (its redraw is fresh, and the request digest differs).
     fn draw(&mut self, step: u64) -> Result<Nonce, StopCause> {
         let protocol = self.profile.protocol();
+        // A shown user's text is untrusted too (INV-37, P-05 §2.3): a nonce
+        // inside it is never drawn again.
+        let user_texts: Vec<&str> = match &self.user {
+            Some(u) => u
+                .users
+                .iter()
+                .map(|e| e.text.inspect("context: user").as_str())
+                .collect(),
+            None => Vec::new(),
+        };
         for _ in 0..3 {
             let n = self.nonces.next(step).ok_or(StopCause::PolicyAbort)?;
             let taken = self.nonces.drawn().any(|m| *m == n);
@@ -1030,7 +1209,7 @@ impl<'a> Loop<'a> {
                 body || context::model_texts(protocol, t)
                     .into_iter()
                     .any(|s| contains_nonce(s, &n))
-            });
+            }) || user_texts.iter().any(|s| contains_nonce(s, &n));
             if !taken && !inside {
                 return Ok(n);
             }
@@ -1088,14 +1267,23 @@ impl<'a> Loop<'a> {
                 "The reply could not be used. Call exactly one tool through the function-calling interface."
             }
             (
-                ModelError::Unavailable(_)
-                | ModelError::RateLimited { .. }
-                | ModelError::ReplayDiverged { .. },
+                ModelError::Unavailable(_) | ModelError::RateLimited { .. },
                 _,
-            ) => return Err(StopCause::ModelUnavailable),
+            ) => {
+                // P-05 §3: in a session an unavailable backend ends the
+                // TURN (the user may be back when it is); a batch run stops.
+                if self.user.is_some() {
+                    return Ok(Flow::EndTurn(TurnEnd::ModelUnavailable));
+                }
+                return Err(StopCause::ModelUnavailable);
+            }
+            (ModelError::ReplayDiverged { .. }, _) => return Err(StopCause::ModelUnavailable),
         };
         self.meter.record_format_error()?;
-        self.feed_stall()?;
+        let stalled = self.feed_stall()?;
+        if let Some(kind) = stalled {
+            return Ok(Flow::EndTurn(TurnEnd::Loop(kind)));
+        }
         self.turns.push(Turn {
             step,
             reply: Untrusted::new(String::new(), Source::Model),
@@ -1103,6 +1291,13 @@ impl<'a> Loop<'a> {
             feedback: Feedback::Harness(HarnessText::from_static(text)),
             notice: None,
         });
+        // P-05 §3: a turn's run of format errors ends the TURN, not the
+        // session (the meter's own limit is off in a session).
+        if let Some(u) = &self.user {
+            if self.meter.consecutive_format_errors() >= u.limits.format_errors {
+                return Ok(Flow::EndTurn(TurnEnd::FormatErrors));
+            }
+        }
         Ok(Flow::Continue)
     }
 
@@ -1127,11 +1322,45 @@ impl<'a> Loop<'a> {
         Ok(())
     }
 
-    /// A step with no action still counts toward no-progress (§2.6).
-    fn feed_stall(&mut self) -> Result<(), StopCause> {
+    /// A step with no action still counts toward no-progress (§2.6). In a
+    /// session a detected loop ends the TURN, not the run (P-05 §3): the
+    /// kind comes back for the turn's `TurnEnded` record.
+    fn feed_stall(&mut self) -> Result<Option<LoopKind>, StopCause> {
         match self.detector.observe(LoopEvent::Step) {
-            LoopSignal::Stop(kind) => Err(StopCause::Loop(kind)),
-            _ => Ok(()),
+            LoopSignal::Stop(kind) => {
+                if self.user.is_some() {
+                    Ok(Some(kind))
+                } else {
+                    Err(StopCause::Loop(kind))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The UI drain (P-05 §1.3, §8): hand every record written and fsynced
+    /// since the last drain to the session's sink, in seq order. Display
+    /// only — never an input to a decision — and a no-op without a sink
+    /// (a batch run's tap stays off, so it buffers nothing).
+    pub(crate) fn ui_drain<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+    ) {
+        let Some(sink) = self.user.as_ref().and_then(|u| u.sink) else {
+            return;
+        };
+        let blobs = match &self.user {
+            Some(u) => u.blobs.clone(),
+            None => return,
+        };
+        for t in w.drain_tap() {
+            sink.emit(&crate::session::UiEvent {
+                seq: t.seq,
+                step: t.step,
+                kind: t.kind,
+                body: &t.body,
+                blobs: &blobs,
+            });
         }
     }
 }

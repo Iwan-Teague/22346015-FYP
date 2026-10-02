@@ -1,6 +1,7 @@
 //! The built-in read tools, in process (design §4.8, §9 H1): `harness.fs.read`,
-//! `harness.fs.search`, `harness.fs.list` and (H2e) `harness.fs.glob`; the
-//! search and the glob are in [`crate::search`].
+//! `harness.fs.search`, `harness.fs.list`, (H2e) `harness.fs.glob` and
+//! (P-24) `harness.fs.outline`; the search and the glob are in
+//! [`crate::search`], the outline in [`crate::outline`].
 //!
 //! [`ReadTools`] is a [`ToolProvider`], so it runs only a
 //! `Journaled<Authorized<Call>>`: policy allowed the call (its `path` passed
@@ -58,6 +59,7 @@ use harness_manifest::ProviderName;
 use harness_policy::{workspace_path, Authorized, Call, WorkspacePath};
 use serde_json::Value;
 
+use crate::glob::Glob;
 use crate::provider::{
     InvokeCtx, ReadRecord, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus,
 };
@@ -149,6 +151,12 @@ pub mod code {
     /// journal code of that submission's result; the model sees the failing
     /// check's output and a harness notice.
     pub const PRESUBMIT_REJECTED: u16 = 22;
+    /// The path is protected (P-29): the edit tools refuse it, by the
+    /// build's deny globs or the task's declared list.
+    pub const PROTECTED: u16 = 23;
+    /// The outline tool was pointed at a file whose extension names no
+    /// language it knows (P-24).
+    pub const NO_OUTLINE: u16 = 24;
 }
 
 const READ: &str = "harness.fs.read";
@@ -156,6 +164,8 @@ const SEARCH: &str = "harness.fs.search";
 const LIST: &str = "harness.fs.list";
 /// `harness.fs.glob` (H2e).
 pub const GLOB: &str = "harness.fs.glob";
+/// `harness.fs.outline` (P-24).
+pub const OUTLINE: &str = "harness.fs.outline";
 
 /// The in-process read tools over one workspace.
 #[derive(Debug)]
@@ -166,6 +176,11 @@ pub struct ReadTools {
     window_lines: u64,
     /// The read window: most bytes of a read's result (H2e).
     window_bytes: usize,
+    /// Workspace-relative globs the policy denies on these tools (P-12):
+    /// search, glob and list skip what they match and say how many. Empty
+    /// by default — a library embedder decides (OD-2); the run's driver
+    /// fills it from the policy.
+    denied: Vec<Glob>,
 }
 
 /// Why the workspace root was refused.
@@ -196,6 +211,7 @@ impl ReadTools {
             root,
             window_lines: READ_MAX_LINES,
             window_bytes: READ_WINDOW_BYTES,
+            denied: Vec::new(),
         })
     }
 
@@ -215,6 +231,27 @@ impl ReadTools {
     /// The read window: (most lines, most bytes) per read.
     pub fn window(&self) -> (u64, usize) {
         (self.window_lines, self.window_bytes)
+    }
+
+    /// The same tools with policy-denied path globs (P-12): search, glob
+    /// and list skip what the globs match and say how many paths they
+    /// skipped, instead of showing denied paths or pretending nothing was
+    /// there. The globs match workspace-relative, `/`-separated paths (the
+    /// policy's own compiled [`Glob`]s, from `UserPolicy::denied_globs`).
+    #[must_use]
+    pub fn with_denied(mut self, denied: Vec<Glob>) -> Self {
+        self.denied = denied;
+        self
+    }
+
+    /// The policy-denied globs (P-12): what search and glob skip per path.
+    pub(crate) fn denied(&self) -> &[Glob] {
+        &self.denied
+    }
+
+    /// Whether a workspace-relative path is denied on these tools.
+    pub(crate) fn denied_hit(&self, rel: &str) -> bool {
+        self.denied.iter().any(|g| g.matches(rel))
     }
 
     /// The canonical workspace root.
@@ -261,7 +298,7 @@ impl ToolProvider for ReadTools {
     }
 
     fn serves(&self, capability: &str) -> bool {
-        matches!(capability, READ | SEARCH | LIST | GLOB)
+        matches!(capability, READ | SEARCH | LIST | GLOB | OUTLINE)
     }
 
     fn invoke(
@@ -271,7 +308,7 @@ impl ToolProvider for ReadTools {
     ) -> Result<ToolResult, ToolError> {
         let c = call.call().call();
         let cap = c.capability.as_str();
-        if !matches!(cap, READ | SEARCH | LIST | GLOB) {
+        if !matches!(cap, READ | SEARCH | LIST | GLOB | OUTLINE) {
             return Ok(refused(cap, RefusalKind::UnknownCapability));
         }
         if Instant::now() >= ctx.deadline {
@@ -281,6 +318,7 @@ impl ToolProvider for ReadTools {
             READ => self.read(&c.args),
             SEARCH => self.search(&c.args, ctx.deadline),
             GLOB => self.glob(&c.args, ctx.deadline),
+            OUTLINE => self.outline(&c.args, ctx.deadline),
             _ => self.list(&c.args, ctx.deadline),
         };
         Ok(finish(cap, out))
@@ -576,12 +614,27 @@ impl ReadTools {
         let mut s = String::new();
         let mut shown = 0usize;
         let mut more = false;
-        while let Some(e) = walk.next_entry() {
+        let mut denied = 0usize;
+        // A denied directory is neither entered nor listed (its children
+        // are denied with it); the entry itself is still walked, and the
+        // file check below skips it from the listing.
+        while let Some(e) = walk.next_entry_if(&mut |e| {
+            if e.depth > 0 && self.denied_hit(&e.rel) {
+                denied += 1;
+                false
+            } else {
+                true
+            }
+        }) {
             if Instant::now() >= deadline {
                 return Err(timeout());
             }
             if e.depth == 0 {
                 continue; // the directory itself
+            }
+            if !e.meta.is_dir() && self.denied_hit(&e.rel) {
+                denied += 1;
+                continue;
             }
             if shown == LIST_MAX_ENTRIES {
                 more = true;
@@ -611,7 +664,11 @@ impl ReadTools {
             head.push_str("; more not shown (the cap is 500)");
         }
         head.push('\n');
-        Ok(ok(head + &s))
+        s.insert_str(0, &head);
+        if denied > 0 {
+            s.push_str(&format!("{denied} path(s) skipped (denied by policy)\n"));
+        }
+        Ok(ok(s))
     }
 }
 
@@ -1206,6 +1263,31 @@ mod tests {
         fs::write(&f, vec![b'a'; 11]).unwrap();
         assert!(read_bounded(&f, 10).is_none());
         assert_eq!(read_bounded(&f, 11).unwrap().len(), 11);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // P-29: protected paths gate EDITS only — reads inside `.git` stay
+    // allowed (the read tools have no protected notion at all).
+    #[test]
+    fn read_of_dot_git_allowed() {
+        let d = dir("read-dot-git", 0);
+        fs::create_dir(d.join(".git")).unwrap();
+        fs::write(
+            d.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        let t = ReadTools::new(&d).unwrap();
+        let out = t.read(&serde_json::json!({ "path": ".git/config" }));
+        match out.status {
+            ToolStatus::Ok => {
+                assert!(out.text.contains("repositoryformatversion"), "{}", out.text);
+                let r = out.read.expect("a read records its digest");
+                assert_eq!(r.path.as_str(), ".git/config");
+                assert_eq!(r.sha256, sha256(b"[core]\n\trepositoryformatversion = 0\n"));
+            }
+            other => panic!("reading .git/config must be allowed, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&d);
     }
 }

@@ -2,22 +2,27 @@
 //! and the gate-child plumbing that turns `rest` into options, an
 //! [`Outcome`](crate::report::Outcome) and an exit code.
 
+use std::collections::BTreeMap;
+
 use gate_outcome::GateId;
 
 use crate::args::{options, USAGE};
 use crate::cmd_events::events;
+use crate::cmd_gc::gc;
 use crate::cmd_manifest::manifest_check;
 use crate::cmd_profile::{profile_check, profile_init};
 use crate::cmd_replay::replay;
 use crate::cmd_run::run_or_resume;
+use crate::cmd_sessions::sessions;
 use crate::report::{emit, exit, refused};
 use crate::Cx;
 
 /// The gate id the report names when `--gate` is not given.
 const DEFAULT_GATE: &str = "rustyharness.run";
 
-/// The options that are flags, not `--key value` pairs (P-11).
-const VALUELESS: &[&str] = &["shell"];
+/// The options that are flags, not `--key value` pairs (P-11; P-12 added
+/// `no-default-denies`).
+const VALUELESS: &[&str] = &["shell", "no-default-denies"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verb {
@@ -51,6 +56,8 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
         ["events", rest @ ..] => events(cx, rest),
         ["profile", "check", rest @ ..] => profile_check(cx, rest),
         ["profile", "init", rest @ ..] => profile_init(cx, rest),
+        ["sessions", rest @ ..] => sessions(cx, rest),
+        ["gc", rest @ ..] => gc(cx, rest),
         _ => {
             note!(cx, "{USAGE}");
             exit::USAGE
@@ -72,6 +79,7 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "allow-exec",
             "preset",
             "shell",
+            "no-default-denies",
         ],
         Verb::Resume => &[
             "run",
@@ -86,6 +94,7 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "allow-exec",
             "preset",
             "shell",
+            "no-default-denies",
         ],
         Verb::Replay => &[
             "run",
@@ -99,6 +108,7 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "allow-exec",
             "preset",
             "shell",
+            "no-default-denies",
         ],
     };
     let parsed = options(rest, allowed, VALUELESS);
@@ -139,10 +149,23 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             note!(cx, "{e}\n{USAGE}");
             refused(exit::USAGE, "usage error".into())
         }
-        Ok(o) => match verb {
-            Verb::Run | Verb::Resume => run_or_resume(cx, &o, verb, &cfg),
-            Verb::Replay => replay(cx, &o, &cfg),
-        },
+        Ok(o) => {
+            // The run bundle (P-14): before a `run`-family verb reads its
+            // inputs, fill the flags it left unset from
+            // `runs/<id>/inputs/`. Flags and config still win, and what
+            // they choose must digest to the bundle's recorded values.
+            let mut owned: BTreeMap<&str, String> =
+                o.into_iter().map(|(k, v)| (k, v.to_owned())).collect();
+            if let Err(x) = crate::bundle::fill(cx, &mut owned, &cfg) {
+                return emit(cx, &gate, x);
+            }
+            let filled: BTreeMap<&str, &str> =
+                owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            match verb {
+                Verb::Run | Verb::Resume => run_or_resume(cx, &filled, verb, &cfg),
+                Verb::Replay => replay(cx, &filled, &cfg),
+            }
+        }
     };
     emit(cx, &gate, result)
 }

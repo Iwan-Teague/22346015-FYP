@@ -53,6 +53,9 @@
 //! own` (its result echoes the model's own list), like the sentinel; policy
 //! allows it by one named rule (`allow.task-todo`). The number of edits and
 //! items is bounded by the tools (the schema subset has no `maxItems`).
+//! `harness.task.delegate {task}` (P-38) starts a read-only helper run:
+//! read / operational / own / none, `content: third_party` (its report is
+//! other people's text by default, like the read tools' results).
 
 mod edit_multi;
 mod edit_replace;
@@ -65,6 +68,7 @@ mod fs_read;
 mod fs_search;
 mod head;
 mod tail;
+mod task_delegate;
 mod task_submit;
 mod task_todo;
 
@@ -91,6 +95,7 @@ pub fn builtin_manifest_json() -> String {
         edit_multi::EDIT_MULTI,
         exec_run::EXEC_RUN,
         task_todo::TASK_TODO,
+        task_delegate::TASK_DELEGATE,
         task_submit::TASK_SUBMIT,
         tail::TAIL,
     ]
@@ -109,7 +114,7 @@ pub fn manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestError> {
 /// fixed: entries are shorter than the manifest summaries and name every
 /// argument the schema has (both pinned by tests). A capability without an
 /// entry here keeps its full summary, so a provider capability is untouched.
-const TERSE_TABLE: [(&str, &str); 11] = [
+const TERSE_TABLE: [(&str, &str); 12] = [
     (
         "harness.fs.read",
         "Read a window of lines from a file: path, start (the first line, 1-based), lines (at most the run's read window)",
@@ -139,6 +144,10 @@ const TERSE_TABLE: [(&str, &str); 11] = [
         "Keep your checklist: items replaces the list, each item a text and a status; without items it is only shown",
     ),
     ("harness.task.submit", "Submit the task for verification: note"),
+    (
+        "harness.task.delegate",
+        "Ask a read-only helper to explore and answer one question: task",
+    ),
 ];
 
 /// The terse sentence for a built-in capability id, or `None` (keep the

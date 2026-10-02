@@ -24,7 +24,11 @@
 //!   rather than escaped.
 //! - `protected` paths exist and lie inside a read-write root.
 //! - `cwd` exists and lies inside a root.
-//! - `network` is `None`; a proxy grant is H4 and refused here.
+//! - `network` is `None`, or `Proxy { port }` with a nonzero port where the
+//!   backend can express a loopback-only outbound allow (the Seatbelt
+//!   profile's `localhost:port` remote; §5.3, measured on this host). A
+//!   proxy grant where the backend cannot express it, or a zero port, is
+//!   refused here.
 //! - `limits`: a wall clock is required; CPU, file size, memory
 //!   (address-space budget) and process count are optional and bounded to
 //!   what the backend's launch protocol accepts (LOW-1). Memory and
@@ -82,10 +86,13 @@ pub enum Network {
     /// No network at all: no connect, no bind, no listen, no resolver
     /// (and, D31, no bind on a shared stack even to loopback).
     None,
-    /// Egress only through the harness's allowlist proxy (H4; refused).
+    /// Egress only to the harness's loopback proxy port (H4, §5.3): the
+    /// profile allows `network-outbound` to `localhost:<port>` and nothing
+    /// else (FT-13-proxy, FT-15-proxy, FT-19, FT-20). Refused where the
+    /// backend cannot express that allow.
     Proxy {
-        /// The task grant's allowlist id.
-        allowlist_id: String,
+        /// The harness pump's loopback port.
+        port: u16,
     },
 }
 
@@ -209,6 +216,10 @@ pub struct Context<'a> {
     pub private_dir: &'a Path,
     /// What the backend can enforce.
     pub enforce: Enforceable,
+    /// Whether the backend can grant [`Network::Proxy`] (the Seatbelt
+    /// loopback-only outbound allow; §5.3). A proxy grant is refused where
+    /// this is false.
+    pub proxy: bool,
 }
 
 /// Validate `spec` (see the module docs).
@@ -250,10 +261,20 @@ pub fn validate(spec: &ConfinedSpec, cx: &Context<'_>) -> Result<Validated, Spec
     {
         return Err(path_err("cwd", &spec.cwd, "is not inside a root"));
     }
-    if spec.network != Network::None {
-        return Err(SpecError::Unsupported(
-            "network through the egress proxy (H4)",
-        ));
+    // The proxy grant's refusals (§5.3): a zero port is a spec error; a
+    // grant on a backend that cannot express the loopback-only allow is
+    // unsupported. What remains validates; the caller renders the port.
+    match spec.network {
+        Network::None => {}
+        Network::Proxy { port: 0 } => {
+            return Err(SpecError::Limit("proxy port must not be 0"));
+        }
+        Network::Proxy { .. } if !cx.proxy => {
+            return Err(SpecError::Unsupported(
+                "a proxy network grant (Seatbelt only; §5.3)",
+            ));
+        }
+        Network::Proxy { .. } => {}
     }
     check_limits(&spec.limits, cx.enforce)?;
     Ok(Validated {
@@ -541,6 +562,7 @@ mod tests {
             home: None,
             private_dir: &privc,
             enforce: ENF,
+            proxy: false,
         };
         let v = validate(&base(&ws), &cx).unwrap();
         let c = std::fs::canonicalize(&ws).unwrap();
@@ -561,11 +583,13 @@ mod tests {
             home: Some(&home),
             private_dir: &privc,
             enforce: ENF,
+            proxy: false,
         };
         let cx_nohome = Context {
             home: None,
             private_dir: &privc,
             enforce: ENF,
+            proxy: false,
         };
         let check = |f: &dyn Fn(&mut ConfinedSpec), cx: &Context<'_>, want: &str| {
             let mut s = base(&ws);
@@ -624,11 +648,7 @@ mod tests {
             "does not exist",
         );
         check(
-            &|s| {
-                s.network = Network::Proxy {
-                    allowlist_id: "a".into(),
-                }
-            },
+            &|s| s.network = Network::Proxy { port: 8080 },
             &cx_nohome,
             "proxy",
         );
@@ -648,6 +668,54 @@ mod tests {
     }
 
     #[test]
+    fn proxy_port_zero_refused() {
+        let ws = tmp("proxy-zero");
+        let privc = std::fs::canonicalize(tmp("proxy-zero-priv")).unwrap();
+        let cx = Context {
+            home: None,
+            private_dir: &privc,
+            enforce: ENF,
+            proxy: true,
+        };
+        let mut s = base(&ws);
+        s.network = Network::Proxy { port: 0 };
+        let e = validate(&s, &cx).unwrap_err();
+        assert!(e.to_string().contains("proxy port"), "{e}");
+    }
+
+    #[test]
+    fn proxy_refused_on_backends_without_support() {
+        let ws = tmp("proxy-nosupport");
+        let privc = std::fs::canonicalize(tmp("proxy-nosupport-priv")).unwrap();
+        let cx = Context {
+            home: None,
+            private_dir: &privc,
+            enforce: ENF,
+            proxy: false,
+        };
+        let mut s = base(&ws);
+        s.network = Network::Proxy { port: 8080 };
+        let e = validate(&s, &cx).unwrap_err();
+        assert!(e.to_string().contains("proxy"), "{e}");
+    }
+
+    #[test]
+    fn a_proxy_grant_validates_where_supported() {
+        let ws = tmp("proxy-ok");
+        let privc = std::fs::canonicalize(tmp("proxy-ok-priv")).unwrap();
+        let cx = Context {
+            home: None,
+            private_dir: &privc,
+            enforce: ENF,
+            proxy: true,
+        };
+        let mut s = base(&ws);
+        s.network = Network::Proxy { port: 8080 };
+        assert!(validate(&s, &cx).is_ok());
+        assert!(validate(&base(&ws), &cx).is_ok());
+    }
+
+    #[test]
     fn limits_are_bounded_on_both_sides() {
         let ws = tmp("limits");
         let privc = std::fs::canonicalize(tmp("limits-priv")).unwrap();
@@ -658,6 +726,7 @@ mod tests {
                 memory: true,
                 processes: true,
             },
+            proxy: false,
         };
         let check = |f: &dyn Fn(&mut ConfinedSpec), cx: &Context<'_>, want: &str| {
             let mut s = base(&ws);

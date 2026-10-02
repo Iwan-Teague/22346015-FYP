@@ -24,6 +24,14 @@
 //!   file-write*` on FIFOs anywhere (the OD-5 draft's FT-27: a FIFO in a
 //!   granted root is otherwise a channel); `deny network*`: no connect, no
 //!   bind, no listen, no unix-socket connect (FT-1, FT-11, FT-15, D31).
+//! - With a [`Network::Proxy`][crate::spec::Network::Proxy] grant, one
+//!   final allow after the deny (later rules override earlier ones, E6):
+//!   `network-outbound` to `localhost:<port>` and nothing else — the
+//!   harness's loopback pump port (§5.3; spelling measured on this host,
+//!   SBPL refuses a numeric host in `(remote ip ...)`). The fetcher dials
+//!   `127.0.0.1:<port>` (§5.2); every other loopback port, IPv6 loopback,
+//!   the resolver and bind stay denied (FT-13-proxy, FT-15-proxy, FT-19,
+//!   FT-20).
 
 use crate::spec::{policy_safe, Validated};
 
@@ -73,11 +81,15 @@ fn ancestors(root: &str) -> Vec<String> {
     out
 }
 
-/// The profile text for `v`. `Err` only if a path is not safe to quote,
-/// which [`crate::spec::validate`] already refuses, so in practice this is
-/// infallible; returning a `Result` keeps the guard real in release builds
-/// (LOW-5) instead of a skipped `debug_assert!`.
-pub fn render(v: &Validated) -> Result<String, UnsafePath> {
+/// The profile text for `v`, plus the proxy overlay for `proxy_port` (the
+/// granted pump port of a [`Network::Proxy`][crate::spec::Network::Proxy]
+/// spec; `None` renders byte-identically to the deny-all form). The caller
+/// passes the port only of a spec that [`crate::spec::validate`] accepted.
+/// `Err` only if a path is not safe to quote, which validate already
+/// refuses, so in practice this is infallible; returning a `Result` keeps
+/// the guard real in release builds (LOW-5) instead of a skipped
+/// `debug_assert!`.
+pub fn render(v: &Validated, proxy_port: Option<u16>) -> Result<String, UnsafePath> {
     let mut p = String::new();
     p.push_str(&format!(
         "(version 1)\n; {PROFILE_VERSION}\n(deny default)\n"
@@ -136,6 +148,11 @@ pub fn render(v: &Validated) -> Result<String, UnsafePath> {
     }
     p.push_str("(deny file-read* file-write* (vnode-type FIFO))\n");
     p.push_str("(deny network*)\n");
+    if let Some(port) = proxy_port {
+        p.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+    }
     Ok(p)
 }
 
@@ -159,7 +176,7 @@ mod tests {
 
     #[test]
     fn deny_default_with_overrides_last() {
-        let p = render(&v()).unwrap();
+        let p = render(&v(), None).unwrap();
         assert!(p.contains("(deny default)"));
         assert!(!p.contains("(allow default)"));
         assert!(!p.contains("mach-lookup"));
@@ -177,7 +194,7 @@ mod tests {
 
     #[test]
     fn read_only_roots_are_not_writable_and_ancestors_are_metadata_only() {
-        let p = render(&v()).unwrap();
+        let p = render(&v(), None).unwrap();
         assert!(!p.contains("(allow file-write* (subpath \"/opt/tool\")"));
         assert!(p.contains("(allow file-read-metadata (literal \"/opt\") (literal \"/w\"))"));
         assert_eq!(
@@ -195,6 +212,38 @@ mod tests {
         assert!(matches!(q("/a\"b"), Err(UnsafePath(_))));
         let mut bad = v();
         bad.read_write.push("/w/ws/a\"b".to_string());
-        assert!(matches!(render(&bad), Err(UnsafePath(_))));
+        assert!(matches!(render(&bad, None), Err(UnsafePath(_))));
+    }
+
+    #[test]
+    fn proxy_profile_allows_only_the_granted_loopback_port() {
+        // Golden suffix: the deny stays, and exactly one allow follows it —
+        // the pump's port, spelled `localhost` (SBPL refuses a numeric host
+        // in `(remote ip ...)`, measured on this host; §5.3).
+        let p = render(&v(), Some(8080)).unwrap();
+        assert!(
+            p.ends_with(
+                "(deny network*)\n\
+                 (allow network-outbound (remote ip \"localhost:8080\"))\n"
+            ),
+            "{p}"
+        );
+        assert_eq!(p.matches("(allow network").count(), 1);
+        assert!(!p.contains("(allow network-bind"));
+        // Without a grant the profile renders byte-identically to the
+        // deny-all form (the P-36 convention).
+        let p = render(&v(), None).unwrap();
+        assert!(p.ends_with("(deny network*)\n"));
+        assert!(!p.contains("(allow network"));
+    }
+
+    #[test]
+    fn proxy_profile_keeps_deny_network_before_the_allow() {
+        let p = render(&v(), Some(8123)).unwrap();
+        let deny = p.find("(deny network*)").unwrap();
+        let allow = p
+            .find("(allow network-outbound (remote ip \"localhost:8123\"))")
+            .unwrap();
+        assert!(deny < allow);
     }
 }

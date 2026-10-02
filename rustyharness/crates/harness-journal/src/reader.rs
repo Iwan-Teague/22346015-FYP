@@ -419,6 +419,8 @@ fn check_source(v: &Value) -> Result<(), BreakKind> {
         // The user at the interface (P-05/P-10): only the session loop
         // writes the source, and only for a `UserTurn`'s text.
         Some("user") if o.len() == 1 => Ok(()),
+        // Fetched over the network (P-39): the URL is escaped runtime text.
+        Some("web") if o.len() == 2 => text("url").map(drop),
         _ => Err(m),
     }
 }

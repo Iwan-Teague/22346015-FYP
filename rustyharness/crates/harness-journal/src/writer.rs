@@ -9,7 +9,9 @@ use gate_outcome::{GateOutcome, IndeterminateKind};
 use harness_core::{sha256, CallDigest, Digest, RunId, StopCause, Untrusted};
 use serde_json::{Map, Value};
 
-use crate::canon::{escape, rfc3339_utc, EventKind, Ident, RecordFields, GENESIS, INLINE_MAX};
+use crate::canon::{
+    check_canonical_body, escape, rfc3339_utc, EventKind, Ident, RecordFields, GENESIS, INLINE_MAX,
+};
 use crate::conditions::{Condition, StandingConditions};
 use crate::event::{BlobRef, Event, Trusted, UntrustedBlob};
 use crate::layout;
@@ -654,6 +656,10 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
         fsync: bool,
     ) -> Result<(u64, Digest), JournalError> {
         self.check_poison()?;
+        // A body outside its kind's canonical shape (P-39c) is refused
+        // before anything is written, without poisoning the writer: a
+        // malformed event is a harness bug, like a duplicate key.
+        check_canonical_body(kind, &body).map_err(JournalError::InvalidEvent)?;
         // Monotonic even if the clock source misbehaves.
         let mono = self.clock.mono_ms().max(self.last_mono);
         let fields = RecordFields {

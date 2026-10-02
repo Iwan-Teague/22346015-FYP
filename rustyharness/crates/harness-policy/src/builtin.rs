@@ -36,6 +36,10 @@ pub const OUTLINE_ID: &str = "harness.fs.outline";
 /// manifest can declare it (the namespace is reserved, §4.3).
 pub const SUBMIT_ID: &str = "harness.task.submit";
 
+/// The delegate capability's id (P-38): one call starts one read-only
+/// helper run. Only the compiled-in `harness` manifest can declare it.
+pub const DELEGATE_ID: &str = "harness.task.delegate";
+
 /// Whether `c` is the built-in submit sentinel with exactly the labels §4.8
 /// gives it (write / public / own / none, content own, no confirmation). A
 /// manifest that labelled it anything else would not be the sentinel, and
@@ -101,6 +105,29 @@ pub(crate) fn is_builtin_todo(c: &Capability) -> bool {
         && c.confirmation() == Confirmation::None
 }
 
+/// Whether `c` is the built-in delegate (P-38) with exactly the labels the
+/// manifest gives it: read / operational / own / none, `content:
+/// third_party` (the helper's report is other people's text by default,
+/// like the read tools' results) and no declared confirmation. Anything
+/// else under that id would not be the harness's delegate.
+pub(crate) fn is_builtin_delegate(c: &Capability) -> bool {
+    c.id().as_str() == DELEGATE_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Read
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::ThirdParty
+        && c.confirmation() == Confirmation::None
+}
+
+/// The grants a helper run may hold, in the fixed priority order the
+/// profile's tool cap cuts them in (P-38 §2.2): the parent's own `harness.fs.*`
+/// reads, never more than the parent holds; the caller appends the submit
+/// sentinel. Nothing else (no edit, no exec, no todo, no delegate) is
+/// eligible, which is how the depth limit binds at grant time.
+pub const CHILD_ELIGIBLE: [&str; 5] = [READ_ID, SEARCH_ID, LIST_ID, GLOB_ID, OUTLINE_ID];
+
 /// The built-in command runner (§4.8; H2d).
 pub const EXEC_ID: &str = "harness.exec.run";
 
@@ -137,6 +164,9 @@ pub enum ToolKind {
     Submit,
     /// The checklist (H2e).
     Todo,
+    /// The delegate capability (P-38): one call starts one read-only
+    /// helper run.
+    Delegate,
     /// A workspace edit (§4.9, H2b).
     Edit,
     /// The command runner (§4.8, H2d).
@@ -146,9 +176,13 @@ pub enum ToolKind {
 impl ToolKind {
     /// Whether the tool operates inside the workspace, so a session
     /// granting it is refused without one (§4.8; formerly the prefix, list
-    /// and id checks in [`Session::plan`]).
+    /// and id checks in [`Session::plan`]). The delegate needs one too: a
+    /// helper with nothing to read is waste (P-38 §1).
     pub fn needs_workspace(self) -> bool {
-        matches!(self, ToolKind::Fs | ToolKind::Edit | ToolKind::Exec)
+        matches!(
+            self,
+            ToolKind::Fs | ToolKind::Edit | ToolKind::Exec | ToolKind::Delegate
+        )
     }
 }
 
@@ -223,6 +257,11 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         id: "harness.task.todo",
         kind: ToolKind::Todo,
         labels: is_builtin_todo,
+    },
+    BuiltinTool {
+        id: "harness.task.delegate",
+        kind: ToolKind::Delegate,
+        labels: is_builtin_delegate,
     },
     BuiltinTool {
         id: "harness.task.submit",

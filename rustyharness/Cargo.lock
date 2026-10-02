@@ -118,8 +118,16 @@ name = "harness-mcp"
 version = "0.0.1"
 dependencies = [
  "harness-core",
+ "harness-tools",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "harness-mcp-fixture"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

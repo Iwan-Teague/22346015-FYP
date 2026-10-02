@@ -18,6 +18,15 @@ pub fn run_dir(state_root: &Path, run: &RunId) -> PathBuf {
     state_root.join("runs").join(run.as_str())
 }
 
+/// `state_root/research/notes` (design §6, INV-49): research notes live at
+/// `<state_root>/research/notes/<id>/{note.json,note.md}` — under the state
+/// root, NOT inside any run directory or attempt, so a note survives a run
+/// ending and a resume finds it by id alone. The `<id>` directory is the
+/// note's 64-hex SHA-256, so it is a safe name by construction (NF-3).
+pub fn research_notes_dir(state_root: &Path) -> PathBuf {
+    state_root.join("research").join("notes")
+}
+
 /// Create `state_root/runs/<run-id>` durably: `runs/` is created if absent
 /// (and `state_root` is fsynced every time), the run directory is created with
 /// `create_dir` (it must not exist), and `runs/` is fsynced so the new entry

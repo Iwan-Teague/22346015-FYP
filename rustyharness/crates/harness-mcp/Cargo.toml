@@ -1,6 +1,6 @@
 [package]
 name = "harness-mcp"
-description = "rustyharness MCP stdio client: the pure wire codec (frames, classification, encoders) now; the client, provider and confined connector in later P-37 slices."
+description = "rustyharness MCP stdio client: the pure wire codec (frames, classification, encoders) and the pure response renderer (P-37f) now; the client, provider and confined connector in later P-37 slices."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# The shared strict JSON reader (harness_core::strict_json, INV-22).
+# The shared strict JSON reader (harness_core::strict_json, INV-22), and the
+# digest and provenance types the renderer's output carries.
 harness-core = { path = "../harness-core" }
+# The ToolStatus/tool-code vocabulary the renderer maps MCP outcomes onto
+# (P-37f; a design §2 edge: harness-mcp -> harness-tools).
+harness-tools = { path = "../harness-tools" }
 # Pure-crate-adjacent allowlist (scripts/ci/purity.sh §5): serde_json,
 # thiserror only from crates.io, both already reviewed there.
 serde_json.workspace = true

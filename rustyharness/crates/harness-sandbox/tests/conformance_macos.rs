@@ -100,6 +100,20 @@ fn perl(tree: &Tree, script: &str, args: &[&str]) -> ConfinedExit {
     run(&tree.spec(&argv))
 }
 
+/// A spec like [`Tree::spec`] but with the proxy network grant on `port`.
+fn proxy_spec(t: &Tree, argv: &[&str], port: u16) -> ConfinedSpec {
+    let mut s = t.spec(argv);
+    s.network = Network::Proxy { port };
+    s
+}
+
+/// Like [`perl`] but with the proxy network grant on `port` (§5.3).
+fn proxy_perl(t: &Tree, port: u16, script: &str, args: &[&str]) -> ConfinedExit {
+    let mut argv = vec![PERL, "-e", script];
+    argv.extend_from_slice(args);
+    run(&proxy_spec(t, &argv, port))
+}
+
 /// Run the same perl unconfined (the control).
 fn control(script: &str, args: &[&str]) -> std::process::Output {
     Command::new(PERL)
@@ -674,10 +688,176 @@ fn ft18_keychain_service_is_unreachable() {
     confirmed(&e);
 }
 
+// The proxy-profile cases (§5.3, P-39e): the profile grants exactly one
+// loopback port — the harness pump's — where the `port` argument of each
+// test is a listener the TEST process holds, standing in for the pump or,
+// in FT-19, for the model server.
+
+/// Positive control for the whole proxy section (FT-13p's granted arm):
+/// under `Network::Proxy`, the confined fetcher can connect to the granted
+/// loopback port and exchange bytes with the harness-side pump.
+#[test]
+fn granted_port_connects() {
+    let t = Tree::new("ft13-granted");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    let script = "use Socket; socket(my $s,PF_INET,SOCK_STREAM,0) or die; connect($s, sockaddr_in($ARGV[0], inet_aton(q{127.0.0.1}))) or die; send($s, q{ping}, 0) or die; my $b; recv($s, $b, 8, 0); print qq{got:$b\\n}";
+    let pump = std::thread::spawn(move || {
+        let mut c = None;
+        for _ in 1..100 {
+            if let Ok((s, _)) = l.accept() {
+                c = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut c = c.expect("the fetcher's connection never arrived");
+        use std::io::{Read, Write};
+        let mut buf = [0u8; 4];
+        c.read_exact(&mut buf).expect("the ping must arrive");
+        assert_eq!(&buf, b"ping");
+        c.write_all(b"ok").expect("the pump can answer");
+    });
+    let e = proxy_perl(&t, port, script, &[&port.to_string()]);
+    pump.join().unwrap();
+    assert_eq!(out(&e), "got:ok\n", "the pump's answer must come back");
+    confirmed(&e);
+}
+
+/// FT-13 under the proxy profile (FT-13p): a direct connect to a routable
+/// address is refused, while the granted port still connects (the positive
+/// control, so the refusal is the profile's doing, not a broken program).
+#[test]
+fn ft13_proxy_direct_connect_refused() {
+    let t = Tree::new("ft13p");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port().to_string();
+    let granted = "use Socket; socket(my $s,PF_INET,SOCK_STREAM,0) or die; print connect($s, sockaddr_in($ARGV[0], inet_aton(q{127.0.0.1}))) ? qq{CONNECTED\\n} : qq{refused\\n}";
+    let direct = "use Socket; socket(my $s,PF_INET,SOCK_STREAM,0) or die; print connect($s, sockaddr_in(80, inet_aton(q{192.0.2.1}))) ? qq{CONNECTED\\n} : qq{refused $!\\n}";
+    let e = proxy_perl(&t, port.parse().unwrap(), granted, &[&port]);
+    assert_eq!(out(&e), "CONNECTED\n", "the granted port must still work");
+    let _ = l.accept(); // drain the fetcher's connection
+    let e = proxy_perl(&t, port.parse().unwrap(), direct, &[]);
+    assert!(
+        out(&e).starts_with("refused Operation not permitted"),
+        "{}",
+        out(&e)
+    );
+    assert!(matches!(l.accept(), Err(ref x) if x.kind() == std::io::ErrorKind::WouldBlock));
+    confirmed(&e);
+}
+
+/// FT-15 under the proxy profile (FT-15p): no resolver is reachable, even
+/// with one loopback port granted (no DNS exfiltration channel).
+#[test]
+fn ft15_proxy_no_resolver() {
+    let t = Tree::new("ft15p");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let script = "my @a = gethostbyname(q{apple.com}); print @a ? qq{RESOLVED\\n} : qq{none\\n}";
+    let c = control(script, &[]);
+    eprintln!(
+        "ft15p control (host DNS): {}",
+        String::from_utf8_lossy(&c.stdout).trim()
+    );
+    let e = proxy_perl(&t, port, script, &[]);
+    assert_eq!(out(&e), "none\n");
+    confirmed(&e);
+}
+
+/// FT-19: any loopback port other than the granted one is refused, even
+/// with a listener standing in for the model server there (§6.5: the model
+/// server must not be reachable from any sandbox).
+#[test]
+fn ft19_other_loopback_port_refused() {
+    let t = Tree::new("ft19");
+    let pump = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let model = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    pump.set_nonblocking(true).unwrap();
+    model.set_nonblocking(true).unwrap();
+    let pump_port = pump.local_addr().unwrap().port();
+    let model_port = model.local_addr().unwrap().port().to_string();
+    let script = "use Socket; for my $a ([q{granted},$ARGV[0]],[q{model},$ARGV[1]]) { socket(my $s,PF_INET,SOCK_STREAM,0) or die; print $a->[0], connect($s, sockaddr_in($a->[1], inet_aton(q{127.0.0.1}))) ? qq{ CONNECTED\\n} : qq{ refused\\n} }";
+    let e = proxy_perl(
+        &t,
+        pump_port,
+        script,
+        &[&pump_port.to_string(), &model_port],
+    );
+    assert_eq!(out(&e), "granted CONNECTED\nmodel refused\n");
+    assert!(matches!(model.accept(), Err(ref x) if x.kind() == std::io::ErrorKind::WouldBlock));
+    confirmed(&e);
+}
+
+/// FT-20: no bind and no listen, even under the proxy profile (the
+/// outbound allow is not a listening grant).
+#[test]
+fn ft20_proxy_no_listen() {
+    let t = Tree::new("ft20");
+    let script = "use Socket; socket(my $s,PF_INET,SOCK_STREAM,0) or die; print bind($s, sockaddr_in(0, inet_aton(q{127.0.0.1}))) ? qq{BOUND\\n} : qq{refused\\n}; socket(my $u,PF_INET,SOCK_DGRAM,0) or die; print bind($u, sockaddr_in(0, inet_aton(q{127.0.0.1}))) ? qq{BOUND\\n} : qq{refused\\n}";
+    let c = control(script, &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&c.stdout),
+        "BOUND\nBOUND\n",
+        "control"
+    );
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let e = proxy_perl(&t, port, script, &[]);
+    assert_eq!(out(&e), "refused\nrefused\n");
+    confirmed(&e);
+}
+
+/// FT-17 and FT-18 re-run under the proxy profile: no mach-lookup grant
+/// comes with the network allow, so LaunchServices and the keychain stay
+/// unreachable.
+#[test]
+fn ft17_ft18_hold_under_proxy_profile() {
+    let t = Tree::new("ft17-18p");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let c = Command::new("/usr/bin/lsappinfo")
+        .args(["info", "-only", "pid", "Finder"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&c.stdout).contains("pid"),
+        "control"
+    );
+    let e = run(&proxy_spec(
+        &t,
+        &["/usr/bin/lsappinfo", "info", "-only", "pid", "Finder"],
+        port,
+    ));
+    assert_eq!(e.status, ChildStatus::Exited(0), "lsappinfo did not run");
+    assert!(!out(&e).contains("pid"), "{}", out(&e));
+    confirmed(&e);
+    let c = Command::new("/usr/bin/security")
+        .arg("list-keychains")
+        .output()
+        .unwrap();
+    assert!(c.status.success(), "control");
+    let e = run(&proxy_spec(
+        &t,
+        &["/usr/bin/security", "list-keychains"],
+        port,
+    ));
+    assert!(
+        matches!(e.status, ChildStatus::Exited(n) if n != 0),
+        "security did not run (or unexpectedly succeeded): {:?}",
+        e.status
+    );
+    assert!(!out(&e).contains("keychain"));
+    confirmed(&e);
+}
+
 /// INV-6: a witness from another backend is refused, and a spec the
 /// backend cannot honour is refused before anything starts. (H2c: memory and
 /// process caps ARE enforceable now, so the unenforceable/invalid cases here
-/// are an out-of-range limit and a proxy grant.)
+/// are an out-of-range limit and a zero proxy port; P-39e: a real proxy
+/// port now spawns, and FT-13-proxy above bounds what it allows.)
 #[test]
 fn inv6_spawn_needs_this_backends_witness_and_an_enforceable_spec() {
     let t = Tree::new("inv6");
@@ -698,14 +878,19 @@ fn inv6_spawn_needs_this_backends_witness_and_an_enforceable_spec() {
     let mut s = t.spec(&["/bin/echo"]);
     s.limits.memory = Some(256 * 1024 * 1024);
     assert!(Seatbelt::new().spawn(&s, witness()).is_ok());
+    // A zero proxy port is refused before start (§5.3).
     let mut s = t.spec(&["/bin/echo"]);
-    s.network = Network::Proxy {
-        allowlist_id: "x".into(),
-    };
+    s.network = Network::Proxy { port: 0 };
     assert!(matches!(
         Seatbelt::new().spawn(&s, witness()),
         Err(SpawnError::Spec(_))
     ));
+    // A real port is accepted by this Seatbelt-capable backend and spawns;
+    // what that profile allows is exactly FT-13-proxy/FT-15-proxy/FT-19/
+    // FT-20 above, and the positive control `granted_port_connects`.
+    let mut s = t.spec(&["/bin/echo"]);
+    s.network = Network::Proxy { port: 8080 };
+    assert!(Seatbelt::new().spawn(&s, witness()).is_ok());
 }
 
 /// Refusal path: without its primitives the backend mints nothing.

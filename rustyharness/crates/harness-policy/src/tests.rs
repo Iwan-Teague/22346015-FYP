@@ -261,6 +261,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             fs_tool: false,
             submit: false,
             todo: false,
+            delegate: false,
             edit: false,
             exec: false,
         },
@@ -1726,6 +1727,7 @@ fn policy_default_table_unchanged() {
         "harness.edit.multi",
         "harness.exec.run",
         "harness.task.todo",
+        "harness.task.delegate",
         "harness.task.submit",
     ];
     let valid_args = [
@@ -1739,6 +1741,7 @@ fn policy_default_table_unchanged() {
         json!({"path": "a.txt", "edits": [{"old": "a", "new": "b"}]}),
         json!({"argv": ["cargo", "test"]}),
         json!({}),
+        json!({"task": "x"}),
         json!({"note": "done"}),
     ];
     let defaults = [
@@ -1775,6 +1778,9 @@ fn policy_default_table_unchanged() {
         },
         PolicyDecision::Allow {
             rule: RuleId::Builtin(TODO_RULE),
+        },
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
         },
         PolicyDecision::Allow {
             rule: RuleId::Builtin("allow.task-submit"),
@@ -1844,7 +1850,7 @@ fn policy_default_table_unchanged() {
 /// the tool count (every table id resolves).
 #[test]
 fn tool_count_policy_default_read_allow() {
-    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 11);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 12);
     let reg = builtin_registry();
     for t in crate::builtin::BUILTIN_TOOLS {
         assert!(
@@ -1861,6 +1867,224 @@ fn tool_count_policy_default_read_allow() {
         s.decide(&call(OUTLINE_ID, json!({"path": "."}))),
         PolicyDecision::Allow {
             rule: RuleId::Builtin("allow.default.read"),
+        }
+    );
+}
+
+// ---- P-38: delegate ----------------------------------------------------------------
+
+/// The delegate row keeps the submit sentinel last: it sits after todo and
+/// before submit in the registration table, and both ids resolve in the
+/// compiled-in registry (P-02 three-way agreement, P-24 style).
+#[test]
+fn builtin_registry_lists_delegate_before_submit() {
+    let pos = |id: &str| {
+        crate::builtin::BUILTIN_TOOLS
+            .iter()
+            .position(|t| t.id == id)
+            .unwrap()
+    };
+    assert!(pos(TODO_ID) < pos(DELEGATE_ID));
+    assert!(pos(DELEGATE_ID) < pos(SUBMIT_ID));
+    let reg = builtin_registry();
+    for id in [DELEGATE_ID, SUBMIT_ID] {
+        assert!(
+            matches!(
+                reg.resolve(id),
+                harness_manifest::admission::Resolved::One { .. }
+            ),
+            "{}",
+            id
+        );
+    }
+}
+
+/// Nothing grants the delegate implicitly: without the grant on the session,
+/// a delegate call is the plain not-granted deny, at decide and authorize.
+#[test]
+fn delegate_denied_without_grant() {
+    let s = read_all();
+    let c = call(DELEGATE_ID, json!({"task": "find the entry point"}));
+    let d = s.decide(&c);
+    assert!(is_deny(&d, &DenyReason::NotGranted), "{d:?}");
+    assert!(s.authorize(c).is_err());
+}
+
+/// Granted, the delegate is a read-class tool like `list`: under the default
+/// policy it decides allow through the default read rule, and authorize
+/// mints the approval with the same rule id.
+#[test]
+fn delegate_allowed_by_default_read_rule_when_granted() {
+    let s = Session::plan(
+        &spec(&[DELEGATE_ID, "harness.fs.read"]),
+        &builtin_registry(),
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    let c = call(DELEGATE_ID, json!({"task": "find the entry point"}));
+    assert_eq!(
+        s.decide(&c),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        }
+    );
+    let a = s.authorize(c).unwrap();
+    assert_eq!(a.rule(), RuleId::Builtin("allow.default.read"));
+}
+
+/// The delegate explores the workspace, so planning refuses the grant when
+/// the session has no workspace (fail-closed, same as the fs tools).
+#[test]
+fn delegate_refused_without_workspace() {
+    let mut sp = spec(&[DELEGATE_ID]);
+    sp.workspace = None;
+    assert_eq!(
+        Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::NoWorkspace(DELEGATE_ID.to_owned())
+    );
+}
+
+/// The delegate args schema is the manifest's: one string `task` of at most
+/// 2000 chars, nothing else — an extra field, an over-long task, a missing
+/// task and a non-string task are all schema denies; the 2000-char ceiling
+/// itself is allowed.
+#[test]
+fn delegate_args_schema_refuses_extra_field_and_long_task() {
+    let s = Session::plan(
+        &spec(&[DELEGATE_ID]),
+        &builtin_registry(),
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    for args in [
+        json!({"task": "x", "steps": 3}),
+        json!({"task": "a".repeat(2001)}),
+        json!({}),
+        json!({"task": 7}),
+    ] {
+        let d = s.decide(&call(DELEGATE_ID, args));
+        assert!(
+            matches!(
+                d,
+                PolicyDecision::Deny {
+                    reason: DenyReason::Args(_),
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+    }
+    assert_eq!(
+        s.decide(&call(DELEGATE_ID, json!({"task": "a".repeat(2000)}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        }
+    );
+}
+
+/// D12 (P-38 §9): a delegate whose child scope reaches above its own
+/// sensitivity is refused at planning. The real manifests never do this, so
+/// the fixture plans `harness.fs.read` (the eligible grant string) over a
+/// `personal` capability; the same capability under a non-eligible grant
+/// string plans fine.
+#[test]
+fn delegate_refused_when_child_scope_more_sensitive() {
+    let builtin_m = builtin::manifest(&ctx()).unwrap();
+    let personal_m = fixture(vec![cap_json(
+        "recs",
+        ["read", "personal", "own", "none", "own", "none"],
+    )]);
+    let lookup = |g: &str| -> Lookup<'_> {
+        let hit = (g == "harness.fs.read" || g == "fixture.personal.read")
+            .then(|| personal_m.capabilities().first().unwrap())
+            .or_else(|| {
+                builtin_m
+                    .capabilities()
+                    .iter()
+                    .find(|c| c.id().as_str() == g)
+            });
+        match hit {
+            Some(c) => Lookup::One(c),
+            None => Lookup::NotFound,
+        }
+    };
+    let mut sp = spec(&["harness.task.delegate", "harness.fs.read"]);
+    sp.personal_data_granted = true;
+    assert_eq!(
+        Session::plan_with(&sp, &UserPolicy::default(), &lookup).unwrap_err(),
+        SessionRefused::DelegateScope(DELEGATE_ID.to_owned())
+    );
+    // The counterfactual: the child cap is only refused through an
+    // eligible grant string; anything else is not the delegate's scope.
+    let mut sp = spec(&["harness.task.delegate", "fixture.personal.read"]);
+    sp.personal_data_granted = true;
+    assert!(Session::plan_with(&sp, &UserPolicy::default(), &lookup).is_ok());
+}
+
+/// A helper run may not hold the delegate itself (no nesting), so
+/// `plan_child` refuses the grant even though plain planning accepts it.
+#[test]
+fn plan_child_refuses_delegate_grant() {
+    assert_eq!(
+        Session::plan_child(
+            &spec(&["harness.fs.read", "harness.task.delegate"]),
+            &builtin_registry(),
+            &UserPolicy::default(),
+        )
+        .unwrap_err(),
+        SessionRefused::ChildScope(DELEGATE_ID.to_owned())
+    );
+}
+
+/// Edit and exec are refused to a helper run too, once plain planning lets
+/// them through (approver present, confinement conformed): the child scope
+/// is read-only plus the submit sentinel, nothing else.
+#[test]
+fn plan_child_refuses_edit_and_exec() {
+    let mut sp = spec(&["harness.edit.replace", "harness.exec.run"]);
+    sp.approver_present = true;
+    sp.conformed = true;
+    sp.exec_programs = vec!["cargo".to_owned()];
+    assert_eq!(
+        Session::plan_child(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::ChildScope("harness.edit.replace".into())
+    );
+}
+
+/// The child scope itself: fs reads plus the submit sentinel plan fine, and
+/// the resulting session still decides through the default read rule.
+#[test]
+fn plan_child_accepts_fs_and_submit() {
+    let mut sp = spec(&[
+        "harness.fs.read",
+        "harness.fs.search",
+        "harness.task.submit",
+    ]);
+    sp.approver_present = true;
+    sp.conformed = true;
+    let s = Session::plan_child(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call("harness.fs.read", json!({"path": "a.rs"}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read"),
+        }
+    );
+}
+
+/// The user deny rule wins over the read default: a granted delegate under
+/// an explicit deny is a user deny citing that rule.
+#[test]
+fn user_deny_rule_on_delegate_wins() {
+    let p = UserPolicy::new(&[DELEGATE_ID], &[], &[]).unwrap();
+    let s = Session::plan(&spec(&[DELEGATE_ID]), &builtin_registry(), &p).unwrap();
+    assert_eq!(
+        s.decide(&call(DELEGATE_ID, json!({"task": "x"}))),
+        PolicyDecision::Deny {
+            reason: DenyReason::UserDenied,
+            rule: RuleId::User {
+                list: RuleList::Deny,
+                index: 0
+            },
         }
     );
 }

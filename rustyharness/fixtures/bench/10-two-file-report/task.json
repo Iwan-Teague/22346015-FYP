@@ -1,0 +1,10 @@
+{
+  "task": "intro.txt holds the report's first line and outro.txt its last. Write report.txt with the first line, then the last line, in that order.",
+  "grants": ["harness.exec.run", "harness.fs.read", "harness.edit.write"],
+  "exec": {"programs": [{"name": "perl", "path": "/usr/bin/perl"}]},
+  "presubmit": {"commands": [["perl", "-e", "open(my $f, q{<}, q{report.txt}) or exit 3; my $c = do { local $/; <$f> }; exit($c eq qq{alpha\\nomega\\n} ? 0 : 3)"]]},
+  "script": [
+    {"tool": "harness.edit.write", "args": {"path": "report.txt", "content": "alpha\nomega\n"}},
+    {"submit": true}
+  ]
+}

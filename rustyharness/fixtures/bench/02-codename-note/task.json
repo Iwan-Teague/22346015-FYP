@@ -1,0 +1,10 @@
+{
+  "task": "Find the project codename in the workspace files and write it, alone on one line, to a file named codename.txt.",
+  "grants": ["harness.exec.run", "harness.fs.read", "harness.fs.list", "harness.edit.write"],
+  "exec": {"programs": [{"name": "perl", "path": "/usr/bin/perl"}]},
+  "presubmit": {"commands": [["perl", "-e", "open(my $f, q{<}, q{codename.txt}) or exit 3; my $c = do { local $/; <$f> }; exit($c eq qq{AMBER-OWL-77\\n} ? 0 : 3)"]]},
+  "script": [
+    {"tool": "harness.edit.write", "args": {"path": "codename.txt", "content": "AMBER-OWL-77\n"}},
+    {"submit": true}
+  ]
+}

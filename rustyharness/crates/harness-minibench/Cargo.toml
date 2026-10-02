@@ -1,0 +1,25 @@
+[package]
+name = "harness-minibench"
+description = "The developer mini-benchmark: run the repo's fixture tasks against a model and record the results (P-21b)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gate-outcome = { path = "../gate-outcome" }
+harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+harness-model = { path = "../harness-model" }
+harness-policy = { path = "../harness-policy" }
+harness-run = { path = "../harness-run" }
+harness-sandbox = { path = "../harness-sandbox" }
+# Shared in-process fixtures: the mini-bench sets a task up exactly the way
+# the gates do.
+harness-testkit = { path = "../harness-testkit" }
+serde.workspace = true
+serde_json.workspace = true

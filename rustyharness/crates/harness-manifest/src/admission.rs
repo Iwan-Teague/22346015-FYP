@@ -10,12 +10,14 @@
 //! 3. **Tier data rules (§4.4 table):** a `pinned` manifest may not declare
 //!    `sensitivity > operational` or `blast_radius > host`, and may not be an
 //!    in-process adapter (§4.5: in-process is `builtin` or `signed` only).
-//! 4. **H1 phase gate:** what this build cannot honour is REFUSED, not
-//!    accepted on trust. Signature verification and manifest-hash pinning
-//!    need the ed25519 and SHA-256 crates and the admission CLI (H4);
-//!    mcp-stdio and in-process transports need `harness-mcp` / `Conformed`
-//!    (H2/H4); secret handles need the §5.5 secrets boundary (H2). So in H1
-//!    only the `builtin` tier with a secret-free `builtin` transport admits.
+//! 4. **Phase gate:** what this build cannot honour is REFUSED, not
+//!    accepted on trust. Signature verification needs the ed25519
+//!    admission path (H4); the in-process transport needs `Conformed`
+//!    (H4); secret handles need the §5.5 secrets boundary (H2). Since
+//!    P-37a a `pinned` manifest over the `mcp-stdio` transport ADMITS
+//!    (§6.3): the manifest-hash pin is data this build honours, and the
+//!    manifest must declare an MCP protocol version this build speaks
+//!    ([`crate::pins::negotiate`], §3.3) — none in common refuses.
 //!
 //! The data rules (1-3) run before the phase gate so they are exercised now
 //! and cannot silently rot while the gate hides them.
@@ -93,6 +95,20 @@ pub enum AdmissionError {
         what: &'static str,
         /// The design phase that adds it.
         phase: &'static str,
+    },
+    /// The manifest declares no MCP protocol version this build speaks
+    /// (§3.3): there is no dialect both sides were reviewed to speak, so
+    /// the provider is refused at admission, not hoped into working.
+    #[error(
+        "provider {provider}: no MCP protocol version in common; this build speaks {supported:?}, the manifest declares {declared:?}; refused"
+    )]
+    ProtocolUnsupported {
+        /// Provider.
+        provider: String,
+        /// What this build speaks.
+        supported: &'static [&'static str],
+        /// What the manifest declared, as given.
+        declared: Vec<String>,
     },
 }
 
@@ -183,21 +199,40 @@ impl Registry {
                     }
                 }
             }
-            // 4. H1 phase gate.
+            // 4. Phase gate. The (pinned, mcp-stdio) pair admits since
+            // P-37a (§6.3); everything else this build cannot honour is
+            // refused, not accepted on trust.
             let gate = |what, phase| AdmissionError::NotInThisPhase {
                 provider: provider.clone(),
                 what,
                 phase,
             };
             match tier {
-                Tier::Builtin => {}
+                Tier::Builtin => match m.transport() {
+                    Transport::Builtin => {}
+                    // Unreachable for a parsed manifest (the compiled-in
+                    // manifest must use the builtin transport); refuse
+                    // anyway rather than trust it.
+                    _ => return Err(gate("the transport", "H4")),
+                },
                 Tier::Signed { .. } => return Err(gate("signature verification", "H4")),
-                Tier::Pinned { .. } => return Err(gate("manifest-hash pinning", "H4")),
-            }
-            match m.transport() {
-                Transport::Builtin => {}
-                Transport::McpStdio { .. } => return Err(gate("the mcp-stdio transport", "H4")),
-                Transport::InProcess { .. } => return Err(gate("the in-process transport", "H4")),
+                Tier::Pinned { .. } => match m.transport() {
+                    Transport::McpStdio { .. } => {
+                        // The MCP dialect must be one both sides were
+                        // reviewed to speak (§3.3).
+                        if let Err(e) = crate::pins::negotiate(m.mcp_protocols()) {
+                            return Err(AdmissionError::ProtocolUnsupported {
+                                provider,
+                                supported: e.supported,
+                                declared: e.declared,
+                            });
+                        }
+                    }
+                    // The in-process pair was refused by the tier data
+                    // rules above, and an external manifest cannot use the
+                    // builtin transport; refuse anyway rather than trust.
+                    _ => return Err(gate("the transport", "H4")),
+                },
             }
             if m.capabilities().iter().any(|c| !c.secrets.is_empty()) {
                 return Err(gate("secret handles", "H2"));

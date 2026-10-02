@@ -75,6 +75,7 @@ pub mod denies;
 pub mod locality;
 pub mod matcher;
 pub mod path;
+pub mod web;
 
 pub use builtin::{
     EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, GLOB_ID, LIST_ID, OUTLINE_ID, READ_ID,

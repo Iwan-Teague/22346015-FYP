@@ -1054,19 +1054,14 @@ fn pinned_tier_data_rules_run_before_the_phase_gate() {
 
 #[test]
 fn what_h1_cannot_honour_is_refused_not_trusted() {
-    let pin = Sha256Pin::parse_hex(PIN).unwrap();
+    // P-37a lifted the phase gate for the (pinned, mcp-stdio) pair
+    // (§6.3, see pinned_mcp_stdio_admits); the signed tier still waits
+    // for signature verification (H4) and is refused, not trusted.
     let f = || parse_v(&fixture()).unwrap();
-    for tier in [
-        Tier::Pinned {
-            manifest_sha256: pin,
-        },
-        Tier::Signed { key_id: "k".into() },
-    ] {
-        assert!(matches!(
-            Registry::admit(vec![(f(), tier)]),
-            Err(AdmissionError::NotInThisPhase { phase: "H4", .. })
-        ));
-    }
+    assert!(matches!(
+        Registry::admit(vec![(f(), Tier::Signed { key_id: "k".into() })]),
+        Err(AdmissionError::NotInThisPhase { phase: "H4", .. })
+    ));
 }
 
 #[test]
@@ -1189,6 +1184,308 @@ fn null_check_runs_after_version_and_reserved_name_checks() {
     let mut m = fixture();
     cap0(&mut m)["limits"] = Value::Null;
     assert!(matches!(parse_v(&m), Err(ManifestError::NullValue(_))));
+}
+
+// --- P-37a: pins, MCP protocol negotiation, the lifted admission gate ---
+
+/// The fixture manifest with its pins recomputed over the exact summary and
+/// schema it declares, so a server presenting exactly those pins clean.
+fn pinned_manifest() -> Manifest {
+    let mut m = fixture();
+    let schema = m["capabilities"][0]["input_schema"].clone();
+    cap0(&mut m)["description_sha256"] =
+        json!(pins::description_digest("Read one item").to_string());
+    cap0(&mut m)["schema_sha256"] = json!(pins::schema_digest(&schema).to_string());
+    parse_v(&m).unwrap()
+}
+
+fn presented(name: &str, description: &str, schema: &Value) -> pins::PresentedTool {
+    pins::PresentedTool {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        input_schema: schema.clone(),
+    }
+}
+
+fn fixture_schema() -> Value {
+    fixture()["capabilities"][0]["input_schema"].clone()
+}
+
+#[test]
+fn negotiate_picks_highest_common_version() {
+    let asc = vec!["2024-11-05".to_string(), "2025-06-18".to_string()];
+    assert_eq!(pins::negotiate(&asc), Ok("2025-06-18"));
+    // Declaration order must not matter; the fixed-width dates sort.
+    let desc = vec!["2025-06-18".to_string(), "2024-11-05".to_string()];
+    assert_eq!(pins::negotiate(&desc), Ok("2025-06-18"));
+}
+
+#[test]
+fn negotiate_none_in_common_refused() {
+    let declared = vec!["2024-11-05".to_string()];
+    let err = pins::negotiate(&declared).unwrap_err();
+    assert_eq!(err.supported, pins::SUPPORTED_MCP_PROTOCOLS);
+    assert_eq!(err.declared, declared);
+}
+
+#[test]
+fn description_digest_is_exact_bytes() {
+    // The standard SHA-256("abc") vector: the exact UTF-8 bytes, nothing
+    // trimmed, normalized or inspected (D5).
+    assert_eq!(
+        pins::description_digest("abc").to_string(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    // Whitespace is bytes too.
+    assert_ne!(
+        pins::description_digest("abc").as_bytes(),
+        pins::description_digest("abc ").as_bytes()
+    );
+    // An absent description hashes the empty string (§6.1).
+    assert_eq!(
+        pins::description_digest("").to_string(),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+#[test]
+fn schema_digest_is_key_order_independent() {
+    let a = json!({"type": "object", "properties": {"k": {"type": "string"}},
+                   "required": ["k"]});
+    let b = json!({"required": ["k"], "properties": {"k": {"type": "string"}},
+                   "type": "object"});
+    assert_eq!(pins::schema_digest(&a), pins::schema_digest(&b));
+    // Content, not key order, is what the pin covers.
+    let extra = json!({"type": "object", "properties": {"k": {"type": "string"}},
+                       "required": ["k"], "additionalProperties": false});
+    assert_ne!(pins::schema_digest(&a), pins::schema_digest(&extra));
+}
+
+#[test]
+fn pin_report_flags_description_drift() {
+    let m = pinned_manifest();
+    let presented = [presented(
+        "read_item",
+        "TAMPERED summary",
+        &fixture_schema(),
+    )];
+    let report = pins::compare(&m, &presented).unwrap();
+    assert_eq!(
+        report.statuses().get("fixture.item.read"),
+        Some(&pins::PinStatus::DescriptionDrift)
+    );
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn pin_report_flags_schema_drift() {
+    let m = pinned_manifest();
+    let mut schema = fixture_schema();
+    schema["properties"]["extra"] = json!({"type": "string"});
+    let presented = [presented("read_item", "Read one item", &schema)];
+    let report = pins::compare(&m, &presented).unwrap();
+    assert_eq!(
+        report.statuses().get("fixture.item.read"),
+        Some(&pins::PinStatus::SchemaDrift)
+    );
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn pin_report_missing_tool_is_missing() {
+    let m = pinned_manifest();
+    let report = pins::compare(&m, &[]).unwrap();
+    assert_eq!(
+        report.statuses().get("fixture.item.read"),
+        Some(&pins::PinStatus::Missing)
+    );
+    assert_eq!(report.dropped(), 0);
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn pin_report_drops_unlisted_tools_and_counts() {
+    let m = pinned_manifest();
+    let presented = [
+        presented("read_item", "Read one item", &fixture_schema()),
+        presented(
+            "sneaky_extra",
+            "Not in the manifest",
+            &json!({"type": "object"}),
+        ),
+    ];
+    let report = pins::compare(&m, &presented).unwrap();
+    assert_eq!(
+        report.statuses().get("fixture.item.read"),
+        Some(&pins::PinStatus::Ok)
+    );
+    // The unlisted tool is dropped and counted, never an error and never
+    // surfaced (§6.1): the manifest, not the server, defines the surface.
+    assert_eq!(report.dropped(), 1);
+    assert!(!report.is_clean());
+}
+
+#[test]
+fn pin_report_duplicate_presented_name_refused() {
+    let m = pinned_manifest();
+    let schema = fixture_schema();
+    let presented = [
+        presented("read_item", "Read one item", &schema),
+        presented("read_item", "The rug-pull twin", &schema),
+    ];
+    // Refused before anything is compared: "first wins" would let a
+    // rug-pull hide behind the duplicate (§8.5).
+    assert_eq!(
+        pins::compare(&m, &presented),
+        Err(pins::CompareError::DuplicatePresentedName(
+            "read_item".to_string()
+        ))
+    );
+}
+
+#[test]
+fn pin_compare_needs_an_mcp_manifest() {
+    // A builtin manifest has no server to compare against (§6.1).
+    let builtin = builtin::manifest(&ValidationContext::new(v(0, 0, 1), &[]).unwrap()).unwrap();
+    let presented = [presented("anything", "x", &json!({"type": "object"}))];
+    assert!(matches!(
+        pins::compare(&builtin, &presented),
+        Err(pins::CompareError::NotMcpStdio("builtin"))
+    ));
+}
+
+#[test]
+fn pinned_mcp_stdio_admits() {
+    let pin = Sha256Pin::parse_hex(PIN).unwrap();
+    let reg = Registry::admit(vec![(
+        parse_v(&fixture()).unwrap(),
+        Tier::Pinned {
+            manifest_sha256: pin,
+        },
+    )])
+    .unwrap();
+    assert!(matches!(
+        reg.resolve("fixture.item.read"),
+        Resolved::One {
+            tier: Tier::Pinned { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn mcp_duplicate_namespace_refused() {
+    // Shadowing runs before the phase gate, so two pinned mcp-stdio
+    // providers with one namespace are refused whatever the gate admits.
+    let pin = Sha256Pin::parse_hex(PIN).unwrap();
+    let tier = Tier::Pinned {
+        manifest_sha256: pin,
+    };
+    let err = Registry::admit(vec![
+        (parse_v(&fixture()).unwrap(), tier.clone()),
+        (parse_v(&fixture()).unwrap(), tier),
+    ])
+    .unwrap_err();
+    assert!(matches!(err, AdmissionError::Shadowed(_)), "{err}");
+}
+
+#[test]
+fn signed_tier_still_refused() {
+    let err = Registry::admit(vec![(
+        parse_v(&fixture()).unwrap(),
+        Tier::Signed { key_id: "k".into() },
+    )])
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AdmissionError::NotInThisPhase {
+                what: "signature verification",
+                phase: "H4",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn in_process_still_refused() {
+    let mut inproc = fixture();
+    inproc["transport"] = json!({"kind": "in-process", "feature": "addon-fixture"});
+    inproc.as_object_mut().unwrap().remove("mcp_protocols");
+    cap0(&mut inproc)
+        .as_object_mut()
+        .unwrap()
+        .remove("mcp_name");
+    let pin = Sha256Pin::parse_hex(PIN).unwrap();
+    let err = Registry::admit(vec![(
+        parse_v(&inproc).unwrap(),
+        Tier::Pinned {
+            manifest_sha256: pin,
+        },
+    )])
+    .unwrap_err();
+    // The pinned tier data rules stand (§6.3): in-process is builtin or
+    // signed only, whatever the phase gate admits.
+    assert!(
+        matches!(
+            err,
+            AdmissionError::TierExceeded {
+                what: "an in-process transport",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn secret_handles_still_refused() {
+    let mut m = fixture();
+    cap0(&mut m)["secrets"] = json!(["tok"]);
+    let pin = Sha256Pin::parse_hex(PIN).unwrap();
+    let err = Registry::admit(vec![(
+        parse_v(&m).unwrap(),
+        Tier::Pinned {
+            manifest_sha256: pin,
+        },
+    )])
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AdmissionError::NotInThisPhase {
+                what: "secret handles",
+                phase: "H2",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn pinned_protocol_none_in_common_refused_at_admission() {
+    let mut m = fixture();
+    m["mcp_protocols"] = json!(["2024-11-05"]);
+    let pin = Sha256Pin::parse_hex(PIN).unwrap();
+    let err = Registry::admit(vec![(
+        parse_v(&m).unwrap(),
+        Tier::Pinned {
+            manifest_sha256: pin,
+        },
+    )])
+    .unwrap_err();
+    // None in common refuses AT ADMISSION (§3.3), not hopefully at connect.
+    assert!(
+        matches!(
+            &err,
+            AdmissionError::ProtocolUnsupported { declared, .. }
+                if *declared == vec!["2024-11-05".to_string()]
+        ),
+        "{err}"
+    );
 }
 
 // ---- fuzz-style robustness (P-54) ----------------------------------------------

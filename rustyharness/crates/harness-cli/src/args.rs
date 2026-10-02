@@ -31,6 +31,13 @@ pub(crate) const USAGE: &str = "usage:
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
                         [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
                         [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
+  rustyharness schedule add --name <name> --task <task.json>
+                        (--daily <HH:MM> | --every <Nh>)
+                        [--profile <profile.json>] [--policy <policy.json>] [--endpoint <url>]
+                        [--workspace <dir>] [--state-root <dir>] [--no-default-denies]
+  rustyharness schedule list      [--state-root <dir>]
+  rustyharness schedule remove    --name <name> [--state-root <dir>]
+  rustyharness schedule run-now   --name <name> [--state-root <dir>]
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json
@@ -42,6 +49,18 @@ defaults (P-07): --workspace is the current directory; --state-root, the
   and `resume --run` need no other flags; flags still override and must
   digest to what the run recorded. gc removes only a finished run's
   workspace/, grading/ and scratch/ — never its journal, blobs or inputs.
+
+schedules (P-49): `schedule add` stores the validated task, profile and
+  policy byte-for-byte in <state-root>/schedules/<name>/ (0600) and, only
+  after a `y` on the same input chat reads lines from, writes the launchd
+  plist (macOS) or systemd user service+timer (Linux), 0600; until then
+  nothing is written. The task must carry an explicit budget (steps or
+  wall_secs) and --allow-exec/--preset/--shell are refused: a timed run
+  executes only what the task file pins, and every ask is denied. The
+  launcher runs `schedule run-now --name <name>`, which re-checks every
+  digest before it runs; `schedule list` shows the next daily run as a
+  UTC estimate (the OS fires it at local HH:MM). Nothing is loaded into
+  launchd or systemd for you.
 
 sensitive paths (P-12): without --no-default-denies the CLI overlays a
   default deny list on the policy (.env, .env.*, *.pem, *.key, id_rsa*,
@@ -153,6 +172,13 @@ mod tests {
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
                         [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
                         [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
+  rustyharness schedule add --name <name> --task <task.json>
+                        (--daily <HH:MM> | --every <Nh>)
+                        [--profile <profile.json>] [--policy <policy.json>] [--endpoint <url>]
+                        [--workspace <dir>] [--state-root <dir>] [--no-default-denies]
+  rustyharness schedule list      [--state-root <dir>]
+  rustyharness schedule remove    --name <name> [--state-root <dir>]
+  rustyharness schedule run-now   --name <name> [--state-root <dir>]
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json
@@ -164,6 +190,18 @@ defaults (P-07): --workspace is the current directory; --state-root, the
   and `resume --run` need no other flags; flags still override and must
   digest to what the run recorded. gc removes only a finished run's
   workspace/, grading/ and scratch/ — never its journal, blobs or inputs.
+
+schedules (P-49): `schedule add` stores the validated task, profile and
+  policy byte-for-byte in <state-root>/schedules/<name>/ (0600) and, only
+  after a `y` on the same input chat reads lines from, writes the launchd
+  plist (macOS) or systemd user service+timer (Linux), 0600; until then
+  nothing is written. The task must carry an explicit budget (steps or
+  wall_secs) and --allow-exec/--preset/--shell are refused: a timed run
+  executes only what the task file pins, and every ask is denied. The
+  launcher runs `schedule run-now --name <name>`, which re-checks every
+  digest before it runs; `schedule list` shows the next daily run as a
+  UTC estimate (the OS fires it at local HH:MM). Nothing is loaded into
+  launchd or systemd for you.
 
 sensitive paths (P-12): without --no-default-denies the CLI overlays a
   default deny list on the policy (.env, .env.*, *.pem, *.key, id_rsa*,

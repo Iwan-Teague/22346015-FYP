@@ -66,6 +66,15 @@
 //! `resume` accept `--output stream-json` to print the same stream, plus a
 //! `usage {...}` line, before the `chain_head` line (the usage module
 //! computes the footer from the journal).
+//!
+//! `schedule` (slice P-49) installs a timed, unattended run: `add` stores
+//! the validated task, profile and policy in `<state-root>/schedules/<name>/`
+//! and, only after a `y` on the same input source `chat` reads lines from,
+//! writes a user-level launchd plist (macOS) or systemd user timer (Linux)
+//! whose command is `schedule run-now --name <name>`. `run-now` is a gate
+//! child under the `rustyharness.schedule` gate id: it re-checks every
+//! recorded digest and then runs exactly as a timer would — every ask a
+//! deny, even at a terminal.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -100,6 +109,7 @@ mod cmd_manifest;
 mod cmd_profile;
 mod cmd_replay;
 mod cmd_run;
+mod cmd_schedule;
 mod cmd_sessions;
 mod config;
 mod dispatch;
@@ -138,8 +148,9 @@ pub struct Cx<'a> {
     /// witness only when the task grants `harness.exec.run`.
     pub confinement: &'a dyn harness_sandbox::Confinement,
     /// Where the `chat` REPL's lines come from (P-18). The shipped binary
-    /// reads this process's stdin; tests inject lines. Every other verb
-    /// ignores it.
+    /// reads this process's stdin; tests inject lines. `schedule add` and
+    /// `schedule remove` (P-49) read the first line as their install or
+    /// removal confirmation. Every other verb ignores it.
     pub input: InputSource<'a>,
     /// The model backend `chat` talks to (P-18). `BuiltIn` means the verb
     /// builds one itself from `--endpoint` (the shipped binary); tests

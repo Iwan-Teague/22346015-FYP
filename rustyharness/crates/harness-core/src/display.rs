@@ -379,4 +379,58 @@ mod tests {
             "\\\\u{1b}"
         );
     }
+
+    // ---- fuzz-style robustness (P-54) -----------------------------------
+    //
+    // The sanitiser takes untrusted text: whatever crossed the trust
+    // boundary, its output must be a fixed point with nothing hidden left
+    // raw, and its bounded form must honour the bound. The inputs come
+    // from `harness_testkit::mutator`, whose seeded xorshift generator
+    // makes every case reproducible from the seed named in the loop.
+
+    use harness_testkit::mutator::{self, XorShift64};
+
+    fn fuzz_sanitiser_cases(cases: usize) {
+        let seed = "name \u{1b}[2J\u{1b}]0;evil\u{7}\u{202e}rtl\u{200b}zw\nline2\ttab\r\n\
+                    \\back\\u{41}\u{feff}bom \u{7f}del \u{c4}m\u{e4}l \u{2028}sep\u{9c}";
+        for case in 0..cases {
+            let mut rng = XorShift64::new(0x5400_00B0_0000 + case as u64);
+            let bytes = mutator::mutate(seed.as_bytes(), &mut rng, 24);
+            let s = String::from_utf8_lossy(&bytes);
+            for mode in [DisplayMode::Line, DisplayMode::Block] {
+                let out = escape_for_terminal(&s, mode);
+                // The contract: nothing hidden survives raw. `\t` is kept
+                // in both modes, `\n` only in `Block`.
+                assert!(
+                    out.chars().all(|c| c == '\t'
+                        || (mode == DisplayMode::Block && c == '\n')
+                        || !is_hidden(c)),
+                    "case {case} ({mode:?}): {out:?}"
+                );
+                // Idempotent: the output is a fixed point.
+                assert_eq!(
+                    escape_for_terminal(&out, mode),
+                    out,
+                    "case {case} ({mode:?})"
+                );
+                // The bounded form honours its bound and is idempotent too.
+                let bounded = sanitize_for_terminal_bounded(&s, mode, 128);
+                assert!(bounded.len() <= 128, "case {case}: {} bytes", bounded.len());
+                assert_eq!(escape_for_terminal(&bounded, mode), bounded, "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_sanitiser_output_has_no_control_chars() {
+        fuzz_sanitiser_cases(mutator::case_count(2_000));
+    }
+
+    /// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+    /// drives the case count up.
+    #[test]
+    #[ignore]
+    fn fuzz_sanitiser_long_cases() {
+        fuzz_sanitiser_cases(mutator::case_count(50_000));
+    }
 }

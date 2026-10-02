@@ -554,7 +554,7 @@ impl<'a> Loop<'a> {
         w.append(step, ev).map_err(journal)?;
         self.meter.tick_wall()?;
 
-        let completion = match result {
+        let mut completion = match result {
             Ok(c) => c,
             Err(e) => return self.model_error(e, step, request_bytes),
         };
@@ -570,6 +570,30 @@ impl<'a> Loop<'a> {
 
         // 4. Parse exactly one action.
         let parsed = parse_reply(&completion, self.profile.protocol(), &self.tools);
+        // P-53: a native profile that opted in to parallel tool calls keeps
+        // the FIRST call of a multi-call reply; the surplus calls are
+        // dropped (never capability-checked, never policy-decided, never
+        // run) and a turn notice says so, and the reply is shown with the
+        // one call that runs. A pure function of the completion and the
+        // profile, so an audit replay re-runs exactly this. No
+        // `FormatError` is recorded and the format-error meter is not
+        // charged when the kept call parses; if it does not (an unknown
+        // tool, bad JSON), the usual error path runs on the new error. The
+        // default profile rejects the whole reply below, as before. The
+        // text protocol is exactly-one-action by its own grammar: its
+        // `SeveralActions` always keeps the format-error path.
+        let mut dropped_calls = 0usize;
+        let parsed = match parsed {
+            Err(FormatError::SeveralActions)
+                if self.profile.protocol() == Protocol::Native
+                    && self.profile.parallel_tool_calls() =>
+            {
+                dropped_calls = completion.tool_calls.len().saturating_sub(1);
+                completion.tool_calls.truncate(1);
+                parse_reply(&completion, self.profile.protocol(), &self.tools)
+            }
+            other => other,
+        };
         // P-05 §3: in a session, a plain-text answer (a `no_action` parse
         // error with no tool call and non-whitespace text) is the turn's
         // answer, not a format error: no `FormatError` record, no account
@@ -658,7 +682,15 @@ impl<'a> Loop<'a> {
         .map_err(journal)?;
 
         // Loop detection on the proposed action (§2.6).
-        let mut notice = None;
+        // P-53: when the opt-in dropped surplus calls, the turn notice says
+        // so before any loop notice (joined, never replaced).
+        let mut notice = (dropped_calls > 0).then(|| {
+            HarnessText::from_facts(format!(
+                "Notice: your reply made {} tool calls; the first one ran and the other {} were dropped. Make exactly one tool call per reply.",
+                dropped_calls + 1,
+                dropped_calls
+            ))
+        });
         match self.detector.observe(LoopEvent::Action {
             tool: tool.clone(),
             args_digest: sha256(args_text.as_bytes()),
@@ -673,10 +705,14 @@ impl<'a> Loop<'a> {
                         .field("stop", Trusted::Bool(false)),
                 )
                 .map_err(journal)?;
-                notice = Some(HarnessText::from_static(
+                let repeat = HarnessText::from_static(
                     "Notice: you have made the same call three times in the last six steps. \
                      Doing it again will stop the run. Try something different or submit.",
-                ));
+                );
+                notice = Some(match notice {
+                    Some(n) => n.joined(&repeat),
+                    None => repeat,
+                });
             }
             LoopSignal::Stop(kind) => return self.loop_stop(w, step, kind),
         }

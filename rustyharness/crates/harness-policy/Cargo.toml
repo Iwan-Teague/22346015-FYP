@@ -17,3 +17,7 @@ harness-core = { path = "../harness-core" }
 harness-manifest = { path = "../harness-manifest" }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# The deterministic mutator for the parsers' fuzz-style robustness tests (P-54).
+harness-testkit = { path = "../harness-testkit" }

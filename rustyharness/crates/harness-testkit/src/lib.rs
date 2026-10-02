@@ -9,6 +9,9 @@
 //! the real `harness_run::run` against the real journal on a real disk,
 //! [`assert_audit_clean`] runs the real audit replay, and [`cli`] drives
 //! the real `harness_cli` verbs in process. The kit adds convenience only.
+//!
+//! [`mutator`] (P-54) adds the deterministic fuzz-style generator the
+//! parsers' robustness tests share.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code, and this crate is a
@@ -24,6 +27,8 @@
         clippy::panic
     )
 )]
+
+pub mod mutator;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

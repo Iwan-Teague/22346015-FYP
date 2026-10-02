@@ -45,6 +45,14 @@ impl HarnessText {
         Self(Cow::Owned(s))
     }
 
+    /// A harness notice this build renders from its own facts — counts,
+    /// names, bounds (P-53's dropped-call notice). The caller must pass
+    /// only harness-side text, never model, tool or server text; those
+    /// stay behind [`Untrusted`].
+    pub fn from_facts(s: String) -> Self {
+        Self(Cow::Owned(s))
+    }
+
     /// A policy denial for arguments outside a tool's schema, naming the
     /// argument and the bounds the tool's own schema gives it: "the argument
     /// `lines` must be an integer from 1 to 100". Everything rendered comes
@@ -282,6 +290,23 @@ impl ToolSpec {
             "Read a window of lines (at most {}) from a file inside the workspace: start is the first line (1-based), lines how many. Paths are relative to the workspace root",
             w.lines
         ));
+        self
+    }
+
+    /// The tool as a terse-docs profile offers it (P-53): the description
+    /// becomes the fixed terse table's one sentence (argument names kept,
+    /// `harness_manifest::builtin::terse_summary`); the schema is
+    /// untouched. A tool the table does not cover (a provider capability)
+    /// keeps its full summary. After [`ToolSpec::with_read_window`], so the
+    /// terse sentence replaces even the read window's dynamic one (the
+    /// schema's `lines` maximum stays).
+    #[must_use]
+    pub fn with_tool_docs(mut self, docs: profile::ToolDocs) -> Self {
+        if docs == profile::ToolDocs::Terse {
+            if let Some(terse) = harness_manifest::builtin::terse_summary(&self.id) {
+                self.description = HarnessText::rendered(terse.to_owned());
+            }
+        }
         self
     }
 }

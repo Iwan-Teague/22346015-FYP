@@ -1231,4 +1231,62 @@ mod tests {
         assert!(got.text.starts_with("abc"), "{got:?}");
         assert!(!got.text.contains('\u{FFFD}'), "{got:?}");
     }
+
+    // ---- fuzz-style robustness (P-54) -----------------------------------
+    //
+    // `to_text` takes untrusted bytes: whatever a fetch returned, it must
+    // answer with an `Extracted` within its documented bounds — never a
+    // panic, never an unbounded run. The inputs come from
+    // `harness_testkit::mutator`, whose seeded xorshift generator makes
+    // every case reproducible from the seed named in the loop (base + case).
+
+    use harness_testkit::mutator::{self, XorShift64};
+
+    fn fuzz_html_cases(cases: usize) {
+        let seed = "<html><head><title>Fuzz \u{1b}[2J</title></head><body>\
+             <h1>Head</h1><p>hello <b>world</b> &amp; friends</p>\
+             <a href=\"https://example.test/a?b=1&amp;c=2\">link one</a>\
+             <ul><li>one</li><li>two</li></ul>\
+             <table><tr><td>a</td><td>b</td></tr></table>\
+             <pre>  keep \t me\n\n  </pre>\
+             <script>if (1 < 2) { eat(\"</p>\"); }</script>\
+             <!-- comment <p>hidden</p> --><div class=x>tail text</div>\
+             </body></html>\u{202e}rtl\u{200b}zw\u{feff}";
+        let limits = ExtractLimits {
+            max_input_bytes: 4096,
+            max_output_bytes: 1024,
+            max_links: 8,
+        };
+        for case in 0..cases {
+            let mut rng = XorShift64::new(0x5400_00A0_0000 + case as u64);
+            let m = mutator::mutate(seed.as_bytes(), &mut rng, 24);
+            let out = to_text(&m, &limits);
+            assert!(
+                out.text.len() <= limits.max_output_bytes,
+                "case {case}: {} bytes",
+                out.text.len()
+            );
+            assert!(out.links.len() <= limits.max_links, "case {case}");
+            assert_eq!(out.digest, sha256(out.text.as_bytes()), "case {case}");
+            // Pure random garbage too, not only mutations of a valid page.
+            let len = rng.below(600);
+            let g = mutator::garbage(&mut rng, len);
+            let out = to_text(&g, &limits);
+            assert!(out.text.len() <= limits.max_output_bytes);
+            assert_eq!(out.digest, sha256(out.text.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn fuzz_html_extractor_never_panics_and_is_bounded() {
+        fuzz_html_cases(mutator::case_count(2_000));
+    }
+
+    /// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+    /// drives the case count up.
+    #[test]
+    #[ignore]
+    fn fuzz_html_long_cases() {
+        fuzz_html_cases(mutator::case_count(50_000));
+    }
 }

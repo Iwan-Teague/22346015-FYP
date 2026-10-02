@@ -110,6 +110,14 @@ pub(crate) fn render_profile(p: &Profile) -> serde_json::Value {
     if p.parallel_tool_calls_false_ok() {
         o.insert("parallel_tool_calls_false_ok".into(), true.into());
     }
+    // P-53: the two fields only when not their defaults, so a profile
+    // written before P-53 renders exactly as it did.
+    if p.parallel_tool_calls() {
+        o.insert("parallel_tool_calls".into(), true.into());
+    }
+    if p.tool_docs() == harness_model::profile::ToolDocs::Terse {
+        o.insert("tool_docs".into(), "terse".into());
+    }
     if p.stream_include_usage_ok() {
         o.insert("stream_include_usage_ok".into(), true.into());
     }
@@ -233,7 +241,11 @@ pub(crate) fn profile_init(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         );
         return exit::FAILED;
     }
-    let profile = Profile::conservative_default(&model);
+    // P-53: a profile for a local small model asks for terse tool docs
+    // (one sentence per tool, argument names kept), so the declarations
+    // stay short; parallel calls stay off (the default).
+    let profile = Profile::conservative_default(&model)
+        .with_tool_docs(harness_model::profile::ToolDocs::Terse);
     let doc = render_profile(&profile);
     // Fail closed on a render drift: the file must parse back to the same
     // content, or nothing is written.

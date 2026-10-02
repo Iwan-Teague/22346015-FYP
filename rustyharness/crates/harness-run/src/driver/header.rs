@@ -179,7 +179,7 @@ impl ExecHeader {
 /// without one reads as before. `mode` and `turn_limits` (P-05 §1.4) are
 /// the session's: absent in a batch run's header, so such a journal reads
 /// as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 16] = [
+pub(crate) const HEADER_INPUT_KEYS: [&str; 17] = [
     "task",
     "grants",
     "workspace_public",
@@ -188,6 +188,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 16] = [
     "policy",
     "checks",
     "builtin_manifest",
+    "tool_docs",
     "shell_enabled",
     "protected",
     "context_format",
@@ -220,6 +221,14 @@ pub(crate) fn limits_fields(l: &MeterLimits) -> [(&'static str, u64); 6] {
 /// every OS.
 pub(crate) fn builtin_manifest_sha256() -> Digest {
     sha256(builtin::builtin_manifest_json().as_bytes())
+}
+
+/// The SHA-256 of the compiled-in terse tool-doc table (P-53): recorded in
+/// the header when a run's profile asks for terse docs, so a journal from
+/// a build whose table differs is refused by name, exactly like the
+/// `builtin_manifest` digest.
+pub(crate) fn terse_table_sha256() -> Digest {
+    sha256(builtin::terse_table_text().as_bytes())
 }
 
 pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> {
@@ -341,6 +350,12 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
                 "measured"
             }),
         );
+    // P-53: which terse table this build renders the tool declarations
+    // with, when the profile asks for terse docs; no key for a full-docs
+    // profile, so every older journal reads as before.
+    if h.profile.tool_docs() == harness_model::profile::ToolDocs::Terse {
+        hd = hd.field("tool_docs", Trusted::Digest(terse_table_sha256()));
+    }
     if let Some(e) = &h.exec {
         hd = hd
             .field(

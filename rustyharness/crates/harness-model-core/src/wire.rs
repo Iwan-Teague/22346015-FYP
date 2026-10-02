@@ -347,6 +347,12 @@ pub fn render_request(req: &ModelRequest, profile: &Profile) -> Result<Value, Re
         if profile.parallel_tool_calls_false_ok() {
             body.insert("parallel_tool_calls".into(), Value::Bool(false));
         }
+        // P-53: an opt-in says so on the wire, the mirror of
+        // `parallel_tool_calls_false_ok`; a server that ignores it meets the
+        // loop's own drop of surplus calls.
+        if profile.parallel_tool_calls() {
+            body.insert("parallel_tool_calls".into(), Value::Bool(true));
+        }
     }
     Ok(Value::Object(body))
 }

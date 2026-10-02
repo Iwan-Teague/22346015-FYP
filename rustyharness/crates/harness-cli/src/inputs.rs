@@ -322,6 +322,25 @@ pub(crate) fn task_text(bytes: &[u8]) -> Result<String, String> {
     let t: TaskFile = serde_json::from_value(v).map_err(|e| format!("task file: {e}"))?;
     Ok(t.task)
 }
+
+/// The explicit budgets a task file sets (P-49): `(steps, wall_secs)`,
+/// each as the file spelled it or absent.
+pub(crate) type Budget = (Option<u32>, Option<u64>);
+
+/// The task file's explicit budgets (P-49): `(steps, wall_secs)` when its
+/// `budget` section sets at least one of the two, `None` when it does not
+/// (a section that sets only `exec_secs`, or none at all). A schedule must
+/// carry an explicit budget: the §2.4 defaults exist for a person's run,
+/// not for one that fires on a timer with nobody watching.
+pub(crate) fn task_budget(bytes: &[u8]) -> Result<Option<Budget>, String> {
+    let v = harness_core::strict_json::parse(bytes)
+        .map_err(|e| format!("task file is not strict JSON: {e}"))?;
+    let t: TaskFile = serde_json::from_value(v).map_err(|e| format!("task file: {e}"))?;
+    match t.budget {
+        Some(b) if b.steps.is_some() || b.wall_secs.is_some() => Ok(Some((b.steps, b.wall_secs))),
+        _ => Ok(None),
+    }
+}
 /// The policy a run uses when no `--policy` is given: the empty library
 /// default (OD-2) with the CLI's sensitive-path default denies overlaid
 /// (P-12), unless `--no-default-denies` turns the overlay off. One

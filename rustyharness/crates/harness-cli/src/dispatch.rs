@@ -60,6 +60,7 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
         ["profile", "init", rest @ ..] => profile_init(cx, rest),
         ["sessions", rest @ ..] => sessions(cx, rest),
         ["gc", rest @ ..] => gc(cx, rest),
+        ["schedule", rest @ ..] => crate::cmd_schedule::schedule(cx, rest),
         ["chat", rest @ ..] => crate::cmd_chat::chat(cx, rest),
         _ => {
             note!(cx, "{USAGE}");

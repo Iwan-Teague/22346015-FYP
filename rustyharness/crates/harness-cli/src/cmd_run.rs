@@ -38,7 +38,28 @@ pub(crate) fn run_or_resume(
     verb: Verb,
     cfg: &Option<crate::config::UserConfig>,
 ) -> Outcome {
-    match try_run(cx, o, verb, cfg) {
+    run_with(cx, o, verb, cfg, false)
+}
+
+/// `schedule run-now` (P-49) runs the same pipeline, but always
+/// unattended: every ask is a deny even at a real terminal, because the
+/// run it previews is one a timer would start with nobody watching (§5.3).
+pub(crate) fn run_or_resume_unattended(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    cfg: &Option<crate::config::UserConfig>,
+) -> Outcome {
+    run_with(cx, o, Verb::Run, cfg, true)
+}
+
+fn run_with(
+    cx: &Cx<'_>,
+    o: &BTreeMap<&str, &str>,
+    verb: Verb,
+    cfg: &Option<crate::config::UserConfig>,
+    force_unattended: bool,
+) -> Outcome {
+    match try_run(cx, o, verb, cfg, force_unattended) {
         Ok(x) | Err(x) => x,
     }
 }
@@ -48,6 +69,7 @@ fn try_run(
     o: &BTreeMap<&str, &str>,
     verb: Verb,
     cfg: &Option<crate::config::UserConfig>,
+    force_unattended: bool,
 ) -> Result<Outcome, Outcome> {
     // `--output stream-json` (P-15): the only output mode. A usage error
     // here stops before anything runs.
@@ -126,7 +148,9 @@ fn try_run(
         ));
     }
     // Who answers an ask (§5.3): with nobody, every ask is a deny (§5.2),
-    // so an unattended run edits only where its policy allows edits.
+    // so an unattended run edits only where its policy allows edits. A
+    // `schedule run-now` (P-49) forces nobody: the run it previews is one
+    // a timer would start, which can never ask.
     let terminal;
     // A config `approver: "none"` says nobody is at the terminal (P-07):
     // every ask is a deny, even at a real terminal. `--approver` does not
@@ -135,19 +159,23 @@ fn try_run(
         Some(c) => c.approver == crate::config::ApproverSetting::Terminal,
         None => true,
     };
-    let approver: Option<&dyn Approver> = match cx.approver {
-        ApproverSource::None => None,
-        ApproverSource::Given(a) => Some(a),
-        ApproverSource::StdinIfTerminal if wants_terminal => {
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() {
-                terminal = TerminalApprover::new(cx);
-                Some(&terminal)
-            } else {
-                None
+    let approver: Option<&dyn Approver> = if force_unattended {
+        None
+    } else {
+        match cx.approver {
+            ApproverSource::None => None,
+            ApproverSource::Given(a) => Some(a),
+            ApproverSource::StdinIfTerminal if wants_terminal => {
+                use std::io::IsTerminal;
+                if std::io::stdin().is_terminal() {
+                    terminal = TerminalApprover::new(cx);
+                    Some(&terminal)
+                } else {
+                    None
+                }
             }
+            ApproverSource::StdinIfTerminal => None,
         }
-        ApproverSource::StdinIfTerminal => None,
     };
     let report = match run_id {
         None => harness_run::run(Run {

@@ -405,3 +405,20 @@ fn doctor_exit_code_follows_fail() {
     assert_eq!(bad.code, 1);
     assert!(stdout(&bad).contains("FAIL state-root"));
 }
+
+/// Windows (S-W1): with no state root given, doctor says plainly that
+/// Windows has no default and no volume query yet — a WARN (the known
+/// shape of this host), never a FAIL, and never a created directory. The
+/// profile check still FAILs on Windows (no config dir until its spike),
+/// so only the state-root line is asserted here.
+#[cfg(target_os = "windows")]
+#[test]
+fn doctor_warns_that_windows_has_no_state_root_yet() {
+    let _env = ENV_LOCK.lock().unwrap();
+    clear_homes();
+    let o = cli(&["doctor"]);
+    let out = stdout(&o);
+    assert!(out.contains("WARN state-root"), "stdout: {out}");
+    assert!(out.contains("sessions stay off"), "stdout: {out}");
+    assert!(!out.contains("FAIL state-root"), "stdout: {out}");
+}

@@ -629,3 +629,582 @@ Odysseus (PewDiePie's self-hosted AI workspace) offers web search/fetch/deep res
 - Crates: harness-cli (usage text and its test), docs.
 - Tests: `every_dispatch_verb_has_usage_text`, `help_for_each_verb_exits_zero`, `usage_mentions_every_flag_of_chat_and_run`, `readme_quickstart_commands_exist_as_verbs`.
 - Deps: P-23, P-26, P-28, P-31. Parallel: yes. Risk: low. ARCH: no.
+
+**P-59 Minibench: profile files, both protocols, journal audit, regression gate against a recorded baseline**
+- Why: P-21b's `harness-minibench` only builds `Profile::conservative_default` from `--model`, so it cannot run the text and native protocols or the recorded profiles (`devkit/glm/profiles`, `devkit/local/profiles`), cannot audit what it produced, and has no regression check. Add: `--profile FILE` (a profile JSON, strict-validated, the TSV's `profile_sha` is that profile's `content_sha256`), `--only NAME[,NAME]` filter, `--keep DIR` (copy every run's journal there) and `--audit` (after each run, `audit_batch`/`audit_session` over the produced journal must report no divergence and an anchored chain head; otherwise the row is marked `audit_fail` and the exit code is non-zero), `--baseline FILE` (a recorded TSV; exit non-zero if a task that passed in the baseline now fails, or steps grew by more than 50% and by at least 3, rows with a different harness version are compared but flagged), `--repeat N` (rows are per attempt; a task passes the gate when it passes in a majority). A recorded results directory `docs/bench/` holds `<date>-<model>-<protocol>.tsv` plus a short `README.md` table. The scripted self-test grows: `minibench_audit_flag_passes_on_scripted_run`, `minibench_baseline_regression_detected`.
+- Crates: harness-minibench (+ `harness-testkit` if a helper is needed).
+- Tests: `profile_file_sets_profile_sha_in_row`, `invalid_profile_file_refused`, `only_filter_runs_named_fixtures`, `audit_flag_marks_divergence_as_audit_fail` (a doctored journal copy), `baseline_regression_on_newly_failing_task`, `baseline_step_growth_flagged`, `baseline_other_harness_version_flagged_not_failed`, `repeat_majority_rule`, `keep_dir_receives_every_journal`.
+- Deps: P-21. Parallel: yes. Risk: low. ARCH: no.
+
+---
+
+### P-39 slices (from the approved web airlock design, `docs/slices/P-39-web-airlock.md` section 11)
+
+Owner approved the airlock and the opt-in `net` feature on 2 Oct. Each card below is a pointer: the spec, schemas, named tests and file lists are in the design note's section 11 row of the same name and in the sections that row cites. Implement exactly that row, with every named test.
+
+**P-39a Pure foundations (url, ipclass, robots, b64, http1, fetchproto, content)**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39a, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39b Research policy and manifest (SessionKind, allowlist, hop decisions, web tool manifests)**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39b, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39c Journal: Egress and EgressDone, ImportedResearch, Source::Research**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39c, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39d Streaming confined stdio primitive (shared with P-37) and conformance cases**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39d, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39e Egress dialer (resolve, check, pin, tunnel; feature net, TLS-free)**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39e, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39f Fetcher workspace fetch/ and the TLS-free build proof (needs OD-W1/OD-W2)**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39f, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39g Web provider (hops, redirects, caps, ScriptedWeb/RecordedWeb/LiveWeb, note saving)**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39g, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39h Research session type (header, context, /allow-host rule)**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39h, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39i Quarantine store and verified import**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39i, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39j CLI: research, hosts, import-research, net status/install-fetcher**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39j, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+**P-39k Hostile suite and eval row for web research**
+- Spec: `docs/slices/P-39-web-airlock.md` section 11, row P-39k, plus the sections it cites (read the whole note first: sections 0, 2.1, 4, 5, 7, 9).
+- Tests: all the named tests in that row; hostile classes in section 7.
+- Rules: pure crates stay pure; default build and root Cargo.lock must contain no TLS crate (purity gate); nothing in this slice opens a network connection outside the dialer; every egress is journaled before it happens.
+
+
+---
+
+### Split cards from the P-38 design note
+
+Scheduling note: the roadmap card listed P-33 as a dependency; this design does not touch the context builder
+(no `rh-context` bump, no hint text), so P-33 is not needed. The loop-touching slices (P-38d, P-38e, P-38f) are
+serial with each other and with every other loop slice (hotspot H-B), so they depend on the end of the W5/W6
+driver chain (P-23, P-26, P-27, P-28) as a scheduling dependency, not a technical one.
+
+**P-38a Delegate capability: manifest fragment, policy registration, `plan_child`**
+- Why: the tool exists only as declared, labelled and planned data before any loop code (design note §1, §9, §11). Add `builtin/task_delegate.rs` (read / operational / own / none, content `third_party`, schema `{task: string ≤ 2000}`), insert before the sentinel, re-pin the built-in manifest digest; `DELEGATE_ID`, `ToolKind::Delegate` (needs a workspace), `is_builtin_delegate`, `CHILD_ELIGIBLE`, `Active.delegate`; `SessionRefused::DelegateScope` in `plan_with` and `Session::plan_child` with `SessionRefused::ChildScope`.
+- Crates: harness-manifest, harness-policy.
+- Tests: `delegate_manifest_fragment_has_read_labels`, `builtin_manifest_bytes_unchanged` (new pinned digest), `builtin_registry_lists_delegate_before_submit`, `delegate_denied_without_grant`, `delegate_allowed_by_default_read_rule_when_granted`, `delegate_refused_without_workspace`, `delegate_args_schema_refuses_extra_field_and_long_task`, `delegate_refused_when_child_scope_more_sensitive` (fixture via `plan_with`), `plan_child_refuses_delegate_grant`, `plan_child_refuses_edit_and_exec`, `plan_child_accepts_fs_and_submit`, `user_deny_rule_on_delegate_wins`.
+- Deps: P-02, P-24. Parallel: yes (manifest/policy only; not with another slice that adds a built-in tool). Risk: low-medium (manifest digest drift is intended and pinned). ARCH: no.
+
+**P-38b Budget carve and child spend in the meter**
+- Why: deterministic carving and absorption are pure and are the budget guarantee (note §5). `Carve`, `carve()`, the constants, `ChildSpend::{measured, recorded}`, `Meter::absorb_child`; purity gate confines `ChildSpend::recorded` to harness-run's driver and replay like `Meter::new_resumed`.
+- Crates: harness-core, scripts/ci (purity.sh only).
+- Tests: `carve_halves_remaining_and_caps`, `carve_keeps_one_parent_step`, `carve_refuses_below_step_minimum`, `carve_refuses_below_token_minimum`, `carve_wall_never_refuses`, `carve_is_deterministic`, `absorb_child_charges_steps_tokens_wall_and_cost`, `absorb_child_latches_typed_cause`, `absorb_child_marks_estimated_tokens`, `child_spend_measured_reads_the_child_meter`, purity selftest case `child_spend_recorded_outside_driver_refused`.
+- Deps: none. Parallel: yes (pure crate). Risk: low. ARCH: no.
+
+**P-38c Approval origin label and `LabelledApprover`**
+- Why: an ask inside a helper must reach the parent's approver and say where it comes from (note §8). `Origin`, `ApprovalRequest::with_origin`, origin as the first display line (trusted ids and numbers only), unchanged display without one; `LabelledApprover` in `approve.rs` forwarding kind, deadline and answer.
+- Crates: harness-policy (approval.rs), harness-run (approve.rs only).
+- Tests: `approval_request_origin_line_first`, `approval_request_without_origin_display_unchanged` (golden), `origin_line_contains_only_ids_and_numbers`, `labelled_approver_forwards_kind_answer_and_deadline`, `labelled_approver_no_answer_is_deny`.
+- Deps: P-23 (same files: approval display and approver). Parallel: yes with P-38a/P-38b; not with another slice editing `approval.rs`. Risk: low. ARCH: no.
+
+**P-38d Child run construction: template, brief, child spec, header link**
+- Why: the child must be a normal batch run with a fixed prompt and a verifiable link before the loop calls it (note §2, §3). New `harness-run/src/delegate.rs`: `CHILD_TEMPLATE` and its pinned digest, `child_task_text` (strip invisibles, nonce redrawn until absent, nonce seeded as drawn), `child_spec` (eligible grants ∩ parent, cut to the tool cap, submit), `ChildCtx`, `run_child` (plan_child, create_run, header with `mode: child`, `parent`, `child`, inherited facts, `Loop::drive`, commit); `prepare` refusals (delegate without an fs grant, budget under 4096 tokens); `HEADER_INPUT_KEYS` 18 and `header_mismatch` arms; batch/session audit and resume refuse a child journal at `mode`.
+- Crates: harness-run.
+- Tests: `child_template_digest_pinned`, `child_task_text_delimits_brief_with_nonce`, `child_brief_containing_nonce_gets_new_nonce`, `child_brief_invisibles_stripped`, `child_spec_grants_are_parent_fs_grants_plus_submit`, `child_spec_cut_to_tool_cap_in_priority_order`, `run_child_scripted_submit_returns_note_and_head`, `child_header_records_parent_link_template_and_limits`, `child_inherits_parent_tree_without_walk`, `child_journal_in_its_own_run_dir`, `delegate_without_fs_grant_refused_before_start`, `delegate_with_tiny_profile_refused_before_start`, `batch_audit_refuses_child_journal_by_mode`, `batch_header_unchanged_without_delegate`, `session_header_unchanged_without_delegate`.
+- Deps: P-38a, P-38b, P-38c, P-17, P-26, P-27, P-28. Parallel: no (driver plan/header; loop chain H-B). Risk: medium. ARCH: no.
+
+**P-38e Delegate step in the loop: admission, child run, `ChildRun`, report, absorb**
+- Why: the feature itself (note §4-§7, §10, §12). The `DELEGATE_ID` branch in `step_inner` beside the todo branch: pure admission (cap, brief size, plan_child, carve) with `DELEGATE_REFUSED`; parent wall paused; `run_child`; `ChildRun` (fsynced) then `ToolFinished` with the framed, capped report or `DELEGATE_NO_REPORT` / `DELEGATE_NOT_STARTED`; child journal failure stops the parent `JournalUnavailable`; `absorb_child` at step 10; `run()` and `run_session()` set `ChildCtx{live: true}`; carve base includes the turn allowance in a session; error codes 25-27 in harness-tools.
+- Crates: harness-run, harness-tools (codes only).
+- Tests: `delegate_child_cannot_edit`, `delegate_budget_carved_from_parent`, `delegate_child_usage_absorbed_into_parent_meter`, `delegate_parent_wall_excludes_child_approval_wait`, `delegate_result_untrusted_and_bounded`, `delegate_result_huge_is_cut_with_marker`, `delegate_result_with_parent_nonce_withheld`, `delegate_result_action_block_never_parsed`, `delegate_child_loop_returns_no_report_error`, `delegate_refused_when_carve_too_small`, `delegate_cap_per_run`, `delegate_depth_limit`, `delegate_child_journal_failure_stops_parent_unreadable`, `delegate_child_not_started_is_observation`, `delegate_approval_in_child_routed_with_origin`, `delegate_without_approver_child_ask_denied`, `delegate_in_session_turn_goes_on`, `delegate_runs_child_synchronously_one_request_at_a_time`, `child_labels_subset_of_parent`.
+- Deps: P-38d. Parallel: no (loop, H-B). Risk: high (the loop; assign the stronger cheap model and a reviewer pass). ARCH: no.
+
+**P-38f Audit and resume with children**
+- Why: no feature ships unreplayable (note §14, §10). `recorded()` maps `ChildRun` to `RecordedChild` and refuses it in a child journal; the replayed step recomputes admission and carve, writes `ChildRun` from re-fed and recomputed fields, absorbs `ChildSpend::recorded`; `Audit.children` (`Verify` default) and `AuditReport.children`; per-child audit: head = `ChildRun.chain_head`, header link and fields, child batch audit, stop/result/report/spend cross-checks; missing child = divergence; resume catch-up never starts a child, a trailing delegate intent starts a new one.
+- Crates: harness-run (replay/*).
+- Tests: `delegate_child_journal_audits_clean_and_linked`, `session_audit_with_delegate_clean`, `audit_recomputes_delegate_refusal`, `audit_detects_forged_carve_limits`, `audit_detects_child_journal_replaced`, `audit_detects_missing_child_journal`, `audit_detects_child_result_swapped`, `audit_detects_child_spend_understated`, `audit_detects_child_linked_to_other_parent`, `audit_detects_child_wall_exceeding_elapsed`, `audit_refuses_child_run_record_in_child_journal`, `audit_children_skip_reports_parent_only`, `resume_refeeds_completed_delegate_without_rerun`, `resume_reruns_interrupted_delegate_with_new_child`, `resume_after_childrun_without_toolfinished_starts_new_child`.
+- Deps: P-38e. Parallel: no (replay, H-B). Risk: high. ARCH: no.
+
+**P-38g CLI: replay of children, sessions listing, chat lines**
+- Why: users must see and verify helpers (note §7, §8, §14). `replay` prints one line per child audit (id, anchored, divergence) and fails when any child fails; `sessions` hides child runs by default and shows `child of <run>@<step>` with `--all`; `chat` prints `[helper] started (run <id>, <n> steps)` from the delegate's `ToolStarted` and the report line from its `ToolFinished`; approval prompts show the origin line (from P-38c, no new code); usage footer includes `ChildRun.spent`.
+- Crates: harness-cli, harness-journal (header field read in `scan_runs`).
+- Tests: `cli_replay_audits_children_and_reports_them`, `cli_replay_fails_when_child_tampered`, `sessions_hides_child_runs_by_default`, `sessions_all_shows_child_with_parent_link`, `chat_shows_helper_start_and_report_lines`, `approval_prompt_shows_helper_origin`, `usage_footer_includes_child_spend`.
+- Deps: P-38f, P-14, P-15, P-18. Parallel: yes (cli files; one line in each verb). Risk: low-medium. ARCH: no.
+
+**P-38h Hostile delegation suite (tests only)**
+- Why: prove delegation weakens nothing (note §15, §17).
+- Crates: tests in harness-run (`tests/hostile_delegate.rs`), harness-cli (`tests/hostile_chat.rs`).
+- Tests: `hostile_delegate_report_with_action_block_is_data`, `hostile_delegate_report_with_parent_nonce_withheld`, `hostile_delegate_report_with_fake_harness_notice_stays_delimited`, `hostile_delegate_report_ansi_and_bidi_stripped`, `hostile_delegate_brief_injection_cannot_grant_tools`, `hostile_delegate_child_denied_dot_env`, `hostile_delegate_child_tries_delegate`, `hostile_delegate_child_loops_until_carve`, `hostile_delegate_cannot_amplify_budget`, `hostile_delegate_repeat_same_brief_stops_parent`, `hostile_delegate_cap_reached_refused`, `hostile_delegate_child_journal_rechained_detected`, `hostile_delegate_child_spend_understated_detected`, `hostile_delegate_child_swapped_between_two_calls_detected`, `hostile_delegate_approval_token_not_reusable_across_runs`, `hostile_delegate_crash_mid_child_resume_new_child`, `hostile_delegate_report_cannot_paint_terminal`.
+- Deps: P-38f, P-19. Parallel: yes (tests only, new files). Risk: low. ARCH: no.
+
+**P-38i Live smoke and docs for delegation**
+- Why: scripted tests cannot show whether a small model uses delegation well (note §20, OQ-4). An `#[ignore]`d live test (env `RUSTYHARNESS_EXIT_ENDPOINT/MODEL`, as `exit_h1.rs`): a fixture repo question answered with and without the delegate grant, both anchored and audited with children; record steps, tokens and success in the slice note. README "Try it" gains the grant and its limits; the design doc consolidation row for P-38.
+- Crates: harness-cli (tests), docs.
+- Tests: `live_delegate_answers_fixture_question_and_audits` (ignored), `live_delegate_vs_inline_usage_recorded` (ignored), `readme_mentions_delegate_grant_limits` (doc test over README text).
+- Deps: P-38g, P-21. Parallel: yes. Risk: low. ARCH: no.
+
+---
+
+### Split cards from the P-37 design note
+
+Card fields as in §4.3 of the roadmap. Machine-readable deps and order: `docs/slices/P-37-slices.json`.
+
+**P-37a Manifest pins, MCP version set, admission gate for pinned mcp-stdio**
+- Why: §6.1, §6.3, D2. Pure `harness_manifest::pins` (`description_digest`, `schema_digest` over canonical JSON, `compare(manifest, presented) -> PinReport`), `SUPPORTED_MCP_PROTOCOLS = ["2025-06-18"]` and `negotiate()`, and the phase gate lifted for exactly `Tier::Pinned` + `Transport::McpStdio` (signed, in-process and secret handles still refused).
+- Crates: harness-manifest.
+- Tests: `schema_digest_is_key_order_independent`, `description_digest_is_exact_bytes`, `pin_report_flags_description_drift`, `pin_report_flags_schema_drift`, `pin_report_missing_tool_is_missing`, `pin_report_drops_unlisted_tools_and_counts`, `pin_report_duplicate_presented_name_refused`, `negotiate_picks_highest_common_version`, `negotiate_none_in_common_refused`, `pinned_mcp_stdio_admits`, `mcp_duplicate_namespace_refused`, `signed_tier_still_refused`, `in_process_still_refused`, `secret_handles_still_refused`, existing manifest tests unchanged.
+- Deps: none. Parallel: yes (manifest only). Risk: low-medium (trust root). ARCH: no.
+
+**P-37b Policy planning for MCP capabilities**
+- Why: §5.4, §6.3, §9 step 1. The planner's lookup carries the provider's tier and transport and the whole manifest; mcp-stdio capabilities require `conformed` (INV-6); pinned-tier derived floor `user_confirm`; provider-declared `write`/`execute` plan and ask instead of `OutOfScope`; egress still refused; process-level label lift (max egress/content/sensitivity over the manifest); quarantine re-runs the trifecta.
+- Crates: harness-policy.
+- Tests: `mcp_capability_without_conformed_refused_at_planning`, `pinned_tier_read_capability_asks_by_default`, `pinned_tier_allow_rule_allows_unattended`, `mcp_protected_action_never_allowed_by_rule`, `mcp_write_capability_plans_and_asks`, `mcp_egress_capability_refused_until_proxy`, `process_label_lift_marks_sibling_capability_third_party`, `quarantined_mcp_capability_denied_with_rule_id`, `quarantine_recomputes_trifecta_and_never_widens`, `builtin_decisions_unchanged`.
+- Deps: P-37a, P-08. Parallel: yes (policy only; not with another `plan_with` slice). Risk: medium (trust root). ARCH: no.
+
+**P-37c `harness-mcp` crate: pure wire codec**
+- Why: §3.1-§3.4. New crate (publish=false), `wire.rs`: bounded newline frame reader over `Read`, strict parse, classification (response / server request / notification / violation), deterministic encoders (`initialize`, `initialized`, `tools/list`, `tools/call`, `-32601` reply). Adds `wire.rs` (and the later `render.rs` path) to the purity gate's pure-file scan.
+- Crates: harness-mcp (new), Cargo.lock (H-F), scripts/ci/purity.sh (scan list only, not the pinned hashes).
+- Tests: `codec_refuses_malformed_json_line`, `codec_refuses_duplicate_keys`, `codec_refuses_frame_over_cap_without_buffering_it`, `codec_refuses_non_utf8`, `codec_refuses_trailing_cr`, `codec_refuses_batch_array`, `codec_classifies_request_notification_response`, `codec_refuses_null_or_float_id`, `encode_call_is_deterministic_and_sorted`, `encode_initialize_has_empty_capabilities`.
+- Deps: none. Parallel: yes (new crate; Cargo.lock regenerate). Risk: low. ARCH: no.
+
+**P-37d `harness-mcp-fixture`: the fake MCP server in Rust**
+- Why: §14. New `publish = false` crate, lib `serve(mode, input, output)` + bin `rh-mcp-fixture` (`--mode`), every hostile mode listed in §14, std + `serde_json` only, `#![forbid(unsafe_code)]`.
+- Crates: harness-mcp-fixture (new), Cargo.lock (H-F).
+- Tests: `fixture_ok_mode_answers_initialize_list_call`, `fixture_every_mode_parses`, `fixture_rug_pull_changes_description_after_n_calls`, `fixture_bin_speaks_newline_json` (spawns `CARGO_BIN_EXE_rh-mcp-fixture` with std in its own integration test), `fixture_pins_helper_matches_ok_mode`.
+- Deps: none. Parallel: yes (new crate; Cargo.lock regenerate). Risk: low. ARCH: no.
+
+**P-37e Client state machine and hostile-server suite**
+- Why: §3.2-§3.5, §4. `client.rs` over a `Transport` trait (send line, receive line before a deadline, kill): connect (version must match exactly, `tools` capability required, pagination bounds, duplicate names refused), call, relist, `-32601` to every server request, noise caps, id discipline, absolute deadlines, provider death on any violation. Tested over in-memory pipes with the fixture lib.
+- Crates: harness-mcp.
+- Tests: `client_protocol_version_mismatch_refused`, `client_server_without_tools_capability_refused`, `client_tools_list_pagination_bounded`, `client_duplicate_tool_name_in_list_refused`, `client_slow_loris_hits_absolute_deadline`, `client_timeout_kills_server`, `client_response_with_unknown_id_is_violation`, `client_response_with_string_id_for_int_is_violation`, `client_duplicate_response_is_violation`, `client_result_and_error_both_is_violation`, `client_notification_flood_is_violation`, `client_server_request_sampling_refused_with_32601`, `client_server_requests_roots_elicitation_ping_refused`, `client_server_request_flood_is_violation`, `client_stdout_garbage_before_initialize_is_violation`, `client_huge_frame_is_violation`, `client_eof_mid_response_is_crash`, `client_cancelled_for_outstanding_id_ends_call`.
+- Deps: P-37a, P-37c, P-37d. Parallel: yes with P-37f/g. Risk: medium (protocol edge cases). ARCH: no.
+
+**P-37f Result renderer (pure, audit-recomputable)**
+- Why: §9 step 5, §12. `render.rs`: raw response line + cap → `(status, text, truncated, digest)`; text blocks only, placeholders for others, `isError` and JSON-RPC errors mapped to new `MCP_TOOL_ERROR`/`MCP_RPC_ERROR` codes, `structuredContent` fallback, byte cap.
+- Crates: harness-mcp, harness-tools (two code constants only).
+- Tests: `render_text_blocks_joined`, `render_image_block_placeholder_only`, `render_resource_link_placeholder_sanitised_and_cut`, `render_is_error_maps_to_tool_error`, `render_rpc_error_message_bounded`, `render_structured_content_fallback_canonical`, `render_bounded_marks_truncated`, `render_deterministic_digest`, `render_action_block_is_plain_text`.
+- Deps: P-37c. Parallel: yes. Risk: low. ARCH: no.
+
+**P-37g Journal kinds and `ToolFinished` MCP fields**
+- Why: §11. `McpConnected`, `McpDrift`, `McpStopped` added to the closed kind set with canonical field lists, all fsynced; optional `mcp_request_id`, `mcp_request`, `mcp_list`, `mcp_noise`, `mcp_response` on `ToolFinished`; reader accepts them; old journals read unchanged.
+- Crates: harness-journal.
+- Tests: `mcp_kinds_round_trip_canonical`, `mcp_kinds_are_fsynced`, `tool_finished_mcp_fields_round_trip`, `mcp_response_blob_tamper_detected`, `unknown_kind_still_refused`, `old_journal_still_reads`.
+- Deps: P-10. Parallel: no other slice touching `canon.rs` (H-E). Risk: low-medium. ARCH: no.
+
+**P-37h `McpProvider`, connector seam, in-memory connector**
+- Why: §7.2, §9, §14. `McpProvider: ToolProvider` (pre-call relist, entry-digest comparison, quarantine/refusal, call, render, `McpRecord`), `McpConnector` trait taking `&Conformed`, `testing::InMemoryConnector` (feature `testing`, dev-only; purity rule: no normal edge enables it), optional `ToolResult.mcp: Option<McpRecord>`.
+- Crates: harness-mcp, harness-tools (`provider.rs` field), scripts/ci/purity.sh (feature rule only).
+- Tests: `provider_relist_drift_quarantines_before_call`, `provider_new_unlisted_tool_does_not_quarantine`, `provider_vanished_tool_quarantines`, `provider_timeout_marks_provider_dead`, `provider_result_is_untrusted_tool_source`, `provider_never_sends_mcp_name_it_was_not_admitted_for`, `builtin_results_have_no_mcp_record`, `testing_feature_not_enabled_by_normal_edges` (purity selftest case).
+- Deps: P-37b, P-37e, P-37f. Parallel: yes (no driver). Risk: medium. ARCH: no.
+
+**P-37i Driver wiring: connect, journal, drift, stop**
+- Why: §6.2 header input, §7, §9, §5.3. `harness-run` takes admissions and an `McpConnector`; header input `mcp_providers`; connect after `RunStarted`; `McpConnected`; connect-time quarantine stops `CouldNotRun` before any model call; MCP `ToolFinished` fields; `McpDrift` + `Quarantined` + withdrawal notice; `McpStopped` at every stop path; MCP grants counted against the tool cap. Tests use a macOS witness and the in-memory connector.
+- Crates: harness-run (driver chain, H-B).
+- Tests: `mcp_call_journaled_and_policy_checked`, `mcp_tool_list_pinned_hash_mismatch_quarantines`, `rug_pull_mid_session_quarantines_and_withdraws`, `tool_block_uses_manifest_summary_not_server_description`, `server_instructions_never_reach_context`, `mcp_result_action_block_never_parsed`, `server_stopped_on_every_stop_path`, `mcp_tools_count_against_max_active_tools`, `mcp_grant_refused_on_host_without_backend` (every OS), `no_mcp_header_unchanged`, `mcp_session_server_survives_user_turns`.
+- Deps: P-37g, P-37h, P-09, P-13. Parallel: no (driver chain). Risk: high (the loop). ARCH: no; reviewer pass required.
+
+**P-37j Audit and resume of MCP runs**
+- Why: §12. Audit re-feeds `McpConnected`/`McpDrift`/`McpStopped` and raw frames, recomputes request digests, pin and quarantine decisions and the rendered observation; resume reconnects and compares baselines; a cut MCP call with effect ≥ write refuses the resume.
+- Crates: harness-run (replay, H-B).
+- Tests: `audit_of_mcp_run_is_clean`, `audit_detects_tampered_mcp_response_even_at_last_step`, `audit_detects_edited_mcp_request_args`, `audit_detects_forged_pin_status`, `audit_detects_decreasing_mcp_request_id`, `resume_mcp_run_reconnects_and_refeeds`, `resume_quarantines_when_baseline_changed`, `resume_refuses_cut_mcp_write_call`, `resume_reruns_cut_mcp_read_call_live`, `audit_session_with_mcp_clean`.
+- Deps: P-37i, P-17. Parallel: no (replay chain). Risk: high. ARCH: no; reviewer pass required.
+
+**P-37k Confined duplex spawn (stdin relay) and pin re-review**
+- Why: §16. `rh-stub/2` relay mode in the domain stub (select-based, never blocking in a write, ≤ 1 MiB pending), `Confinement::spawn_duplex` (default refuses), `ConfinedDuplex`; `confine_spawn_sha256` updated in `purity.sh` in the same commit, said loudly in the slice note; exec's `rh-stub/1` path byte-for-byte unchanged in behaviour.
+- Crates: harness-sandbox, scripts/ci/purity.sh (H-G).
+- Tests: `duplex_round_trips_lines`, `duplex_payload_never_on_argv`, `relay_stop_works_when_server_never_reads_stdin`, `duplex_stop_sweeps_domain_confirmed`, `duplex_close_stdin_lets_server_exit`, `stub_v1_exec_behaviour_unchanged` (existing exec and conformance suites), `no_confinement_spawn_duplex_refuses`.
+- Deps: P-36, P-41. Parallel: no (`confine_spawn.rs` and its pin). Risk: high (spawn site). ARCH: no.
+
+**P-37l `ConfinedConnector`, end-to-end confined tests, conformance, INV-31**
+- Why: §5.1, §14. Builds the server's `ConfinedSpec` from the admission record (scratch-only writes, optional read-only workspace, built env, no network), spawns through `spawn_duplex`; e2e tests in `harness-mcp-fixture/tests/` with the real binary and sandbox (macOS; skipped with reason elsewhere); the zero-core-diff test.
+- Crates: harness-mcp, harness-mcp-fixture (tests), adapters/fixture-mcp (data).
+- Tests: `confined_connector_refuses_without_witness`, `spec_for_server_has_no_workspace_write`, `spec_env_only_admission_values`, `mcp_server_runs_confined` (fixture `confinement-probe`: home write, workspace write, network to model port and internet, home canary read all refused), `e2e_ok_mode_run_audits_clean`, `e2e_rug_pull_quarantines`, `e2e_hostile_modes_end_provider_not_run`, `e2e_server_killed_at_run_end`, `fixture_provider_integrates_with_zero_core_diff`.
+- Deps: P-37k, P-37i, P-37j. Parallel: yes after k (no shared hotspot). Risk: medium-high. ARCH: no.
+
+**P-37m `rustyharness provider` and task wiring**
+- Why: §6.2, §6.4. `provider add|repin|list|remove` writing the admission record and manifest copy in the user config dir (TTY confirmation; refuses without one), registry built from built-ins plus admitted providers, admissions and the confined connector passed to `run`/`chat`; approval prompt shows the manifest summary; usage text.
+- Crates: harness-cli.
+- Tests: `provider_add_refuses_drifted_server_and_prints_presented_hashes`, `provider_add_requires_tty_confirmation`, `provider_add_writes_record_0600_outside_workspace`, `provider_repin_shows_old_and_new_description`, `provider_remove_only_its_own_files`, `admission_read_write_workspace_refused`, `approval_shows_manifest_summary_only`, `run_with_mcp_grant_uses_admitted_provider`, `usage_text_lists_provider_verbs`.
+- Deps: P-37l, P-07, P-23. Parallel: small cli hotspot (dispatch line). Risk: medium (trust-base writes). ARCH: no.
+
+---
+
+### Split cards from the P-36 design note
+
+Order: P-36a → P-36b → P-36d → P-36l is the serial sandbox/pin chain. P-36c, P-36e, P-36g, P-36h can run
+beside it. P-36f, P-36i, P-36j, P-36k are the tools and loop chain (P-36j and P-36k touch the driver
+hotspot H-B: never parallel with another loop slice). P-36m and P-36n close.
+
+**P-36a Ports conformance first: `Network::Loopback`, Seatbelt port rules, live port probe**
+- Why: §4.3, §4.4, §12. Measure what SBPL can express before anything uses it. `spec.rs`: `Network::Loopback{bind, connect, lan}`, `Context.reserved_ports`, validation (≥1024, not reserved, lan ⊆ bind, ≤4 binds); `profile.rs`: rules after `(deny network*)` plus the final reserved-port deny, `Network::None` byte-identical; `seatbelt.rs`: `probe_ports` and `PortsWitness`; `conformance.rs`: the `PORTS_CASES` variants, added to the macOS row only if every test passes here (else the slice note records the measurement and ports stay refused). Records whether `localhost` covers `::1` and whether `/private/etc/hosts` must be readable.
+- Crates: harness-sandbox (`spec.rs`, `profile.rs`, `seatbelt.rs`, `conformance.rs`, new `tests/conformance_ports_macos.rs`). Not `confine_spawn.rs`.
+- Tests: `ft_ports_bind_granted_loopback_port_is_allowed`, `ft_ports_bind_ungranted_port_is_refused`, `ft_ports_bind_wildcard_address_is_refused_without_lan`, `ft_ports_bind_wildcard_address_is_allowed_with_lan_grant`, `ft_ports_connect_to_granted_port_is_allowed`, `ft_ports_connect_to_ungranted_loopback_port_is_refused`, `ft_ports_connect_to_model_server_port_is_refused`, `ft_ports_outbound_routable_unix_and_dns_still_refused`, `ft_ports_udp_bind_refused`, `validate_refuses_port_below_1024_and_reserved`, `validate_refuses_lan_not_subset_of_bind`, `render_puts_port_allows_after_network_deny_and_reserved_deny_last`, `network_none_profile_unchanged_byte_for_byte`, `probe_ports_refuses_when_an_ungranted_bind_succeeds` (injected observation), existing conformance suite unchanged.
+- Deps: P-41, P-29. Parallel: no (sandbox chain head; profile/spec are shared with P-36b). Risk: high (security boundary; UNVERIFIED SBPL syntax). ARCH: no.
+
+**P-36b Live confined child: ring buffer, cursors, deadline closer (pin change)**
+- Why: §4.2, §5.3. `ConfinedChild::{try_status, read, totals, stop}`, `Confinement::spawn_live(spec, ev, LiveOpts)`, `Ring` (circular buffer, monotonic total, running SHA-256, 4 KiB tail for the report), the pure window fn of §3.2 (backend-neutral module so the Linux backend reuses it), report stripping on reads after exit, the lifetime closer thread. `wait()` byte-identical for exec.run. The stub text is unchanged. Re-pin `confine_spawn_sha256` per §13.
+- Crates: harness-sandbox (`confine_spawn.rs`, `lib.rs`, new `ring.rs`, new `tests/conformance_bg_macos.rs`), `scripts/ci/purity.sh`.
+- Tests: `ring_cursor_arithmetic_next_and_tail`, `ring_drop_counts_overwritten_bytes`, `ring_stream_sha_covers_every_byte`, `read_strips_trailing_stub_report_after_exit`, `wait_api_unchanged_for_exec_run`, `ft_bg_long_lived_child_is_swept_on_stop`, `ft_bg_setsid_descendant_is_swept_on_stop`, `ft_bg_parent_sigkill_sweeps_the_domain` (re-execs the test binary), `ft_bg_lifetime_closer_stops_child_while_parent_blocks`, `ft_bg_output_flood_keeps_memory_bounded`, `ft_bg_fork_bomb_stopped_by_watchdog_other_children_unaffected`, `bg_soak_ten_minutes` (`#[ignore]`), purity + purity-selftest pass with the new pin.
+- Deps: P-36a. Parallel: no (pinned spawn file, H-G). Risk: high. ARCH: no.
+
+**P-36c `rh-fileop/1` codec (pure)**
+- Why: §7.3. Request/response framing and error codes as a pure module, so the helper slice only adds the stub and the process. No I/O, no spawn.
+- Crates: harness-sandbox (new `fileop/proto.rs`).
+- Tests: `fileop_frame_round_trip_every_op`, `fileop_frame_refuses_oversize_item`, `fileop_frame_refuses_bad_count_and_non_decimal_length`, `fileop_response_error_codes_round_trip`, `fileop_path_must_be_workspace_relative_without_dot_components`, `fileop_codec_is_deterministic`.
+- Deps: none. Parallel: yes (new file; not a pin slice). Risk: low. ARCH: no.
+
+**P-36d Confined file-op helper: fork-less stub, profile, process (pin change + new pin)**
+- Why: §7.1-7.3, owner decision 7. `fileop_stub.rs` (`FILEOP_STUB`, start canary, ops of §7.3 with core `Digest::SHA`, `O_NOFOLLOW`, link+unlink move, directory fsync), `Stub::{Domain, FileOp}` select in `confine_spawn.rs`, `profile::render_fileop` (no fork, exec perl only, workspace rw or ro), `harness_sandbox::fileop::FileOpHelper` (start, request with deadline, restart), `FILEOP_CASES` in the macOS row when green. New pin `fileop_stub_sha256` and re-pin of `confine_spawn_sha256` per §13, with the two new selftest cases.
+- Crates: harness-sandbox (`fileop_stub.rs`, `fileop/mod.rs`, `confine_spawn.rs`, `profile.rs`, `conformance.rs`, new `tests/conformance_fileop_macos.rs`), `scripts/ci/purity.sh`, `scripts/ci/purity-selftest.sh`.
+- Tests: `fileop_helper_reads_and_writes_inside_workspace`, `fileop_symlink_to_outside_is_refused_by_the_kernel`, `fileop_symlink_swap_race_never_reaches_outside` (2000 iterations against a confined swapper), `fileop_fifo_is_refused_fast`, `fileop_protected_path_write_refused`, `fileop_helper_cannot_fork`, `fileop_hard_link_from_outside_refused`, `fileop_replace_refuses_changed_expect_sha`, `fileop_move_never_overwrites`, `fileop_readonly_profile_refuses_every_write`, `fileop_request_timeout_kills_and_restarts_helper`, `fileop_stub_refuses_to_start_unconfined`, purity selftest `fileop stub changed without re-pin`, `a fork added to the fileop stub`.
+- Deps: P-36b, P-36c. Parallel: no (pinned files, H-G). Risk: high. ARCH: no.
+
+**P-36e `FileOps` trait: built-in file tools behind one seam (no behaviour change)**
+- Why: §7.4. Move every filesystem access of read/search/glob/list/outline/edit (replace, write, multi, and patch/delete/move from P-25) and `workspace_tree` behind `trait FileOps` with an `InProcess` impl holding today's code; results, digests and errors byte-identical.
+- Crates: harness-tools.
+- Tests: all existing `cargo test -p harness-tools` unchanged, `file_ops_in_process_results_byte_identical` (golden over a fixture tree: every tool's output digest before = after), `tool_modules_touch_fs_only_through_file_ops` (source scan test: no `std::fs` outside `file_ops/in_process.rs` and the scratch setup).
+- Deps: P-22, P-25. Parallel: yes with the sandbox chain (different crate); not with other harness-tools edit slices. Risk: medium (large mechanical move). ARCH: no.
+
+**P-36f Route file tools through the helper in runs that execute**
+- Why: §7.4-7.5, INV-42. `Confined(FileOpHelper)` impl of `FileOps`; `workspace_tree` via the `tree` op; planning starts the helper after the witness for any execute-class grant (refuses the run if it cannot start); header `file_ops`; bounded restarts then `SandboxLost`; the helper's `tree` digest must equal the in-process one. Records the measured cost in the slice note.
+- Crates: harness-tools (`file_ops/confined.rs`), harness-run (planning, header, stop on helper loss).
+- Tests: `run_with_exec_grant_uses_confined_file_ops`, `run_without_exec_grant_stays_in_process`, `header_records_file_ops_mode_and_stub_digest`, `old_header_digest_unchanged_without_file_ops`, `helper_tree_digest_equals_in_process_digest`, `helper_start_failure_refuses_the_run`, `helper_lost_three_times_stops_sandbox_lost`, `hanging_file_op_ends_in_tool_timeout_within_wall`, `edit_through_helper_audits_clean`.
+- Deps: P-36d, P-36e, P-13. Parallel: no with other driver slices (planning/header). Risk: medium-high. ARCH: no.
+
+**P-36g Bg tools in manifest and policy; port and LAN grants**
+- Why: §3, §6.1, §6.3, §9. Manifest fragments and policy registration for `harness.exec.start/read/stop` with defaults (`ask.exec.default`, `allow.exec.bg-read`, `allow.exec.bg-stop`), the LAN floor rule `ask.exec.lan-bind` (protected_action), the trifecta E label from `lan_ports`, task-file `exec.ports`/`exec.lan_ports` parse and checks, CLI `--allow-port`, `--allow-lan-port`, `--bg-persist`, model port derived from the endpoint, `reserved_ports` in the library API.
+- Crates: harness-manifest, harness-policy, harness-cli (`inputs.rs`, `args.rs`).
+- Tests: `builtin_manifest_lists_bg_tools`, `policy_default_start_asks_read_and_stop_allow`, `lan_port_start_asks_every_time_protected_action`, `lan_ports_label_egress_for_trifecta`, `lan_ports_allowed_with_public_workspace_and_ask`, `session_grant_never_covers_lan_start`, `port_grant_refuses_model_server_port`, `port_grant_refuses_below_1024_and_duplicates`, `port_grant_library_requires_reserved_ports_with_loopback_endpoint`, `task_file_ports_parse_and_header_digest`, `old_task_file_digest_unchanged`, `bg_grant_without_exec_setup_refused`.
+- Deps: P-02, P-08, P-11, P-23. Parallel: yes (manifest/policy/cli; no sandbox, no driver). Risk: medium (trust root). ARCH: no.
+
+**P-36h Journal: `BgStopped`, `OrphanCheck`, the `bg` record**
+- Why: §10. Two new kinds in `canon.rs`/`event.rs` (fsynced), canonical bodies; `bg_fields`/`parse_bg` beside `exec_fields`/`parse_exec`; `connect` in the exec record only when non-empty; header `bg`/`ports`/`file_ops` objects absent when unused.
+- Crates: harness-journal, harness-run (`driver/tools.rs` record fns only).
+- Tests: `bg_stopped_and_orphan_check_kinds_round_trip_canonical`, `unknown_kind_still_refused`, `tool_finished_bg_record_round_trip_every_op`, `exec_record_connect_absent_when_empty_digest_unchanged`, `old_journal_still_reads`.
+- Deps: P-10. Parallel: yes (journal + one record module). Risk: low-medium. ARCH: no.
+
+**P-36i `BgTools` provider: start, read, stop**
+- Why: §3, §6.2. `harness-tools::bg`: `BgManager` (ids, live map, port holdings, host port check, limits, cursors per stream, `ready` wait, rendering with dropped/skipped markers, `poll()`), the `BgTools` `ToolProvider` serving the three ids through `spawn_live`; exec.run gets `connect` = ports of live ids; refuses unless `file_ops` is the helper.
+- Crates: harness-tools (new `bg.rs`, `exec.rs` connect field), harness-sandbox (use only).
+- Tests: `bg_start_returns_sequential_ids`, `bg_start_refuses_program_not_on_allowlist`, `bg_start_refuses_ungranted_or_held_port`, `bg_start_refuses_over_max_live_and_max_starts`, `bg_start_refuses_when_port_busy_on_host`, `bg_read_next_and_tail_modes_cursor_arithmetic`, `bg_read_reports_dropped_after_ring_overrun`, `bg_read_wait_returns_on_new_output_or_exit`, `bg_read_without_id_lists_all`, `bg_stop_sweeps_and_returns_final_output`, `bg_read_of_unknown_or_stopped_id_refused`, `bg_ready_port_waits_for_listener`, `exec_run_gets_connect_ports_of_live_bg`, `bg_requires_confined_file_ops`.
+- Deps: P-36b, P-36f, P-36g, P-36h. Parallel: no with other harness-tools exec slices. Risk: medium-high. ARCH: no.
+
+**P-36j Driver: kill at every stop, step-boundary poll, planning checks**
+- Why: §5.1, §5.2, §9, INV-40/41. Wire `BgTools` into the run and session loops: poll at each step start and before each start decision (journal `BgStopped{exited|lifetime}`), stop-all before `TurnEnded` (turn scope), `InputEnded`, `RunStopped` for every cause, `SandboxLost` cascade, `Drop` backstop on early return, planning refusals (witness sets, port probe, helper, scope), tree measured after the stop-all.
+- Crates: harness-run (driver, session; H-B chain).
+- Tests: `bg_process_killed_on_run_end`, `bg_process_killed_on_stop_by_budget`, `bg_turn_scoped_killed_at_turn_end`, `bg_session_scoped_survives_turn_and_dies_at_session_end`, `bg_session_scope_refused_without_persist_flag`, `bg_exit_observed_and_journaled_at_step_boundary`, `bg_lifetime_expiry_journaled`, `bg_unconfirmed_stop_stops_run_sandbox_lost_after_stopping_others`, `bg_killed_when_run_returns_early_on_journal_failure`, `bg_refused_when_witness_lacks_bg_or_ports_cases`, `bind_to_model_server_port_refused`, `bind_ungranted_port_refused`, `lan_bind_requires_separate_grant`.
+- Deps: P-36i, P-13. Parallel: no (driver hotspot H-B). Risk: high. ARCH: no.
+
+**P-36k Audit and resume of runs with background processes**
+- Why: §11, INV-40. Audit re-feeds bg results and `BgStopped`/`OrphanCheck`, recomputes ids, refusals, liveness, cursor arithmetic, `connect`, and the stop-before-end rule; resume runs the orphan check, journals `BgStopped` for ids the kept records leave live, and keeps the mid-turn tree rule.
+- Crates: harness-run (`replay/audit.rs`, `replay/resume.rs`, `replay/feed.rs`).
+- Tests: `bg_output_cursor_replayable`, `session_with_bg_audits_clean`, `audit_detects_edited_bg_cursor`, `audit_detects_missing_bg_stop_before_run_stopped`, `audit_recomputes_bg_refusals`, `audit_detects_read_reporting_running_after_stop`, `audit_detects_decreasing_stream_total`, `resume_after_crash_with_live_bg_records_stop_and_continues_at_boundary`, `resume_mid_turn_refused_when_bg_changed_tree`.
+- Deps: P-36j, P-17. Parallel: no (replay chain). Risk: high. ARCH: no.
+
+**P-36l Orphan markers, lease, next-start check (pin change)**
+- Why: §5.4. Markers in `runs/<run>/bg/`; the stub's `lease` frame line with an inherited shared `flock` (re-pin `confine_spawn_sha256` per §13); the lease probe (confined perl by default, std `try_lock` if Q-P36-6 says bump); the next-start scan for `run`/`chat`/`resume`; `OrphanCheck` record; `RunRefused::OrphansSuspected`; `doctor --orphans` report and user-confirmed clear. No pid kill unless Q-P36-3 is answered yes.
+- Crates: harness-sandbox (`confine_spawn.rs` stub lease, `seatbelt.rs` lease probe), harness-run (marker write/close, start scan), harness-cli (`cmd_doctor.rs`), `scripts/ci/purity.sh`.
+- Tests: `orphan_marker_written_and_closed_on_confirmed_stop`, `lease_inherited_by_setsid_descendant`, `next_start_clear_markers_recorded`, `next_start_with_held_lease_refuses_bg_grant`, `next_start_with_busy_recorded_port_refuses_port_grant`, `orphan_check_journaled_in_new_run`, `task_without_bg_runs_with_orphan_warning`, `doctor_reports_and_clears_orphan_markers_only_on_confirmation`, purity + selftest pass with the new pin.
+- Deps: P-36j, P-36d, P-43. Parallel: no (pinned spawn file, H-G). Risk: high. ARCH: no.
+
+**P-36m Chat surface for background processes**
+- Why: §6.3, Q-P36-2. Banner lists granted ports (loopback/LAN) and `--bg-persist`; prompt shows the running count; `/bg` lists and `/bg stop N` stops through the session API (a user-initiated stop is not a tool call: it is a `BgStopped{reason: "user"}` record, written between turns and re-fed by the audit as an input); LAN ask text in plain words; bg output shown sanitised (P-04).
+- Crates: harness-cli (`repl.rs`, `render.rs`, `cmd_chat.rs`), harness-run (one `BgStopped` reason and its audit re-feed).
+- Tests: `chat_banner_lists_granted_ports`, `chat_prompt_shows_running_bg_count`, `chat_slash_bg_lists_and_stops`, `chat_user_bg_stop_journaled_and_audited`, `chat_lan_ask_prompt_says_reachable_from_network`, `chat_bg_output_has_no_raw_escapes`.
+- Deps: P-36j, P-36k, P-18. Parallel: yes with P-36l (cli vs sandbox; `cmd_doctor.rs` is P-36l's only cli file). Risk: low-medium. ARCH: no.
+
+**P-36n Hostile suite for background processes and the helper (tests only)**
+- Why: §14. The adversarial table end to end through `run`/`run_session` with a scripted model and a mock model server; every test asserts outcome, journal kinds and `assert_audit_clean` where the run commits.
+- Crates: tests in harness-run (`tests/hostile_bg.rs`), harness-sandbox (re-exec helper for the SIGKILL case).
+- Tests: `hostile_bg_fork_bomb_contained`, `hostile_bg_setsid_escape_swept`, `hostile_bg_member_kills_stub_stops_run_and_marks_orphan`, `hostile_bg_port_squat_ungranted_refused`, `hostile_bg_binds_wildcard_without_lan_refused`, `hostile_bg_connects_model_server_refused`, `hostile_bg_output_flood_bounded`, `hostile_bg_zombie_after_harness_sigkill_none_survive`, `hostile_bg_symlink_swap_vs_edit_never_escapes`, `hostile_bg_edits_read_file_forces_stale_read`, `hostile_bg_writes_dot_git_refused`, `hostile_bg_forged_stub_report_in_output_ignored`, `hostile_bg_nonce_in_output_withheld`, `hostile_bg_lifetime_while_model_blocks`.
+- Deps: P-36k, P-36l. Parallel: yes (tests only, new files). Risk: low. ARCH: no.
+
+---
+
+### Split cards from the P-39 design note
+
+Card fields are as in roadmap §4.3. All are wave 9, after this note is approved. Each one can be merged
+alone with the gates green. The web code stays unreachable by users until P-39k. The default build
+gains no TLS dependency until P-39n, the explicit `net` slice, and even after P-39n the default
+feature set has none.
+
+**P-39a Pure egress rules: URL parser, exact allowlist, address classes, redirect resolution**
+- Why: §4.1, §4.2. Every later slice decides with these pure functions, and so does the audit.
+  `harness-policy/src/web.rs`:
+  - `parse_url(&str) -> Result<WebUrl, UrlRefused>`: strict; ASCII/`xn--` hosts; no userinfo;
+    IP-literal shorthands refused; fragment dropped; ≤ 4096 bytes.
+  - `Allowlist::load(&[String])`: exact `host`, `host:port`, `http://host[:port]`; `*`, wildcards,
+    leading or trailing dots, single-label names, `localhost`, `.local`, `.internal`, `.localhost`,
+    `.arpa` and non-global IP literals refused; ≤ 64 entries.
+  - `classify(core::net::IpAddr) -> AddrClass`: the §4.2 table; IPv4-mapped and NAT64 classified by
+    the embedded IPv4; 2002::/16 refused.
+  - `classify_answer(&[IpAddr]) -> Result<IpAddr, AnswerRefused>`: any non-global address refuses;
+    empty refuses; otherwise the first.
+  - `resolve_location(&WebUrl, &str)`: RFC 3986 subset, re-parsed; https→http refused.
+
+  Uses `core::net` only. Confirm the purity grep does not match it.
+- Crates: harness-policy.
+- Tests: `url_parser_refuses_userinfo_controls_and_shorthand_ipv4`, `url_fragment_dropped_and_target_verbatim`, `allowlist_refuses_star_and_wildcards`, `allowlist_refuses_localhost_single_label_and_private_literals`, `allowlist_matches_exact_scheme_host_port`, `classify_refuses_every_private_range` (table over every row of §4.2), `ipv4_mapped_and_nat64_classified_by_embedded_v4`, `mixed_answer_refused_and_empty_answer_refused`, `redirect_location_resolved_and_rechecked`, `https_to_http_downgrade_refused`, `port_outside_allowlist_refused`; `sh scripts/ci/purity.sh` passes.
+- Deps: P-08. Parallel: yes (a new file plus one `mod` line in harness-policy). Risk: medium (security table; review the table against IANA special-purpose registries). ARCH: no.
+
+**P-39b Research manifest and the research session kind in policy (no prompt per fetch)**
+- Why: §2.1–§2.3, INV-42, INV-53.
+  - harness-manifest: fragments `builtin/web_fetch.rs` and `builtin/web_search.rs`, labelled read /
+    operational / own / internet / third_party / `none`, with schemas `{url ≤4096, start?≥1,
+    lines? 1..400}` and `{query ≤256, max_results? 1..10}`. `research_manifest_json()` = head + web
+    fetch + web search + task todo + task submit + tail (the todo and submit fragments reused byte for
+    byte); `research_manifest()`.
+  - harness-policy: `SessionKind {Coding, Research(WebGrant{allowlist, search: bool, confirmed})}` on
+    `SessionSpec` (`Coding` is the default, so existing callers are unchanged). Plan rules (§2.2 item
+    3): a research session has no workspace, no personal data, builtin-tier caps only, and a
+    confirmation present; egress is planned only for the two web ids in `Research`; a user ask rule on
+    a web id gives `OutOfScope`. A `decide` web branch before step 2: `Allow`
+    `allow.web.session-allowlist` / `allow.web.search-endpoint`, or `Deny` `deny.web.*`; **never
+    `Ask`**. Registration entries in `builtin.rs`.
+- Crates: harness-manifest, harness-policy.
+- Tests: `coding_manifest_bytes_unchanged` (the existing pin, untouched), `research_manifest_bytes_pinned`, `coding_registry_has_no_web_capability`, `web_session_refused_with_workspace_grant` (the research manifest plus a workspace gives the `Trifecta` refusal naming workspace/workspace/web), `research_session_refuses_fs_edit_exec_grants`, `research_session_with_personal_capability_refused_by_trifecta` (a test-only lookup through `plan_with`), `research_session_without_confirmation_refused`, `web_decisions_never_ask` (property over URL samples × approver present/absent), `ask_rule_on_web_capability_refuses_session`, `fetch_to_unlisted_host_denied_with_rule_id`, `search_query_bounds_enforced`, `egress_still_out_of_scope_in_coding_sessions`, `policy_default_table_unchanged`.
+- Deps: P-39a, P-02. Parallel: yes with P-39c/d/e (no shared files). Risk: medium-high (trust root; the "floor met at session start" rule must be reviewed against INV-25). ARCH: no.
+
+**P-39c Journal: `Egress` body, `NoteSaved` and `NoteImported` kinds, `Source::Web`**
+- Why: §4.5, §6, §7.
+  - `canon.rs`: the canonical field list for `Egress` (already a reserved name and already fsynced);
+    two new kinds `NoteSaved` (`bytes, note, sources, turn`) and `NoteImported` (`bytes, confirm,
+    note, path, sha256`), both fsynced, added to `KINDS` and `needs_fsync`. Hotspot H-E: done once
+    here.
+  - harness-core: `Source::Web(String)` (the URL), with canonical form `{"kind":"web","url":…}`
+    escaped like other untrusted text.
+  - `layout.rs`: `research_notes_dir(state_root)`.
+- Crates: harness-journal, harness-core.
+- Tests: `egress_body_round_trips_canonical`, `egress_body_with_extra_key_refused`, `egress_is_fsynced`, `note_kinds_round_trip_and_fsynced`, `unknown_kind_still_refused`, `source_web_escaped_in_journal`, `old_journal_still_reads`.
+- Deps: P-10. Parallel: not with any other slice that edits `canon.rs` (P-37/P-38 if they add kinds); otherwise yes. Risk: low-medium. ARCH: no.
+
+**P-39d `harness-fetch`: the HTTP-only fetcher crate and binary, and the frame codec**
+- Why: §5.1, §5.2, INV-46, INV-48.
+  - harness-core `fetch_frame.rs` (pure): the `rh-fetch/1` codec. Strict JSON header (≤ 16 KiB, via
+    `strict_json`); `body_len` must equal the remaining bytes.
+  - New workspace member `crates/harness-fetch` (lib plus bin `rustyharness-fetch`; dependencies
+    harness-core and serde_json only):
+    - `read_request` (strict);
+    - `fetch_over<S: Read+Write>` (CONNECT with the token, then its own bounded HTTP/1.1 client:
+      Content-Length, chunked, read-to-close, 1xx skip, identity only, smuggling shapes refused,
+      redirects reported and never followed);
+    - `main` (read `argv[1]`, connect to `127.0.0.1:proxy_port`, run `fetch_over`, write the frame,
+      exit 0).
+
+    No `net` feature yet: https requests return `error: tls_unavailable`.
+  - Purity gate: an allowlist for harness-fetch's default tree.
+- Crates: harness-fetch (new), harness-core, scripts/ci/purity.sh (plus Cargo.lock, H-F).
+- Tests: `parses_content_length_body`, `parses_chunked_body_bounded`, `chunk_size_line_over_16_hex_refused`, `gzip_content_encoding_refused`, `content_length_and_chunked_together_refused`, `oversize_headers_refused`, `body_over_cap_truncated_and_marked`, `redirect_not_followed_location_reported`, `connect_token_sent_first`, `https_without_net_is_tls_unavailable`, `frame_round_trips`, `frame_with_short_or_long_body_refused`, `frame_duplicate_key_refused`, `garbage_response_is_typed_error_not_panic` (malformed corpus ≥ 20 cases); the purity gate passes with the new allowlist; the INV-24 TLS denylist still passes.
+- Deps: none. Parallel: yes (new crate; Cargo.lock regenerated by `cargo update -w`). Risk: medium (a parser of hostile bytes; bounded, no unsafe). ARCH: no.
+
+**P-39e Seatbelt `Network::Proxy{port}` and the airlock conformance cases**
+- Why: §5.3, INV-44, INV-46.
+  - `spec.rs`: `Network::Proxy { port: u16 }` (the unused `allowlist_id` goes away); `validate`
+    accepts it with port ≠ 0, Seatbelt only.
+  - `profile.rs`: `(allow network-outbound (remote ip "localhost:<port>"))` after `(deny network*)`.
+    The **first step** is to confirm the SBPL spelling on this host. If none passes, keep refusing
+    `Proxy` and report.
+  - `conformance.rs`: cases FT-13p, FT-15p, FT-19, FT-20 and `AIRLOCK_CASES`, in
+    `tests/conformance_macos.rs`.
+  - Does **not** touch `confine_spawn.rs` or `capture.rs`: no purity pin moves.
+- Crates: harness-sandbox.
+- Tests: `proxy_profile_allows_only_the_granted_loopback_port` (render golden), `proxy_profile_keeps_deny_network_before_the_allow`, `proxy_port_zero_refused`, `proxy_refused_on_backends_without_support`; macOS conformance `ft13_proxy_direct_connect_refused`, `ft15_proxy_no_resolver`, `ft19_other_loopback_port_refused` (a planted listener stands in for the model server), `ft20_proxy_no_listen`, `granted_port_connects` (positive control), `ft17_ft18_hold_under_proxy_profile`.
+- Deps: P-41. Parallel: not with P-36 (both edit `profile.rs` network rules); yes with the rest. Risk: high (sandbox profile; UNVERIFIED SBPL). ARCH: no.
+
+**P-39f Harness-side pump, resolver and connectors (`harness-sandbox::egress`)**
+- Why: §3 steps 1–4 and 6, §4.3, INV-43, INV-44, INV-48, INV-52.
+  - `egress.rs`:
+    - `Resolver` trait (`SystemResolver`: `ToSocketAddrs` on a helper thread with a 5 s deadline);
+    - `Connector` trait (`DirectConnector`: `TcpStream::connect_timeout`, `#[cfg(feature = "net")]`
+      only; `LoopbackConnector` for the search endpoint and user proxy, refuses any non-loopback
+      address);
+    - `EgressLog` trait (`append(&EgressRecord) -> Result<(), EgressLogError>`);
+    - `open_hop(...)`: resolve, `classify_answer` (P-39a), **append `Egress` first** (Err → refuse,
+      no connect), bind `127.0.0.1:0`, run the pump thread (exactly one connection; first line must
+      be `CONNECT <expected host:port>` with the token, else 403 and close; then connect, `200`, relay
+      with byte caps and deadline); return `HopIo{resolved, chosen, bytes_up, bytes_down, elapsed,
+      ended}`.
+  - Feature `net` on harness-sandbox (no new crates).
+  - `gates.sh` gains clippy and tests with `-p harness-sandbox --features net`.
+  - Test-only `RemapConnector` behind a dev-only feature, which the purity gate refuses on normal
+    edges (the fault-injection pattern).
+- Crates: harness-sandbox (+ dev-dep harness-fetch), scripts/ci/gates.sh, scripts/ci/purity.sh.
+- Tests: `pump_journals_before_connect`, `egress_append_failure_refuses_hop` (the fixture sees zero connections), `egress_to_private_ip_refused_after_dns`, `mixed_dns_answer_refused`, `dns_rebinding_fixture_second_answer_never_used` (resolver call count 1), `dns_timeout_refuses_hop`, `wrong_token_refused`, `second_connect_refused`, `connect_target_mismatch_refused`, `pump_caps_bytes_and_time`, `loopback_connector_refuses_non_loopback`, `default_build_refuses_direct_mode` (without `net`), `remap_connector_not_on_a_normal_edge` (purity selftest plant).
+- Deps: P-39a, P-39c, P-39d. Parallel: yes with P-39e (different files in harness-sandbox: `egress.rs` vs `spec.rs`/`profile.rs`; `lib.rs` gets one `mod` line, merge carefully). Risk: high (network code in the trust base). ARCH: no.
+
+**P-39g `WebTools`: `harness.web.fetch` through the confined fetcher**
+- Why: §3, §4.4, INV-45, INV-46, INV-47, INV-48.
+  - `harness-tools/src/web.rs`, the `WebTools` provider (namespace `harness`, `serves` the
+    `harness.web.*` verbs). Per hop:
+    - write `req.json` to `<scratch>/web/<step>-<hop>/`;
+    - `open_hop` (P-39f), using the `EgressLog` from `InvokeCtx.egress` (a new optional field in
+      `provider.rs`; `None` means web calls are refused);
+    - spawn the fetcher via `Confinement::spawn` with the §5.3 spec, using `HopRunner`
+      (`ConfinedHopRunner` | test-only `InProcessHopRunner`);
+    - `parse_frame`.
+
+    Then the redirect chain (P-39a re-checks, ≤ 5); the content verdict (types `text/html`,
+    `application/xhtml+xml`, `text/plain`, `text/markdown`, `application/json`; charsets utf-8,
+    us-ascii, iso-8859-1, windows-1252; NUL sniff in the first 8 KiB); P-44 `to_text` or
+    `sanitize_for_terminal_bounded`; the session cache keyed by final URL (a later window is served
+    with no egress); budgets.
+  - The result: an output observation `Untrusted(Source::Web)` with a header line (URL, status, type,
+    size, digest, line window), `hops[]` (measured and derived fields), body and text blobs.
+  - Fetcher pin: path and SHA-256 are checked at provider construction.
+- Crates: harness-tools.
+- Tests: `fetch_html_extracted_untrusted_web_source`, `fetched_text_marked_untrusted`, `redirect_to_private_ip_refused_per_hop`, `redirect_to_unlisted_host_refused`, `too_many_redirects_refused`, `content_type_pdf_refused`, `declared_html_binary_body_refused`, `missing_content_type_refused`, `latin1_decoded_unknown_charset_refused`, `giant_response_truncated_marked`, `second_window_served_from_cache_without_egress`, `fetch_budget_exhausted_refused`, `terminal_escapes_in_page_inert`, `fetch_refused_without_egress_log`, `fetch_refused_without_conformed`, `fetcher_digest_mismatch_refused`, `fetcher_runs_confined_end_to_end` (macOS, skipped elsewhere with a reason).
+- Deps: P-39b, P-39c, P-39e, P-39f, P-44. Parallel: yes (new file; `provider.rs` gets one field). Risk: medium-high. ARCH: no.
+
+**P-39h `harness.web.search` via the user's loopback SearXNG**
+- Why: §8, INV-47.
+  - The search endpoint config type (loopback rule reused from `harness-model-core/src/endpoint.rs`).
+  - Search through `open_hop` in `search-endpoint` mode (`LoopbackConnector`, no resolution) and the
+    fetcher: `GET /search?q=…&format=json&pageno=1&safesearch=1`, body ≤ 512 KiB.
+  - Parse in-process: `serde_json::Value`; only `results[].{url,title,content}`; URLs through
+    `parse_url`, invalid ones dropped and counted; cuts at 120 and 300 characters; sanitised; each
+    marked `[fetchable]` or `[not on allowlist]`.
+  - Search budget. The raw JSON is a blob only.
+- Crates: harness-tools, harness-model-core (expose the loopback check as a pure fn if it is not
+  already public).
+- Tests: `search_results_bounded_sanitised_and_marked_fetchable`, `search_raw_json_never_in_output`, `search_endpoint_must_be_loopback`, `search_query_journaled_in_egress`, `search_budget_exhausted_refused`, `searxng_garbage_json_typed_error`, `javascript_url_result_dropped_and_counted`.
+- Deps: P-39g. Parallel: yes. Risk: medium. ARCH: no.
+
+**P-39i Research sessions without a workspace in `harness-run` (skeleton, no web yet)**
+- Why: §2.1, §2.4, INV-42.
+  - `TaskSpec.kind: SessionKind` (`Coding` is the default; nothing else changes).
+  - `prepare` and `plan` (`driver/plan.rs:69`, `:253`) take the workspace as optional internally:
+    `Prepared.read_tools`, `edit_tools`, `tree` and `facts` become `Option`; with no workspace there
+    is no tree walk, the research facts block is used, and `SessionSpec.workspace = None` with
+    `kind: Research`.
+  - The research registry; header keys `session_kind` and `web` added to `HEADER_INPUT_KEYS` (absent
+    for coding).
+  - `rh-research/1`: the system template and facts (`harness-model-core/src/context.rs`).
+  - `run_research(ResearchRun)` reuses the session loop (P-13); P-05 D4's turn-start re-measure and
+    the resume tree check are skipped when there is no workspace.
+  - A research session here can be granted only todo and submit. The web capabilities are refused
+    until P-39j wires them.
+- Crates: harness-run, harness-model-core.
+- Tests: `research_session_has_no_workspace_grant`, `research_session_runs_two_turns_and_audits_clean` (scripted model, todo only), `research_header_records_kind_allowlist_and_confirmation`, `coding_header_digest_unchanged`, `batch_and_session_context_digests_unchanged`, `research_context_format_is_rh_research_1`, `research_refused_without_conformed` (the airlock cases are required even before web is wired: fail-closed), `resume_of_research_session_skips_tree_check`.
+- Deps: P-39b, P-39e, P-13, P-17. Parallel: no with driver/context-chain slices (P-22, P-23, P-26, P-27, P-28, P-30, P-33, P-38). Risk: high (driver hotspot H-B; mechanical `Option` threading; reviewer pass required). ARCH: no.
+
+**P-39j Wire the web tools into research sessions, and the offline audit**
+- Why: §3, §9, INV-43, INV-51.
+  - `EgressLog` over the run's `JournalWriter` (`Egress` appended and fsynced through the writer; a
+    poisoned writer refuses).
+  - `WebTools` built in research sessions with the confinement witness, the fetcher pin, the allowlist
+    and the budgets.
+  - `ToolFinished` hop bodies.
+  - Audit (`replay/feed.rs`, `replay/audit.rs`): `Recorded` gains web inputs (`resolved` lists, frames
+    from blobs, byte counts, elapsed, `ended`). `RecordedResolver` and `RecordedHopRunner` re-feed
+    them. Decisions, redirects, verdicts, extraction, observations, cache hits, budgets and `Egress`
+    records are recomputed and compared.
+  - Resume carries the egress counts.
+- Crates: harness-run, harness-tools (the `Recorded*` seam types).
+- Tests: `egress_event_precedes_forward` (sequence order in a real journal), `research_scripted_fetch_journals_egress_before_tool_finished`, `research_replay_audits_clean_offline`, `tampered_body_blob_diverges`, `tampered_dns_answer_diverges`, `audit_never_opens_a_socket` (panicking resolver and confinement), `poisoned_writer_refuses_fetch` (fault-injected `JournalFile`: zero fixture connections), `resume_refetches_interrupted_hop_and_counts_both`.
+- Deps: P-39g, P-39h, P-39i. Parallel: no (driver/replay chain). Risk: high. ARCH: no.
+
+**P-39k CLI: research sessions, the `web` config section, start-of-session confirmation**
+- Why: §2.1, §2.3, §5.5, INV-53.
+  - `chat --research --allow-host H…` and research task files (`session`, `web`; refused
+    combinations exit 2 or 4).
+  - User config `web` section: `mode`, `fetcher{path,sha256}`, `search_endpoint`, `user_proxy`,
+    `user_proxy_ack`, `budgets`. It is read only from the config dir.
+  - Before the first model call: print the allowlist, mode, budgets, search endpoint and fetcher
+    digest, and require a typed `yes` on a TTY. Non-TTY needs `--allow-unattended-web`, else exit 4.
+  - The banner discloses web mode. `/status` shows budgets used.
+  - `doctor` (P-43) checks the fetcher pin and the airlock witness coverage.
+- Crates: harness-cli.
+- Tests: `chat_research_requires_typed_confirmation`, `chat_research_with_workspace_flag_refused`, `research_task_with_exec_or_workspace_keys_refused`, `unattended_research_needs_flag`, `config_web_section_strict`, `direct_mode_refused_without_net_build`, `banner_discloses_web_mode_and_hosts`, `chat_research_session_audits_clean` (mock model, in-process hop runner), `doctor_reports_fetcher_pin_and_airlock_cases`.
+- Deps: P-39j, P-18, P-07, P-43. Parallel: yes (cli only). Risk: medium. ARCH: no.
+
+**P-39l Quarantined notes: build, store, `NoteSaved`, `notes list|show|verify|rebuild`**
+- Why: §6, INV-49.
+  - Note builder from journal records (deterministic; harness-run `research/note.rs`).
+  - Saved at each research turn that ends `answered` or `submitted`, and by `/save-note`.
+  - `NoteSaved` first, then the files (0700/0600, atomic, immutable).
+  - Audit recomputes the `NoteSaved` id.
+  - CLI verb `notes` (`cmd_notes.rs`): `list`, `show` (sanitised), `verify [--anchor]`, `rebuild --run`.
+- Crates: harness-run, harness-cli.
+- Tests: `note_saved_content_addressed_and_immutable`, `note_labels_untrusted_web`, `note_verify_detects_tamper` (edited `note.json`; a source digest not in the journal; edited journal → chain error), `note_saved_audit_recomputes_id`, `note_missing_file_listed_and_rebuilt`, `notes_show_sanitises_terminal_escapes`, `note_written_only_under_state_root_research`, `research_notes_never_reach_policy` (a note holding policy, task and config JSON; the config/inputs/plan modules never name the notes dir; policy digest unchanged).
+- Deps: P-39k, P-14. Parallel: yes with P-39m's CLI part only after this merges (P-39m needs the store). Risk: medium. ARCH: no.
+
+**P-39m `/import-research` and `notes export`: the human-only airlock**
+- Why: §7, INV-50.
+  - `UserInput` gains `Input::Import(ImportRequest{note, dest, confirmed})` (`harness-run/src/session.rs`).
+  - At a turn boundary the loop verifies the note, checks the destination (`workspace_path`, not
+    protected (P-29), must not exist), journals `NoteImported` (bytes as a blob), creates the file
+    with the edit engine's atomic create, and records its digest in the loop's own tree, so it is not
+    an external change.
+  - REPL `/import-research <id|path> [dest]`: full sanitised preview, then the typed 8-character id
+    prefix; any other answer or EOF cancels.
+  - `notes export <id> --out FILE`: TTY only, same dialogue, refuses `state_root` and config paths.
+  - Audit re-feeds `NoteImported`.
+- Crates: harness-run, harness-cli, harness-tools (expose the create path if it is private).
+- Tests: `import_requires_user_confirmation`, `import_wrong_prefix_cancels`, `import_refused_without_tty`, `model_cannot_trigger_import`, `imported_file_read_is_untrusted_workspace_source`, `import_refuses_existing_or_protected_destination`, `import_refuses_note_outside_store_or_unverified`, `import_not_flagged_as_external_change`, `session_with_import_audits_clean`, `export_refuses_state_root_and_config_paths`, `pasting_note_answer_as_message_refused_with_hint`.
+- Deps: P-39l, P-18, P-29. Parallel: no with other `session.rs` slices (P-23, P-26, P-28). Risk: medium-high (it is the declassifier). ARCH: no.
+
+**P-39n `net` feature: rustls in the fetcher, direct egress in the build, licence and purity review**
+- Why: §5.4, INV-52. **Needs owner question OQ-1 answered before merge.**
+  - `harness-fetch/net`: optional `rustls` (no default features; `std`, `tls12`, `ring`; ring
+    provider installed explicitly) and `webpki-roots`; `fetch_over_tls` (SNI = host, ALPN
+    `http/1.1`, frame `tls{version,suite,cert_sha256}`).
+  - Feature forwarding `harness-cli/net` → `harness-tools/net` → `harness-sandbox/net`. harness-cli
+    never depends on harness-fetch.
+  - `deny.toml`: the licence additions measured with `cargo deny list`, each crate listed with a
+    reason under `[bans]`.
+  - `purity.sh`: the `harness-fetch --features net` allowlist (the exact reviewed set); `harness-cli
+    --all-features` TLS denylist; a selftest plant.
+  - `gates.sh`: a `harness-fetch --features net` clippy and test step.
+  - README "Try it": the build line.
+- Crates: harness-fetch, harness-cli (feature line only), deny.toml, scripts/ci/{purity.sh,purity-selftest.sh,gates.sh} (plus Cargo.lock, H-F).
+- Tests: `tls_handshake_against_fixture_with_test_root` (a committed static test CA and leaf PEM; a rustls server under dev-deps), `wrong_host_cert_refused`, `expired_cert_refused`, `sni_is_the_allowlisted_host`, `cli_never_links_tls` (purity), `default_features_have_no_tls_crate` (purity; INV-24 check unchanged), `net_tree_equals_reviewed_set` (purity), `tls_handshake_inside_proxy_sandbox` (macOS positive control).
+- Deps: P-39d, P-39f, P-39k. Parallel: yes (fetcher crate plus scripts). Risk: high (supply chain; C in ring). ARCH: no (decided here; owner sign-off is OQ-1).
+
+**P-39o User-proxy mode: the default build's web path, IP checks delegated and disclosed**
+- Why: §5.5, decision #2 option A, owner question OQ-4.
+  - `mode: user-proxy`: the pump target is the configured loopback proxy (`LoopbackConnector`). The
+    fetcher sends an absolute-form `GET https://host/target` (no CONNECT, no TLS in the fetcher).
+  - `Egress.ip = "delegated"`. The allowlist, budgets and response handling are unchanged.
+  - Config requires `user_proxy_ack: "ip-checks-delegated"`. Banner and header disclose it.
+  - Doc recipe `docs/web-user-proxy.md`, naming one proxy that accepts absolute-form https
+    (UNVERIFIED per proxy).
+- Crates: harness-tools, harness-fetch, harness-cli.
+- Tests: `user_proxy_mode_requires_ack`, `user_proxy_must_be_loopback`, `user_proxy_egress_journals_delegated_ip`, `allowlist_still_enforced_in_user_proxy_mode`, `user_proxy_absolute_form_request_shape`, `user_proxy_session_audits_clean`.
+- Deps: P-39k. Parallel: yes with P-39l/m/n. Risk: medium. ARCH: no.
+
+**P-39p Adversarial airlock suite (tests only)**
+- Why: §11. Proves that the airlock holds under hostile pages, DNS, fetchers and users, end to end
+  through the session loop and the REPL, and that the whole hostile session audits offline.
+- Crates: tests in harness-run (`tests/hostile_web.rs`), harness-cli (`tests/hostile_research.rs`), harness-testkit (fixture server, fake resolver).
+- Tests: `hostile_web_prompt_injection_in_page`, `hostile_web_forged_nonce_in_page`, `hostile_web_redirect_to_metadata_ip`, `hostile_web_redirect_to_private_via_dns`, `hostile_web_dns_rebinding`, `hostile_web_mixed_answer`, `hostile_web_ipv4_mapped_v6`, `hostile_web_giant_response`, `hostile_web_endless_chunked`, `hostile_web_slowloris`, `hostile_web_header_flood`, `hostile_web_gzip_bomb`, `hostile_web_zip_as_html`, `hostile_web_content_type_games`, `hostile_web_smuggling_shapes`, `hostile_web_terminal_escapes`, `hostile_web_search_snippet_injection`, `hostile_web_note_poisoning`, `hostile_web_import_without_typing`, `hostile_web_fetcher_lies`, `hostile_web_audit_offline`.
+- Deps: P-39h, P-39m, P-03, P-19. Parallel: yes (tests only, separate files). Risk: low. ARCH: no.
+
+Order and lanes:
+- **Lane A** (pure, then policy): P-39a → P-39b.
+- **Lane B:** P-39c.
+- **Lane C:** P-39d.
+- **Lane D:** P-39e.
+- Then P-39f (after a, c, d), then P-39g (after b, e, f), then P-39h, then P-39i (after b and e; it can
+  run alongside f/g/h, but it is in the driver chain), then P-39j, then P-39k.
+- Then P-39l → P-39m, alongside P-39n (owner-gated) and P-39o.
+- P-39p last.
+
+The machine-readable copy is `docs/slices/P-39-slices.json`.

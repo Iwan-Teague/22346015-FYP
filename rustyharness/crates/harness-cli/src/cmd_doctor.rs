@@ -160,6 +160,14 @@ fn sandbox(cx: &Cx<'_>) -> bool {
 /// (created owner-only when missing, exactly as the run verbs do, P-07).
 /// An explicit state root is never created, so a missing one is reported:
 /// FAIL with the command that fixes it.
+///
+/// Windows (S-W1): there is no default home yet (`config::home_dir` is
+/// `None` until its spike lands) and no volume query, so no state root
+/// can be confirmed local and no session can start. That is the host's
+/// known shape, not a broken installation: WARN, saying what is missing.
+/// An explicitly given root still goes through [`check_state_root`], whose
+/// locality check refuses it (the Windows probe is unmeasured) — a FAIL,
+/// because a root the run verbs will refuse must not be presented as fine.
 fn state_root(
     cx: &Cx<'_>,
     o: &std::collections::BTreeMap<&str, &str>,
@@ -179,6 +187,13 @@ fn state_root(
     };
     match root {
         Some(root) => check_state_root(cx, &root),
+        None if cfg!(windows) => check_line(
+            cx,
+            Status::Warn,
+            "state-root",
+            "no state root given and Windows has no default or volume query yet, so sessions \
+             stay off (spike S-W2); fix: none yet",
+        ),
         None => check_line(
             cx,
             Status::Fail,

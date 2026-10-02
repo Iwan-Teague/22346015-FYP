@@ -241,6 +241,12 @@ pub(crate) fn section(
 /// refused when the search reaches it (a relative entry would resolve
 /// against a working directory this run does not control); a broken or
 /// escaping symlink is refused with it.
+///
+/// Windows (S-W1): a directory entry for a program is usually `name.exe`,
+/// so each directory is searched for the name as given first, then the
+/// `.exe` form (PATHEXT's first entry; the other script extensions are
+/// deliberately not searched — a `.bat` is not a program this harness
+/// pins). Off Windows only the name as given is tried.
 pub(crate) fn look_up(name: &str, path_var: &OsStr) -> Result<PathBuf, String> {
     for dir in std::env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
@@ -252,29 +258,41 @@ pub(crate) fn look_up(name: &str, path_var: &OsStr) -> Result<PathBuf, String> {
                  absolute directories only"
             ));
         }
-        let candidate = dir.join(name);
-        let Ok(_) = std::fs::symlink_metadata(&candidate) else {
-            continue;
-        };
-        let real = std::fs::canonicalize(&candidate).map_err(|e| {
-            format!("--allow-exec: {name}: {candidate:?} does not resolve to a file: {e}")
-        })?;
-        if real.to_str().is_none() {
-            return Err(format!(
-                "--allow-exec: {name}: the resolved path is not UTF-8"
-            ));
+        for candidate in candidate_names(&dir, name) {
+            let Ok(_) = std::fs::symlink_metadata(&candidate) else {
+                continue;
+            };
+            let real = std::fs::canonicalize(&candidate).map_err(|e| {
+                format!("--allow-exec: {name}: {candidate:?} does not resolve to a file: {e}")
+            })?;
+            if real.to_str().is_none() {
+                return Err(format!(
+                    "--allow-exec: {name}: the resolved path is not UTF-8"
+                ));
+            }
+            if !std::fs::metadata(&real)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "--allow-exec: {name}: {real:?} is not a regular file"
+                ));
+            }
+            return Ok(real);
         }
-        if !std::fs::metadata(&real)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            return Err(format!(
-                "--allow-exec: {name}: {real:?} is not a regular file"
-            ));
-        }
-        return Ok(real);
     }
     Err(format!("--allow-exec: no {name} on PATH"))
+}
+
+/// The spellings of `name` tried in one PATH directory: the name exactly
+/// as given (a pinned path must mean what was written), plus on Windows
+/// the `.exe` form, which is how `cargo` sits on disk there.
+fn candidate_names(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut v = vec![dir.join(name)];
+    if cfg!(windows) {
+        v.push(dir.join(format!("{name}.exe")));
+    }
+    v
 }
 
 /// The read-only root a preset derives from its anchor's resolved path: the
@@ -477,6 +495,65 @@ mod tests {
         assert_eq!(with_shell.programs[1].name, "sh");
         assert!(with_shell.programs[1].path.is_absolute());
         assert!(with_shell.shell_enabled());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn look_up_tries_the_name_as_spelled() {
+        // Off Windows there is no implicit suffix: `mytool.sh` on disk is
+        // found only by asking for `mytool.sh` (S-W1 pins this so the
+        // Windows `.exe` search stays the one platform exception).
+        let d = tmp("as-spelled");
+        script(&d, "mytool.sh");
+        let path = path_var(std::slice::from_ref(&d));
+        assert!(look_up("mytool", &path)
+            .unwrap_err()
+            .contains("no mytool on PATH"));
+        let found = look_up("mytool.sh", &path).unwrap();
+        assert_eq!(found, script(&d, "mytool.sh"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rh-p11-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        d
+    }
+
+    fn path_var(dirs: &[PathBuf]) -> OsString {
+        std::env::join_paths(dirs.iter().map(|d| d.join("bin"))).unwrap()
+    }
+
+    // S-W1: `cargo` resolves to `cargo.exe` on Windows, by the bare name,
+    // so the preset anchors are findable there; the name as spelled is
+    // still tried first.
+    #[test]
+    fn look_up_finds_the_exe_form() {
+        let d = tmp("exe");
+        let exe = d.join("bin").join("mytool.exe");
+        std::fs::write(&exe, b"").unwrap();
+        let path = path_var(std::slice::from_ref(&d));
+        let found = look_up("mytool", &path).unwrap();
+        assert_eq!(found, std::fs::canonicalize(&exe).unwrap());
+        // The bare spelling wins when both forms sit in the directory.
+        let bare = d.join("bin").join("mytool");
+        std::fs::write(&bare, b"").unwrap();
+        assert_eq!(
+            look_up("mytool", &path).unwrap(),
+            std::fs::canonicalize(&bare).unwrap()
+        );
+        // Nothing by that name (in either form) is still "not on PATH".
+        assert!(look_up("absent-tool", &path)
+            .unwrap_err()
+            .contains("no absent-tool on PATH"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

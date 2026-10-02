@@ -21,7 +21,10 @@
 //!   process of the sandbox instance when a call ends
 //!   (`confine_spawn`). Linux: [`linux::Linux`] reads the host's
 //!   confinement facts and refuses (the mechanism is owner decision D29).
-//!   Windows: unavailable (spike S-W1).
+//!   Windows: [`windows::Windows`], the S-W1 stub — it measures nothing
+//!   (Win32 needs `unsafe`, forbidden workspace-wide) and refuses, so
+//!   read/edit sessions are all Windows gets until its conformance suite
+//!   passes there.
 //!
 //! **Host probes**, here because they measure the host: filesystem
 //! locality ([`locality`], §2.8) and the environment sample
@@ -49,6 +52,7 @@ pub mod profile;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 pub mod spec;
+pub mod windows;
 
 use conformance::{Case, MatrixRow};
 pub use spec::{
@@ -482,7 +486,12 @@ fn platform_probe() -> Result<Conformed, Unavailable> {
     seatbelt::Seatbelt::new().probe()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn platform_probe() -> Result<Conformed, Unavailable> {
+    windows::Windows.probe()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_probe() -> Result<Conformed, Unavailable> {
     linux::Linux.probe()
 }
@@ -515,7 +524,11 @@ impl Confinement for SystemConfinement {
         {
             seatbelt::Seatbelt::new().spawn(spec, ev)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            windows::Windows.spawn(spec, ev)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             linux::Linux.spawn(spec, ev)
         }

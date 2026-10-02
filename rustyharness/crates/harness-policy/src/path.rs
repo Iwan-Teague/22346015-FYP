@@ -270,4 +270,150 @@ mod tests {
         let p = workspace_path("a/b/c").unwrap();
         assert_eq!(p.components().collect::<Vec<_>>(), ["a", "b", "c"]);
     }
+
+    // S-W1: the spellings Windows itself would rewrite (drive letters,
+    // verbatim prefixes, separators, stripped dots and spaces) are refused
+    // lexically, so a path argument means the same bytes on every host
+    // (nothing is normalised away silently). Pure: runs on every OS.
+    #[test]
+    fn windows_path_normalisation_cases() {
+        for (bad, why) in [
+            // Drive letters and NTFS streams are `:`.
+            ("C:/Users/x", PathRefused::Colon),
+            ("c:/users/x", PathRefused::Colon),
+            ("C:x", PathRefused::Colon),
+            ("report.md:ads", PathRefused::Colon),
+            // Windows separators.
+            ("src\\lib.rs", PathRefused::Backslash),
+            // The verbatim prefix, in both separator spellings.
+            ("\\\\?\\C:\\x", PathRefused::Backslash),
+            ("//?/C:/x", PathRefused::Absolute),
+            ("\\\\.\\NUL", PathRefused::Backslash),
+            // Win32 strips trailing dots and spaces, so `a.` would open `a`.
+            ("a.", PathRefused::TrailingDotOrSpace),
+            ("a. ", PathRefused::TrailingDotOrSpace),
+            ("a /b", PathRefused::TrailingDotOrSpace),
+            // `.` and `..` components, doubled separators.
+            ("./a", PathRefused::CurrentDir),
+            ("a/../b", PathRefused::Parent),
+            ("a//b", PathRefused::EmptyComponent),
+            ("a/", PathRefused::EmptyComponent),
+            // Control characters (Win32 forbids these in names too).
+            ("a\u{1}b", PathRefused::Control),
+        ] {
+            assert_eq!(workspace_path(bad), Err(why), "{bad:?}");
+        }
+        // The one normalisation the rule DOES do: `.` is the root, stored
+        // as the empty relative path.
+        assert_eq!(workspace_path(".").unwrap().as_str(), "");
+        // Case: ordinary names keep their exact case (the matcher stays
+        // case-sensitive so a replay means the same file everywhere);
+        // device names are the one ASCII-case-insensitive check.
+        assert_eq!(workspace_path("SRC/Lib.rs").unwrap().as_str(), "SRC/Lib.rs");
+    }
+
+    // S-W1: UNC shapes — `\\server\share`, the `\\?\` and `\??\` verbatim
+    // forms, and their forward-slash spellings — never reach a tool. The
+    // lexical rule refuses the `\` and `:` spellings, and the locality
+    // classifier (`is_unc_shape`, the same predicate the Windows system
+    // probe reports) refuses the `Path`-level forms a host path could
+    // still arrive as.
+    #[test]
+    fn unc_and_device_paths_refused() {
+        for bad in [
+            ("\\\\server\\share\\x", PathRefused::Backslash),
+            ("//server/share/x", PathRefused::Absolute),
+            ("\\\\?\\UNC\\server\\share", PathRefused::Backslash),
+            ("//?/UNC/server/share", PathRefused::Absolute),
+            ("\\\\.\\NUL", PathRefused::Backslash),
+        ] {
+            let (bad, why) = bad;
+            assert_eq!(workspace_path(bad), Err(why), "{bad:?}");
+            assert!(crate::locality::is_unc_shape(bad), "{bad:?}");
+        }
+        // The verbatim DISK spelling (`\\?\C:\…`) is not UNC — it goes to
+        // the volume query, which refuses for lack of a Windows probe —
+        // and the NT `\??\` form is verbatim too; both are refused
+        // lexically here for their backslashes/colons.
+        assert!(!crate::locality::is_unc_shape("\\\\?\\C:\\x"));
+        assert!(!crate::locality::is_unc_shape("\\??\\C:\\x"));
+        for bad in ["\\\\?\\C:\\x", "\\??\\C:\\x"] {
+            assert_eq!(workspace_path(bad), Err(PathRefused::Backslash), "{bad:?}");
+        }
+        // A device name hides behind a directory or an extension; the
+        // stem (text before the first `.`, trailing spaces dropped) is
+        // what Win32 maps.
+        for bad in ["x/COM1", "x/NUL.txt", "x/conin$.log", "x/LPT\u{b2}"] {
+            assert_eq!(workspace_path(bad), Err(PathRefused::DeviceName), "{bad:?}");
+        }
+    }
+
+    // S-W1: the reserved set, exhaustively over the DEVICE_NAMES list
+    // shape: every device, upper/lower case, with and without an
+    // extension, in the root and nested, including the superscript-digit
+    // spellings (COM¹-LPT³).
+    #[test]
+    fn reserved_names_refused() {
+        let stems = [
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "CONIN$",
+            "CONOUT$",
+            "COM0",
+            "COM1",
+            "COM2",
+            "COM3",
+            "COM4",
+            "COM5",
+            "COM6",
+            "COM7",
+            "COM8",
+            "COM9",
+            "COM\u{b9}",
+            "COM\u{b2}",
+            "COM\u{b3}",
+            "LPT0",
+            "LPT1",
+            "LPT2",
+            "LPT3",
+            "LPT4",
+            "LPT5",
+            "LPT6",
+            "LPT7",
+            "LPT8",
+            "LPT9",
+            "LPT\u{b9}",
+            "LPT\u{b2}",
+            "LPT\u{b3}",
+        ];
+        for stem in stems {
+            let lower = stem.to_ascii_lowercase();
+            for name in [stem.to_owned(), lower, format!("{stem}.txt")] {
+                assert_eq!(
+                    workspace_path(&name),
+                    Err(PathRefused::DeviceName),
+                    "{name:?}"
+                );
+                assert_eq!(
+                    workspace_path(&format!("d/{name}")),
+                    Err(PathRefused::DeviceName),
+                    "d/{name}"
+                );
+            }
+        }
+        // Non-device lookalikes stay ordinary names.
+        for ok in [
+            "conn",
+            "com1x",
+            "com10",
+            "lpt10",
+            "null",
+            "auxiliary",
+            "conin",
+        ] {
+            assert!(workspace_path(ok).is_ok(), "{ok:?}");
+        }
+    }
 }

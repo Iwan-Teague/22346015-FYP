@@ -148,7 +148,7 @@ fn usable_model_name(s: &str) -> bool {
 }
 
 /// Write `bytes` so only the owner can read them (0600 on unix).
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let mut f =
         std::fs::File::create(path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     f.write_all(bytes)

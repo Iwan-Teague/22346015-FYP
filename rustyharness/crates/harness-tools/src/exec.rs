@@ -521,6 +521,9 @@ pub struct ExecTools<'a> {
     confinement: &'a dyn Confinement,
     witness: Conformed,
     walk_timeout: Duration,
+    /// Directories the sandbox renders as read-only overlays (P-29): the
+    /// merged protected-path deny sources reduced to existing dirs.
+    protected_dirs: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for ExecTools<'_> {
@@ -557,7 +560,17 @@ impl<'a> ExecTools<'a> {
             confinement,
             witness,
             walk_timeout,
+            protected_dirs: Vec::new(),
         })
+    }
+
+    /// Set the protected-path overlay directories (P-29): the deny-source
+    /// globs reduced by [`crate::protected::overlay_dirs`] against the
+    /// workspace root. Empty by default (nothing protected).
+    #[must_use]
+    pub fn with_protected_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.protected_dirs = dirs;
+        self
     }
 
     /// The canonical workspace root.
@@ -885,7 +898,7 @@ impl ToolProvider for ExecTools<'_> {
             env: self.env(),
             read_only: self.pinned.spec.read_only.clone(),
             read_write: vec![self.root.clone(), self.scratch.dir.clone()],
-            protected: Vec::new(),
+            protected: self.protected_dirs.clone(),
             network: Network::None,
             limits: Limits {
                 wall,

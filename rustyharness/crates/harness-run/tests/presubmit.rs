@@ -112,6 +112,7 @@ fn task(grants: &[&str], exec: Option<ExecSpec>, presubmit: Option<PresubmitSpec
         workspace_public: false,
         exec,
         presubmit,
+        protected: Vec::new(),
     }
 }
 

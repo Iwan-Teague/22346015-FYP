@@ -37,6 +37,10 @@ struct TaskFile {
     /// that grants `harness.exec.run`.
     #[serde(default)]
     presubmit: Option<PresubmitFile>,
+    /// Task-declared protected-path globs (P-29): edits under them are
+    /// refused, exec sees them read-only. Absent: only the defaults.
+    #[serde(default)]
+    protected: Vec<String>,
 }
 
 /// A task file's `presubmit` section (H3a): the commands run, in the
@@ -165,7 +169,7 @@ impl ExecFile {
 }
 
 /// Largest input file read (task, policy, profile).
-const INPUT_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const INPUT_MAX_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn read_input(path: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
@@ -193,6 +197,19 @@ pub(crate) struct Inputs {
     pub(crate) registry: Registry,
     /// The budgets and timeouts, the task's budget section applied.
     pub(crate) config: RunConfig,
+    /// The header's input digests (the same ones `harness_run` journals):
+    /// sha256 of the task text, the profile's content digest, the policy's
+    /// digest. The run bundle records these, and its self-check compares
+    /// against them.
+    pub(crate) digests: InputDigests,
+}
+
+/// The three input digests a journal header and a run bundle carry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InputDigests {
+    pub(crate) task: harness_core::Digest,
+    pub(crate) profile: harness_core::Digest,
+    pub(crate) policy: harness_core::Digest,
 }
 
 pub(crate) fn required<'a>(
@@ -216,8 +233,14 @@ pub(crate) fn inputs(
         refused(exit::UNREADABLE_INPUT, e)
     };
     let task: TaskFile = strict(required(cx, o, "task")?).map_err(unreadable)?;
+    // The sensitive-path default denies (P-12): unless the flag turns the
+    // overlay off, the CLI's default deny list is applied on top of the
+    // given policy (or the empty one), for run, resume and replay alike.
+    // The effective policy — defaults included — is what the run header
+    // digests, so replay under a different overlay setting is refused.
+    let no_default_denies = o.contains_key("no-default-denies");
     let policy = match crate::config::value(o, cfg, "policy") {
-        None => UserPolicy::default(),
+        None => default_policy(no_default_denies).map_err(unreadable)?,
         Some(p) => {
             // v2 (P-08): the policy crate parses the file itself, so the
             // CLI and the audit read one grammar; unknown keys, malformed
@@ -225,7 +248,14 @@ pub(crate) fn inputs(
             let bytes = read_input(p).map_err(unreadable)?;
             let v = harness_core::strict_json::parse(&bytes)
                 .map_err(|e| unreadable(format!("{p} is not strict JSON: {e}")))?;
-            UserPolicy::from_json(&v).map_err(|e| unreadable(format!("policy: {e}")))?
+            let policy =
+                UserPolicy::from_json(&v).map_err(|e| unreadable(format!("policy: {e}")))?;
+            if no_default_denies {
+                policy
+            } else {
+                harness_policy::denies::overlay_default_denies(policy)
+                    .map_err(|e| unreadable(format!("policy: {e}")))?
+            }
         }
     };
     let profile_path = crate::config::value(o, cfg, "profile").ok_or_else(|| {
@@ -235,6 +265,10 @@ pub(crate) fn inputs(
     let profile = Profile::parse(&read_input(profile_path).map_err(unreadable)?)
         .map_err(|e| unreadable(format!("{profile_path}: {e}")))?;
     let registry = builtin_registry().map_err(unreadable)?;
+    // The digests the header will carry, from the values the run uses.
+    let task_text_for_digest = task.task.clone();
+    let profile_sha = profile.content_sha256();
+    let policy_digest = policy.digest();
     // The exec section (H2d): the task file's own, or the one --allow-exec,
     // --preset and --shell describe (P-11). The two never mix: a task file
     // with an exec section already pins its programs, and exec_presets
@@ -267,12 +301,63 @@ pub(crate) fn inputs(
             workspace_public: task.workspace_public,
             exec,
             presubmit,
+            protected: task.protected,
         },
         policy,
         profile,
         registry,
         config,
+        digests: InputDigests {
+            task: harness_core::sha256(task_text_for_digest.as_bytes()),
+            profile: profile_sha,
+            policy: policy_digest,
+        },
     })
+}
+
+/// The task text in task-file bytes (bundle self-check and `sessions`).
+pub(crate) fn task_text(bytes: &[u8]) -> Result<String, String> {
+    let v = harness_core::strict_json::parse(bytes)
+        .map_err(|e| format!("task file is not strict JSON: {e}"))?;
+    let t: TaskFile = serde_json::from_value(v).map_err(|e| format!("task file: {e}"))?;
+    Ok(t.task)
+}
+/// The policy a run uses when no `--policy` is given: the empty library
+/// default (OD-2) with the CLI's sensitive-path default denies overlaid
+/// (P-12), unless `--no-default-denies` turns the overlay off. One
+/// spelling for the run here and for the bundle's recomputation on
+/// `replay` and `resume` (`bundle::check_against_bundle`), so the digest
+/// a run records and the digest a replay recomputes cannot drift.
+pub(crate) fn default_policy(no_default_denies: bool) -> Result<UserPolicy, String> {
+    if no_default_denies {
+        return Ok(UserPolicy::default());
+    }
+    harness_policy::denies::overlay_default_denies(UserPolicy::default())
+        .map_err(|e| format!("policy: {e}"))
+}
+
+/// The digest of the policy in policy-file bytes, as the run digests it:
+/// the v2 grammar (P-08) lives in the policy crate, and the effective
+/// policy — the CLI's default denies on top (P-12) unless the run turned
+/// the overlay off — is what the header and the bundle record.
+pub(crate) fn policy_digest(bytes: &[u8], overlay: bool) -> Result<harness_core::Digest, String> {
+    let v = harness_core::strict_json::parse(bytes)
+        .map_err(|e| format!("policy file is not strict JSON: {e}"))?;
+    let policy = UserPolicy::from_json(&v).map_err(|e| format!("policy: {e}"))?;
+    let policy = if overlay {
+        harness_policy::denies::overlay_default_denies(policy)
+            .map_err(|e| format!("policy: {e}"))?
+    } else {
+        policy
+    };
+    Ok(policy.digest())
+}
+
+/// The content digest of the profile in profile bytes.
+pub(crate) fn profile_digest(bytes: &[u8]) -> Result<harness_core::Digest, String> {
+    Profile::parse(bytes)
+        .map(|p| p.content_sha256())
+        .map_err(|e| format!("profile: {e}"))
 }
 
 /// The budgets and timeouts of a run or resume this binary starts: the
@@ -320,4 +405,26 @@ fn builtin_registry() -> Result<Registry, String> {
     let ctx = ValidationContext::new(v, &[]).map_err(|e| e.to_string())?;
     let m = builtin::manifest(&ctx).map_err(|e| e.to_string())?;
     Registry::admit(vec![(m, Tier::Builtin)]).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskFile;
+
+    /// The `protected` section (P-29): present globs parse; absent, the
+    /// task carries only the build's defaults (`None` here, the CLI maps
+    /// that to an empty task list).
+    #[test]
+    fn protected_parses_when_present_and_is_empty_when_absent() {
+        let with: TaskFile = serde_json::from_str(
+            r#"{"task":"t","grants":[],"protected":["secrets/**",".git/**"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with.protected,
+            vec!["secrets/**".to_owned(), ".git/**".to_owned()]
+        );
+        let without: TaskFile = serde_json::from_str(r#"{"task":"t","grants":[]}"#).unwrap();
+        assert!(without.protected.is_empty());
+    }
 }

@@ -80,6 +80,7 @@ use crate::builtin::{
     canonical_root, code, err, finish, ok, refused, resolve as resolve_path, Out, ResolveErr,
     RootRefused,
 };
+use crate::protected::Protected;
 use crate::provider::{EditRecord, InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult};
 
 /// Largest file the edit engine reads or writes — the same cap as
@@ -398,6 +399,15 @@ pub enum EditError {
         /// Why it failed.
         error: Box<EditError>,
     },
+    /// The path is protected (P-29, ROADMAP §4.3): it matches the build's
+    /// deny globs or the task's declared list, and the edit tools do not
+    /// edit it. Reported before anything is read, created or written;
+    /// `pattern` names the glob that matched.
+    #[error("the path is protected ({pattern})")]
+    Protected {
+        /// The glob that matched.
+        pattern: String,
+    },
 }
 
 impl EditError {
@@ -422,21 +432,45 @@ impl From<ResolveErr> for EditError {
 #[derive(Debug)]
 pub struct EditEngine {
     root: PathBuf,
+    protected: Protected,
 }
 
 impl EditEngine {
     /// An edit engine over the workspace at `root`, which must be a
     /// real directory (not a symlink) — the same root rule as the read
-    /// tools. The root is canonicalised once here.
+    /// tools. The root is canonicalised once here. Protected paths
+    /// start empty; the driver installs the run's list with
+    /// [`EditEngine::with_protected`].
     pub fn new(root: &Path) -> Result<Self, RootRefused> {
         Ok(Self {
             root: canonical_root(root)?,
+            protected: Protected::empty(),
         })
+    }
+
+    /// The same engine with a protected-path deny list (P-29): every
+    /// edit to a path matching one is refused before anything is read
+    /// or written.
+    #[must_use]
+    pub fn with_protected(mut self, protected: Protected) -> Self {
+        self.protected = protected;
+        self
     }
 
     /// The canonical workspace root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The P-29 floor: a workspace path matching a deny glob is refused
+    /// before anything else looks at it.
+    fn guard(&self, wp: &WorkspacePath) -> Result<(), EditError> {
+        match self.protected.matched(wp.as_str()) {
+            None => Ok(()),
+            Some(pattern) => Err(EditError::Protected {
+                pattern: pattern.to_owned(),
+            }),
+        }
     }
 
     /// Exact search/replace (§4.9): `old` must match `count` times,
@@ -446,6 +480,7 @@ impl EditEngine {
     /// re-read digest equals the expected splice.
     pub fn replace(&self, req: &ReplaceReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        self.guard(&wp)?;
         check_replace_args(req)?;
         let (path, meta) = resolve_path(&self.root, &wp)?;
         let Some(meta) = meta else {
@@ -477,6 +512,7 @@ impl EditEngine {
     /// line of each match, in the text each replacement was matched in.
     pub fn multi(&self, req: &MultiReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        self.guard(&wp)?;
         let total = req.edits.len();
         if total == 0 || total > MULTI_MAX_EDITS {
             return Err(EditError::EditCount {
@@ -511,6 +547,7 @@ impl EditEngine {
     /// [`WRITE_OVERWRITE_MAX_LINES`] lines.
     pub fn write(&self, req: &WriteReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        self.guard(&wp)?;
         let mut made: Vec<String> = Vec::new();
         let (path, meta) = match resolve_path(&self.root, &wp) {
             Ok(x) => x,
@@ -1205,6 +1242,17 @@ impl EditTools {
         })
     }
 
+    /// The same tools with a protected-path deny list (P-29): edits and
+    /// previews of matching paths are refused with
+    /// [`EditError::Protected`] before anything is touched.
+    #[must_use]
+    pub fn with_protected(self, protected: Protected) -> Self {
+        Self {
+            ns: self.ns,
+            engine: self.engine.with_protected(protected),
+        }
+    }
+
     /// The canonical workspace root.
     pub fn root(&self) -> &Path {
         self.engine.root()
@@ -1335,6 +1383,7 @@ impl EditTools {
 
     fn preview_replace(&self, req: &ReplaceReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        self.engine.guard(&wp)?;
         check_replace_args(req)?;
         let (path, meta) = resolve_path(&self.engine.root, &wp).map_err(EditError::from)?;
         let Some(meta) = meta else {
@@ -1354,6 +1403,7 @@ impl EditTools {
 
     fn preview_multi(&self, req: &MultiReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        self.engine.guard(&wp)?;
         let total = req.edits.len();
         if total == 0 || total > MULTI_MAX_EDITS {
             return Err(EditError::EditCount {
@@ -1381,6 +1431,7 @@ impl EditTools {
 
     fn preview_write(&self, req: &WriteReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
+        self.engine.guard(&wp)?;
         let (path, meta) = match resolve_path(&self.engine.root, &wp) {
             Ok(x) => x,
             // A directory on the way is missing (H2f): apply would make
@@ -1473,6 +1524,10 @@ fn edit_err(e: &EditError) -> Out {
         EditError::PathRefused(p) => err(
             code::PATH_REFUSED,
             &format!("the path is refused: {p}; write it relative to the workspace root, like src/lib.rs"),
+        ),
+        EditError::Protected { pattern } => err(
+            code::PROTECTED,
+            &format!("the path is protected ({pattern}); this harness does not edit it, so leave it alone and say so in the submit note"),
         ),
         EditError::BadCount => err(code::BAD_ARGS, "count must be at least 1; leave count out for one replacement"),
         EditError::EmptyOld => err(code::BAD_ARGS, "old is empty; give the exact text to replace, copied from the file (to make a new file use harness.edit.write)"),
@@ -1970,6 +2025,121 @@ mod tests {
             tools.preview(&call, &ReadLog::default()),
             Err(PreviewRefused::NotEdit(cap)) if cap == "harness.fs.read"
         ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // --- P-29: protected paths ---
+
+    // The default deny globs (no task list) refuse every edit route into
+    // `.git` — replace, multi, write-overwrite and write-create, apply
+    // and preview alike — before anything is read or created; a
+    // non-protected file still edits.
+    #[test]
+    fn edit_into_dot_git_refused() {
+        let ws = scratch("protected-git");
+        let protected = crate::protected::Protected::new(&[]).expect("defaults compile");
+        let tools = EditTools::new(&ws)
+            .expect("tools")
+            .with_protected(protected.clone());
+        let engine = EditEngine::new(&ws)
+            .expect("engine")
+            .with_protected(protected);
+        std::fs::create_dir_all(ws.join(".git")).expect("git dir");
+        std::fs::write(ws.join(".git/config"), "[core]\n").expect("seed");
+        std::fs::write(ws.join("README.md"), "hello\n").expect("seed");
+        let mut reads = ReadLog::default();
+        reads.record(".git/config", sha256(b"[core]\n"));
+        reads.record("README.md", sha256(b"hello\n"));
+
+        let refused_protected = |r: &Result<Applied, EditError>| match r {
+            Err(EditError::Protected { pattern }) => assert_eq!(pattern, ".git/**"),
+            other => panic!("expected Protected refusal, got {other:?}"),
+        };
+        refused_protected(&engine.replace(
+            &ReplaceReq {
+                path: ".git/config".into(),
+                old: "[core]".into(),
+                new: "[hacked]".into(),
+                count: 1,
+            },
+            &reads,
+        ));
+        refused_protected(&engine.write(
+            &WriteReq {
+                path: ".git/config".into(),
+                content: "x\n".into(),
+            },
+            &reads,
+        ));
+        // A create inside `.git` makes nothing, not even directories.
+        refused_protected(&engine.write(
+            &WriteReq {
+                path: ".git/hooks/x".into(),
+                content: "y\n".into(),
+            },
+            &ReadLog::default(),
+        ));
+        assert!(!ws.join(".git/hooks").exists(), "nothing created");
+        refused_protected(&engine.multi(
+            &MultiReq {
+                path: ".git/config".into(),
+                edits: vec![Replacement {
+                    old: "[core]".into(),
+                    new: "[m]".into(),
+                }],
+            },
+            &reads,
+        ));
+
+        // The previews refuse exactly like apply.
+        let protected_preview = |r: Result<String, PreviewRefused>| match r {
+            Err(PreviewRefused::Edit(EditError::Protected { pattern })) => {
+                assert_eq!(pattern, ".git/**")
+            }
+            other => panic!("expected Protected refusal, got {other:?}"),
+        };
+        protected_preview(tools.preview(
+            &Call {
+                capability: REPLACE.to_owned(),
+                args: serde_json::json!({"path": ".git/config", "old": "[core]", "new": "z"}),
+            },
+            &reads,
+        ));
+        protected_preview(tools.preview(
+            &Call {
+                capability: MULTI.to_owned(),
+                args: serde_json::json!({"path": ".git/config", "edits": [{"old": "[core]", "new": "z"}]}),
+            },
+            &reads,
+        ));
+        protected_preview(tools.preview(
+            &Call {
+                capability: WRITE.to_owned(),
+                args: serde_json::json!({"path": ".git/hooks/y", "content": "z\n"}),
+            },
+            &ReadLog::default(),
+        ));
+        assert!(!ws.join(".git/hooks").exists(), "a preview creates nothing");
+
+        // The file is unchanged, byte for byte.
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".git/config")).expect("read back"),
+            "[core]\n"
+        );
+
+        // The same engine still edits a non-protected file.
+        let applied = engine
+            .replace(
+                &ReplaceReq {
+                    path: "README.md".into(),
+                    old: "hello".into(),
+                    new: "HELLO".into(),
+                    count: 1,
+                },
+                &reads,
+            )
+            .expect("non-protected edit goes through");
+        assert_eq!(applied.after, sha256(b"HELLO\n"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

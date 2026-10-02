@@ -215,6 +215,10 @@ pub(crate) struct PresubmitState {
     submissions: u32,
     turned_back: u32,
     last: Option<PresubmitResult>,
+    /// `turned_back` when the current user turn began (P-05 §9): in a
+    /// session the bound is per turn, so each turn can turn a failing
+    /// submission back `max_rounds` times again. Always 0 in a batch run.
+    turn_base: u32,
 }
 
 impl PresubmitState {
@@ -225,7 +229,15 @@ impl PresubmitState {
             submissions: 0,
             turned_back: 0,
             last: None,
+            turn_base: 0,
         })
+    }
+
+    /// Start a user turn (P-05 §9): the per-turn bound on turned-back
+    /// submissions counts from here. A no-op in a batch run, which never
+    /// calls it.
+    pub(crate) fn begin_turn(&mut self) {
+        self.turn_base = self.turned_back;
     }
 
     /// The report so far.
@@ -311,8 +323,11 @@ impl<'a> Loop<'a> {
         let state = self.presubmit.as_mut().ok_or(StopCause::PolicyAbort)?;
         state.submissions += 1;
         // A failing check turns the submission back until the bound is
-        // spent; then it is accepted, and the failure is recorded.
-        let back = result == PresubmitResult::Failed && state.turned_back < spec.max_rounds;
+        // spent; then it is accepted, and the failure is recorded. In a
+        // session the bound is per user turn (P-05 §9), so a later turn can
+        // turn submissions back again; in a batch run `turn_base` is 0.
+        let back = result == PresubmitResult::Failed
+            && state.turned_back - state.turn_base < spec.max_rounds;
         state.turned_back += u32::from(back);
         state.last = Some(result);
         let (submissions, turned_back) = (state.submissions, state.turned_back);

@@ -160,7 +160,14 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
     // must be the recorded ones (H1 phase-exit review F-1).
     check_header(
         head,
-        &expected_inputs(r.spec, r.registry, r.policy, r.profile, &r.config.limits),
+        &expected_inputs(
+            r.spec,
+            r.registry,
+            r.policy,
+            r.profile,
+            &r.config.limits,
+            None,
+        ),
     )
     .map_err(|d| nope(d.why))?;
     if head.body.get("approver_present").and_then(Value::as_bool) != Some(r.approver.is_some()) {
@@ -257,6 +264,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         environment: r.env.sample(),
         environment_recorded: false,
         approver_present: r.approver.is_some(),
+        session: None,
         exec: pre
             .exec
             .as_ref()
@@ -316,6 +324,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        user: None,
     });
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);

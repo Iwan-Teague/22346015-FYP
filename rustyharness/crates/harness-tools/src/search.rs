@@ -46,6 +46,15 @@
 //! store is never what a task asks for, and its entries would use up the
 //! walk's limit); the result says how many were skipped. Starting a search
 //! AT a `.git` directory searches it.
+//!
+//! **Policy-denied paths are skipped, never silent (P-12).** The read tools
+//! may carry deny globs from the run's policy ([`ReadTools::with_denied`]):
+//! a directory a glob names is neither entered nor matched, a file it names
+//! is not searched or matched, and the result says how many paths were
+//! skipped. The start path itself is not pre-checked here — a call whose
+//! `path` names a denied path is refused by the policy before the tools run
+//! (the same matcher), so what arrives here is a walk that stays inside
+//! what the policy allows.
 
 use std::time::Instant;
 
@@ -391,9 +400,16 @@ fn below<'a>(start: &WorkspacePath, rel: &'a str) -> &'a str {
     }
 }
 
-/// Whether a walked directory is entered: not a `.git` below the start, and
-/// not excluded.
-fn enter(e: &Entry, start: &WorkspacePath, exclude: Option<&Glob>, gits: &mut usize) -> bool {
+/// Whether a walked directory is entered: not a `.git` below the start, not
+/// a policy-denied path (counted when skipped, P-12), and not excluded.
+fn enter(
+    e: &Entry,
+    start: &WorkspacePath,
+    exclude: Option<&Glob>,
+    gits: &mut usize,
+    denied: &[Glob],
+    denied_count: &mut usize,
+) -> bool {
     if e.depth == 0 {
         return true;
     }
@@ -401,11 +417,18 @@ fn enter(e: &Entry, start: &WorkspacePath, exclude: Option<&Glob>, gits: &mut us
         *gits += 1;
         return false;
     }
+    if denied.iter().any(|g| g.matches(&e.rel)) {
+        *denied_count += 1;
+        return false;
+    }
     !exclude.is_some_and(|g| g.matches(below(start, &e.rel)))
 }
 
 /// The walk's counters, for the result's foot.
-fn foot(s: &mut String, walk: &Walk, skipped: usize, gits: usize) {
+fn foot(s: &mut String, walk: &Walk, skipped: usize, gits: usize, denied: usize) {
+    if denied > 0 {
+        s.push_str(&format!("{denied} path(s) skipped (denied by policy)\n"));
+    }
     if skipped > 0 {
         s.push_str(&format!(
             "{skipped} file(s) not searched (larger than 1 MiB, unreadable or not UTF-8)\n"
@@ -480,16 +503,27 @@ impl ReadTools {
             let mut shown: Vec<Block> = Vec::new();
             let mut more: Vec<(String, usize)> = Vec::new();
             let mut budget = Budget::default();
-            let (mut total, mut skipped, mut gits) = (0usize, 0usize, 0usize);
+            let (mut total, mut skipped, mut gits, mut denied) = (0usize, 0usize, 0usize, 0usize);
             let mut matched_files = 0usize;
             let mut counted_all = true;
-            while let Some(entry) =
-                walk.next_entry_if(&mut |e| enter(e, &wp, exclude.as_ref(), &mut gits))
-            {
+            while let Some(entry) = walk.next_entry_if(&mut |e| {
+                enter(
+                    e,
+                    &wp,
+                    exclude.as_ref(),
+                    &mut gits,
+                    self.denied(),
+                    &mut denied,
+                )
+            }) {
                 if Instant::now() >= deadline {
                     return Err(timeout());
                 }
                 if !entry.meta.is_file() {
+                    continue;
+                }
+                if self.denied_hit(&entry.rel) {
+                    denied += 1;
                     continue;
                 }
                 let rel_below = below(&wp, &entry.rel);
@@ -598,7 +632,7 @@ impl ReadTools {
                 "a hit line longer than 200 bytes is shown as the 200 bytes around its match; read that line to see all of it\n",
             );
             }
-            foot(&mut s, &walk, skipped, gits);
+            foot(&mut s, &walk, skipped, gits, denied);
             Ok((s, budget.cut_by_size))
         };
         let mut used = context;
@@ -635,13 +669,23 @@ impl ReadTools {
         let mut walk =
             Walk::new(start, wp.as_str().to_owned(), meta, depth, WALK_MAX_ENTRIES).until(deadline);
         let mut gits = 0usize;
+        let mut denied = 0usize;
         let mut found: Vec<(String, u64)> = Vec::new();
         let mut more = false;
-        while let Some(e) = walk.next_entry_if(&mut |e| enter(e, &wp, None, &mut gits)) {
+        while let Some(e) =
+            walk.next_entry_if(&mut |e| enter(e, &wp, None, &mut gits, self.denied(), &mut denied))
+        {
             if Instant::now() >= deadline {
                 return Err(timeout());
             }
-            if e.depth == 0 || !e.meta.is_file() || !glob.matches(below(&wp, &e.rel)) {
+            if e.depth == 0 || !e.meta.is_file() {
+                continue;
+            }
+            if self.denied_hit(&e.rel) {
+                denied += 1;
+                continue;
+            }
+            if !glob.matches(below(&wp, &e.rel)) {
                 continue;
             }
             if found.len() == GLOB_MAX_RESULTS {
@@ -666,7 +710,7 @@ impl ReadTools {
         for (rel, len) in &found {
             s.push_str(&format!("{rel} ({len} bytes)\n"));
         }
-        foot(&mut s, &walk, 0, gits);
+        foot(&mut s, &walk, 0, gits, denied);
         Ok(ok(s))
     }
 }

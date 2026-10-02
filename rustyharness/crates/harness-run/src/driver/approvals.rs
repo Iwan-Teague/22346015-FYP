@@ -106,6 +106,9 @@ impl<'a> Loop<'a> {
                         at,
                     );
                     let deadline = Instant::now() + self.config.approval_timeout;
+                    // P-05 §8: the sink has seen the ask (and every record
+                    // before it) before the human is waited on.
+                    self.ui_drain(w);
                     // §2.4: the wait for a human is not charged to the
                     // wall budget (the guard resumes the clock on drop).
                     let pause = self.meter.pause_wall()?;

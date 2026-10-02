@@ -11,21 +11,37 @@ pub(crate) const USAGE: &str = "usage:
                        --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
                        [--policy <policy.json>] [--gate <gate-id>] [--output stream-json]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
+                       [--no-default-denies]
   rustyharness resume --run <run-id> + the run options
   rustyharness replay --run <run-id> --task <task.json> --state-root <dir>
                        --profile <profile.json> [--attempt <n>] [--anchor <sha256>]
                        [--policy <policy.json>] [--gate <gate-id>]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
+                       [--no-default-denies]
   rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
+  rustyharness sessions [--state-root <dir>] [--run <run-id>]
+  rustyharness gc --run <run-id> | --older-than <N>d   [--state-root <dir>]
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json
   (strict JSON; a flag always overrides it) when the flag is not given;
   without any of them the state root is the per-user data directory's
   rustyharness/ (created 0700). The config is read only from the user's
-  config directory, never from the workspace.
+  config directory, never from the workspace. Every run copies its resolved
+  task, profile and policy into runs/<id>/inputs/ (0600), so `replay --run`
+  and `resume --run` need no other flags; flags still override and must
+  digest to what the run recorded. gc removes only a finished run's
+  workspace/, grading/ and scratch/ — never its journal, blobs or inputs.
+
+sensitive paths (P-12): without --no-default-denies the CLI overlays a
+  default deny list on the policy (.env, .env.*, *.pem, *.key, id_rsa*,
+  .aws/**, .ssh/**, .git/config, .npmrc, .netrc) for read, search, glob,
+  list and the edits; search, glob and list say how many paths they
+  skipped, and the effective policy is what the run header digests.
+  --no-default-denies turns the overlay off; replay and resume must be
+  given the same flag the run was given.
 
 exec by name (P-11): for a task that grants harness.exec.run but has no
   exec section, --allow-exec resolves each name against this process's own
@@ -109,21 +125,37 @@ mod tests {
                        --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
                        [--policy <policy.json>] [--gate <gate-id>] [--output stream-json]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
+                       [--no-default-denies]
   rustyharness resume --run <run-id> + the run options
   rustyharness replay --run <run-id> --task <task.json> --state-root <dir>
                        --profile <profile.json> [--attempt <n>] [--anchor <sha256>]
                        [--policy <policy.json>] [--gate <gate-id>]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
+                       [--no-default-denies]
   rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
+  rustyharness sessions [--state-root <dir>] [--run <run-id>]
+  rustyharness gc --run <run-id> | --older-than <N>d   [--state-root <dir>]
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json
   (strict JSON; a flag always overrides it) when the flag is not given;
   without any of them the state root is the per-user data directory's
   rustyharness/ (created 0700). The config is read only from the user's
-  config directory, never from the workspace.
+  config directory, never from the workspace. Every run copies its resolved
+  task, profile and policy into runs/<id>/inputs/ (0600), so `replay --run`
+  and `resume --run` need no other flags; flags still override and must
+  digest to what the run recorded. gc removes only a finished run's
+  workspace/, grading/ and scratch/ — never its journal, blobs or inputs.
+
+sensitive paths (P-12): without --no-default-denies the CLI overlays a
+  default deny list on the policy (.env, .env.*, *.pem, *.key, id_rsa*,
+  .aws/**, .ssh/**, .git/config, .npmrc, .netrc) for read, search, glob,
+  list and the edits; search, glob and list say how many paths they
+  skipped, and the effective policy is what the run header digests.
+  --no-default-denies turns the overlay off; replay and resume must be
+  given the same flag the run was given.
 
 exec by name (P-11): for a task that grants harness.exec.run but has no
   exec section, --allow-exec resolves each name against this process's own

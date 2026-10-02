@@ -240,7 +240,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     };
     if let Err(d) = check_header(
         head,
-        &expected_inputs(a.spec, a.registry, a.policy, a.profile, a.limits),
+        &expected_inputs(a.spec, a.registry, a.policy, a.profile, a.limits, None),
     ) {
         return Ok(failed(d, None));
     }
@@ -337,6 +337,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         environment,
         environment_recorded: true,
         approver_present,
+        session: None,
         exec: exec_header,
     })
     .map_err(AuditRefused::Plan)?;
@@ -394,6 +395,7 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&a.spec.presubmit),
+        user: None,
     });
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);

@@ -65,8 +65,8 @@ use harness_tools::{ExecSetupError, ExecSpec};
 
 pub(crate) use approvals::Approvals;
 pub(crate) use header::{
-    builtin_manifest_sha256, header, limits_fields, ExecHeader, HeaderInputs, SandboxRecord,
-    HEADER_INPUT_KEYS,
+    builtin_manifest_sha256, header, limits_fields, protected_task_digest, ExecHeader,
+    HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
 };
 pub(crate) use plan::{attempt_check, create_run, loop_facts, plan, prepare, todo_for, Prepared};
 pub(crate) use step::{BudgetNotices, Loop, LoopInit, NonceSource};
@@ -95,6 +95,9 @@ pub struct TaskSpec {
     /// one turns the submission back, up to a bound. Needs the exec grant
     /// and section; `None`: a submit is accepted at once, exactly as before.
     pub presubmit: Option<PresubmitSpec>,
+    /// Task-declared protected-path globs (P-29), on top of the build's
+    /// defaults: edits under them are refused, exec sees them read-only.
+    pub protected: Vec<String>,
 }
 
 /// Budgets and timeouts (§2.4).
@@ -231,6 +234,14 @@ pub enum RunRefused {
     /// The task's pre-submit checks are refused (H3a).
     #[error("presubmit refused: {0}")]
     Presubmit(#[from] PresubmitRefused),
+    /// A protected-path glob or ask rule this build must write is refused
+    /// (P-29): a task glob the glob compiler rejects, or a floor rule the
+    /// user policy already states. The run does not start half-protected.
+    #[error("protected paths refused: {0}")]
+    Protected(&'static str),
+    /// The session's turn limits are out of range (P-05 §4); nothing ran.
+    #[error("turn limits refused: {0}")]
+    TurnLimits(&'static str),
 }
 
 impl RunRefused {
@@ -323,6 +334,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         environment: r.env.sample(),
         environment_recorded: false,
         approver_present: r.approver.is_some(),
+        session: None,
         exec: exec_header,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
@@ -365,6 +377,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         todo: todo_for(&r.spec.grants),
         notices: BudgetNotices::live(r.config.limits.wall),
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        user: None,
     });
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);

@@ -8,16 +8,38 @@ use harness_core::{sha256, MeterLimits, Source, Untrusted};
 use harness_journal::{Header, Ident, StartError, Trusted};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::builtin;
-use harness_model::context::CONTEXT_FORMAT;
+use harness_model::context::{CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol};
 use harness_policy::{UserPolicy, SUBMIT_ID};
 use harness_sandbox::Conformed;
 use harness_tools::builtin::WorkspaceFacts;
+use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
 use harness_tools::Pinned;
 use serde_json::Value;
 
 use super::{RunConfig, TaskSpec};
 use crate::sample;
+
+/// The `protected` header field (P-29): what the task declared (a digest,
+/// the globs are run input), plus this build's deny and ask defaults
+/// (compile-time constants, listed). An audit recomputes all three, so a
+/// journal from a build with different defaults is refused by name.
+pub(crate) fn protected_task_digest(globs: &[String]) -> Digest {
+    let mut s = String::from("[");
+    for (i, g) in globs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&Value::from(g.as_str()).to_string());
+    }
+    s.push(']');
+    sha256(s.as_bytes())
+}
+
+/// A compile-time glob list as a trusted list (P-29).
+fn trusted_globs(globs: &[&'static str]) -> Trusted {
+    Trusted::List(globs.iter().map(|g| Trusted::Text(g)).collect())
+}
 
 /// Everything the journal header is built from.
 pub(crate) struct HeaderInputs<'a> {
@@ -41,6 +63,9 @@ pub(crate) struct HeaderInputs<'a> {
     pub(crate) environment_recorded: bool,
     /// Whether an approver answers asks in this run (§5.2, H2b).
     pub(crate) approver_present: bool,
+    /// The session's turn limits (P-05 §1.4); `None` for a batch run, whose
+    /// header carries neither `mode` nor `turn_limits`.
+    pub(crate) session: Option<crate::session::TurnLimits>,
     /// The command runner's header fields, with an exec grant (H2d).
     pub(crate) exec: Option<ExecHeader>,
 }
@@ -151,8 +176,10 @@ impl ExecHeader {
 /// harness build: a journal another build wrote is refused by name, never
 /// replayed into a mismatch. `shell_enabled` and `exec` (H2d) are the
 /// task's exec allowlist: absent without an exec grant, so a journal
-/// without one reads as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 13] = [
+/// without one reads as before. `mode` and `turn_limits` (P-05 §1.4) are
+/// the session's: absent in a batch run's header, so such a journal reads
+/// as before.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 16] = [
     "task",
     "grants",
     "workspace_public",
@@ -162,10 +189,13 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 13] = [
     "checks",
     "builtin_manifest",
     "shell_enabled",
+    "protected",
     "context_format",
     "limits",
     "exec",
     "presubmit",
+    "mode",
+    "turn_limits",
 ];
 
 /// The header's `limits` object, field by field: the one encoding the
@@ -266,9 +296,30 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
             "shell_enabled",
             Trusted::Bool(h.exec.as_ref().is_some_and(|e| e.shell_enabled)),
         )
+        // The protected paths (P-29): what the task declared (a digest of
+        // the globs, they are run input) and this build's deny/ask
+        // defaults; an audit recomputes all three.
+        .field(
+            "protected",
+            Trusted::Obj(vec![
+                (
+                    "task",
+                    Trusted::Digest(protected_task_digest(&spec.protected)),
+                ),
+                ("deny_default", trusted_globs(DEFAULT_DENY)),
+                ("ask_default", trusted_globs(DEFAULT_ASK)),
+            ]),
+        )
         // What this build's contexts and requests are (H1h): a replay
-        // recomputes them, so it needs the same format.
-        .field("context_format", Trusted::Text(CONTEXT_FORMAT))
+        // recomputes them, so it needs the same format. A session run's
+        // contexts differ (the users' share, P-05 §2.3), so it has its own.
+        .field(
+            "context_format",
+            Trusted::Text(match h.session {
+                Some(_) => SESSION_CONTEXT_FORMAT,
+                None => CONTEXT_FORMAT,
+            }),
+        )
         // The sandbox commands run under (H2d): the witness's backend, row
         // and bars; `none` for a run without an exec grant (no witness was
         // asked for).
@@ -311,6 +362,17 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
                 ("spec", Trusted::Digest(p.digest())),
                 ("commands", Trusted::U64(p.commands.len() as u64)),
                 ("max_rounds", Trusted::U64(u64::from(p.max_rounds))),
+            ]),
+        );
+    }
+    // P-05 §1.4: the session's mode and turn limits, header inputs an
+    // audit or a resume compares; no key in a batch run's header.
+    if let Some(t) = &h.session {
+        hd = hd.field("mode", Trusted::Text("session")).field(
+            "turn_limits",
+            Trusted::Obj(vec![
+                ("steps", Trusted::U64(u64::from(t.steps))),
+                ("format_errors", Trusted::U64(u64::from(t.format_errors))),
             ]),
         );
     }

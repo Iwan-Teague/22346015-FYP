@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use gate_outcome::{Finding, GateOutcome, IndeterminateKind};
+use gate_outcome::{Finding, FindingCode, GateOutcome, IndeterminateKind, Severity};
 use harness_core::RunId;
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_run::{Approver, Resume, Run, RunRefused};
@@ -225,6 +225,37 @@ fn try_run(
             "every pre-submit check passing at the accepted submission",
             words,
         ));
+    }
+    // The run bundle (P-14, OD-5(d)): copy the resolved inputs into
+    // `runs/<id>/inputs/` so `replay --run`/`resume --run` need no other
+    // flags. The run is already committed, so a bundle that fails to write
+    // (or fails its self-check) never changes the outcome: a Low finding
+    // and a note say the convenience is missing.
+    let bundle_src = crate::bundle::BundleSource::new(
+        crate::config::value(o, cfg, "task"),
+        crate::config::value(o, cfg, "profile"),
+        crate::config::value(o, cfg, "policy"),
+    );
+    if let Err(e) = crate::bundle::write_run_bundle(
+        &report.run_dir,
+        &bundle_src,
+        endpoint,
+        workspace.as_ref(),
+        &inp.digests,
+        // The policy was digested under the run's own overlay setting
+        // (P-12); the bundle self-check must digest it the same way.
+        !o.contains_key("no-default-denies"),
+    ) {
+        note!(cx, "run bundle not written: {e}");
+        if let Ok(f) = Finding::new(
+            Severity::Low,
+            FindingCode("harness.bundle".to_owned()),
+            format!("run {} inputs/", report.run),
+            "the run's inputs copied into the state root",
+            e,
+        ) {
+            findings.push(f);
+        }
     }
     if stream {
         stream_json(cx, &report);

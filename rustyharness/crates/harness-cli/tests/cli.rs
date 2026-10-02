@@ -1997,6 +1997,175 @@ fn h3a_a_spent_bound_is_reported_as_a_check_still_failing() {
     assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
 }
 
+// ---- P-12: the CLI's sensitive-path default denies --------------------------------
+
+/// Without `--policy` the CLI overlays its default deny list (P-12): the
+/// model's read of `.env` is denied at the policy and the denial — never
+/// the secret — reaches the model's next prompt. With
+/// `--no-default-denies` the same task reads the file.
+#[test]
+fn read_dot_env_denied_by_default_cli() {
+    let fx = fixture("denies-default");
+    std::fs::write(fx.ws.join(".env"), "SECRET=1\n").unwrap();
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = captured.clone();
+    let m = mock_with(
+        vec![
+            act("harness.fs.read", r#"{"path":".env"}"#),
+            act("harness.task.submit", r#"{"note":"done"}"#),
+        ],
+        move |req| sink.lock().unwrap().push(req.to_owned()),
+    );
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+    assert_eq!(
+        o.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // Two chat requests: the second carries the denial, not the secret.
+    {
+        let got = captured.lock().unwrap();
+        assert_eq!(got.len(), 2, "{}", got.len());
+        assert!(got[1].contains("Policy denied the call."), "{}", got[1]);
+        assert!(!got[1].contains("SECRET=1"), "{}", got[1]);
+    }
+    assert_eq!(
+        std::fs::read_to_string(fx.ws.join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+
+    // The off-switch: the same task reads `.env` whole.
+    let fx = fixture("denies-off");
+    std::fs::write(fx.ws.join(".env"), "SECRET=1\n").unwrap();
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = captured.clone();
+    let m = mock_with(
+        vec![
+            act("harness.fs.read", r#"{"path":".env"}"#),
+            act("harness.task.submit", r#"{"note":"done"}"#),
+        ],
+        move |req| sink.lock().unwrap().push(req.to_owned()),
+    );
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.push("--no-default-denies");
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(
+        o.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let got = captured.lock().unwrap();
+    assert!(got[1].contains("SECRET=1"), "{}", got[1]);
+}
+
+/// The bundle and the overlay setting (P-14 × P-12): a run's recorded
+/// policy digest is the effective policy's, so a run made with
+/// `--no-default-denies` replays from its bundle only under the same
+/// setting; replaying with the default overlay on is a different policy,
+/// refused by name before the audit (exit 4).
+#[test]
+fn replay_of_a_no_default_denies_run_needs_the_same_setting() {
+    let fx = fixture("denies-off-bundle");
+    let m = mock(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.push("--no-default-denies");
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let id = run_id(&o);
+
+    // The same setting: the bundle fills the policy, the audit matches.
+    let rp = replay_bin(&fx, &id, &["--no-default-denies"]);
+    let rerr = String::from_utf8_lossy(&rp.stderr);
+    assert_eq!(rp.code(), Some(5), "{rerr}");
+    assert!(rerr.contains(REPLAY_MATCHED), "{rerr}");
+
+    // The other setting: a different policy digest, refused by the bundle.
+    let rp = replay_bin(&fx, &id, &[]);
+    let rerr = String::from_utf8_lossy(&rp.stderr);
+    assert_eq!(rp.code(), Some(4), "{rerr}");
+    assert!(
+        rerr.contains("policy the default policy does not match the digests recorded"),
+        "{rerr}"
+    );
+}
+
+/// The bundle records the policy the run digested — the default with the
+/// overlay applied (P-12) — so a replay under a different overlay setting
+/// is refused by name before anything runs, and the run's own setting
+/// replays clean.
+#[test]
+fn replay_needs_the_runs_default_deny_overlay_setting() {
+    let fx = fixture("denies-bundle-on");
+    let m = mock(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+    assert_eq!(
+        o.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let id = run_id(&o);
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    // The run's setting: matched.
+    let rp = replay_bin(&fx, &id, &["--anchor", &head]);
+    let err = String::from_utf8_lossy(&rp.stderr);
+    assert!(err.contains(REPLAY_MATCHED), "{err}");
+    // The overlay turned off for the replay: refused, by name.
+    let rp = replay_bin(&fx, &id, &["--anchor", &head, "--no-default-denies"]);
+    assert_eq!(rp.code(), Some(4));
+    let err = String::from_utf8_lossy(&rp.stderr);
+    assert!(
+        err.contains("policy the default policy does not match the digests recorded"),
+        "{err}"
+    );
+
+    // The mirror image: a run without the overlay, replayed with it.
+    let fx = fixture("denies-bundle-off");
+    let m = mock(vec![act("harness.task.submit", r#"{"note":"done"}"#)]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.push("--no-default-denies");
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(
+        o.code(),
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let id = run_id(&o);
+    let head = String::from_utf8(o.stdout.clone())
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("chain_head ")
+        .unwrap()
+        .to_owned();
+    let rp = replay_bin(&fx, &id, &["--anchor", &head]);
+    assert_eq!(rp.code(), Some(4));
+    let err = String::from_utf8_lossy(&rp.stderr);
+    assert!(
+        err.contains("policy the default policy does not match the digests recorded"),
+        "{err}"
+    );
+    let rp = replay_bin(&fx, &id, &["--anchor", &head, "--no-default-denies"]);
+    let err = String::from_utf8_lossy(&rp.stderr);
+    assert!(err.contains(REPLAY_MATCHED), "{err}");
+}
+
 // ---- P-15: the events projection, --follow, and the usage footer ------------
 
 use harness_journal::canon::{EventKind as JK, RecordFields, GENESIS};

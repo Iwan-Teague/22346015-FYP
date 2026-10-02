@@ -71,13 +71,16 @@ use serde_json::Value;
 
 pub mod approval;
 pub mod builtin;
+pub mod denies;
 pub mod locality;
 pub mod matcher;
 pub mod path;
 
 pub use builtin::{
-    EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
+    EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, GLOB_ID, LIST_ID, OUTLINE_ID, READ_ID,
+    SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
 };
+pub use denies::{default_denies, overlay_default_denies, DEFAULT_DENY_GLOBS};
 pub use matcher::Matcher;
 pub use path::{workspace_path, PathRefused, WorkspacePath};
 
@@ -351,6 +354,21 @@ impl UserPolicy {
             }
         }
         harness_core::sha256(s.as_bytes())
+    }
+
+    /// Append one rule to the `ask` list (the P-29 protected-path floor:
+    /// the harness raises its own asks on top of whatever the user wrote).
+    /// A rule whose key (selector AND matcher) is already present in any
+    /// list is refused as [`PolicyConfigError::Ambiguous`]: a floor that
+    /// also allowed the same call would say two things about one rule.
+    pub fn push_ask(&mut self, rule: Rule) -> Result<(), PolicyConfigError> {
+        for list in [&self.deny, &self.ask, &self.allow] {
+            if list.iter().any(|r| r.key() == rule.key()) {
+                return Err(PolicyConfigError::Ambiguous(rule.key()));
+            }
+        }
+        self.ask.push(rule);
+        Ok(())
     }
 
     /// The indices (in list order) of the rules of `list` whose selector

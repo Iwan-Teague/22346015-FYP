@@ -100,6 +100,7 @@ fn spec(grants: &[&str]) -> TaskSpec {
         workspace_public: false,
         exec: None,
         presubmit: None,
+        protected: Vec::new(),
     }
 }
 
@@ -639,6 +640,36 @@ fn h2e_glob_and_regex_search_run_in_the_loop_and_audit_clean() {
         found[0].1
     );
     assert!(backend.bodies.borrow()[3].contains("this call repeats an earlier one exactly"));
+    assert_eq!(s.audit(&state, &r, 1).divergence, None);
+}
+
+// P-24: the outline runs in the loop: journaled, audited clean, and a
+// repeated outline on an unchanged workspace is noticed like any read.
+#[test]
+fn p24_outline_runs_in_the_loop_and_audits_clean() {
+    let (state, ws) = scratch("outline");
+    let s = Setup::new(&["harness.fs.outline"]);
+    let outlines = || action("harness.fs.outline", &json!({}));
+    let backend = capture(&s.profile, vec![outlines(), outlines(), submit()]);
+    let r = s.go(&state, &ws, &backend);
+    assert_eq!(r.cause, StopCause::Submitted);
+    let recs = records(&r, 1);
+    let got = results(&recs, "harness.fs.outline");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, "ok");
+    let out = &got[0].1;
+    assert!(
+        out.starts_with("1 symbol(s) in 1 file(s) under .; sha256 "),
+        "{out}"
+    );
+    assert!(
+        out.contains("src/lib.rs\n  4: pub fn backoff(n: u32) -> u64 {\n"),
+        "{out}"
+    );
+    // The two calls over the same workspace agree byte for byte.
+    assert_eq!(got[0].1, got[1].1);
+    // The repeated call was noticed like any repeated read.
+    assert!(backend.bodies.borrow()[2].contains("this call repeats an earlier one exactly"));
     assert_eq!(s.audit(&state, &r, 1).divergence, None);
 }
 

@@ -121,6 +121,7 @@ pub fn read_spec(task: &str) -> TaskSpec {
         workspace_public: false,
         exec: None,
         presubmit: None,
+        protected: Vec::new(),
     }
 }
 

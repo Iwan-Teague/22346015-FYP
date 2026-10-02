@@ -29,6 +29,8 @@
 pub mod builtin;
 pub mod edit;
 pub mod exec;
+pub mod outline;
+pub mod protected;
 pub mod provider;
 pub mod registry;
 pub mod search;
@@ -41,6 +43,7 @@ pub use exec::{
     plain_name, ExecLimits, ExecProgram, ExecSetupError, ExecSpec, ExecTools, Pinned, MAX_PROGRAMS,
 };
 pub use harness_core::glob;
+pub use outline::OUTLINE_MAX_ENTRIES;
 pub use provider::{
     EditRecord, ExecCleanup, ExecEnd, ExecRecord, InvokeCtx, ReadRecord, RefusalKind, ToolError,
     ToolProvider, ToolResult, ToolStatus,

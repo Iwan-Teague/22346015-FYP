@@ -52,6 +52,7 @@ pub mod conditions;
 pub mod event;
 pub mod layout;
 pub mod reader;
+pub mod scan;
 pub mod tail;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod testing;
@@ -65,10 +66,11 @@ compile_error!(
 );
 pub mod writer;
 
-pub use canon::{EventKind, Ident};
+pub use canon::{rfc3339_utc, EventKind, Ident};
 pub use conditions::{Condition, ConditionKind};
 pub use event::{Event, Trusted, UntrustedBlob};
 pub use reader::{verify, BlobSource, BreakKind, Broken, JournalReader, Record, Verified};
+pub use scan::{scan_runs, ScanError, ScannedRun};
 pub use tail::{JournalTail, Poll};
 pub use writer::{
     BlobSink, Clock, Header, JournalError, JournalFile, JournalWriter, Journaled, Released,

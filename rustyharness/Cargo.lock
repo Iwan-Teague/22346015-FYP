@@ -111,6 +111,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-minibench"
+version = "0.0.1"
+dependencies = [
+ "gate-outcome",
+ "harness-core",
+ "harness-journal",
+ "harness-model",
+ "harness-policy",
+ "harness-run",
+ "harness-sandbox",
+ "harness-testkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harness-model"
 version = "0.0.1"
 dependencies = [

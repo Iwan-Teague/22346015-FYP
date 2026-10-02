@@ -1,0 +1,10 @@
+{
+  "task": "Use the command runner to create the file built.txt whose entire content is the single word ok (no trailing newline).",
+  "grants": ["harness.fs.read", "harness.exec.run"],
+  "exec": {"programs": [{"name": "perl", "path": "/usr/bin/perl"}]},
+  "presubmit": {"commands": [["perl", "-e", "open(my $f, q{<}, q{built.txt}) or exit 3; my $c = do { local $/; <$f> }; exit($c eq q{ok} ? 0 : 3)"]]},
+  "script": [
+    {"tool": "harness.exec.run", "args": {"argv": ["perl", "-e", "open(my $f, q{>}, q{built.txt}) or die; print $f q{ok}"]}},
+    {"submit": true}
+  ]
+}

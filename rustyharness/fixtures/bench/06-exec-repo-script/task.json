@@ -1,0 +1,10 @@
+{
+  "task": "Run the workspace script bin/make.sh with sh (it writes made.txt), then submit.",
+  "grants": ["harness.fs.read", "harness.exec.run"],
+  "exec": {"programs": [{"name": "sh", "path": "/bin/sh"}, {"name": "perl", "path": "/usr/bin/perl"}]},
+  "presubmit": {"commands": [["perl", "-e", "open(my $f, q{<}, q{made.txt}) or exit 3; my $c = do { local $/; <$f> }; exit($c eq qq{made\\n} ? 0 : 3)"]]},
+  "script": [
+    {"tool": "harness.exec.run", "args": {"argv": ["sh", "bin/make.sh"]}},
+    {"submit": true}
+  ]
+}

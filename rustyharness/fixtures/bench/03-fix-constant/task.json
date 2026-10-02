@@ -1,0 +1,11 @@
+{
+  "task": "In src/lib.rs, the MODE constant still says wip. Replace that word with stable.",
+  "grants": ["harness.exec.run", "harness.fs.read", "harness.edit.replace"],
+  "exec": {"programs": [{"name": "perl", "path": "/usr/bin/perl"}]},
+  "presubmit": {"commands": [["perl", "-e", "open(my $f, q{<}, q{src/lib.rs}) or exit 3; my $c = do { local $/; <$f> }; exit(($c =~ /stable/ && $c !~ /wip/) ? 0 : 3)"]]},
+  "script": [
+    {"tool": "harness.fs.read", "args": {"path": "src/lib.rs"}},
+    {"tool": "harness.edit.replace", "args": {"path": "src/lib.rs", "old": "wip", "new": "stable"}},
+    {"submit": true}
+  ]
+}

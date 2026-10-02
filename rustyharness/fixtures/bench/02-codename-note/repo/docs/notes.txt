@@ -1,0 +1,4 @@
+Project notes
+
+The project codename is AMBER-OWL-77.
+It ships in spring.

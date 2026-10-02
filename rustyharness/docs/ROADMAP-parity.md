@@ -494,8 +494,8 @@ Suggested definition of done for any slice: card tests green + `sh scripts/ci/ga
 
 | Id | Question | Default until answered | Blocks |
 |---|---|---|---|
-| Q-1 | Revisit the trifecta (OPEN-QUESTIONS 1.7 / design Q7) for web research: is the airlock design (research session without workspace, human-reviewed import) acceptable, or is a plan-then-execute/dual-LLM path wanted? | Never combine workspace + egress; no web tools | P-39 |
-| Q-2 | TLS: may the build take a reviewed C-free TLS stack (feature `hosted`) for hosted models/web fetch, or must hosted/web stay behind the user's own loopback proxy? May a hosted model see `personal` data (design Q2)? | No TLS in tree; hosted only via user's loopback proxy; no `personal` data to a hosted upstream | P-31 (declaration only), P-39 |
+| Q-1 (APPROVED 2026-10-02: airlock now, dual-LLM later as a research track, never a prompt per fetch) | Revisit the trifecta (OPEN-QUESTIONS 1.7 / design Q7) for web research: is the airlock design (research session without workspace, human-reviewed import) acceptable, or is a plan-then-execute/dual-LLM path wanted? | Never combine workspace + egress; no web tools | P-39 |
+| Q-2 (APPROVED 2026-10-02: no TLS in the default build; opt-in `net` feature, out-of-process fetcher, after review) | TLS: may the build take a reviewed C-free TLS stack (feature `hosted`) for hosted models/web fetch, or must hosted/web stay behind the user's own loopback proxy? May a hosted model see `personal` data (design Q2)? | No TLS in tree; hosted only via user's loopback proxy; no `personal` data to a hosted upstream | P-31 (declaration only), P-39 |
 | Q-3 | Does a profile declared `upstream:"hosted"` through a loopback proxy count as a hosted model for the disclosure rules? | Yes: hosted rules apply to anything the user declares hosted | P-31 |
 | Q-4 | Session-scoped "always allow this pattern" grants (relaxes the strict one-call approval binding the owner kept; tokens stay single-use, the grant is a journaled rule). Also `--accept-edits` once undo exists? | Prompts offer yes/no only; session grants and `--accept-edits` off (flags refused) | P-23, P-28 |
 | Q-5 | Several read-only calls per reply (OPEN-QUESTIONS 9). | One action per reply | not scheduled |
@@ -584,3 +584,48 @@ Odysseus (PewDiePie's self-hosted AI workspace) offers web search/fetch/deep res
 - Crates: harness-cli (`exec_presets.rs`, `cmd_doctor.rs`), a new pure module for the object-file parser (harness-core or harness-tools; no I/O in a pure crate: the file read stays in the CLI).
 - Tests: `macho_load_commands_parsed_from_fixture_bytes`, `rpath_and_loader_path_expanded`, `transitive_depth_is_bounded`, `deps_outside_allowed_prefixes_listed_and_refused`, `preset_rust_includes_cargo_dylib_roots` (this machine: skipped with reason if cargo is not a Mach-O), `header_records_lib_roots`, `doctor_flags_a_program_that_cannot_run_in_the_sandbox`, `malformed_object_file_is_refused_not_panicked`.
 - Deps: P-11, P-43. Risk: medium (parser of untrusted-ish binaries: bounded, no unsafe, fuzz-style tests). ARCH: no.
+
+---
+
+### Added by the manager (2026-10-02, afternoon)
+
+**P-52 Workspace modes: in place, scratch copy, git worktree, with review-and-apply**
+- Why: let a user (and a small model) work on a throwaway copy and keep only what they review. `chat`/`run` gain `--workspace-mode in-place|scratch|worktree` (default `in-place`, unchanged). `scratch`: the CLI (trust base, not the model) copies the workspace into `<state-root>/scratch/<session>/` (skips `target/`, `node_modules/`, `.git` internals are copied only if `--scratch-with-git`; refuses over a size cap with a clear message) and records source path, copy manifest digest and per-file digests in the journal header; the model only ever sees the copy. `worktree`: the CLI runs `git worktree add` with fixed argv (no model input in argv) under the state root, only when the workspace is a clean git repo; otherwise refused. `rustyharness apply --session ID [--dry-run]` shows the diff scratch vs original (P-16 renderer), and applies it only after typed confirmation; every original file must still match its recorded digest (else listed as a conflict and skipped, never overwritten); an apply report is written and the chain is unaffected. `/apply` and `/discard` in `chat`.
+- Crates: harness-cli (`workspace_mode.rs`, `cmd_apply.rs`), harness-run (header fields only), harness-testkit.
+- Tests: `scratch_mode_edits_never_touch_original`, `scratch_copy_skips_target_dir_and_records_manifest`, `scratch_refused_over_size_cap`, `worktree_mode_refused_on_dirty_repo`, `apply_requires_typed_confirmation`, `apply_skips_conflicting_original_and_reports_it`, `apply_dry_run_changes_nothing`, `scratch_session_audits_clean`, `in_place_default_unchanged`.
+- Deps: P-14, P-16, P-18. Parallel: yes (cli files only; one dispatch line each). Risk: medium. ARCH: no.
+
+**P-53 Chat robust for small models: terse tool docs per profile, parallel reads opt-in**
+- Why: the live runs (P-21) show small local models fumble long tool descriptions and call many tools per turn. Profile fields `tool_docs: "full"|"terse"` (terse = the description is cut to one sentence plus the argument names, from a fixed table in `harness-manifest`, digest-recorded in the header) and `parallel_tool_calls: false` by default (a second call in one assistant turn is rejected with a clear tool error and journaled, unless the profile opts in), and `max_active_tools` honoured in the declarations. No change to the rendered context text (`rh-context` stays at its current version); only the tool declarations in the request change, and the profile stamp covers the new fields.
+- Crates: harness-manifest (terse table), harness-model-core (declaration rendering only), harness-cli (profile fields, `profile init` defaults for local small models), harness-run (reject surplus calls).
+- Tests: `terse_docs_are_shorter_and_keep_arg_names`, `terse_table_covers_every_builtin_tool`, `second_tool_call_in_a_turn_rejected_when_not_opted_in`, `parallel_calls_allowed_when_profile_opts_in`, `profile_stamp_changes_with_tool_docs`, `max_active_tools_limits_declarations`, `replay_audits_clean_with_terse_docs`.
+- Deps: P-21 (the benchmark decides the exact defaults), P-18. Parallel: no (touches the declaration trio, H-C). Risk: medium. ARCH: no.
+
+**P-54 Fuzz-style robustness tests (no new crates): journal reader, HTML extractor, sanitiser, config and policy parsers**
+- Why: hardening. A tiny seeded xorshift generator and byte-mutation helpers in `harness-testkit` (deterministic, no `rand`), used to feed mutated/truncated/garbage input to every parser of untrusted bytes and assert: no panic, no hang (iteration and size bounded), and either a clean typed error or a value that round-trips. Seeds are fixed so failures reproduce; the case count is modest in gates (e.g. 2000 per target) and larger under an ignored `RH_FUZZ_CASES` test.
+- Crates: harness-testkit (mutator), tests in harness-journal (reader/verifier), harness-core (html, display sanitiser, config), harness-policy (policy file parser), harness-manifest (manifest parser).
+- Tests: `fuzz_journal_reader_mutated_valid_log_never_panics`, `fuzz_journal_truncation_at_every_byte_is_typed_error`, `fuzz_html_extractor_never_panics_and_is_bounded`, `fuzz_sanitiser_output_has_no_control_chars`, `fuzz_policy_parser_never_panics`, `fuzz_manifest_parser_never_panics`, `fuzz_config_parser_never_panics`, `mutator_is_deterministic_for_a_seed`.
+- Deps: P-03, P-44. Parallel: yes. Risk: low. ARCH: no.
+
+**P-55 Fuzz-style tests for the Mach-O/ELF dependency parser (P-51) and the patch parser (P-25)**
+- Why: those parsers read untrusted-ish binary and text input. Same mutator as P-54. Split in two commits so the patch half can follow P-25.
+- Crates: the parser crates' tests only.
+- Tests: `fuzz_macho_parser_never_panics`, `fuzz_macho_truncation_at_every_byte_is_typed_error`, `fuzz_elf_parser_never_panics`, `fuzz_macho_bounds_hold_on_cyclic_dependency_fixture`, `fuzz_patch_parser_never_panics` (only when P-25 is merged), `fuzz_patch_parser_bounded_on_huge_hunk_counts`.
+- Deps: P-51, P-54. Parallel: yes. Risk: low. ARCH: no.
+
+**P-56 ARCH: Linux sandbox backend (Landlock + seccomp) and the Linux conformance suite**
+- Design note first (reasoning model): raw-syscall Landlock ruleset + seccomp-bpf filter built in `harness-sandbox` (`unsafe` stays confined there; no new crate if at all possible, else a written reason), mapping from the existing confinement spec to Landlock rights, network deny by default, a witness/probe at startup like Seatbelt (fail closed: if the witness does not pass, exec refuses as today), the conformance suite re-used, and how it is verified when the dev machine is macOS (cross-`cargo check --target x86_64-unknown-linux-gnu`, runtime tests skipped with a stated reason, an explicit "UNVERIFIED on real Linux" status in `docs/STATUS.md` until someone runs the suite on Linux). Split into slices by the note.
+- Crates (expected): harness-sandbox.
+- Deps: P-41 (probe robustness). Risk: high. ARCH: **yes**.
+
+**P-57 Windows spike S-W1: read/edit only**
+- Why: make the workspace build for `x86_64-pc-windows-msvc` (cross `cargo check`) with exec refused ("no confinement on this platform", same fail-closed message as Linux today), read/edit/search/outline tools working, path handling (drive letters, `\\?\`, case-insensitivity, reserved names, UNC paths refused) in the policy path matcher, and `doctor` reporting it. No exec on Windows until a conformance suite passes there.
+- Crates: harness-core/policy (path handling), harness-sandbox (cfg stubs), harness-cli.
+- Tests: `windows_path_normalisation_cases` (pure, runs everywhere), `unc_and_device_paths_refused`, `reserved_names_refused`, `exec_refuses_without_confinement_on_windows` (cfg), plus a CI-script-free cross check recorded in the slice note.
+- Deps: P-11. Parallel: yes (policy path module only). Risk: medium. ARCH: no.
+
+**P-58 Docs: user guide, `--help` completeness, version and changelog**
+- Why: definition of done. `docs/USER-GUIDE.md` (install, 5-minute quickstart for a local model and for a hosted one through the loopback proxy, `profile init`, `doctor`, `chat`, `run`, `replay`, `sessions`, `schedule`, policy file format, profiles, workspace modes, the security model in plain words, limits), every verb's `--help` text complete and covered by a test that every dispatch verb has usage text, `CHANGELOG.md`, version bump to 0.2.0 in the workspace manifest. Scheduled late (after the interactive features it documents).
+- Crates: harness-cli (usage text and its test), docs.
+- Tests: `every_dispatch_verb_has_usage_text`, `help_for_each_verb_exits_zero`, `usage_mentions_every_flag_of_chat_and_run`, `readme_quickstart_commands_exist_as_verbs`.
+- Deps: P-23, P-26, P-28, P-31. Parallel: yes. Risk: low. ARCH: no.

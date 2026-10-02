@@ -29,7 +29,7 @@ use harness_model::{
 };
 use harness_policy::{Call, PolicyDecision, Session, SUBMIT_ID, TODO_ID};
 use harness_tools::builtin::WorkspaceTree;
-use harness_tools::{ExecCleanup, InvokeCtx, ReadLog, TodoList, ToolProvider, ToolStatus};
+use harness_tools::{ExecCleanup, Image, InvokeCtx, ReadLog, TodoList, ToolProvider, ToolStatus};
 use serde_json::Value;
 
 use super::approvals::Approvals;
@@ -1009,8 +1009,46 @@ impl<'a> Loop<'a> {
                     if let Some(b) = e.before {
                         ev = ev.field("before", Trusted::Digest(b));
                     }
+                    // The pre-image store (P-22): the file's bytes before and
+                    // after are kept as content-addressed blobs, and the
+                    // record cites them by their digests (`before_blob` only
+                    // when there was a before; the after-blob is what a
+                    // `/diff` shows). An image whose bytes do not hash to the
+                    // digest the edit itself carries would make a record no
+                    // replay can recompute, so it is refused before the
+                    // record is written, with nothing journaled.
+                    let mut store = |img: &Image| {
+                        w.untrusted_stored(&Untrusted::new(
+                            img.bytes.clone(),
+                            Source::Workspace(e.path.as_str().to_owned()),
+                        ))
+                    };
+                    let before_blob = match &e.before_image {
+                        Some(img) => {
+                            let d = store(img).map_err(journal)?;
+                            if Some(d.sha256()) != e.before || d.sha256() != img.sha256 {
+                                return Err(journal(JournalError::InvalidEvent(
+                                    "an edit image does not hash to the digest the edit carries",
+                                )));
+                            }
+                            Some(d.sha256())
+                        }
+                        // A create keeps no pre-image: the field's absence is
+                        // the absent marker.
+                        None => None,
+                    };
+                    let after_img = store(&e.after_image).map_err(journal)?;
+                    if after_img.sha256() != e.after || after_img.sha256() != e.after_image.sha256 {
+                        return Err(journal(JournalError::InvalidEvent(
+                            "an edit image does not hash to the digest the edit carries",
+                        )));
+                    }
+                    if let Some(d) = before_blob {
+                        ev = ev.field("before_blob", Trusted::Digest(d));
+                    }
                     ev = ev
                         .field("after", Trusted::Digest(e.after))
+                        .field("after_blob", Trusted::Digest(after_img.sha256()))
                         .field("workspace_tree", Trusted::Digest(tree));
                     w.append(step, ev).map_err(journal)?;
                     // The harness wrote these bytes: they are the file's

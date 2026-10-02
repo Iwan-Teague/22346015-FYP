@@ -406,6 +406,97 @@ fn doctor_exit_code_follows_fail() {
     assert!(stdout(&bad).contains("FAIL state-root"));
 }
 
+/// P-51: the preset programs that are here are run through the sandbox
+/// (`<program> --version`), with the read-only roots their dynamic
+/// libraries need, and one that cannot run is named with the exact path
+/// that was blocked. A fake `go` (a Mach-O whose library lies outside
+/// every allowed prefix) is the only program on PATH: the exec-programs
+/// check must WARN with the library's path, and doctor still exits 0
+/// (a WARN, like the sandbox refusal). macOS only: it needs the
+/// confinement witness to run anything.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_flags_a_program_that_cannot_run_in_the_sandbox() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let fx = fixture("exec-programs");
+    let profile = fx.install_stamped_profile();
+    let _ = profile;
+    set_homes(&fx);
+    let m = mock(r#"{"data":[{"id":"m"}]}"#);
+    // The fake preset program: a little-endian 64-bit Mach-O that loads
+    // one library by `@executable_path`. The library exists, but outside
+    // the program's toolchain root (`fake`) and — with HOME unset below —
+    // outside every allowed prefix: the P-51 resolution must refuse it and
+    // name it.
+    let fake = fx.base.join("fake");
+    let lib = fx.base.join("elsewhere").join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("libblocked.dylib"), b"whatever").unwrap();
+    let mut go: Vec<u8> = Vec::new();
+    go.extend_from_slice(&0xfeedfacfu32.to_le_bytes());
+    go.extend_from_slice(&0x0100_000cu32.to_le_bytes()); // CPU_TYPE_ARM64
+    go.extend_from_slice(&0u32.to_le_bytes());
+    go.extend_from_slice(&6u32.to_le_bytes()); // MH_DYLIB
+    go.extend_from_slice(&1u32.to_le_bytes()); // ncmds
+    go.extend_from_slice(&0u32.to_le_bytes()); // sizeofcmds
+    go.extend_from_slice(&0u32.to_le_bytes());
+    go.extend_from_slice(&0u32.to_le_bytes());
+    let name = "@executable_path/../../elsewhere/lib/libblocked.dylib";
+    let size = (24 + name.len() + 1).div_ceil(4) * 4;
+    go.extend_from_slice(&0x0cu32.to_le_bytes()); // LC_LOAD_DYLIB
+    go.extend_from_slice(&(size as u32).to_le_bytes());
+    go.extend_from_slice(&24u32.to_le_bytes()); // name.offset
+    go.extend_from_slice(&1u32.to_le_bytes()); // timestamp
+    go.extend_from_slice(&0u32.to_le_bytes());
+    go.extend_from_slice(&0u32.to_le_bytes());
+    go.extend_from_slice(name.as_bytes());
+    go.push(0);
+    go.resize(go.len() + (size - 24 - name.len() - 1), 0);
+    go[20..24].copy_from_slice(&(32u32.to_le_bytes()));
+    let bin = fake.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("go"), &go).unwrap();
+    // Only the fake program is on PATH: the other presets' anchors are
+    // missing (the presets line WARNs for them; this test reads the
+    // exec-programs line), and nothing else is started. HOME is unset for
+    // the call: the fixture lies under this user's home directory, which
+    // IS an allowed prefix (P-51), and the test needs the lib to be
+    // outside every one of them.
+    let real_path = std::env::var_os("PATH");
+    let real_home = std::env::var_os("HOME");
+    std::env::set_var("PATH", bin.canonicalize().unwrap());
+    std::env::remove_var("HOME");
+    let state = fx.state();
+    let o = cli(&[
+        "doctor",
+        "--endpoint",
+        &endpoint(&m),
+        "--state-root",
+        state.to_str().unwrap(),
+    ]);
+    match real_path {
+        Some(p) => std::env::set_var("PATH", p),
+        None => std::env::remove_var("PATH"),
+    }
+    match real_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    clear_homes();
+    let out = stdout(&o);
+    assert_eq!(o.code, 0, "stderr: {}", stderr(&o));
+    assert!(
+        out.contains("WARN exec-programs") && out.contains("libblocked.dylib"),
+        "{out}"
+    );
+    // The exact path, not a summary: the canonical directory the task's
+    // exec section would have to name.
+    assert!(
+        out.contains(&lib.canonicalize().unwrap().display().to_string()),
+        "{out}"
+    );
+}
+
 /// Windows (S-W1): with no state root given, doctor says plainly that
 /// Windows has no default and no volume query yet — a WARN (the known
 /// shape of this host), never a FAIL, and never a created directory. The

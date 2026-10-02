@@ -56,6 +56,7 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
         ["resume", rest @ ..] => gate_child(cx, rest, Verb::Resume),
         ["replay", rest @ ..] => gate_child(cx, rest, Verb::Replay),
         ["events", rest @ ..] => events(cx, rest),
+        ["apply", rest @ ..] => crate::cmd_apply::apply(cx, rest),
         ["profile", "check", rest @ ..] => profile_check(cx, rest),
         ["profile", "init", rest @ ..] => profile_init(cx, rest),
         ["sessions", rest @ ..] => sessions(cx, rest),
@@ -84,6 +85,7 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "preset",
             "shell",
             "no-default-denies",
+            "workspace-mode",
         ],
         Verb::Resume => &[
             "run",
@@ -115,7 +117,13 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "no-default-denies",
         ],
     };
-    let parsed = options(rest, allowed, VALUELESS);
+    // `scratch-with-git` (P-52) goes with `--workspace-mode scratch`, which
+    // only a run may take; replay has no workspace to copy.
+    let valueless: &[&str] = match verb {
+        Verb::Run => &["shell", "no-default-denies", "scratch-with-git"],
+        Verb::Resume | Verb::Replay => VALUELESS,
+    };
+    let parsed = options(rest, allowed, valueless);
     let gate_text = parsed
         .as_ref()
         .ok()

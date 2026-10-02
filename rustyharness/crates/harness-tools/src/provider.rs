@@ -188,6 +188,20 @@ pub enum ExecCleanup {
     Unconfirmed,
 }
 
+/// A file image (P-22 pre-image store): a file's whole bytes and their
+/// SHA-256, which is the blob name the run stores them under. The edit
+/// engine returns the file's images with every verified edit — the
+/// pre-image (its bytes before the edit; `None` for a create) and the
+/// post-image — so the journal can cite both as blobs and the restore
+/// primitive can put the pre-image back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    /// SHA-256 of [`Image::bytes`].
+    pub sha256: Digest,
+    /// The whole file's bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// A file read and its content digest (§2.3 "Stale reads").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRecord {
@@ -208,6 +222,11 @@ pub struct EditRecord {
     pub before: Option<Digest>,
     /// SHA-256 of the file after the edit, as re-read and verified.
     pub after: Digest,
+    /// The file's bytes before the edit, with their digest (P-22); `None`
+    /// when the edit created it.
+    pub before_image: Option<Image>,
+    /// The file's verified bytes after the edit, with their digest (P-22).
+    pub after_image: Image,
 }
 
 /// A provider-level failure (the provider could not even report a status).

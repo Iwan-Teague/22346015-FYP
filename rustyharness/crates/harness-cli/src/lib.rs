@@ -101,6 +101,7 @@ macro_rules! say {
 mod approver;
 mod args;
 mod bundle;
+mod cmd_apply;
 mod cmd_chat;
 mod cmd_doctor;
 mod cmd_events;
@@ -113,15 +114,20 @@ mod cmd_schedule;
 mod cmd_sessions;
 mod config;
 mod dispatch;
+mod exec_libs;
 mod exec_presets;
 mod inputs;
 mod render;
 mod repl;
 mod report;
 mod usage;
+mod workspace_mode;
 
 pub use approver::{ApproverSource, TerminalApprover};
 pub use dispatch::main_with;
+// The exec resolution the integration tests recompute (the journal
+// header's exec input must be checkable from outside the crate, P-51).
+pub use exec_presets::resolve_names;
 pub use repl::{BackendSource, InputSource};
 
 /// Where the CLI writes, and what it is given from outside: the locality

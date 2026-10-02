@@ -758,13 +758,39 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
         &mut self,
         payload: &Untrusted<T>,
     ) -> Result<UntrustedBlob, JournalError> {
+        self.untrusted_home(payload, true)
+    }
+
+    /// Put an untrusted payload into the blob store, never inline (P-22:
+    /// a file image must be in `blobs/` for the restore primitive to find,
+    /// whatever its size and encoding). The blob's name is the bytes'
+    /// SHA-256, so re-storing the same bytes is a no-op; a blob failure
+    /// poisons the writer like any other.
+    pub fn untrusted_stored<T: AsRef<[u8]>>(
+        &mut self,
+        payload: &Untrusted<T>,
+    ) -> Result<UntrustedBlob, JournalError> {
+        self.untrusted_home(payload, false)
+    }
+
+    /// [`JournalWriter::untrusted`] and [`JournalWriter::untrusted_stored`]
+    /// differ only in whether an inline carrier is allowed.
+    fn untrusted_home<T: AsRef<[u8]>>(
+        &mut self,
+        payload: &Untrusted<T>,
+        inline_allowed: bool,
+    ) -> Result<UntrustedBlob, JournalError> {
         self.check_poison()?;
         let bytes = payload.inspect("journal: untrusted payload home").as_ref();
         let digest = sha256(bytes);
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let inline = match std::str::from_utf8(bytes) {
-            Ok(s) if bytes.len() <= INLINE_MAX => Some(escape(s)),
-            _ => None,
+        let inline = if inline_allowed {
+            match std::str::from_utf8(bytes) {
+                Ok(s) if bytes.len() <= INLINE_MAX => Some(escape(s)),
+                _ => None,
+            }
+        } else {
+            None
         };
         let blob = if inline.is_none() {
             let name = digest.to_string();

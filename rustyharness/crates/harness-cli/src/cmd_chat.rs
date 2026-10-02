@@ -50,7 +50,12 @@ const ALLOWED: &[&str] = &[
     "preset",
     "shell",
     "no-default-denies",
+    "workspace-mode",
 ];
+
+/// The chat verb's valueless flags (`--scratch-with-git` goes with
+/// `--workspace-mode scratch`, P-52).
+const FLAGS: &[&str] = &["shell", "no-default-denies", "scratch-with-git"];
 
 /// The token budget every CLI run is given (`inputs.rs`; the profile
 /// derived default; the task's `budget` section does not set tokens).
@@ -87,7 +92,7 @@ pub(crate) fn chat(cx: &Cx<'_>, rest: &[&str]) -> u8 {
             other => filtered.push(other),
         }
     }
-    let parsed = crate::args::options_with_flags(&filtered, ALLOWED, crate::dispatch::VALUELESS);
+    let parsed = crate::args::options_with_flags(&filtered, ALLOWED, FLAGS);
     let gate_text = parsed
         .as_ref()
         .ok()
@@ -244,6 +249,25 @@ fn try_chat(
         note!(cx, "{why}");
         return refused(exit::INDETERMINATE, why);
     }
+    // The workspace mode (P-52): in-place (the default, unchanged) or a
+    // scratch copy the session sees instead of the original. `worktree` is
+    // refused at the option parser (INV-23); a copy failure refuses before
+    // anything runs.
+    let mode = match crate::workspace_mode::parse_mode(o) {
+        Ok(m) => m,
+        Err(e) => {
+            note!(cx, "{e}\n{}", crate::args::USAGE);
+            return refused(exit::USAGE, e);
+        }
+    };
+    let prep = match crate::workspace_mode::prepare(cx, &mode, &workspace, &state_root) {
+        Ok(p) => p,
+        Err(r) => {
+            note!(cx, "{}", r.why);
+            return refused(r.code, r.why);
+        }
+    };
+    let workspace: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(prep.workspace);
     // The backend: the shipped binary builds the OpenAI-compatible client
     // from --endpoint (and checks the server); an embedder hands one over
     // and no endpoint is needed.

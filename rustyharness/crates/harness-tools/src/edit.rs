@@ -81,12 +81,20 @@ use crate::builtin::{
     RootRefused,
 };
 use crate::protected::Protected;
-use crate::provider::{EditRecord, InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult};
+use crate::provider::{
+    EditRecord, Image, InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult,
+};
 
 /// Largest file the edit engine reads or writes — the same cap as
 /// `fs.read` ([`READ_MAX_BYTES`](crate::builtin::READ_MAX_BYTES)), so a
 /// file the harness can read whole is one it can edit.
 pub const EDIT_MAX_BYTES: u64 = crate::builtin::READ_MAX_BYTES;
+/// Largest file the pre-image store keeps (P-22, 2 MiB): an edit to a
+/// file whose prior bytes are over this is refused, fail closed, so
+/// every applied edit keeps a restorable pre-image (a file the read
+/// tools can show whole but the store cannot keep is one the harness
+/// does not edit).
+pub const PRE_IMAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Most lines a whole-file overwrite may target (§4.8: 400).
 pub const WRITE_OVERWRITE_MAX_LINES: usize = 400;
 /// Most "nearest match" line numbers a [`EditError::ZeroMatches`] lists.
@@ -248,7 +256,9 @@ pub struct WriteReq {
 }
 
 /// A successful edit: the before/after digests the H2 journal wants
-/// (§4.9 step 5). `before` is `None` for a create.
+/// (§4.9 step 5). `before` is `None` for a create. The images (P-22)
+/// carry the file's whole bytes before and after, for the pre-image
+/// store: the run keeps them as content-addressed blobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     /// The workspace path edited.
@@ -257,6 +267,12 @@ pub struct Applied {
     pub before: Option<Digest>,
     /// The file's SHA-256 after the edit.
     pub after: Digest,
+    /// The file's bytes before the edit, with their digest (`None` for a
+    /// create; P-22). Its digest is [`Applied::before`].
+    pub before_image: Option<Image>,
+    /// The file's verified bytes after the edit, with their digest
+    /// [`Applied::after`] (P-22).
+    pub after_image: Image,
     /// A replace's matches: the 1-based line of each in the file before
     /// the edit. Empty for a write.
     pub lines: Vec<usize>,
@@ -303,6 +319,16 @@ pub enum EditError {
     /// Larger than the edit cap.
     #[error("{len} bytes is over the {cap}-byte cap")]
     TooLarge {
+        /// The offending size.
+        len: u64,
+        /// The cap.
+        cap: u64,
+    },
+    /// The file's prior bytes are over the pre-image cap (P-22): the
+    /// pre-image store could not keep them, so the edit is refused, fail
+    /// closed, with the file untouched.
+    #[error("{len} bytes is over the {cap}-byte pre-image cap")]
+    PreImageTooLarge {
         /// The offending size.
         len: u64,
         /// The cap.
@@ -489,14 +515,25 @@ impl EditEngine {
         if !meta.is_file() {
             return Err(EditError::NotAFile);
         }
+        check_pre_image(meta.len())?;
         let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
         let (spliced, lines) = plan_replace(req, text, &bytes)?;
         let expected = sha256(&spliced);
+        let lines_after = line_count(&spliced);
         atomic_write(&path, &spliced, Some(meta.permissions()))?;
-        let mut applied = self.verify(&wp, Some(before), expected, line_count(&spliced))?;
+        let mut applied = self.verify(
+            &wp,
+            Some(Image {
+                sha256: before,
+                bytes,
+            }),
+            expected,
+            spliced,
+            lines_after,
+        )?;
         applied.lines = lines;
         Ok(applied)
     }
@@ -528,14 +565,25 @@ impl EditEngine {
         if !meta.is_file() {
             return Err(EditError::NotAFile);
         }
+        check_pre_image(meta.len())?;
         let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
         let (spliced, lines) = plan_multi(req, text, &bytes)?;
         let expected = sha256(&spliced);
+        let lines_after = line_count(&spliced);
         atomic_write(&path, &spliced, Some(meta.permissions()))?;
-        let mut applied = self.verify(&wp, Some(before), expected, line_count(&spliced))?;
+        let mut applied = self.verify(
+            &wp,
+            Some(Image {
+                sha256: before,
+                bytes,
+            }),
+            expected,
+            spliced,
+            lines_after,
+        )?;
         applied.lines = lines;
         Ok(applied)
     }
@@ -579,7 +627,8 @@ impl EditEngine {
                     remove_dirs(&self.root, &made);
                     return Err(e.into());
                 }
-                let mut applied = self.verify(&wp, None, expected, line_count(content))?;
+                let mut applied =
+                    self.verify(&wp, None, expected, content.to_vec(), line_count(content))?;
                 applied.dirs = made;
                 Ok(applied)
             }
@@ -587,14 +636,25 @@ impl EditEngine {
                 if !meta.is_file() {
                     return Err(EditError::NotAFile);
                 }
+                check_pre_image(meta.len())?;
                 let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
                 let before = sha256(&bytes);
                 reads.check(wp.as_str(), before).map_err(EditError::from)?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
                 let out_bytes = plan_write_overwrite(req, text, &bytes)?;
                 let expected = sha256(&out_bytes);
+                let lines_after = line_count(&out_bytes);
                 atomic_write(&path, &out_bytes, Some(meta.permissions()))?;
-                self.verify(&wp, Some(before), expected, line_count(&out_bytes))
+                self.verify(
+                    &wp,
+                    Some(Image {
+                        sha256: before,
+                        bytes,
+                    }),
+                    expected,
+                    out_bytes,
+                    lines_after,
+                )
             }
         }
     }
@@ -604,19 +664,26 @@ impl EditEngine {
     /// re-read takes the same component-by-component walk and the same
     /// cap as every other access, so a target that became a symlink (or
     /// grew past the cap) after the rename fails the edit instead of
-    /// being followed.
+    /// being followed. The images travel with the result (P-22): they
+    /// were captured before anything was written.
     fn verify(
         &self,
         wp: &WorkspacePath,
-        before: Option<Digest>,
+        before_image: Option<Image>,
         expected: Digest,
+        after_bytes: Vec<u8>,
         lines_after: usize,
     ) -> Result<Applied, EditError> {
-        self.reread(wp, before, expected)
+        self.reread(wp, before_image.as_ref().map(|i| i.sha256), expected)
             .map(|after| Applied {
                 path: wp.clone(),
-                before,
+                before: before_image.as_ref().map(|i| i.sha256),
                 after,
+                before_image,
+                after_image: Image {
+                    sha256: after,
+                    bytes: after_bytes,
+                },
                 lines: Vec::new(),
                 lines_after,
                 dirs: Vec::new(),
@@ -1028,10 +1095,26 @@ fn check_cap(content: &[u8]) -> Result<(), EditError> {
     Ok(())
 }
 
+/// Refuse an edit to a file whose prior bytes are over the pre-image cap
+/// (P-22), before anything is read into a plan or written: the pre-image
+/// store could not keep them, so the edit is refused, fail closed. `len`
+/// is the file's metadata size, so an oversize file is refused without
+/// being read.
+fn check_pre_image(len: u64) -> Result<(), EditError> {
+    if len > PRE_IMAGE_MAX_BYTES {
+        return Err(EditError::PreImageTooLarge {
+            len,
+            cap: PRE_IMAGE_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// Read at most `cap` bytes of `path` (`len` its metadata size, so an
 /// oversize file is refused without opening it; the bounded read also
-/// refuses a file that grew between the two).
-fn read_capped(path: &Path, len: u64, cap: u64) -> Result<Vec<u8>, EditError> {
+/// refuses a file that grew between the two). Crate-visible for the
+/// restore primitive's read-back.
+pub(crate) fn read_capped(path: &Path, len: u64, cap: u64) -> Result<Vec<u8>, EditError> {
     if len > cap {
         return Err(EditError::TooLarge { len, cap });
     }
@@ -1183,7 +1266,13 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
 /// renamed over the target. On any failure the temp file is removed and
 /// the target is untouched. The directory is not fsynced — the tested
 /// property is the rename's atomicity, not power-loss durability.
-fn atomic_write(target: &Path, bytes: &[u8], perms: Option<fs::Permissions>) -> io::Result<()> {
+/// Crate-visible for the restore primitive (P-22), which applies the
+/// same way.
+pub(crate) fn atomic_write(
+    target: &Path,
+    bytes: &[u8],
+    perms: Option<fs::Permissions>,
+) -> io::Result<()> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let (tmp, mut f) = create_temp(dir)?;
     let done = (|| -> io::Result<()> {
@@ -1392,6 +1481,7 @@ impl EditTools {
         if !meta.is_file() {
             return Err(EditError::NotAFile.into());
         }
+        check_pre_image(meta.len())?;
         let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
@@ -1420,6 +1510,7 @@ impl EditTools {
         if !meta.is_file() {
             return Err(EditError::NotAFile.into());
         }
+        check_pre_image(meta.len())?;
         let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
@@ -1457,6 +1548,7 @@ impl EditTools {
                 if !meta.is_file() {
                     return Err(EditError::NotAFile.into());
                 }
+                check_pre_image(meta.len())?;
                 let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
                 let before = sha256(&bytes);
                 reads.check(wp.as_str(), before).map_err(EditError::from)?;
@@ -1508,6 +1600,8 @@ fn record(a: &Applied) -> EditRecord {
         path: a.path.clone(),
         before: a.before,
         after: a.after,
+        before_image: a.before_image.clone(),
+        after_image: a.after_image.clone(),
     }
 }
 
@@ -1553,6 +1647,7 @@ fn edit_err(e: &EditError) -> Out {
         EditError::NotAFile => err(code::NOT_A_FILE, "not a regular file: name a file, not a directory (harness.fs.list shows what a directory holds)"),
         EditError::NotUtf8 => err(code::NOT_TEXT, "not UTF-8 text: this tool edits text files only; leave the file alone"),
         EditError::TooLarge { .. } => err(code::TOO_LARGE, "the file is larger than the edit cap: this tool cannot edit it; leave it alone and say so in the submit note"),
+        EditError::PreImageTooLarge { .. } => err(code::TOO_LARGE, "the file is larger than the pre-image cap: an edit keeps the file's prior bytes so it can be undone, and these would not fit; leave the file alone and say so in the submit note"),
         EditError::TooManyLines { lines, cap } => err(
             code::LINE_CAP,
             &format!(
@@ -2140,6 +2235,156 @@ mod tests {
             )
             .expect("non-protected edit goes through");
         assert_eq!(applied.after, sha256(b"HELLO\n"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // --- P-22: the pre-image store ---
+
+    // A verified edit carries the file's images (P-22): the bytes before
+    // (with their digest) and the verified bytes after, so the run can
+    // keep both as content-addressed blobs.
+    #[test]
+    fn applied_carries_pre_and_post_images() {
+        let ws = scratch("p22-images");
+        std::fs::write(ws.join("f.txt"), b"alpha\nbeta\n").expect("seed");
+        let engine = EditEngine::new(&ws).expect("engine");
+        let mut reads = ReadLog::default();
+        reads.record("f.txt", sha256(b"alpha\nbeta\n"));
+        let applied = engine
+            .replace(
+                &ReplaceReq {
+                    path: "f.txt".into(),
+                    old: "beta".into(),
+                    new: "delta".into(),
+                    count: 1,
+                },
+                &reads,
+            )
+            .expect("edit");
+        assert_eq!(applied.before, Some(sha256(b"alpha\nbeta\n")));
+        assert_eq!(
+            applied.before_image.as_ref().expect("pre-image").bytes,
+            b"alpha\nbeta\n".to_vec()
+        );
+        assert_eq!(
+            applied.before_image.as_ref().expect("pre-image").sha256,
+            sha256(b"alpha\nbeta\n")
+        );
+        assert_eq!(applied.after, sha256(b"alpha\ndelta\n"));
+        assert_eq!(applied.after_image.bytes, b"alpha\ndelta\n".to_vec());
+        assert_eq!(applied.after_image.sha256, applied.after);
+        // A create carries no pre-image, and its post-image is the body.
+        let applied = engine
+            .write(
+                &WriteReq {
+                    path: "new.txt".into(),
+                    content: "fresh\n".into(),
+                },
+                &ReadLog::default(),
+            )
+            .expect("create");
+        assert!(applied.before.is_none() && applied.before_image.is_none());
+        assert_eq!(applied.after_image.bytes, b"fresh\n".to_vec());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // The pre-image cap (P-22): a file whose prior bytes are over 2 MiB is
+    // refused, fail closed, before anything is read into a plan or written
+    // — by apply and preview alike, for every edit route — with the file
+    // untouched. A file of exactly the cap still edits.
+    #[test]
+    fn pre_image_over_cap_refuses_edit() {
+        let ws = scratch("p22-over-cap");
+        let over = PRE_IMAGE_MAX_BYTES + 1;
+        std::fs::write(ws.join("big.txt"), vec![b'a'; over as usize]).expect("seed");
+        // The edge file is at the cap and carries one unique needle (its
+        // last `ab`): an edit must still go through at exactly the cap.
+        let mut edge = vec![b'a'; PRE_IMAGE_MAX_BYTES as usize];
+        edge[PRE_IMAGE_MAX_BYTES as usize - 1] = b'b';
+        std::fs::write(ws.join("edge.txt"), &edge).expect("seed");
+        let engine = EditEngine::new(&ws).expect("engine");
+        let mut reads = ReadLog::default();
+        reads.record("big.txt", sha256(&vec![b'a'; over as usize]));
+        reads.record("edge.txt", sha256(&edge));
+
+        let over_req = ReplaceReq {
+            path: "big.txt".into(),
+            old: "a".into(),
+            new: "b".into(),
+            count: 1,
+        };
+        match engine.replace(&over_req, &reads) {
+            Err(EditError::PreImageTooLarge { len, cap }) => {
+                assert_eq!(len, over);
+                assert_eq!(cap, PRE_IMAGE_MAX_BYTES);
+            }
+            other => panic!("expected PreImageTooLarge, got {other:?}"),
+        }
+        // Multi and write-overwrite refuse the same way.
+        assert!(matches!(
+            engine.multi(
+                &MultiReq {
+                    path: "big.txt".into(),
+                    edits: vec![Replacement {
+                        old: "a".into(),
+                        new: "b".into(),
+                    }],
+                },
+                &reads,
+            ),
+            Err(EditError::PreImageTooLarge { .. })
+        ));
+        assert!(matches!(
+            engine.write(
+                &WriteReq {
+                    path: "big.txt".into(),
+                    content: "small\n".into(),
+                },
+                &reads,
+            ),
+            Err(EditError::PreImageTooLarge { .. })
+        ));
+        // The file is untouched, byte for byte.
+        assert_eq!(
+            std::fs::metadata(ws.join("big.txt")).expect("meta").len(),
+            over
+        );
+
+        // The preview refuses exactly like apply.
+        let tools = EditTools::new(&ws).expect("tools");
+        assert!(matches!(
+            tools.preview(
+                &Call {
+                    capability: REPLACE.to_owned(),
+                    args: serde_json::json!({
+                        "path": "big.txt", "old": "a", "new": "b", "count": 1
+                    }),
+                },
+                &reads,
+            ),
+            Err(PreviewRefused::Edit(EditError::PreImageTooLarge { .. }))
+        ));
+        // A file of exactly the cap still edits (the unique `ab`).
+        let applied = engine
+            .replace(
+                &ReplaceReq {
+                    path: "edge.txt".into(),
+                    old: "ab".into(),
+                    new: "ba".into(),
+                    count: 1,
+                },
+                &reads,
+            )
+            .expect("at-cap edit goes through");
+        assert_eq!(
+            applied
+                .before_image
+                .as_ref()
+                .expect("pre-image")
+                .bytes
+                .len() as u64,
+            PRE_IMAGE_MAX_BYTES
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

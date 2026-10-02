@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::driver::step::UserState;
 use crate::driver::{
     commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ExecHeader,
-    HeaderInputs, Loop, LoopInit, NonceSource, ReadLog, SandboxRecord,
+    HeaderInputs, Loop, LoopInit, NonceSource, ReadLog, SandboxRecord, WorkspaceModeRecord,
 };
 use crate::presubmit::PresubmitState;
 use crate::sample;
@@ -330,6 +330,25 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             ))
         }
     };
+    // The workspace-mode record (P-52): the replay cannot re-measure the
+    // host files it names, so it re-states the recorded value verbatim. A
+    // recorded value that is not one this build writes refuses by name.
+    let workspace_mode = match head.body.get("workspace_mode") {
+        Some(v) => match WorkspaceModeRecord::parse(v) {
+            Some(m) => Some(m),
+            None => {
+                return Ok(failed(
+                    diverge(
+                        0,
+                        0,
+                        "the header's workspace-mode record is not one this build writes",
+                    ),
+                    None,
+                ))
+            }
+        },
+        None => None,
+    };
     let (session, tools) = plan(
         a.spec,
         a.registry,
@@ -355,6 +374,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         approver_present,
         session: turn.copied(),
         exec: exec_header,
+        workspace_mode: workspace_mode.as_ref(),
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)

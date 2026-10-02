@@ -1048,7 +1048,8 @@ mod tests {
                 audit,
             };
             let (row, report) = run_one(name, &self.dir.join(name), &opts, &backend).unwrap();
-            (row, report.unwrap())
+            let report = report.unwrap_or_else(|| panic!("run refused: {row:?}"));
+            (row, report)
         }
     }
 
@@ -1107,7 +1108,9 @@ mod tests {
         assert!(row.pass);
 
         // A state root of our own holding a copy of the kept journal,
-        // with one byte flipped in the middle: the chain cannot verify.
+        // with one byte flipped in the middle (always a different byte,
+        // or a journal whose middle byte was already `c` would doctor to
+        // itself and audit clean): the chain cannot verify.
         let root = keeper.base().join("doctored-state");
         let att = root
             .join("runs")
@@ -1117,7 +1120,7 @@ mod tests {
         let journal = att.join("journal.jsonl");
         let mut bytes = std::fs::read(&journal).unwrap();
         let mid = bytes.len() / 2;
-        bytes[mid] = if bytes[mid] == b'a' { b'b' } else { b'c' };
+        bytes[mid] = if bytes[mid] == b'a' { b'b' } else { b'a' };
         std::fs::write(&journal, &bytes).unwrap();
 
         let t = load_task(&s.dir.join(name)).unwrap();

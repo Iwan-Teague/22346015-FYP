@@ -15,16 +15,19 @@
 //! error. A WARN is a working-but-limited host (no sandbox on Linux, no
 //! terminal, an unstamped profile), never a bad installation.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use harness_core::display::{sanitize_for_terminal, DisplayMode};
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_model::profile::Profile;
+use harness_sandbox::{ChildStatus, ConfinedSpec, Conformed, Limits, Network, Refused};
 
 use crate::args::{options, USAGE};
 use crate::config;
-use crate::exec_presets::look_up;
+use crate::exec_libs;
+use crate::exec_presets::{look_up, toolchain_root};
 use crate::report::exit;
 use crate::Cx;
 
@@ -88,7 +91,10 @@ pub(crate) fn doctor(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         Err(e) => (None, Some(e)),
     };
     let mut failed = false;
-    failed |= sandbox(cx);
+    // The witness once: the sandbox check reports it and the exec-programs
+    // check (P-51) runs through it.
+    let witness = cx.confinement.require();
+    failed |= sandbox(cx, &witness);
     failed |= state_root(cx, &o, &cfg);
     failed |= match config_error {
         Some(e) => check_line(
@@ -110,6 +116,7 @@ pub(crate) fn doctor(cx: &Cx<'_>, rest: &[&str]) -> u8 {
     failed |= endpoint(cx, config::value(&o, &cfg, "endpoint"));
     failed |= profile(cx, &cfg);
     failed |= presets(cx);
+    failed |= exec_programs(cx, &witness);
     failed |= terminal(cx);
     note!(
         cx,
@@ -131,8 +138,8 @@ pub(crate) fn doctor(cx: &Cx<'_>, rest: &[&str]) -> u8 {
 /// the refusal and its fix. A refusal is a WARN, not a FAIL: read-only
 /// sessions work everywhere the locality check does; only
 /// `harness.exec.run` needs the witness (README, H2d).
-fn sandbox(cx: &Cx<'_>) -> bool {
-    match cx.confinement.require() {
+fn sandbox(cx: &Cx<'_>, witness: &Result<Conformed, Refused>) -> bool {
+    match witness {
         Ok(w) => check_line(
             cx,
             Status::Pass,
@@ -414,6 +421,195 @@ fn presets(cx: &Cx<'_>) -> bool {
             ),
         )
     }
+}
+
+/// The preset programs that ARE here, proved to run in the sandbox
+/// (P-51): each is run as `<program> --version` through the confinement
+/// witness, with the read-only roots its toolchain and (since P-51) its
+/// dynamic libraries need. A program that cannot run is the P-51 bug
+/// shape (a dyld error inside the sandbox turning a correct agent's
+/// pre-submit check into `submitted_checks_failed`), so it is named here
+/// with exactly the path that was blocked — a WARN, not a FAIL, like the
+/// sandbox refusal: a program that cannot run confines the presets, not
+/// the rest of the harness. No program is started at all where the
+/// sandbox refuses.
+fn exec_programs(cx: &Cx<'_>, witness: &Result<Conformed, Refused>) -> bool {
+    let w = match witness {
+        Ok(w) => w,
+        Err(refused) => {
+            return check_line(
+                cx,
+                Status::Warn,
+                "exec-programs",
+                &format!(
+                    "the sandbox refuses ({}), so no preset program can be proved to run in \
+                     it; fix: see the sandbox line above",
+                    refused.0
+                ),
+            );
+        }
+    };
+    let Some(path) = std::env::var_os("PATH") else {
+        return check_line(
+            cx,
+            Status::Warn,
+            "exec-programs",
+            "PATH is not set, so no preset program can be proved to run; fix: run with PATH set",
+        );
+    };
+    // One scratch directory for the probes (working directory, HOME,
+    // TMPDIR), removed afterwards: the one write beside the default state
+    // root, and it is under the system's temporary directory.
+    let scratch = std::env::temp_dir().join(format!("rustyharness-doctor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    if std::fs::create_dir_all(&scratch).is_err() {
+        return check_line(
+            cx,
+            Status::Fail,
+            "exec-programs",
+            "no scratch directory could be created in the temporary directory; fix: check \
+             TMPDIR",
+        );
+    }
+    let home = exec_libs::home_dir();
+    let (mut ran, mut broken): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (_, anchor) in PRESETS {
+        let Ok(bin) = look_up(anchor, &path) else {
+            continue;
+        };
+        let Ok(root) = toolchain_root(&bin) else {
+            continue;
+        };
+        // The same resolution a run would do: the toolchain root, then
+        // the program's dynamic libraries. A resolution that would refuse
+        // a run is exactly what this line exists to say first.
+        let allowed = exec_libs::Allowed {
+            roots: std::slice::from_ref(&root),
+            home: home.as_deref(),
+        };
+        let libs = match exec_libs::resolve(&bin, &allowed) {
+            Ok(lr) => lr,
+            Err(e) => {
+                broken.push(format!("{anchor}: {e}"));
+                continue;
+            }
+        };
+        let mut roots = vec![root];
+        roots.extend(libs.roots);
+        match run_version_confined(cx, &bin, &roots, &scratch, w) {
+            Ok(()) => ran.push((*anchor).to_owned()),
+            Err(e) => broken.push(format!("{anchor}: {e}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    if !broken.is_empty() {
+        return check_line(
+            cx,
+            Status::Warn,
+            "exec-programs",
+            &format!(
+                "{}; fix: give tasks an exec section with the named directories as read_only \
+                 roots, or install the program under an allowed prefix",
+                broken.join("; ")
+            ),
+        );
+    }
+    if ran.is_empty() {
+        return check_line(
+            cx,
+            Status::Warn,
+            "exec-programs",
+            "no preset program is on PATH, so none could be proved to run in the sandbox; \
+             fix: see the presets line above",
+        );
+    }
+    check_line(
+        cx,
+        Status::Pass,
+        "exec-programs",
+        &format!("ran --version in the sandbox: {}", ran.join(", ")),
+    )
+}
+
+/// One `<program> --version` through the confinement witness: exit 0 is a
+/// pass. Anything else is a failure whose text names the exact path the
+/// sandbox blocked, when the program's own output names one (a dyld
+/// error does).
+fn run_version_confined(
+    cx: &Cx<'_>,
+    bin: &Path,
+    roots: &[PathBuf],
+    scratch: &Path,
+    w: &Conformed,
+) -> Result<(), String> {
+    let dir = bin
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("/usr/bin")
+        .to_owned();
+    let spec = ConfinedSpec {
+        argv: vec![bin.as_os_str().to_owned(), OsString::from("--version")],
+        cwd: scratch.to_path_buf(),
+        env: vec![
+            (
+                "PATH".into(),
+                OsString::from(format!("{dir}:/usr/bin:/bin")),
+            ),
+            ("HOME".into(), scratch.as_os_str().to_owned()),
+            ("TMPDIR".into(), scratch.as_os_str().to_owned()),
+        ],
+        read_only: roots.to_vec(),
+        read_write: vec![scratch.to_path_buf()],
+        protected: Vec::new(),
+        network: Network::None,
+        limits: Limits::wall(Duration::from_secs(60)),
+    };
+    let child = cx
+        .confinement
+        .spawn(&spec, w)
+        .map_err(|e| format!("the sandbox refused the program's setup: {e:?}"))?;
+    let exit = child.wait();
+    match exit.status {
+        ChildStatus::Exited(0) => Ok(()),
+        other => {
+            let why = match other {
+                ChildStatus::Exited(c) => format!("exit status {c}"),
+                ChildStatus::Signaled(n) => format!("signal {n}"),
+                ChildStatus::TimedOut => "past its time limit".to_owned(),
+                ChildStatus::ProcessLimit => "past its process limit".to_owned(),
+                ChildStatus::ExecFailed => "the program could not be started".to_owned(),
+                ChildStatus::Unknown => "no status the harness can trust".to_owned(),
+            };
+            Err(match blocked_path(&exit.stderr) {
+                Some(p) => format!("cannot run in the sandbox ({why}): the sandbox blocked {p}"),
+                None => format!("cannot run in the sandbox ({why}); its output names no path"),
+            })
+        }
+    }
+}
+
+/// The first path the program's stderr names as not loaded, not found or
+/// not permitted (a dyld or sandbox denial), cut to one line.
+fn blocked_path(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    for line in text.lines() {
+        let low = line.to_ascii_lowercase();
+        if low.contains("not loaded")
+            || low.contains("image not found")
+            || low.contains("not permitted")
+            || low.contains("not allowed")
+        {
+            let token = line
+                .split([' ', ',', '(', ')', '"', '\''])
+                .find(|t| t.starts_with('/'))?;
+            let mut cut = token.len().min(200);
+            while !token.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            return Some(token[..cut].to_owned());
+        }
+    }
+    None
 }
 
 /// The terminal check: asks (edits, commands) are answered by the person

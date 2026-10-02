@@ -25,7 +25,7 @@ use crate::driver::step::UserState;
 use crate::driver::{
     attempt_check, commit, exec_tools, header, loop_facts, new_meter_resumed, prepare, todo_for,
     Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, Prepared,
-    ReadLog,
+    ReadLog, WorkspaceModeRecord,
 };
 use crate::presubmit::PresubmitState;
 use crate::session::{
@@ -267,6 +267,20 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
     // carried from attempt to attempt, so the catch-up renders every
     // recorded request byte for byte; the workspace as it is now was
     // checked against the journal above.
+    // The workspace-mode record (P-52): the resumed attempt names the
+    // same scratch copy, re-stated from the recorded header. A recorded
+    // value that is not one this build writes refuses the resume.
+    let workspace_mode = match head.body.get("workspace_mode") {
+        Some(v) => match WorkspaceModeRecord::parse(v) {
+            Some(m) => Some(m),
+            None => {
+                return Err(not_resumable(
+                    "the header's workspace-mode record is not one this build writes",
+                ))
+            }
+        },
+        None => None,
+    };
     let hdr = header(&HeaderInputs {
         spec: r.spec,
         registry: r.registry,
@@ -284,6 +298,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             .exec
             .as_ref()
             .map(|(p, w)| ExecHeader::live(p, w, r.config)),
+        workspace_mode: workspace_mode.as_ref(),
     })?;
     let exec = exec_tools(&pre, &run_dir, r.confinement, r.config)?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
@@ -603,6 +618,20 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             .and_then(Value::as_u64)
             .unwrap_or(0),
     };
+    // The workspace-mode record (P-52): the resumed session names the
+    // same scratch copy, re-stated from the recorded header. A recorded
+    // value that is not one this build writes refuses the resume.
+    let workspace_mode = match head.body.get("workspace_mode") {
+        Some(v) => match WorkspaceModeRecord::parse(v) {
+            Some(m) => Some(m),
+            None => {
+                return Err(not_resumable(
+                    "the header's workspace-mode record is not one this build writes",
+                ))
+            }
+        },
+        None => None,
+    };
     let hdr = header(&HeaderInputs {
         spec: r.spec,
         registry: r.registry,
@@ -620,6 +649,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             .exec
             .as_ref()
             .map(|(p, w)| ExecHeader::live(p, w, &r.config.run)),
+        workspace_mode: workspace_mode.as_ref(),
     })?;
     let exec = exec_tools(&pre, &run_dir, r.confinement, &r.config.run)?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(

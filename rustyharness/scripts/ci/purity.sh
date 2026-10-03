@@ -816,12 +816,20 @@ sort -u "$tmpdir/ws-registry-raw" >"$tmpdir/ws-registry" || fail "sort failed (I
 #     harness-sandbox-linux, so no other platform's build pulls them. None
 #     has a process API; the unsafe sits in harness-sandbox-linux under the
 #     §5b ratchet, one `// SAFETY:` comment per site.
+#   enumflags2_derive (S-Lb fix-up): the `#[bitflags]` proc-macro
+#     `enumflags2` reexports — a MANDATORY, non-optional dependency of
+#     `enumflags2` 0.7 (locked 0.7.12, no feature turns it off), so the
+#     reviewed `landlock` tree cannot be built without it. Like
+#     `serde_derive` above, it executes only at build time inside rustc
+#     and generates impl blocks: no build script, no `links`, no FFI, no
+#     process, file or network API; its dependencies (proc-macro2, quote,
+#     syn) are already on this list. MIT OR Apache-2.0.
 printf '%s\n' \
     serde serde_core serde_derive proc-macro2 quote syn unicode-ident \
     serde_json itoa ryu memchr zmij thiserror thiserror-impl \
     sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
     cpufeatures libc regex regex-automata regex-syntax \
-    landlock rustix enumflags2 >"$tmpdir/allowed-registry-raw"
+    landlock rustix enumflags2 enumflags2_derive >"$tmpdir/allowed-registry-raw"
 sort -u "$tmpdir/allowed-registry-raw" >"$tmpdir/allowed-registry" || fail "sort failed (INV-23)"
 comm -23 "$tmpdir/ws-registry" "$tmpdir/allowed-registry" >"$tmpdir/ws-unlisted" || fail "comm failed (INV-23)"
 if [ -s "$tmpdir/ws-unlisted" ]; then

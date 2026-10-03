@@ -184,6 +184,15 @@ pub mod code {
     /// The confined fetcher failed to run or returned a bad frame
     /// (P-39g).
     pub const WEB_FETCHER: u16 = 34;
+    /// A search query is missing, not a string, or fails the §2.3 query
+    /// rule (P-39h).
+    pub const WEB_QUERY: u16 = 35;
+    /// No search endpoint is configured for this session's provider
+    /// (P-39h).
+    pub const WEB_NO_SEARCH: u16 = 36;
+    /// The search endpoint answered non-200, or with a body that is not
+    /// usable SearXNG JSON (P-39h).
+    pub const WEB_SEARCH_PARSE: u16 = 37;
 }
 
 const READ: &str = "harness.fs.read";

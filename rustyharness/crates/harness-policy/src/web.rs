@@ -453,7 +453,10 @@ pub(crate) const MAX_QUERY_CHARS: usize = 256;
 /// control, zero-width or bidi code point. The schema bounds `maxLength`
 /// only; the lower bound and the invisibility rule are policy's (the same
 /// code point set the manifest refuses in summaries).
-pub(crate) fn query_clean(q: &str) -> bool {
+///
+/// Public since P-39h: the provider re-checks the query before egress
+/// (defence in depth, the same way it re-checks the URL rule).
+pub fn query_clean(q: &str) -> bool {
     q.chars().count() <= MAX_QUERY_CHARS
         && !q.is_empty()
         && !q.chars().any(|c| c.is_control() || is_invisible_or_bidi(c))

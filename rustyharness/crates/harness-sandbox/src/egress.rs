@@ -597,32 +597,23 @@ where
         return Err(HopRefused::NoDirectEgress);
     }
 
-    // Resolve once per hop (§4.3). The pump never re-resolves.
-    let resolved = match resolver.resolve(&req.host, req.port) {
-        Ok(addrs) => addrs,
-        Err(ResolveRefused::Timeout) => {
-            journal_refuse(log, req, RefuseReason::DnsTimeout)?;
-            return Err(HopRefused::DnsTimeout);
+    // Search-endpoint mode (P-39h): the host is a user-configured loopback
+    // IP (SearXNG on `127.0.0.1` or `[::1]`), so no resolution happens and
+    // the loopback-classification waiver never applies to anything else.
+    // The host must already be an address: a name here would mean a DNS
+    // lookup this mode does not do, so it is refused (fail closed).
+    let (resolved, chosen) = if req.mode == EgressMode::SearchEndpoint {
+        match req.host.parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_loopback() => (Vec::new(), ip),
+            _ => {
+                journal_refuse(log, req, RefuseReason::NoAddress)?;
+                return Err(HopRefused::Resolve(
+                    "search endpoint host must be a loopback IP".into(),
+                ));
+            }
         }
-        Err(ResolveRefused::Failed(why)) => {
-            journal_refuse(log, req, RefuseReason::NoAddress)?;
-            return Err(HopRefused::Resolve(why));
-        }
-    };
-
-    // Classify the WHOLE answer (INV-44): one non-global address refuses
-    // the hop; nothing is filtered out, so a rebinding answer that mixes a
-    // good address in cannot smuggle the good one through.
-    let chosen = match classify_answer(&resolved) {
-        Ok(ip) => ip,
-        Err(AnswerRefused::Empty) => {
-            journal_refuse_with(log, req, RefuseReason::NoAddress, resolved)?;
-            return Err(HopRefused::NoAddress);
-        }
-        Err(AnswerRefused::NonGlobal { ip, class }) => {
-            journal_refuse_with(log, req, RefuseReason::NonGlobalAddress, resolved)?;
-            return Err(HopRefused::NonGlobalAddress { ip, class });
-        }
+    } else {
+        open_hop_resolved(log, resolver, req)?
     };
 
     // Journal allow BEFORE anything is bound or dialled (INV-43). A failed
@@ -674,6 +665,43 @@ where
         chosen,
         handle,
     })
+}
+
+/// The resolve-then-classify path for the non-search modes (§4.3): resolve
+/// once per hop, classify the WHOLE answer (INV-44), journaling every
+/// refusal. The pump never re-resolves.
+fn open_hop_resolved<L, R>(
+    log: &L,
+    resolver: &R,
+    req: &HopRequest<'_>,
+) -> Result<(Vec<IpAddr>, IpAddr), HopRefused>
+where
+    L: EgressLog + ?Sized,
+    R: Resolver + ?Sized,
+{
+    let resolved = match resolver.resolve(&req.host, req.port) {
+        Ok(addrs) => addrs,
+        Err(ResolveRefused::Timeout) => {
+            journal_refuse(log, req, RefuseReason::DnsTimeout)?;
+            return Err(HopRefused::DnsTimeout);
+        }
+        Err(ResolveRefused::Failed(why)) => {
+            journal_refuse(log, req, RefuseReason::NoAddress)?;
+            return Err(HopRefused::Resolve(why));
+        }
+    };
+    let chosen = match classify_answer(&resolved) {
+        Ok(ip) => ip,
+        Err(AnswerRefused::Empty) => {
+            journal_refuse_with(log, req, RefuseReason::NoAddress, resolved)?;
+            return Err(HopRefused::NoAddress);
+        }
+        Err(AnswerRefused::NonGlobal { ip, class }) => {
+            journal_refuse_with(log, req, RefuseReason::NonGlobalAddress, resolved)?;
+            return Err(HopRefused::NonGlobalAddress { ip, class });
+        }
+    };
+    Ok((resolved, chosen))
 }
 
 /// A running pump: the loopback port the fetcher dials, and the future hop

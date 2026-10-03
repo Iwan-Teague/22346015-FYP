@@ -1208,3 +1208,82 @@ Order and lanes:
 - P-39p last.
 
 The machine-readable copy is `docs/slices/P-39-slices.json`.
+
+### Track S-L (Linux)
+
+The Linux confinement backend (design note `docs/slices/S-L-linux-sandbox.md`, owner decision D29 / Q-17).
+Namespace-less Landlock (ABI 1–4+) + seccomp-bpf + no_new_privs + rlimits + subreaper/pgid kill as the
+fail-closed default; an unprivileged namespace tier (ports, stronger kill) as a later opt-in. `unsafe`
+is confined to a new `harness-sandbox-linux` crate (design §6.7). Runtime tests run in a real Linux VM
+over ssh, never `cargo check` alone; the matrix row is committed only from a green run on a real kernel.
+Each card is one GLM-flash slice. The machine-readable deps are in the note's `deps_extra.json` object.
+
+#### S-La — crate skeleton and delegation seam
+**S-La New `harness-sandbox-linux` crate, `unsafe` ratchet, delegation from `linux.rs`**
+- Why: give `unsafe` a home (design §6.7, L-D1/L-D2) and wire `harness_sandbox::linux::Linux::probe()` to delegate to it on `target_os=linux` while every other OS pulls none of it. No behaviour change yet: `probe()` still refuses, but now through the new crate's "primitives present?" check, not an unconditional `NotBuilt`. New crate `#![allow(unsafe_code)]` with a `// SAFETY:`-per-site ratchet; `harness-sandbox` stays `#![forbid(unsafe_code)]`. Add the crate to `scripts/ci/purity.sh` §5 as the single named `unsafe` exception with an `unsafe`-site count, the registry allowlist additions (`landlock`, `rustix` or `nix`, `enumflags2`, `libc`), and the target-gated path dep. No new behaviour reaches `harness-run`.
+- Crates: harness-sandbox-linux (new), harness-sandbox (`linux.rs` delegation, `Cargo.toml` target dep), scripts/ci/purity.sh, deny.toml, Cargo.lock (H-F).
+- Tests: `linux_crate_builds_on_linux_target` (cfg), `probe_still_refuses_without_primitives`, `unsafe_site_count_matches_ratchet` (purity selftest), `purity_allows_the_named_linux_unsafe_crate_only`, existing `cargo test -p harness-sandbox` unchanged on macOS.
+- Deps: ARCH:S-L. Parallel: no (crate head; touches purity/deny/lock). Risk: medium (supply chain, gate changes). ARCH: no.
+
+#### S-Lb — Landlock ruleset from a Validated spec
+**S-Lb Landlock ruleset: read/write/exec rights from the spec, ABI-aware, degrade = refuse**
+- Why: §1 (fs read/write/protected/exec parity, FT-3/4/9/10/12, hard-link). Map `Validated.{read_only, read_write, protected}` to a `landlock::Ruleset` using `PathFd` handles: read trees + devices + ro roots get `ReadFile|ReadDir`; rw roots add `WriteFile|Truncate|MakeReg|MakeDir|Remove*|Refer`; protected dirs get read-only rights (path specificity beats the rw rule). HARD-require the ABI the grants need (`CompatLevel::HardRequirement`, not best-effort): a kernel below it → `PrimitiveMissing("landlock-abi")`, never a weaker domain (L-D5). Pure rule-building is unit-tested on any OS; applying is linux-only.
+- Crates: harness-sandbox-linux (`landlock_rules.rs`).
+- Tests: `rules_grant_exactly_the_spec_roots`, `protected_dir_is_read_only_inside_a_writable_root`, `missing_required_abi_refuses_not_degrades`, `ro_root_gets_no_write_right`, `refer_denied_outside_rw_roots` (hard-link).
+- Deps: S-La. Parallel: yes (with S-Lc). Risk: high (security boundary). ARCH: no.
+
+#### S-Lc — seccomp denylist
+**S-Lc seccomp-bpf denylist: network off by default, escape syscalls refused**
+- Why: §1 "what Landlock cannot do" — close the socket/ptrace/io_uring/mount/unshare/kexec/bpf/perf/keyring gaps with one seccomp filter applied last before exec. Build the `BpfProgram` as pure-Rust data (an arch-guarded nr→RET_ERRNO ladder, ~100 lines) behind an internal `SeccompFilter` trait; one `seccomp(2)`/`prctl` apply is the only `unsafe`. `Network::None` denies the whole `socket` family; `clone3` denied outright, `clone` arg-filtered on `CLONE_NEW*`. The filter data builder is unit-tested anywhere; applying is linux-only.
+- Crates: harness-sandbox-linux (`seccomp.rs`).
+- Tests: `filter_data_denies_the_documented_syscalls`, `filter_data_is_deterministic`, `network_syscalls_denied_at_network_none`, `clone3_denied_and_clone_newns_flag_filtered`, `applied_filter_blocks_socket_in_a_child` (linux, control: unconfined child can `socket`).
+- Deps: S-La. Parallel: yes (with S-Lb). Risk: high (security boundary). ARCH: no.
+
+#### S-Ld — supervisor: subreaper, pgid, pidfd, reliable kill
+**S-Ld Supervisor: subreaper + process group + pidfd + control pipe; stop and crash both empty the tree**
+- Why: §1 process-tree containment / "every command process is gone" (FT-5/8/16/16-setsid). The launcher sets `PR_SET_CHILD_SUBREAPER`, runs the program in its own `setpgid` group, holds a `pidfd` and a control pipe with `PR_SET_PDEATHSIG` so a harness crash makes the kernel signal the helper, which sweeps. Stop = `kill_process_group(SIGKILL)` + reap descendants from the subreaper's child list (a `setsid` escapee is still reaped by the subreaper). Reuse the backend-neutral `ring.rs` for live output and the existing `ConfinedExit`/`DomainCleanup` vocabulary. `close_range` before exec so no harness fd leaks (fd-inherit case). No `ConfinedChild` API change.
+- Crates: harness-sandbox-linux (`supervisor.rs`), harness-sandbox (reuse `ring.rs`, `spec.rs`).
+- Tests: `stop_kills_the_whole_process_group`, `setsid_double_fork_escapee_is_reaped_by_the_subreaper`, `crash_of_the_parent_sweeps_via_pdeathsig`, `no_stray_fd_crosses_exec`, `ring_output_is_bounded_and_digested` (reuse), `wall_clock_and_rlimit_cpu_both_stop_a_busy_loop`.
+- Deps: S-Lb, S-Lc. Parallel: no (joins the two halves). Risk: high. ARCH: no.
+#### S-Le — live probe, witness mint, matrix row
+**S-Le Live self-probe that applies the sandbox in a child, verifies canaries refused, mints `Conformed`**
+- Why: §3.4, INV-6/INV-15. A probe child spawned through the real supervisor path applies Landlock+seccomp+rlimits then attempts the canaries (connect, bind, write-outside, read-home-canary + symlink, env, benign-control, fork/mem bomb, setsid sweep); any canary NOT refused → `LiveProbeFailed`, no witness (final, never retried — load-shaped Io retries only, matching `seatbelt.rs` H2f). Commit the first Linux `MatrixRow` (`linux-landlock-seccomp-nons-v1`, `NetworkMechanism::LinuxLandlockSeccomp`, `KillDomain::LinuxCgroup`-or-subreaper, guards per tier) covering `H2_EXIT_CASES` — but ONLY after S-Lf is green on a real kernel (this card lands the probe + an UNCOMMITTED row behind a feature/test gate; the row is committed in the same PR S-Lf passes). Mint stays crate-private in `linux.rs` (INV-15). Add the `backend` journal object (§3.5), replay-recomputed.
+- Crates: harness-sandbox-linux (`probe.rs`), harness-sandbox (`linux.rs` mint, `conformance.rs` row), the journal/header layer (`backend` object), replay audit.
+- Tests: `probe_mints_only_when_every_canary_is_refused`, `an_escape_is_final_and_mints_nothing`, `a_load_shaped_io_failure_is_retried`, `witness_names_backend_abi_and_guards`, `backend_object_round_trips_and_replay_recomputes_it`, `require_passes_on_linux_when_the_probe_passes` (linux/VM).
+- Deps: S-Ld. Parallel: no. Risk: high. ARCH: no.
+#### S-Lf — Linux conformance parity suite
+**S-Lf `tests/conformance_linux.rs`: the macOS suite mirrored through the real spawn seam**
+- Why: §4. One-for-one with `conformance_macos.rs`, same `Case` ids (FT-1..FT-18 as applicable, D31, nested-sandbox, hard-link), each checked from OUTSIDE with an unconfined control, `--test-threads=1`. This is the suite `rh-dev linux` runs in the VM; its green run on a real kernel is what lets S-Le commit the matrix row. FT-17 handling per L-Q3 (macOS-only on the row, reason recorded) until decided.
+- Crates: harness-sandbox (`tests/conformance_linux.rs`, `#![cfg(target_os="linux")]`).
+- Tests (named cases): `ft1_tcp_connect_refused`, `ft3_writes_outside_fail`, `ft4_secrets_and_home_unreadable`, `ft5_fork_bomb_bounded`, `ft6_memory_bomb_bounded`, `ft7_disk_fill_capped`, `ft8_busy_loop_killed`, `ft9_protected_paths_read_only`, `ft10_harness_state_unreadable`, `ft11_unix_socket_connect_fails`, `ft12_symlink_escape_refused`, `ft15_no_dns`, `ft16_setsid_escapee_reaped`, `d31_bind_refused`, `nested_sandbox_cannot_loosen`, `hard_link_from_outside_refused`.
+- Deps: S-Le, S-Lh. Parallel: no (verified serially in the one VM). Risk: high. ARCH: no.
+#### S-Lg — Linux-specific escape cases
+**S-Lg Linux escape cases: openat2, /proc mem, fd-inherit, LD_PRELOAD, setuid, memfd-exec, abstract unix, ptrace, fork-bomb-pgroup, /dev/shm+tmpfs**
+- Why: §4 Linux-specific table. New `Case` variants added to the Linux row ONLY as each test passes on a real kernel (P-36 §12 discipline). Covers the escapes a path/string sandbox misses.
+- Crates: harness-sandbox (`conformance.rs` new `Case` variants + ids; `tests/conformance_linux.rs` additions).
+- Tests: `linux_openat2_resolve_flags_cannot_escape_roots`, `linux_proc_self_mem_and_pid_mem_are_not_a_write_channel`, `linux_no_unexpected_fd_is_inherited_into_the_child`, `linux_ld_preload_and_loader_env_are_absent`, `linux_setuid_binary_gains_nothing_under_no_new_privs`, `linux_memfd_create_then_execveat_is_refused`, `linux_abstract_unix_socket_connect_is_refused`, `linux_ptrace_of_a_sibling_is_refused`, `linux_fork_bomb_and_setsid_double_fork_are_all_reaped`, `linux_dev_shm_and_tmpfs_writes_stay_inside_roots`.
+- Deps: S-Lf. Parallel: no. Risk: high. ARCH: no.
+#### S-Lh — rh-dev linux VM runner
+**S-Lh `rh-dev linux`: sync workspace to the Linux VM over ssh, run the suite with a timeout, report pass/fail**
+- Why: §5.1. A Rust subcommand on `tools/rh-dev` (no shell logic, memory "rust-only-tooling"): `--boot` via `utmctl`, poll ssh, `rsync` the tree (excl. target/.git), run `cargo test -p harness-sandbox --test conformance_linux -- --nocapture --test-threads=1` (+ unit tests) with a wall-clock timeout that kills the ssh child's group, parse `test result:` lines, exit 0 only if all pass, `--keep-logs`. Acquires `/tmp/rh-linux-vm.lock` for the whole run (one VM, serialised). Unreachable VM → loud non-zero "SKIPPED, not a pass".
+- Crates: tools/rh-dev (new `linux.rs` module; reuse its `Command`/output-parse helpers).
+- Tests: `rh_dev_linux_parses_cargo_test_result_lines`, `rh_dev_linux_unreachable_vm_is_loud_nonzero`, `rh_dev_linux_acquires_the_vm_lock`, `rh_dev_linux_builds_the_ssh_and_rsync_argv_without_a_shell`.
+- Deps: none. Parallel: yes (dev tool only). Risk: medium. ARCH: no.
+#### S-Li — conductor optional Linux step
+**S-Li Conductor Linux gate step: run `rh-dev linux` after macOS gates, never silently green**
+- Why: §5.2–5.3. For slices touching `harness-sandbox-linux`/`conformance_linux`, the conductor runs `rh-dev linux` after the macOS member gates pass; reachable → gates the merge like any other gate; unreachable/busy → loud banner, `linux: skipped` in the worker report, slice marked NOT Linux-verified (row not committed from a skipped run). Thin launcher only; all logic in `rh-dev`.
+- Crates: devkit/swarm (verify/conductor integration — a launcher line), docs note of the contract.
+- Tests: manual/recorded in the slice note (conductor is throwaway orchestration); assert the banner text and the non-green-on-skip behaviour in `rh-dev linux` itself (covered by S-Lh tests).
+- Deps: S-Lh. Parallel: yes. Risk: low. ARCH: no.
+#### S-Lj — opt-in namespace tier and loopback ports
+**S-Lj Namespace tier: unprivileged userns/netns/pidns + harness forwarder, enabling `Network::Loopback` ports**
+- Why: §1 ports row + P-36 §8 point 3. Where `HostFacts.userns_usable()` is true, an opt-in tier: empty netns + a harness-process forwarder (host `127.0.0.1:<p>` ⇄ bind-mounted unix socket ⇄ inside-netns `127.0.0.1:<p>`), PID-namespace init for atomic whole-tree kill (`KillDomain::LinuxPidNamespace`), and `NetworkMechanism::LinuxNetNamespace`. Only this tier lists `PORTS_CASES` on its row (seccomp cannot inspect sockaddr, so the default tier refuses ports). AppArmor-restricted-userns hosts stay on the default tier (ports refused), never refuse outright (L-Q8).
+- Crates: harness-sandbox-linux (`namespaces.rs`), harness-sandbox (`conformance.rs` netns row, `tests/conformance_linux.rs` ports cases).
+- Tests: `netns_tier_blocks_all_network_until_a_port_is_granted`, `granted_loopback_port_connects_through_the_forwarder`, `model_port_is_never_forwarded`, `pid_namespace_kill_leaves_no_descendant`, `apparmor_restricted_userns_falls_back_to_default_tier_not_refusal`, `default_tier_witness_refuses_loopback_ports` (covers() gate).
+- Deps: S-Lf. Parallel: yes (with S-Lk). Risk: high. ARCH: no.
+#### S-Lk — cgroup v2 bounds and the confined file-op helper
+**S-Lk cgroup v2 `memory.max`/`pids.max` (whole-tree bounds) and the Linux `rustyharness __confine fileop` helper**
+- Why: §1 memory/process rows (stronger bars `MemoryGuard::LinuxCgroupMax`, `ProcessGuard::LinuxPidsMax`) where a delegated cgroup subtree exists (`HostFacts.cgroup_v2`); and the Linux file-op helper (P-36 §8 point 4): `rustyharness __confine fileop` in a mount view with only the workspace, the same `rh-fileop/1` codec (`fileop/proto.rs`, already backend-neutral), no perl. Falls back to `RLIMIT_AS`/watchdog when no cgroup subtree is delegated.
+- Crates: harness-sandbox-linux (cgroup setup, fileop helper), harness-sandbox (reuse `fileop/proto.rs`, `conformance.rs` FILEOP_CASES on the Linux row).
+- Tests: `cgroup_pids_max_is_a_hard_fork_bomb_bound`, `cgroup_memory_max_bounds_the_whole_tree`, `falls_back_to_rlimit_when_no_delegated_subtree`, `fileop_helper_reads_and_writes_inside_workspace`, `fileop_symlink_to_outside_refused_by_the_kernel`, `fileop_helper_cannot_fork`.
+- Deps: S-Lf. Parallel: yes (with S-Lj). Risk: high. ARCH: no.

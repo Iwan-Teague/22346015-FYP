@@ -260,6 +260,7 @@ dependencies = [
  "harness-fetch",
  "harness-journal",
  "harness-manifest",
+ "harness-model-core",
  "harness-policy",
  "harness-sandbox",
  "regex",

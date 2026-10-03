@@ -625,3 +625,78 @@ fn egress_decision_wire_text() {
     assert_eq!(EgressPurpose::Search.as_str(), "search");
     assert_eq!(HopEnded::ConnectFailed.as_str(), "connect_failed");
 }
+
+// ---------------------------------------------------------------------------
+// P-39h: search-endpoint mode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_hop_journals_allow_and_dials_loopback_without_resolution() {
+    let fixture = spawn_fixture(5);
+    let log = RecordingLog::default();
+    let resolver = FakeResolver::default();
+    let port = fixture.addr().port();
+    let req = HopRequest {
+        hop: 9,
+        url: format!("http://127.0.0.1:{port}/search?q=x&format=json"),
+        host: "127.0.0.1".to_string(),
+        port,
+        mode: EgressMode::SearchEndpoint,
+        purpose: EgressPurpose::Search,
+        token: "t",
+        budgets: HopBudgets::default(),
+    };
+    let pump = open_hop(&log, &resolver, LoopbackConnector, &req).unwrap();
+
+    // INV-43: allowed before any byte; no resolution happened (§8 step 1).
+    let records = log.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].decision, EgressDecision::Allow);
+    assert!(records[0].resolved.is_empty());
+    assert_eq!(records[0].ip, Some(IpAddr::from([127, 0, 0, 1])));
+    assert_eq!(records[0].purpose, EgressPurpose::Search);
+    assert_eq!(records[0].mode, EgressMode::SearchEndpoint);
+    drop(records);
+    assert_eq!(resolver.calls(), 0, "search endpoints are never resolved");
+
+    let frame = run_fetch(pump.port(), "t", "127.0.0.1", port);
+    assert_eq!(frame.header.status, Some(200));
+    let io = pump.join();
+    assert_eq!(io.ended, HopEnded::Relayed);
+    assert_eq!(io.chosen, IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(fixture.accepts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn search_endpoint_non_loopback_host_refused_and_journalled() {
+    let fixture = spawn_fixture(0);
+    let log = RecordingLog::default();
+    let resolver = FakeResolver::default();
+    for host in ["10.0.0.5", "example.test", "[::1]x"] {
+        let req = HopRequest {
+            hop: 9,
+            url: format!("http://{host}/search?q=x"),
+            host: host.to_string(),
+            port: fixture.addr().port(),
+            mode: EgressMode::SearchEndpoint,
+            purpose: EgressPurpose::Search,
+            token: "t",
+            budgets: HopBudgets::default(),
+        };
+        let refused = open_hop(&log, &resolver, LoopbackConnector, &req).unwrap_err();
+        assert!(
+            matches!(refused, HopRefused::Resolve(_)),
+            "host {host}: {refused:?}"
+        );
+    }
+    let records = log.records.lock().unwrap();
+    assert_eq!(records.len(), 3);
+    for r in records.iter() {
+        assert_eq!(r.decision.wire_str(), "refuse:no-address");
+        assert!(r.resolved.is_empty());
+        assert_eq!(r.ip, None);
+    }
+    drop(records);
+    assert_eq!(resolver.calls(), 0, "never resolved, refused outright");
+    assert_eq!(fixture.accepts.load(Ordering::SeqCst), 0);
+}

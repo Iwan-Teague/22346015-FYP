@@ -20,6 +20,10 @@ harness-policy = { path = "../harness-policy" }
 # The command runner (H2d) starts every command through the sandbox's
 # Confinement seam, with its Conformed witness (design §1.2 edge).
 harness-sandbox = { path = "../harness-sandbox" }
+# `harness.web.search` (P-39h) reuses the loopback endpoint rule for the
+# user's SearXNG endpoint (P-39-web-airlock §8). A downward, acyclic edge;
+# the design graph does not draw it (yet), noted in docs/slices/P-39h.md.
+harness-model-core = { path = "../harness-model-core" }
 # `harness.fs.search` with `regex: true` (H2e): linear-time matching, and
 # the parser's typed errors for a bad pattern (workspace Cargo.toml says why).
 regex.workspace = true

@@ -1,5 +1,5 @@
-//! The web tool (`harness.web.fetch`, P-39g): one fetch through the
-//! confined fetcher, per the airlock design (§3-§5 of
+//! The web tools (`harness.web.fetch` P-39g, `harness.web.search` P-39h)
+//! through the confined fetcher, per the airlock design (§3-§5 and §8 of
 //! `docs/01-design-v0.1.md` and `docs/slices/P-39-web-airlock.md` §11).
 //!
 //! The provider never touches the network itself. Every hop goes:
@@ -23,6 +23,17 @@
 //! on the same URL is served with no egress at all. Budgets (§4.4): at
 //! most 20 fetches and 32 MiB down per session, one hop's wall clock per
 //! hop, at most 5 redirects per call.
+//!
+//! Search (§8, P-39h) rides the same one relay per hop: the endpoint is a
+//! SearXNG-compatible server the user runs on loopback (parsed with the
+//! same rule as the model endpoint, `harness_model_core::endpoint`), the
+//! hop is opened in `search-endpoint` mode — no resolution, the pump dials
+//! the loopback address directly — and the fetcher asks it for
+//! `GET /search?q=…&format=json`. The raw JSON is a blob for audit only;
+//! the observation is rebuilt in process from `results[]`, each URL
+//! re-checked through `parse_url`, titles and snippets cut and sanitized,
+//! each entry marked fetchable or not. A search never widens the
+//! allowlist.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,11 +47,14 @@ use harness_core::html::{self, ExtractLimits};
 use harness_core::{sha256, Digest, Sha256Stream, Source, Untrusted};
 use harness_journal::Journaled;
 use harness_manifest::ProviderName;
-use harness_policy::web::{parse_url, resolve_location, Allowlist, WebUrl, MAX_URL_BYTES};
-use harness_policy::{Authorized, Call, WEB_FETCH_ID};
+use harness_model_core::endpoint::{Endpoint, LoopbackHost};
+use harness_policy::web::{
+    parse_url, query_clean, resolve_location, Allowlist, WebUrl, MAX_URL_BYTES,
+};
+use harness_policy::{Authorized, Call, WEB_FETCH_ID, WEB_SEARCH_ID};
 use harness_sandbox::egress::{
     open_hop, Connector, EgressDecision, EgressLog, EgressMode, EgressPurpose, EgressRecord,
-    HopBudgets, HopRefused, HopRequest, RefuseReason, Resolver,
+    HopBudgets, HopRefused, HopRequest, LoopbackConnector, RefuseReason, Resolver,
 };
 use harness_sandbox::{ChildStatus, ConfinedSpec, Confinement, Conformed, Limits, Network};
 use serde_json::{json, Value};
@@ -78,6 +92,27 @@ pub const DEFAULT_FETCHES: u32 = 20;
 
 /// Bytes down per provider (session) by default (§4.4).
 pub const DEFAULT_BYTES_DOWN: u64 = 32 * 1024 * 1024;
+
+/// Searches per provider (session) by default (§4.4).
+pub const DEFAULT_SEARCHES: u32 = 10;
+
+/// Searches per provider (session), at most (§4.4).
+pub const MAX_SEARCHES: u32 = 100;
+
+/// The search endpoint's JSON body, in bytes (§8: 512 KiB).
+pub const SEARCH_BODY_MAX_BYTES: u64 = 512 * 1024;
+
+/// Characters kept from one result title (§8).
+pub const SEARCH_TITLE_MAX_CHARS: usize = 120;
+
+/// Characters kept from one result snippet (§8).
+pub const SEARCH_SNIPPET_MAX_CHARS: usize = 300;
+
+/// Results shown when the call does not ask for a count (§4.4).
+pub const DEFAULT_SEARCH_RESULTS: u64 = 5;
+
+/// Results shown per search, at most (§4.4).
+pub const MAX_SEARCH_RESULTS: u64 = 10;
 
 /// The content types a response may carry (§11). Anything else — PDFs,
 /// images, `application/octet-stream` — is refused, never downloaded into
@@ -174,6 +209,8 @@ impl std::fmt::Debug for BoxConnector {
 pub struct WebBudgets {
     /// Fetches per session (cache hits do not count).
     pub fetches: u32,
+    /// Searches per session (P-39h).
+    pub searches: u32,
     /// Bytes down per session, across every hop.
     pub bytes_down: u64,
     /// The body one fetch keeps; the fetcher truncates over this.
@@ -186,6 +223,7 @@ impl Default for WebBudgets {
     fn default() -> Self {
         Self {
             fetches: DEFAULT_FETCHES,
+            searches: DEFAULT_SEARCHES,
             bytes_down: DEFAULT_BYTES_DOWN,
             body_max_bytes: BODY_MAX_BYTES,
             hop: HopBudgets::default(),
@@ -261,6 +299,7 @@ struct CachedPage {
 struct Session {
     cache: BTreeMap<String, CachedPage>,
     fetches: u32,
+    searches: u32,
     bytes_down: u64,
     next_hop: u64,
 }
@@ -389,13 +428,14 @@ impl HopRunner for ConfinedHopRunner<'_> {
     }
 }
 
-/// The built-in web tool (§3, P-39g). One capability:
-/// `harness.web.fetch`.
+/// The built-in web tools (§3, §8; P-39g, P-39h): `harness.web.fetch`
+/// and `harness.web.search`.
 pub struct WebTools<'a> {
     ns: ProviderName,
     web_dir: PathBuf,
     allowlist: Allowlist,
     budgets: WebBudgets,
+    search_endpoint: Option<Endpoint>,
     egress: Egress,
     runner: Box<dyn HopRunner + 'a>,
     session: Session,
@@ -408,11 +448,13 @@ impl<'a> WebTools<'a> {
     /// cases (INV-46, checked at the earliest point of the byte-moving
     /// path). Tests bypass the confined path via
     /// [`WebTools::new_with_runner`].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         scratch: &Path,
         allowlist: Allowlist,
         budgets: WebBudgets,
         fetcher: FetcherPin,
+        search: Option<Endpoint>,
         confinement: &'a dyn Confinement,
         witness: Conformed,
         egress: Egress,
@@ -426,7 +468,7 @@ impl<'a> WebTools<'a> {
             witness,
             fetcher.path.clone(),
         )?);
-        Self::assemble(web_dir, allowlist, budgets, fetcher, egress, runner)
+        Self::assemble(web_dir, allowlist, budgets, fetcher, search, egress, runner)
     }
 
     /// Build the provider with an explicit hop runner: every check of
@@ -438,6 +480,7 @@ impl<'a> WebTools<'a> {
         allowlist: Allowlist,
         budgets: WebBudgets,
         fetcher: FetcherPin,
+        search: Option<Endpoint>,
         runner: Box<dyn HopRunner + 'a>,
         egress: Egress,
     ) -> Result<Self, WebSetupError> {
@@ -445,7 +488,7 @@ impl<'a> WebTools<'a> {
         let web_dir = scratch.join("web");
         make_dir(&web_dir).map_err(io)?;
         let web_dir = fs::canonicalize(&web_dir).map_err(io)?;
-        Self::assemble(web_dir, allowlist, budgets, fetcher, egress, runner)
+        Self::assemble(web_dir, allowlist, budgets, fetcher, search, egress, runner)
     }
 
     /// Shared tail of the constructors: budgets and the fetcher pin are
@@ -455,6 +498,7 @@ impl<'a> WebTools<'a> {
         allowlist: Allowlist,
         budgets: WebBudgets,
         fetcher: FetcherPin,
+        search: Option<Endpoint>,
         egress: Egress,
         runner: Box<dyn HopRunner + 'b>,
     ) -> Result<WebTools<'b>, WebSetupError> {
@@ -464,6 +508,11 @@ impl<'a> WebTools<'a> {
             return Err(WebSetupError::Budgets(
                 "body cap must be in [1, 2 MiB]".into(),
             ));
+        }
+        if budgets.searches == 0 || budgets.searches > MAX_SEARCHES {
+            return Err(WebSetupError::Budgets(format!(
+                "searches must be in [1, {MAX_SEARCHES}]"
+            )));
         }
         HopBudgets::new(budgets.hop.wall(), budgets.hop.relay_cap_bytes())
             .map_err(|e| WebSetupError::Budgets(e.to_string()))?;
@@ -480,6 +529,7 @@ impl<'a> WebTools<'a> {
             web_dir,
             allowlist,
             budgets,
+            search_endpoint: search,
             egress,
             runner,
             session: Session::default(),
@@ -500,7 +550,7 @@ impl ToolProvider for WebTools<'_> {
     }
 
     fn serves(&self, capability: &str) -> bool {
-        capability == WEB_FETCH_ID
+        capability == WEB_FETCH_ID || capability == WEB_SEARCH_ID
     }
 
     fn invoke(
@@ -510,7 +560,7 @@ impl ToolProvider for WebTools<'_> {
     ) -> Result<ToolResult, ToolError> {
         let c = call.call().call();
         let cap = c.capability.as_str();
-        if cap != WEB_FETCH_ID {
+        if cap != WEB_FETCH_ID && cap != WEB_SEARCH_ID {
             return Ok(refused(cap, RefusalKind::UnknownCapability));
         }
         if Instant::now() >= ctx.deadline {
@@ -527,6 +577,9 @@ impl ToolProvider for WebTools<'_> {
                 Vec::new(),
             ));
         };
+        if cap == WEB_SEARCH_ID {
+            return self.search(&c.args, log, ctx.deadline);
+        }
         let Some(raw) = c.args.get("url").and_then(Value::as_str) else {
             return Ok(self.fail(
                 code::BAD_ARGS,
@@ -615,6 +668,308 @@ impl ToolProvider for WebTools<'_> {
 }
 
 impl WebTools<'_> {
+    /// One search (§8, P-39h): the query re-checked against §2.3 (policy
+    /// checked it at authorize; this is the only path to egress), the hop
+    /// opened in search-endpoint mode — no resolution, loopback only,
+    /// journaled like every hop — and the endpoint's JSON rebuilt into a
+    /// bounded, sanitized observation. The raw JSON is a blob for audit
+    /// (its digest rides the hop record); it never reaches the context.
+    #[allow(clippy::too_many_lines)]
+    fn search(
+        &mut self,
+        args: &Value,
+        log: &dyn EgressLog,
+        deadline: Instant,
+    ) -> Result<ToolResult, ToolError> {
+        let Some(endpoint) = self.search_endpoint.as_ref() else {
+            return Ok(self.fail(
+                code::WEB_NO_SEARCH,
+                "no search endpoint is configured for this session",
+                WEB_SEARCH_ID.to_owned(),
+                Vec::new(),
+            ));
+        };
+        let addr_host = match &endpoint.host {
+            LoopbackHost::V4 => "127.0.0.1",
+            LoopbackHost::V6 => "[::1]",
+        };
+        let (port, base_path) = (endpoint.port, endpoint.base_path.clone());
+        let Some(query) = args.get("query").and_then(Value::as_str) else {
+            return Ok(self.fail(
+                code::WEB_QUERY,
+                "query must be a string",
+                WEB_SEARCH_ID.to_owned(),
+                Vec::new(),
+            ));
+        };
+        if !query_clean(query) {
+            return Ok(self.fail(
+                code::WEB_QUERY,
+                "query fails the §2.3 bounds (1..=256 chars, no control, zero-width or bidi)",
+                query.to_owned(),
+                Vec::new(),
+            ));
+        }
+        let shown = match args.get("max_results") {
+            None | Some(Value::Null) => DEFAULT_SEARCH_RESULTS,
+            Some(v) => match v.as_u64() {
+                Some(n) if (1..=MAX_SEARCH_RESULTS).contains(&n) => n,
+                _ => {
+                    return Ok(self.fail(
+                        code::BAD_ARGS,
+                        "max_results must be an integer in [1, 10]",
+                        query.to_owned(),
+                        Vec::new(),
+                    ))
+                }
+            },
+        };
+        self.session.searches += 1;
+        if self.session.searches > self.budgets.searches {
+            return Ok(self.fail(
+                code::WEB_BUDGET,
+                "session search budget exhausted",
+                query.to_owned(),
+                Vec::new(),
+            ));
+        }
+        let wall = self
+            .budgets
+            .hop
+            .wall()
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if wall.is_zero() {
+            return Ok(self.fail(
+                code::WEB_BUDGET,
+                "the per-call deadline passed before the search",
+                WEB_SEARCH_ID.to_owned(),
+                Vec::new(),
+            ));
+        }
+        let Ok(budgets) = HopBudgets::new(wall, SEARCH_BODY_MAX_BYTES + 64 * 1024) else {
+            return Ok(self.fail(
+                code::WEB_BUDGET,
+                "hop budgets out of range",
+                WEB_SEARCH_ID.to_owned(),
+                Vec::new(),
+            ));
+        };
+        let target = format!(
+            "{base}/search?q={}&format=json&pageno=1&safesearch=1",
+            percent_encode_query(query),
+            base = base_path,
+        );
+        let request_url = format!("http://{addr_host}:{port}{target}");
+        let hop_no = self.session.next_hop;
+        self.session.next_hop += 1;
+        let token = hop_token(hop_no);
+        let hreq = HopRequest {
+            hop: hop_no,
+            url: request_url.clone(),
+            host: addr_host.to_owned(),
+            port,
+            mode: EgressMode::SearchEndpoint,
+            purpose: EgressPurpose::Search,
+            token: &token,
+            budgets,
+        };
+        // Journals the decision (allow or refusal) before any byte. The
+        // pump dials the loopback endpoint through the dedicated
+        // connector; nothing here resolves (§8 steps 1-2).
+        let pump = match open_hop(log, self.egress.resolver.as_ref(), LoopbackConnector, &hreq) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(self.fail(code::WEB_EGRESS, &egress_msg(&e), request_url, Vec::new()))
+            }
+        };
+        let relay_port = pump.port();
+        let hop_dir = self.web_dir.join(format!("hop-{hop_no}"));
+        if let Err(e) = make_dir(&hop_dir) {
+            return Ok(self.fail(
+                code::WEB_FETCHER,
+                &format!("hop dir: {e}"),
+                request_url,
+                Vec::new(),
+            ));
+        }
+        let req_path = hop_dir.join("req.json");
+        if let Err(e) = write_search_request(
+            &req_path, relay_port, &token, addr_host, port, &target, wall,
+        ) {
+            return Ok(self.fail(
+                code::WEB_FETCHER,
+                &format!("request file: {e}"),
+                request_url,
+                Vec::new(),
+            ));
+        }
+        let run = HopRun {
+            req_path: &req_path,
+            hop_dir: &hop_dir,
+            proxy_port: relay_port,
+            wall,
+            output_bytes: SEARCH_BODY_MAX_BYTES + 4096,
+        };
+        let framed = self.runner.run(&run);
+        let io = pump.join();
+        self.session.bytes_down += io.bytes_down;
+        // §5.3: the hop directory holds only the request file and is
+        // removed once the hop ends. Best effort: the frame is already
+        // in memory and the egress record already journaled.
+        let _ = fs::remove_dir_all(&hop_dir);
+        let record = |frame: Option<&harness_core::fetch_frame::Frame>| WebHop {
+            hop: hop_no,
+            url: request_url.clone(),
+            status: frame.and_then(|f| f.header.status),
+            content_type: frame.and_then(|f| f.header.content_type.clone()),
+            body_len: frame.map_or(0, |f| f.header.body_len),
+            body_sha256: frame.map_or(sha256(&[]), |f| sha256(&f.body)),
+            truncated: frame.is_some_and(|f| f.header.truncated),
+            bytes_up: io.bytes_up,
+            bytes_down: io.bytes_down,
+            elapsed_ms: u64::try_from(io.elapsed.as_millis()).unwrap_or(u64::MAX),
+            ended: io.ended.as_str(),
+            mode: EgressMode::SearchEndpoint.as_str(),
+            ip: Some(io.chosen),
+            location: None,
+        };
+        let frame = match framed {
+            Ok(bytes) => {
+                match harness_core::fetch_frame::parse_frame(&bytes, SEARCH_BODY_MAX_BYTES) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let hops = vec![record(None)];
+                        return Ok(self.fail(code::WEB_FETCHER, &e.to_string(), request_url, hops));
+                    }
+                }
+            }
+            Err(e) => {
+                let hops = vec![record(None)];
+                return Ok(self.fail(code::WEB_FETCHER, &e.to_string(), request_url, hops));
+            }
+        };
+        let hops = vec![record(Some(&frame))];
+        if let Some(kind) = frame.header.error.as_deref() {
+            return Ok(self.fail(code::WEB_FETCHER, kind, request_url, hops));
+        }
+        let status = frame.header.status.unwrap_or(0);
+        if status != 200 {
+            return Ok(self.fail(
+                code::WEB_SEARCH_PARSE,
+                &format!("search endpoint returned {status}"),
+                request_url,
+                hops,
+            ));
+        }
+        let body = serde_json::from_slice::<Value>(&frame.body);
+        let doc = match body {
+            Ok(d) => d,
+            Err(_) => {
+                return Ok(self.fail(
+                    code::WEB_SEARCH_PARSE,
+                    "search endpoint response is not JSON",
+                    request_url,
+                    hops,
+                ))
+            }
+        };
+        let Some(results) = doc.get("results").and_then(Value::as_array) else {
+            return Ok(self.fail(
+                code::WEB_SEARCH_PARSE,
+                "search endpoint response has no results array",
+                request_url,
+                hops,
+            ));
+        };
+        Ok(self.finish_search(query, shown, results, request_url, hops))
+    }
+
+    /// Rebuild the observation from the search JSON (§8 step 4): only
+    /// `results[].{url,title,content}` are read; every URL goes through
+    /// `parse_url` (bad ones dropped and counted); titles and snippets
+    /// are sanitized and cut; each kept entry is marked fetchable or not.
+    /// The allowlist is never widened by a search result.
+    fn finish_search(
+        &self,
+        query: &str,
+        shown: u64,
+        results: &[Value],
+        request_url: String,
+        hops: Vec<WebHop>,
+    ) -> ToolResult {
+        let mut kept: Vec<(String, bool, String, Option<String>)> = Vec::new();
+        let mut dropped = 0u64;
+        for r in results {
+            if kept.len() as u64 >= shown {
+                break;
+            }
+            let Some(url) = r.get("url").and_then(Value::as_str) else {
+                dropped += 1;
+                continue;
+            };
+            let Ok(parsed) = parse_url(url) else {
+                dropped += 1;
+                continue;
+            };
+            let fetchable = self.allowlist.allows(&parsed);
+            let title = r
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let snippet = r
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            kept.push((
+                format!("{}:{}{}", parsed.host(), parsed.port(), parsed.target()),
+                fetchable,
+                title,
+                snippet,
+            ));
+        }
+        let mut obs = String::new();
+        obs.push_str(&format!(
+            "search \"{}\": {} results ({} dropped: bad URL)\n",
+            sanitize_for_terminal_bounded(query, DisplayMode::Block, MAX_URL_BYTES),
+            kept.len(),
+            dropped
+        ));
+        for (i, (where_, fetchable, title, snippet)) in kept.iter().enumerate() {
+            let mark = if *fetchable {
+                "fetchable"
+            } else {
+                "not on allowlist"
+            };
+            let title = sanitize_for_terminal_bounded(
+                title,
+                DisplayMode::Block,
+                4 * SEARCH_TITLE_MAX_CHARS,
+            );
+            let title = cut_chars(&title, SEARCH_TITLE_MAX_CHARS);
+            obs.push_str(&format!("{}. [{mark}] {where_} — {title}\n", i + 1));
+            if let Some(snippet) = snippet {
+                let snippet = sanitize_for_terminal_bounded(
+                    snippet,
+                    DisplayMode::Block,
+                    4 * SEARCH_SNIPPET_MAX_CHARS,
+                );
+                let snippet = cut_chars(&snippet, SEARCH_SNIPPET_MAX_CHARS);
+                obs.push_str("   ");
+                obs.push_str(snippet);
+                obs.push('\n');
+            }
+        }
+        let record = WebRecord {
+            hops,
+            final_url: request_url.clone(),
+            text_sha256: sha256(obs.as_bytes()),
+            cached: false,
+        };
+        self.done(&request_url, obs, record)
+    }
+
     /// The fetch loop: at most `MAX_HOPS` hops, each journaled before any
     /// byte moves, redirects re-checked per hop.
     #[allow(clippy::too_many_lines)]
@@ -1031,6 +1386,62 @@ fn render(page: &CachedPage, header: &str, start: u64, lines: u64) -> String {
         obs.push_str(&format!("\n[{cut} bytes cut]\n"));
     }
     obs
+}
+
+/// Percent-encode a search query for the endpoint's `q=` parameter
+/// (§8): RFC 3986 unreserved characters pass, everything else becomes
+/// `%XX` (uppercase hex). The query is already §2.3-clean, so this is
+/// about the URL grammar, not about hiding content.
+fn percent_encode_query(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    for b in q.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Cut to at most `max_chars` characters, on a char boundary.
+fn cut_chars(s: &str, max_chars: usize) -> &str {
+    s.char_indices()
+        .nth(max_chars)
+        .map_or(s, |(idx, _)| &s[..idx])
+}
+
+/// Serialize the search hop's `rh-fetch/1` request file (§8 step 3): the
+/// target is the endpoint's `/search` path, JSON asked for by `accept`,
+/// the body capped at [`SEARCH_BODY_MAX_BYTES`].
+fn write_search_request(
+    path: &Path,
+    proxy_port: u16,
+    token: &str,
+    host: &str,
+    port: u16,
+    target: &str,
+    wall: Duration,
+) -> io::Result<()> {
+    let timeout_ms = wall.as_millis().min(60_000);
+    let doc = json!({
+        "v": 1,
+        "proxy_port": proxy_port,
+        "token": token,
+        "scheme": "http",
+        "host": host,
+        "port": port,
+        "target": target,
+        "accept": "application/json",
+        "max_body": SEARCH_BODY_MAX_BYTES,
+        "max_header_bytes": 32 * 1024,
+        "timeout_ms": timeout_ms,
+        "user_agent": "",
+        "mode": "proxy",
+    });
+    let bytes = serde_json::to_vec(&doc).map_err(io::Error::other)?;
+    fs::write(path, bytes)
 }
 
 /// Serialize the hop's `rh-fetch/1` request file.

@@ -121,6 +121,7 @@ impl Rig {
                     step: self.step,
                     deadline,
                     reads: &harness_tools::ReadLog::default(),
+                    egress: None,
                 },
             )
             .unwrap()

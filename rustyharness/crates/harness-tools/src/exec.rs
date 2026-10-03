@@ -843,6 +843,7 @@ fn result_of(cap: &str, out: Out) -> ToolResult {
         read: None,
         edits: Vec::new(),
         exec: None,
+        web: None,
     }
 }
 
@@ -943,6 +944,7 @@ impl ToolProvider for ExecTools<'_> {
                 elapsed_ms: u64::try_from(exit.elapsed.as_millis()).unwrap_or(u64::MAX),
                 workspace,
             }),
+            web: None,
         })
     }
 }

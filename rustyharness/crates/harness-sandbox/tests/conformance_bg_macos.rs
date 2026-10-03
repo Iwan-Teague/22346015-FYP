@@ -369,6 +369,68 @@ fn ft_bg_parent_sigkill_sweeps_the_domain() {
     }
 }
 
+/// `bg-parent-death` with the harness left unreaped: a SIGKILLed harness
+/// is a zombie until its parent waits on it, and on macOS `kill(0, zombie)`
+/// still succeeds — so the stub must ride the reap window out (re-checking
+/// its per-pass success) and sweep anyway, instead of canarying the moment
+/// the harness dies and orphaning the domain. The zombie is held for 400ms,
+/// well past the stub's first per-pass checks, then reaped.
+#[test]
+fn ft_bg_sigkilled_unreaped_harness_still_sweeps() {
+    let t = Tree::new("parent-death-unreaped");
+    let pidfile = t.ws.join("pid");
+    let grandfile = t.ws.join("grand");
+    let exe = std::env::current_exe().unwrap();
+    let mut h = Command::new(exe)
+        .args(["bg_sigkill_harness_entrypoint", "--exact", "--nocapture"])
+        .env("RH_BG_HARNESS", "sigkill")
+        .env("RH_BG_WS", &t.ws)
+        .env("RH_BG_CHILD_PF", &pidfile)
+        .env("RH_BG_GRAND_PF", &grandfile)
+        .spawn()
+        .unwrap();
+    let harness_pid = h.id();
+    let (pid, grand) = {
+        wait_for(&pidfile, "the harness child's pid marker");
+        wait_for(&grandfile, "the setsid grandchild's pid marker");
+        (pid_in(&pidfile), pid_in(&grandfile))
+    };
+    // Murder the harness with the call still open, then leave the corpse
+    // alone: no `wait`, no reaper thread. A pre-fix stub canaries within
+    // ~20ms of this kill, while the zombie still answers `kill(0)`.
+    Command::new("/bin/kill")
+        .arg("-KILL")
+        .arg(harness_pid.to_string())
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    use std::os::unix::process::ExitStatusExt;
+    let status = h.wait().unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "the harness should have died by our SIGKILL, got {status:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while alive(pid) || alive(grand) {
+        if Instant::now() >= deadline {
+            // Clean the survivors so a failed run leaves no orphans.
+            for p in [pid, grand] {
+                let _ = Command::new("/bin/kill")
+                    .arg("-KILL")
+                    .arg(p.to_string())
+                    .status();
+            }
+            panic!(
+                "the domain outlived its killed and deliberately unreaped harness \
+                 (pid {pid}, grand {grand}); the stub must retry through the reap \
+                 window instead of canarying on a zombie"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// `bg-lifetime`: the deadline closer closes the control pipe at the
 /// lifetime while the caller keeps blocking on the child; the domain is
 /// swept and `try_status` starts returning the collected exit.

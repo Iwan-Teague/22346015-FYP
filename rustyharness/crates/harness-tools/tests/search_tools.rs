@@ -120,6 +120,7 @@ impl Rig {
                     step: self.step,
                     deadline: Instant::now() + Duration::from_secs(30),
                     reads: &harness_tools::ReadLog::default(),
+                    egress: None,
                 },
             )
             .unwrap()

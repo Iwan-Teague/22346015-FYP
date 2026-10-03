@@ -65,6 +65,7 @@ impl ToolProvider for Spy {
             read: None,
             edits: Vec::new(),
             exec: None,
+            web: None,
         })
     }
 }
@@ -134,6 +135,7 @@ fn step(w: &mut W, s: &Session, p: &mut Spy, n: u64) -> Result<(), JournalError>
         step: n,
         deadline: Instant::now(),
         reads: &harness_tools::ReadLog::default(),
+        egress: None,
     };
     let result = p.invoke(journaled, &ctx).expect("spy never fails");
     let out = w.untrusted(&result.output)?;

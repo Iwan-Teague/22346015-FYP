@@ -77,6 +77,7 @@ impl ToolProvider for Canned {
             read: None,
             edits: Vec::new(),
             exec: None,
+            web: None,
         })
     }
 }

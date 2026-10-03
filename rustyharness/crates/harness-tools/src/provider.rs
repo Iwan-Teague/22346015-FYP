@@ -50,6 +50,7 @@ use harness_core::{Digest, Untrusted};
 use harness_journal::Journaled;
 use harness_manifest::ProviderName;
 use harness_policy::{Authorized, Call};
+use harness_sandbox::egress::EgressLog;
 
 use crate::edit::ReadLog;
 
@@ -116,6 +117,11 @@ pub struct ToolResult {
     /// whether everything it started is confirmed gone, what it wrote, and
     /// the workspace re-measured after it. `None` when no command started.
     pub exec: Option<ExecRecord>,
+    /// For a web call (`harness.web.fetch`, P-39g): the per-hop records
+    /// (§4.5, §11) the run pairs with its journaled `Egress` entries
+    /// (INV-43; the pairing itself is P-39j), plus the final URL and the
+    /// digest of the extracted text. `None` for every non-web tool.
+    pub web: Option<crate::web::WebRecord>,
 }
 
 /// What a command did (H2d). The run journals it with the command's
@@ -242,8 +248,9 @@ pub struct EditRecord {
 pub struct ToolError(pub String);
 
 /// Per-invocation context (§4.5). `conformed` joins when `Conformed`
-/// exists (H2); secrets handles join with §5.5 (H2).
-#[derive(Debug, Clone, Copy)]
+/// exists (H2); secrets handles join with §5.5 (H2); the egress log joins
+/// with the web airlock (P-39g).
+#[derive(Clone, Copy)]
 pub struct InvokeCtx<'a> {
     /// The loop step.
     pub step: u64,
@@ -254,6 +261,23 @@ pub struct InvokeCtx<'a> {
     /// so no provider can mark a file as read; the run records reads from
     /// results.
     pub reads: &'a ReadLog,
+    /// The run's egress log, when this run granted web access (P-39g):
+    /// every hop a web provider opens is journaled through it before any
+    /// byte moves (§4.5, INV-43). `None` means the run granted no web
+    /// access, and a web provider must refuse before any egress; the loop
+    /// wires the journal sink in P-39j.
+    pub egress: Option<&'a dyn EgressLog>,
+}
+
+impl std::fmt::Debug for InvokeCtx<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvokeCtx")
+            .field("step", &self.step)
+            .field("deadline", &self.deadline)
+            .field("reads", &self.reads)
+            .field("egress", &self.egress.is_some())
+            .finish()
+    }
 }
 
 /// A provider of capabilities (§4.5).

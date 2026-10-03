@@ -409,6 +409,7 @@ impl<'a> Loop<'a> {
             step,
             deadline: Instant::now() + self.config.exec_call_timeout.min(self.remaining_wall()),
             reads: &self.reads,
+            egress: None,
         };
         let (mut fed_environment, mut fed_tree) = (None, None);
         let result = if let Some(rec) = self.feed.pop_front() {

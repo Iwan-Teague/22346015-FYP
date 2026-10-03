@@ -149,6 +149,7 @@ impl RecordedResult {
             read,
             edits,
             exec,
+            web: None,
         })
     }
 }

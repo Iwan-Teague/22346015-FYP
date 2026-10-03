@@ -476,6 +476,73 @@ fn second_connect_refused() {
     assert_eq!(fixture.accepts.load(Ordering::SeqCst), 1);
 }
 
+/// The origin closing FIRST (before the fetcher lets go of the tunnel)
+/// must not turn a clean hop into `aborted`: the pump never shuts a
+/// socket down under the other relay thread — on Darwin that surfaces as
+/// ECONNRESET in a sibling's blocked read, which used to audit `relayed`
+/// hops as `aborted`. Instead the finished direction flags the sibling,
+/// which stops orderly at its next bounded poll.
+#[test]
+fn origin_eof_before_fetcher_close_still_relays() {
+    // Origin: answer one request, then close its half immediately.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        let mut got: Vec<u8> = Vec::new();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let body = "hello";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    });
+
+    let log = RecordingLog::default();
+    let resolver = FakeResolver::default();
+    let pump = open_hop(
+        &log,
+        &resolver,
+        RemapConnector::new(addr),
+        &hop_request(EgressMode::UserProxy, "t", HopBudgets::default()),
+    )
+    .unwrap();
+
+    let mut sock = raw_connect(pump.port(), "t", "example.test", 8080);
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    sock.read_to_end(&mut response).unwrap();
+    assert!(response.ends_with(b"hello"), "{response:?}");
+    // The origin is long gone; the fetcher still holds the session for a
+    // moment, exactly the window where the old cross-thread shutdown
+    // raced the blocked up-relay read.
+    thread::sleep(Duration::from_millis(150));
+    drop(sock);
+
+    let io = pump.join();
+    assert_eq!(io.ended, HopEnded::Relayed);
+    assert!(io.bytes_down >= 5);
+    assert!(io.bytes_up > 0);
+}
+
 #[test]
 fn connect_target_mismatch_refused() {
     let fixture = spawn_fixture(5);

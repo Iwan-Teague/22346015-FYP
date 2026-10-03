@@ -67,13 +67,18 @@ fn public_api_paths_unchanged() {
     t::<harness_run::replay::Divergence>();
     t::<harness_run::replay::Resume>();
 
-    // The `approve` and `presubmit` modules stay public too.
+    // The `approve`, `presubmit` and `postedit` modules stay public too.
     t::<harness_run::approve::ApprovalAnswer>();
     t::<harness_run::approve::ApproverKind>();
     t::<harness_run::presubmit::PresubmitRefused>();
     t::<harness_run::presubmit::PresubmitReport>();
     t::<harness_run::presubmit::PresubmitResult>();
     t::<harness_run::presubmit::PresubmitSpec>();
+    t::<harness_run::postedit::PostEditRefused>();
+    t::<harness_run::postedit::PostEditReport>();
+    t::<harness_run::postedit::PostEditResult>();
+    t::<harness_run::postedit::PostEditSpec>();
+    t::<harness_run::postedit::PostEditCheck>();
 
     // A trait object path and a public record are nameable as before.
     let no_approver: Option<&'static dyn harness_run::Approver> = None;

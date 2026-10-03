@@ -17,8 +17,8 @@ use harness_journal::{
 use harness_manifest::admission::Registry;
 use harness_model::context::{
     self, budget_notice, budget_notice_session, step_notice, valid_wall_notice, wall_threshold,
-    BudgetNotice, ContextError, Delimiting, Fact, Feedback, Renderings, Shown, ShownCall, Turn,
-    UserEntry, SUBMIT_ACCEPTED_FAILING_TEXT, SUBMIT_ACCEPTED_TEXT,
+    BudgetNotice, ContextError, Delimiting, Fact, Feedback, Renderings, SessionModeView, Shown,
+    ShownCall, Turn, UserEntry, SUBMIT_ACCEPTED_FAILING_TEXT, SUBMIT_ACCEPTED_TEXT,
 };
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
@@ -27,9 +27,14 @@ use harness_model::wire::{contains_nonce, render_request};
 use harness_model::{
     Completion, HarnessText, ModelBackend, ModelError, ModelRequest, TaskText, ToolSpec,
 };
-use harness_policy::{Call, PolicyDecision, Session, SUBMIT_ID, TODO_ID};
+use harness_policy::{
+    is_plan_tool_id, Call, Matcher, PolicyDecision, Session, SessionMode, PLAN_SUBMIT_ID,
+    SUBMIT_ID, TODO_ID,
+};
 use harness_tools::builtin::WorkspaceTree;
-use harness_tools::{ExecCleanup, Image, InvokeCtx, ReadLog, TodoList, ToolProvider, ToolStatus};
+use harness_tools::{
+    EditRecord, ExecCleanup, Image, InvokeCtx, ReadLog, TodoList, ToolProvider, ToolStatus,
+};
 use serde_json::Value;
 
 use super::approvals::Approvals;
@@ -95,6 +100,13 @@ pub(crate) struct Loop<'a> {
     /// The task's pre-submit checks and what they did so far (H3a); `None`
     /// for a task without any: a submission is then accepted at once.
     pub(crate) presubmit: Option<PresubmitState>,
+    /// The task's post-edit checks and what they did so far (P-27); `None`
+    /// for a task without any: an edit then stands as it lands.
+    pub(crate) post_edit: Option<crate::postedit::PostEditState>,
+    /// The workspace root, for a post-edit check's rollback to the
+    /// pre-images (P-27); `None` in an audit, which never touches the
+    /// workspace.
+    pub(crate) workspace_root: Option<std::path::PathBuf>,
     /// The workspace states the journal carries, for a session's `/undo`
     /// and `/rewind` (P-26); rebuilt the same way in an audit and a
     /// resume's catch-up.
@@ -107,6 +119,118 @@ pub(crate) struct Loop<'a> {
     /// research text). Never `true` with `user: None` — a research session
     /// is always a driven session.
     pub(crate) research: bool,
+    /// The plan awaiting `/build` (P-28): set by an accepted
+    /// `harness.plan.submit`, taken by an approval. Not in `LoopInit`: it
+    /// always starts empty, in a live run, an audit and a resume alike — a
+    /// resume and an audit re-derive it by re-driving the recorded calls.
+    pub(crate) plan_pending: Option<PendingPlan>,
+    /// The rendered approved-plan block (P-28): what `build_session` shows
+    /// as the user's own approved intent. Also always starts empty and is
+    /// re-derived the same way.
+    pub(crate) plan_approved: Option<String>,
+}
+
+/// A submitted plan awaiting the user's `/build` (P-28): the validated
+/// parts, and the digest the `ModeChanged` record carries. The digest is
+/// over the canonical JSON of exactly these parts, so a replay that
+/// re-derives the plan from the same call names the same digest.
+pub(crate) struct PendingPlan {
+    pub(crate) summary: String,
+    pub(crate) files: Vec<String>,
+    pub(crate) steps: Vec<String>,
+    pub(crate) digest: Digest,
+}
+
+impl PendingPlan {
+    /// The plan as the context shows it once approved (P-28): the user's
+    /// approved intent, rendered from the validated parts.
+    pub(crate) fn block_text(&self) -> String {
+        let mut s = String::from("Summary: ");
+        s.push_str(self.summary.trim());
+        s.push_str("\nFiles:\n");
+        for f in &self.files {
+            s.push_str("- ");
+            s.push_str(f);
+            s.push('\n');
+        }
+        s.push_str("Steps:\n");
+        for (i, st) in self.steps.iter().enumerate() {
+            s.push_str(&format!("{}. {st}\n", i + 1));
+        }
+        s
+    }
+
+    /// Validate a plan call's args (P-28): a non-empty summary within the
+    /// schema cap, relative in-workspace file paths (no more than 64, each
+    /// within the schema cap, duplicates collapsed), and non-empty steps
+    /// (no more than 64, each within the schema cap). Anything else is a
+    /// bad call: the observation says so and the turn goes on.
+    fn parse(args: &Value) -> Result<Self, String> {
+        let summary = args
+            .get("summary")
+            .and_then(Value::as_str)
+            .ok_or("summary must be a string")?
+            .to_owned();
+        if summary.trim().is_empty() {
+            return Err("summary must not be empty".to_owned());
+        }
+        if summary.len() > 2000 {
+            return Err("summary is over 2000 bytes".to_owned());
+        }
+        let files_v = args
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or("files must be an array of paths")?;
+        if files_v.is_empty() {
+            return Err("files must name at least one path".to_owned());
+        }
+        if files_v.len() > 64 {
+            return Err("files has more than 64 entries".to_owned());
+        }
+        let mut files: Vec<String> = Vec::new();
+        for f in files_v {
+            let s = f.as_str().ok_or("files entries must be strings")?;
+            if s.is_empty() || s.len() > 4096 {
+                return Err("a file path is empty or over 4096 bytes".to_owned());
+            }
+            if s.starts_with('/') || s.split(['/', '\\']).any(|c| c == "..") {
+                return Err("file paths must be relative and stay inside the workspace".to_owned());
+            }
+            if !files.iter().any(|x| x == s) {
+                files.push(s.to_owned());
+            }
+        }
+        let steps_v = args
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or("steps must be an array of strings")?;
+        if steps_v.len() > 64 {
+            return Err("steps has more than 64 entries".to_owned());
+        }
+        let mut steps: Vec<String> = Vec::new();
+        for st in steps_v {
+            let t = st.as_str().ok_or("steps entries must be strings")?;
+            if t.trim().is_empty() {
+                return Err("a step must not be empty".to_owned());
+            }
+            if t.len() > 500 {
+                return Err("a step is over 500 bytes".to_owned());
+            }
+            steps.push(t.to_owned());
+        }
+        let canonical = serde_json::json!({
+            "summary": summary,
+            "files": files,
+            "steps": steps,
+        });
+        let digest = sha256(canonical.to_string().as_bytes());
+        Ok(Self {
+            summary,
+            files,
+            steps,
+            digest,
+        })
+    }
 }
 
 /// The interactive session's state on the loop (P-05): the current turn's
@@ -166,6 +290,8 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) todo: Option<TodoList>,
     pub(crate) notices: BudgetNotices,
     pub(crate) presubmit: Option<PresubmitState>,
+    pub(crate) post_edit: Option<crate::postedit::PostEditState>,
+    pub(crate) workspace_root: Option<std::path::PathBuf>,
     pub(crate) restore: crate::restore::RestoreLog,
     pub(crate) user: Option<UserState<'a>>,
     pub(crate) research: bool,
@@ -199,6 +325,8 @@ impl<'a> Loop<'a> {
             todo,
             notices,
             presubmit,
+            post_edit,
+            workspace_root,
             restore,
             user,
             research,
@@ -229,9 +357,13 @@ impl<'a> Loop<'a> {
             todo,
             notices,
             presubmit,
+            post_edit,
+            workspace_root,
             restore,
             user,
             research,
+            plan_pending: None,
+            plan_approved: None,
         }
     }
 }
@@ -309,6 +441,9 @@ pub(crate) enum TurnEnd {
     Answered,
     Submitted,
     SubmittedChecksFailed,
+    /// The plan sentinel was accepted (P-28): the turn is over so the user
+    /// can read the plan and answer `/build` or `/plan`.
+    PlanSubmitted,
     TurnSteps,
     FormatErrors,
     Loop(LoopKind),
@@ -322,6 +457,7 @@ impl TurnEnd {
             TurnEnd::Answered => "answered",
             TurnEnd::Submitted => "submitted",
             TurnEnd::SubmittedChecksFailed => "submitted_checks_failed",
+            TurnEnd::PlanSubmitted => "plan_submitted",
             TurnEnd::TurnSteps => "turn_steps",
             TurnEnd::FormatErrors => "format_errors",
             TurnEnd::Loop(kind) => match kind {
@@ -382,6 +518,129 @@ impl<'a> Loop<'a> {
 
     pub(crate) fn remaining_wall(&self) -> Duration {
         self.config.limits.wall.saturating_sub(self.meter.elapsed())
+    }
+
+    /// Whether the session is in plan mode (P-28): read-only tools only,
+    /// until the user approves the pending plan with `/build`.
+    pub(crate) fn plan_mode(&self) -> bool {
+        self.session.mode() == SessionMode::Plan
+    }
+
+    /// The tools the request declares (P-28): in plan mode, only the plan
+    /// set survives (the read-class fs tools, the checklist and the plan
+    /// sentinel) — the model sees no edit or exec tool to name. In build
+    /// mode the full declared list minus the plan sentinel (a plan-mode
+    /// tool: not declared, not granted — policy denies it, so a build
+    /// session names the same tools it named before P-28 and the profile's
+    /// active-tool bound is unchanged). The context build and the wire
+    /// render take the same list, so a request names and shows the same
+    /// ids.
+    pub(crate) fn active_tools(&self) -> Vec<ToolSpec> {
+        if self.plan_mode() {
+            self.tools
+                .iter()
+                .filter(|t| is_plan_tool_id(&t.id))
+                .cloned()
+                .collect()
+        } else {
+            self.tools
+                .iter()
+                .filter(|t| t.id != PLAN_SUBMIT_ID)
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// The plan-mode view the session context renders (P-28): the mode
+    /// line, and the approved-plan block once `/build` approved one. A
+    /// pure function of the loop state, so audit replay recomputes it.
+    fn mode_view(&self) -> SessionModeView {
+        SessionModeView {
+            plan_mode: self.plan_mode(),
+            approved_plan: self.plan_approved.clone(),
+        }
+    }
+
+    /// `/plan` (P-28): narrow the session to the plan set. A research
+    /// session or a batch loop has no plan mode (fail closed: refuse
+    /// silently, journal nothing). Idempotent: `/plan` twice journals one
+    /// `ModeChanged`.
+    pub(crate) fn plan_mode_enter<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+    ) -> Result<(), StopCause> {
+        if self.research || self.user.is_none() || self.plan_mode() {
+            return Ok(());
+        }
+        // The plan set must fit the profile's active-tool bound, or the
+        // first plan-mode request would be refused mid-run (fail closed:
+        // `/plan` does nothing rather than narrowing into a stop).
+        let plan_tools = self.tools.iter().filter(|t| is_plan_tool_id(&t.id)).count();
+        if u32::try_from(plan_tools).unwrap_or(u32::MAX) > self.profile.max_active_tools() {
+            return Ok(());
+        }
+        self.session.enter_plan();
+        w.append(
+            self.step,
+            Event::new(EventKind::ModeChanged).field("mode", Trusted::Text("plan")),
+        )
+        .map_err(journal)?;
+        Ok(())
+    }
+
+    /// `/build` (P-28): approve the pending plan. With none pending,
+    /// nothing is journaled and the loop asks for the next input. With
+    /// one: the full active set is re-decided and the trifecta recomputed
+    /// (fail closed: a refusal leaves the pending plan and the mode
+    /// unchanged), every active edit capability takes one `plan.allow`
+    /// rule per approved file (an edit on a named file skips its ask; the
+    /// move tool's target must match too), and the `ModeChanged` record
+    /// names the plan digest.
+    pub(crate) fn build_approve<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+    ) -> Result<(), StopCause> {
+        if self.research || self.user.is_none() {
+            return Ok(());
+        }
+        let Some(pending) = self.plan_pending.take() else {
+            return Ok(());
+        };
+        if self.session.build().is_err() {
+            // The widened set is lethal (a quarantine since the plan could
+            // not have made it worse, but fail closed all the same): the
+            // approval does not stand, the plan stays pending.
+            self.plan_pending = Some(pending);
+            return Ok(());
+        }
+        // The plan rules: for each active edit capability, one path-glob
+        // rule per approved file. A file whose glob cannot compile (it
+        // cannot: `parse` bounds and shapes every path, but fail closed)
+        // refuses the whole approval.
+        let mut matchers: Vec<(_, Matcher)> = Vec::new();
+        for cap in self.session.edit_caps() {
+            for f in &pending.files {
+                match Matcher::path_glob(f) {
+                    Ok(m) => matchers.push((cap.clone(), m)),
+                    Err(_) => {
+                        self.plan_pending = Some(pending);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        for (cap, m) in matchers {
+            self.session.grant_plan(&cap, m);
+        }
+        self.plan_approved = Some(pending.block_text());
+        w.append(
+            self.step,
+            Event::new(EventKind::ModeChanged)
+                .field("mode", Trusted::Text("build"))
+                .field("plan_digest", Trusted::Digest(pending.digest)),
+        )
+        .map_err(journal)?;
+        Ok(())
     }
 
     /// One step, then (when the run goes on) the budget notices it earned,
@@ -516,10 +775,13 @@ impl<'a> Loop<'a> {
         // budget for them (P-05 §2.3); a research session's build (P-39i)
         // takes the research rules and facts instead of the coding ones.
         let first = self.first_render()?;
+        // P-28: in plan mode the request names and shows only the plan set
+        // (the read tools, the checklist, the plan sentinel).
+        let tools = self.active_tools();
         let built = match (&self.user, self.research) {
             (Some(u), true) => context::build_research(
                 self.profile,
-                &self.tools,
+                &tools,
                 self.task,
                 &self.facts,
                 &self.turns,
@@ -528,12 +790,13 @@ impl<'a> Loop<'a> {
             ),
             (Some(u), false) => context::build_session(
                 self.profile,
-                &self.tools,
+                &tools,
                 self.task,
                 &self.facts,
                 &self.turns,
                 &u.users,
                 &self.nonces.assigned,
+                &self.mode_view(),
             ),
             // Fail closed: a batch loop never renders research text. A
             // research spec is refused by `run` and `resume` (and a batch
@@ -542,7 +805,7 @@ impl<'a> Loop<'a> {
             (None, true) => return Err(StopCause::PolicyAbort),
             (None, false) => context::build(
                 self.profile,
-                &self.tools,
+                &tools,
                 self.task,
                 &self.facts,
                 &self.turns,
@@ -571,7 +834,7 @@ impl<'a> Loop<'a> {
         w.append(step, ev).map_err(journal)?;
 
         // 3. Call the model under the remaining wall budget.
-        let (req, rendered) = self.request(built.messages)?;
+        let (req, rendered) = self.request(built.messages, &tools)?;
         let ev = requested_event(&rendered, first.as_ref().map(|(s, d)| (*s, d)))
             .ok_or(StopCause::PolicyAbort)?;
         w.append(step, ev).map_err(journal)?;
@@ -951,6 +1214,74 @@ impl<'a> Loop<'a> {
             return Ok(Flow::Continue);
         }
 
+        // The plan sentinel (P-28): like the checklist, recorded and never
+        // run by a provider. A valid call is stored as the pending plan and
+        // ends the turn, so the user can read it and answer `/build`; an
+        // invalid one (or any call outside a session, which has no user to
+        // approve a plan) is an error observation and the turn goes on.
+        if tool == PLAN_SUBMIT_ID {
+            let intent_seq = journaled.intent_seq();
+            let args = journaled.call().call().args.clone();
+            drop(journaled);
+            let (status, text) = if self.user.is_none() {
+                (
+                    ToolStatus::Error {
+                        code: harness_tools::builtin::code::BAD_ARGS,
+                    },
+                    "error: harness.plan.submit needs a session (a user to approve the plan)"
+                        .to_owned(),
+                )
+            } else {
+                match PendingPlan::parse(&args) {
+                    Ok(p) => {
+                        self.plan_pending = Some(p);
+                        (
+                            ToolStatus::Ok,
+                            "Plan recorded. It is shown to the user for approval with /build."
+                                .to_owned(),
+                        )
+                    }
+                    Err(e) => (
+                        ToolStatus::Error {
+                            code: harness_tools::builtin::code::BAD_ARGS,
+                        },
+                        format!("error: {e}"),
+                    ),
+                }
+            };
+            let digest = sha256(text.as_bytes());
+            let body = Untrusted::new(text, Source::Tool(PLAN_SUBMIT_ID.to_owned()));
+            let out = w.untrusted(&body).map_err(journal)?;
+            let mut ev = Event::new(EventKind::ToolFinished)
+                .field("intent_seq", Trusted::U64(intent_seq))
+                .field("status", Trusted::Text(status_name(status)))
+                .field("truncated", Trusted::Bool(false))
+                .field("digest", Trusted::Digest(digest))
+                .field("output", Trusted::Untrusted(out));
+            if let ToolStatus::Error { code } = status {
+                ev = ev.field("code", Trusted::U64(u64::from(code)));
+            }
+            w.append(step, ev).map_err(journal)?;
+            self.detector.observe(LoopEvent::Observation { digest });
+            self.turns.push(Turn {
+                step,
+                reply,
+                action: Some(shown),
+                feedback: Feedback::Observation {
+                    call: tool,
+                    body,
+                    digest,
+                },
+                notice,
+            });
+            self.meter.tick_wall()?;
+            self.observe_budgets(w, step)?;
+            if matches!(status, ToolStatus::Ok) {
+                return Ok(Flow::EndTurn(TurnEnd::PlanSubmitted));
+            }
+            return Ok(Flow::Continue);
+        }
+
         // P-05 §8: the sink has seen the intent (and every record before
         // it) before a provider runs.
         self.ui_drain(w);
@@ -1014,9 +1345,15 @@ impl<'a> Loop<'a> {
         let mut repeated = false;
         let mut exec_stop = None;
         let mut exec_changed = false;
+        // The edit's own records and the tree before it (P-27): a failing
+        // post-edit check rolls the edit back from here.
+        let mut edit_records: Vec<EditRecord> = Vec::new();
+        let mut pre_edit_tree = self.tree;
         let feedback = match result {
-            Ok(res) => {
+            Ok(mut res) => {
                 let out = w.untrusted(&res.output).map_err(journal)?;
+                edit_records = std::mem::take(&mut res.edits);
+                pre_edit_tree = self.tree;
                 // A verified edit (§4.9 step 5): one `EditApplied` per
                 // touched file before the `ToolFinished`, so a durable
                 // result implies a durable record of every change (P-25: a
@@ -1025,8 +1362,8 @@ impl<'a> Loop<'a> {
                 // when re-fed: a resume's catch-up measured its listing
                 // after the edit), and each file's own path is in its
                 // record, not the call's.
-                if res.status == ToolStatus::Ok && !res.edits.is_empty() {
-                    for (i, e) in res.edits.iter().enumerate() {
+                if res.status == ToolStatus::Ok && !edit_records.is_empty() {
+                    for (i, e) in edit_records.iter().enumerate() {
                         let tree = match (fed_edit_trees.get(i), self.workspace.as_mut()) {
                             (Some(&t), _) => t,
                             (None, Some(ws)) => match e.after {
@@ -1239,6 +1576,11 @@ impl<'a> Loop<'a> {
                 ))
             }
         };
+        // P-27: the task's post-edit checks run against the edit that just
+        // landed; a failing check (or one that could not run) rolls it back
+        // and this step's feedback becomes the check's diagnostics.
+        let (feedback, restored) =
+            self.post_edit_round(w, step, &edit_records, &edited, pre_edit_tree, feedback)?;
         if unverified {
             return Err(StopCause::PolicyAbort);
         }
@@ -1272,6 +1614,14 @@ impl<'a> Loop<'a> {
             ))
         } else {
             notice
+        };
+        // P-27: a rollback says so in the same slot as the other notices.
+        let notice = match restored {
+            Some(n) => Some(match notice {
+                Some(prev) => prev.joined(&n),
+                None => n,
+            }),
+            None => notice,
         };
         self.turns.push(Turn {
             step,
@@ -1375,10 +1725,11 @@ impl<'a> Loop<'a> {
     fn request(
         &self,
         messages: Vec<harness_model::Message>,
+        tools: &[ToolSpec],
     ) -> Result<(ModelRequest, Value), StopCause> {
         let req = ModelRequest {
             messages,
-            tools: self.tools.clone(),
+            tools: tools.to_vec(),
         };
         let v = render_request(&req, self.profile).map_err(|_| StopCause::PolicyAbort)?;
         Ok((req, v))

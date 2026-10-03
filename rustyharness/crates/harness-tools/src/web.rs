@@ -1326,6 +1326,7 @@ impl WebTools<'_> {
             read: None,
             edits: Vec::new(),
             exec: None,
+            mcp: None,
             web: Some(record),
         }
     }
@@ -1344,6 +1345,7 @@ impl WebTools<'_> {
             read: None,
             edits: Vec::new(),
             exec: None,
+            mcp: None,
             web: Some(WebRecord {
                 hops,
                 final_url,

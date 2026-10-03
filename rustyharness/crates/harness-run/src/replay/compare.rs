@@ -148,6 +148,10 @@ pub(crate) fn expected_inputs(
     if let Some(p) = &spec.presubmit {
         m.insert("presubmit".into(), p.header_value());
     }
+    // The post-edit checks (P-27): the same.
+    if let Some(p) = &spec.post_edit {
+        m.insert("post_edit".into(), p.header_value());
+    }
     m.insert(
         "context_format".into(),
         Value::from(match &spec.kind {
@@ -235,6 +239,7 @@ fn header_mismatch(key: &str) -> &'static str {
              recorded header"
         }
         "presubmit" => "the pre-submit checks given differ from the recorded header",
+        "post_edit" => "the post-edit checks given differ from the recorded header",
         "protected" => {
             "the protected-path lists (task-declared or this build's defaults) differ from the \
              recorded header"

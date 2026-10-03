@@ -26,7 +26,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -81,7 +82,8 @@ const CONNECT_HEAD_CAP_BYTES: usize = 8 * 1024;
 const HEAD_END: &[u8] = b"\r\n\r\n";
 
 /// How long to wait for the down-relay thread to report after the up
-/// direction has finished (it has already been unblocked by shutdown).
+/// direction has finished (it always ends by the wall deadline, and stops
+/// within one `IO_SLICE` of the sibling direction finishing).
 const RELAY_JOIN: Duration = Duration::from_secs(5);
 
 /// The CONNECT handshake replies.
@@ -868,35 +870,53 @@ fn pump_run<C: Connector>(
         return finish(HopEnded::Aborted, 0, 0);
     }
 
-    // Relay both directions under the cap and the wall budget.
+    // Relay both directions under the cap and the wall budget. No thread
+    // ever shuts a socket down under the other one: on Darwin a shutdown
+    // under a sibling's blocked read surfaces as ECONNRESET and used to
+    // audit clean hops as `aborted`. Each direction instead wakes at
+    // least every `IO_SLICE`, sees the sibling-finished flag and then
+    // stops orderly — the peer half of the session is already closed, so
+    // no further byte is wanted. A genuine transport fault still ends
+    // the hop `aborted`.
     let Ok(mut session_down) = session.try_clone() else {
         return finish(HopEnded::Aborted, 0, 0);
     };
     let Ok(mut origin_down) = origin.try_clone() else {
         return finish(HopEnded::Aborted, 0, 0);
     };
+    let up_done = Arc::new(AtomicBool::new(false));
+    let down_done = Arc::new(AtomicBool::new(false));
     let (down_tx, down_rx) = mpsc::channel();
+    let sibling_up = up_done.clone();
+    let sibling_down = down_done.clone();
     let down = thread::Builder::new()
         .name("egress-relay-down".to_string())
         .spawn(move || {
-            let result = relay(&mut origin_down, &mut session_down, deadline, cap);
-            // Unblock the other direction whatever happened here.
-            let _ = origin_down.shutdown(Shutdown::Both);
-            let _ = session_down.shutdown(Shutdown::Both);
+            let result = relay(
+                &mut origin_down,
+                &mut session_down,
+                deadline,
+                cap,
+                &sibling_up,
+            );
+            sibling_down.store(true, Ordering::Release);
             let _ = down_tx.send(result);
         });
     let Ok(down_handle) = down else {
         return finish(HopEnded::Aborted, 0, 0);
     };
 
-    let (bytes_up, up_end) = relay(&mut session, &mut origin, deadline, cap);
-    let _ = session.shutdown(Shutdown::Both);
-    let _ = origin.shutdown(Shutdown::Both);
+    let (bytes_up, up_end) = relay(&mut session, &mut origin, deadline, cap, &down_done);
+    up_done.store(true, Ordering::Release);
     let (bytes_down, down_end) = match down_rx.recv_timeout(RELAY_JOIN) {
         Ok(pair) => pair,
         Err(_) => (0, DirectionEnd::Aborted),
     };
     drop(down_handle);
+    // Both directions have ended and no thread is blocked on either
+    // socket any more: close both before the drain phase.
+    let _ = session.shutdown(Shutdown::Both);
+    let _ = origin.shutdown(Shutdown::Both);
 
     let ended = match (up_end, down_end) {
         (DirectionEnd::Capped, _) | (_, DirectionEnd::Capped) => HopEnded::Capped,
@@ -1044,7 +1064,8 @@ fn write_reply(stream: &mut TcpStream, reply: &[u8], deadline: Instant) -> io::R
 /// How one relay direction ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectionEnd {
-    /// Peer closed.
+    /// Peer closed, or the sibling direction finished with the peer half
+    /// of the session closed behind it (an orderly stop, not a fault).
     Eof,
     /// The cap stopped the direction.
     Capped,
@@ -1055,13 +1076,15 @@ enum DirectionEnd {
 }
 
 /// Relay one direction (`from` → `to`) under the wall deadline and the
-/// per-direction cap. Never writes a byte past the cap; returns the count
-/// moved and how the direction ended.
+/// per-direction cap, stopping orderly when `sibling_done` is set (the
+/// sibling thread finished its direction). Never writes a byte past the
+/// cap; returns the count moved and how the direction ended.
 fn relay(
     from: &mut TcpStream,
     to: &mut TcpStream,
     deadline: Instant,
     cap: u64,
+    sibling_done: &AtomicBool,
 ) -> (u64, DirectionEnd) {
     let mut buf = [0u8; RELAY_CHUNK];
     let mut count: u64 = 0;
@@ -1069,6 +1092,9 @@ fn relay(
         let Some(left) = remaining(deadline) else {
             return (count, DirectionEnd::TimedOut);
         };
+        if sibling_done.load(Ordering::Acquire) {
+            return (count, DirectionEnd::Eof);
+        }
         let slice = left.min(IO_SLICE);
         if from.set_read_timeout(Some(slice)).is_err() {
             return (count, DirectionEnd::Aborted);

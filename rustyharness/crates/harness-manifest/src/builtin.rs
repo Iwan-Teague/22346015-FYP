@@ -41,6 +41,11 @@
 //! changes nothing but the run's phase; policy allows it by one named rule
 //! (`allow.task-submit`).
 //!
+//! The plan sentinel (P-28): `harness.plan.submit`, write / public / own /
+//! none, `content: own` (its result is the harness's own receipt for the
+//! plan, never other people's text), like the submit sentinel; policy
+//! allows it by one named rule (`allow.plan-submit`).
+//!
 //! H2e (design rows H2e): `harness.fs.search` matches a literal substring
 //! by default, as before, and a regular expression with `regex: true`,
 //! with `include` / `exclude` globs and `context` lines; `harness.fs.glob`
@@ -85,6 +90,7 @@ mod fs_outline;
 mod fs_read;
 mod fs_search;
 mod head;
+mod plan_submit;
 mod tail;
 mod task_delegate;
 mod task_submit;
@@ -122,6 +128,7 @@ pub fn builtin_manifest_json() -> String {
         exec_stop::EXEC_STOP,
         task_todo::TASK_TODO,
         task_delegate::TASK_DELEGATE,
+        plan_submit::PLAN_SUBMIT,
         task_submit::TASK_SUBMIT,
         tail::TAIL,
     ]
@@ -166,7 +173,7 @@ pub fn research_manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestEr
 /// fixed: entries are shorter than the manifest summaries and name every
 /// argument the schema has (both pinned by tests). A capability without an
 /// entry here keeps its full summary, so a provider capability is untouched.
-const TERSE_TABLE: [(&str, &str); 18] = [
+const TERSE_TABLE: [(&str, &str); 19] = [
     (
         "harness.fs.read",
         "Read a window of lines from a file: path, start (the first line, 1-based), lines (at most the run's read window)",
@@ -220,6 +227,10 @@ const TERSE_TABLE: [(&str, &str); 18] = [
         "Keep your checklist: items replaces the list, each item a text and a status; without items it is only shown",
     ),
     ("harness.task.submit", "Submit the task for verification: note"),
+    (
+        "harness.plan.submit",
+        "Show a plan for approval before editing: summary, files (paths the plan will touch) and steps",
+    ),
     (
         "harness.task.delegate",
         "Ask a read-only helper to explore and answer one question: task",

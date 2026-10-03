@@ -348,6 +348,12 @@ pub struct Client<C: Clock, T: Transport<Deadline = C::Time>> {
     reader: wire::FrameReader,
     /// The fault that ended the connection, replayed forever after (§4).
     dead: Option<Fault>,
+    /// The request id of the exchange seen last (P-37h: the provider's
+    /// `McpRecord.request_id`, §9 step 6).
+    last_id: Option<u64>,
+    /// The noise count of the exchange seen last, reset-or-faulted (P-37h:
+    /// the provider's `McpRecord.noise`).
+    last_noise: u64,
 }
 
 impl<C: Clock, T: Transport<Deadline = C::Time>> Client<C, T> {
@@ -362,6 +368,8 @@ impl<C: Clock, T: Transport<Deadline = C::Time>> Client<C, T> {
             noise: Noise::default(),
             reader: wire::FrameReader::new(),
             dead: None,
+            last_id: None,
+            last_noise: 0,
         }
     }
 
@@ -375,6 +383,20 @@ impl<C: Clock, T: Transport<Deadline = C::Time>> Client<C, T> {
     /// Whether the connection has ended (any fault, or [`Client::kill`]).
     pub fn is_dead(&self) -> bool {
         self.dead.is_some()
+    }
+
+    /// The request id of the exchange seen last (P-37h): `None` before the
+    /// first request. The provider journals it as `McpRecord.request_id`
+    /// (§9 step 6), so the record names the frame the wire carried.
+    pub fn last_request_id(&self) -> Option<u64> {
+        self.last_id
+    }
+
+    /// The noise count of the exchange seen last (P-37h): server-originated
+    /// frames between our request and its end, however the exchange ended.
+    /// The provider journals it as `McpRecord.noise`.
+    pub fn last_exchange_noise(&self) -> u64 {
+        self.last_noise
     }
 
     /// The lifecycle handshake and the baseline list (§3.3): `initialize`
@@ -525,6 +547,7 @@ impl<C: Clock, T: Transport<Deadline = C::Time>> Client<C, T> {
             Some(next) => self.next_id = next,
             None => return Err(self.die(Fault::Violation(Violation::IdSpaceExhausted))),
         }
+        self.last_id = Some(id);
         Ok(id)
     }
 
@@ -642,6 +665,7 @@ impl<C: Clock, T: Transport<Deadline = C::Time>> Client<C, T> {
             match exchange {
                 Exchange::Open => continue,
                 Exchange::Won(_) | Exchange::Cancelled => {
+                    self.last_noise = self.noise.msgs;
                     self.noise = Noise::default();
                     self.outstanding = None;
                     return Ok(match exchange {
@@ -657,6 +681,8 @@ impl<C: Clock, T: Transport<Deadline = C::Time>> Client<C, T> {
     /// (§4: a violated, timed-out, ended or stopped server is never
     /// spoken to again).
     fn die(&mut self, fault: Fault) -> Fault {
+        // The provider's record cites the noise the dying exchange carried.
+        self.last_noise = self.noise.msgs;
         self.transport.kill();
         self.dead = Some(fault.clone());
         fault
@@ -676,10 +702,88 @@ fn ended(fault: TransportFault) -> Fault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     /// One named entry, the shape every real page carries.
     fn entry(name: &str) -> Value {
         serde_json::json!({"name": name, "description": "d"})
+    }
+
+    /// A transport whose server side is a script of queued chunks (P-37h:
+    /// the id and noise accessors, against a deterministic peer). Pure, so
+    /// it may live inside this scanned crate; the hostile wire suites live
+    /// in the fixture package.
+    struct Scripted {
+        chunks: VecDeque<Vec<u8>>,
+        sent: Vec<Vec<u8>>,
+    }
+    impl Transport for Scripted {
+        type Deadline = u64;
+        fn send(&mut self, frame: &[u8]) -> Result<(), TransportFault> {
+            self.sent.push(frame.to_vec());
+            Ok(())
+        }
+        fn recv(&mut self, _deadline: u64) -> Result<Option<Vec<u8>>, TransportFault> {
+            Ok(self.chunks.pop_front())
+        }
+        fn kill(&mut self) {}
+    }
+
+    /// Counts milliseconds up from zero; deadlines never move backwards.
+    struct StepClock;
+    impl Clock for StepClock {
+        type Time = u64;
+        fn after(&self, budget: Duration) -> u64 {
+            u64::try_from(budget.as_millis()).unwrap_or(u64::MAX)
+        }
+    }
+
+    fn response(id: u64, result: Value) -> String {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+    }
+
+    #[test]
+    fn client_accessors_track_request_ids_and_noise() {
+        // initialize (id 1), then one noise notification ahead of the list
+        // page (id 2): the record facts a provider cites are the last
+        // exchange's.
+        let script = Scripted {
+            chunks: VecDeque::from(vec![
+                format!(
+                    "{}\n",
+                    response(
+                        1,
+                        serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}})
+                    )
+                )
+                .into_bytes(),
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{}}}}\n{}\n",
+                    response(2, serde_json::json!({"tools": [entry("echo")]}))
+                )
+                .into_bytes(),
+            ]),
+            sent: Vec::new(),
+        };
+        let mut client = Client::new(StepClock, script);
+        let connected = client
+            .connect(
+                "2025-06-18",
+                "0.0.1",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("scripted connect");
+        assert_eq!(connected.tools.len(), 1);
+        assert_eq!(client.last_request_id(), Some(2));
+        assert_eq!(client.last_exchange_noise(), 1);
+        // A fresh exchange resets the count; the id climbs.
+        client
+            .call("echo", &Map::new(), Duration::from_secs(1))
+            .expect_err("the script has no answer for a call");
+        assert_eq!(client.last_request_id(), Some(3));
+        assert_eq!(client.last_exchange_noise(), 0);
     }
 
     #[test]

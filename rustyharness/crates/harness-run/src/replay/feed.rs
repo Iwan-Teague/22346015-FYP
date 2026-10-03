@@ -378,10 +378,11 @@ pub(crate) fn recorded(
             // the tree digest the record names; everything else (the files
             // the undone edits named, the notice) is recomputed from the
             // journal's own edit records and compared by the record's body.
+            // P-27: a post-edit rollback names the edit's own step
+            // (`to_step` = the record's step); the hook recomputes it in
+            // place, so it is checked for shape but not re-fed as an input
+            // — only a `/undo` (a step earlier than its own) is.
             EventKind::Restored => {
-                if !session {
-                    return Err(bad());
-                }
                 if r.body.len() != 3
                     || !["to_step", "tree_digest", "files"]
                         .iter()
@@ -404,10 +405,15 @@ pub(crate) fn recorded(
                 if files.iter().any(|f| !f.is_string()) {
                     return Err(bad());
                 }
-                inputs.push_back(RecordedInput::Restore {
-                    to_step,
-                    tree_digest,
-                });
+                if to_step != r.step {
+                    if !session {
+                        return Err(bad());
+                    }
+                    inputs.push_back(RecordedInput::Restore {
+                        to_step,
+                        tree_digest,
+                    });
+                }
             }
             // P-17 §6: a `UserTurn` is re-fed in exactly its re-fed parts —
             // the text, the facts it was measured with, and its wall time —
@@ -489,6 +495,30 @@ pub(crate) fn recorded(
             }
             // A turn boundary is the loop's own: recomputed, never re-fed.
             EventKind::TurnEnded => {}
+            // P-28: a session's mode changes re-feed as the input they were
+            // (`/plan`, `/build`); the replay re-derives the state each
+            // names and the record bodies are compared. Only a session
+            // writes them (a batch loop has no user to answer).
+            EventKind::ModeChanged if session => {
+                let mode = r.body.get("mode").and_then(Value::as_str).ok_or_else(bad)?;
+                match mode {
+                    "plan" if r.body.len() == 1 => inputs.push_back(RecordedInput::PlanMode),
+                    "build" if r.body.len() == 2 => {
+                        // The digest itself is recomputed from the re-driven
+                        // plan call; here it only has to be a digest.
+                        r.body
+                            .get("plan_digest")
+                            .and_then(Value::as_str)
+                            .is_some_and(|d| {
+                                d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())
+                            })
+                            .then_some(())
+                            .ok_or_else(bad)?;
+                        inputs.push_back(RecordedInput::BuildPlan);
+                    }
+                    _ => return Err(bad()),
+                }
+            }
             // A record no slice owns yet is not a shape this loop writes
             // (P-17 §6). The background-process kinds are owned from P-36h
             // (canon, the record shapes), but nothing writes them until

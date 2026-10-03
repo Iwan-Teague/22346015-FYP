@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::approve::Approver;
+use crate::postedit::{PostEditRefused, PostEditReport, PostEditSpec, PostEditState};
 use crate::presubmit::{PresubmitRefused, PresubmitReport, PresubmitSpec, PresubmitState};
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
 use harness_core::environment::EnvProbe;
@@ -106,6 +107,11 @@ pub struct TaskSpec {
     /// one turns the submission back, up to a bound. Needs the exec grant
     /// and section; `None`: a submit is accepted at once, exactly as before.
     pub presubmit: Option<PresubmitSpec>,
+    /// Checks the harness runs after every successful edit (P-27): a
+    /// failing one rolls the edit back from its pre-image (or keeps it,
+    /// when the check says so). Needs the exec grant and section; `None`:
+    /// an edit stands as it lands, exactly as before.
+    pub post_edit: Option<PostEditSpec>,
     /// Task-declared protected-path globs (P-29), on top of the build's
     /// defaults: edits under them are refused, exec sees them read-only.
     pub protected: Vec<String>,
@@ -279,6 +285,9 @@ pub enum RunRefused {
     /// The task's pre-submit checks are refused (H3a).
     #[error("presubmit refused: {0}")]
     Presubmit(#[from] PresubmitRefused),
+    /// The task's post-edit checks are refused (P-27).
+    #[error("post_edit refused: {0}")]
+    PostEdit(#[from] PostEditRefused),
     /// A protected-path glob or ask rule this build must write is refused
     /// (P-29): a task glob the glob compiler rejects, or a floor rule the
     /// user policy already states. The run does not start half-protected.
@@ -346,6 +355,9 @@ pub struct RunReport {
     /// What the task's pre-submit checks did (H3a); `None` for a task
     /// without any.
     pub presubmit: Option<PresubmitReport>,
+    /// What the task's post-edit checks did (P-27); `None` for a task
+    /// without any.
+    pub post_edit: Option<PostEditReport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +462,8 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         todo: todo_for(&r.spec.grants),
         notices: BudgetNotices::live(r.config.limits.wall),
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        post_edit: PostEditState::of(&r.spec.post_edit),
+        workspace_root: Some(r.workspace.to_path_buf()),
         restore: Default::default(),
         user: None,
     });
@@ -466,6 +480,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         journal_error: released.error,
         possibly_environmental: lp.pressure,
         presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
+        post_edit: lp.post_edit.as_ref().map(PostEditState::report),
     })
 }
 

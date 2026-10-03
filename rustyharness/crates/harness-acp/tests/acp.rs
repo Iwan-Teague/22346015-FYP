@@ -239,6 +239,7 @@ fn edit_fixture(label: &str) -> Fixture {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: SessionKind::Coding,
     };

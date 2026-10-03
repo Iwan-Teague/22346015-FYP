@@ -1,7 +1,7 @@
 //! The files a gate-child verb reads before anything runs: the task spec
-//! (with its `exec`, `budget` and `presubmit` sections), the policy and
-//! the profile, each strict JSON, bounded, and refused by name when
-//! unusable.
+//! (with its `exec`, `budget`, `presubmit` and `post_edit` sections), the
+//! policy and the profile, each strict JSON, bounded, and refused by name
+//! when unusable.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -37,6 +37,10 @@ struct TaskFile {
     /// that grants `harness.exec.run`.
     #[serde(default)]
     presubmit: Option<PresubmitFile>,
+    /// Checks the harness runs after every successful edit (P-27), in a
+    /// task that grants `harness.exec.run`.
+    #[serde(default)]
+    post_edit: Option<Vec<PostEditFile>>,
     /// Task-declared protected-path globs (P-29): edits under them are
     /// refused, exec sees them read-only. Absent: only the defaults.
     #[serde(default)]
@@ -66,6 +70,19 @@ impl PresubmitFile {
                 .unwrap_or(harness_run::presubmit::DEFAULT_ROUNDS),
         }
     }
+}
+
+/// One task file `post_edit` entry (P-27): a glob over the files one edit
+/// touches and the command run for the first path it matches (`{path}` in
+/// the argv), kept on failure only when the task says so.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostEditFile {
+    #[serde(rename = "match")]
+    r#match: String,
+    argv: Vec<String>,
+    #[serde(default, deserialize_with = "present")]
+    keep_on_failure: Option<bool>,
 }
 
 /// A task file's `budget` section (H2e): the step budget and the wall-clock
@@ -344,6 +361,27 @@ pub(crate) fn inputs(
         p.check(&task.grants, exec.as_ref())
             .map_err(|e| unreadable(format!("presubmit: {e}")))?;
     }
+    // The post-edit checks (P-27): compiled globs, bounded and on the
+    // allowlist, in a task that grants the command runner, or the task file
+    // is unusable input (exit 4).
+    let post_edit = match &task.post_edit {
+        None => None,
+        Some(entries) => {
+            let checks = entries
+                .iter()
+                .map(|c| harness_run::PostEditCheck {
+                    pattern: c.r#match.clone(),
+                    argv: c.argv.clone(),
+                    keep_on_failure: c.keep_on_failure.unwrap_or(false),
+                })
+                .collect();
+            let p = harness_run::PostEditSpec::new(checks)
+                .map_err(|e| unreadable(format!("post_edit: {e}")))?;
+            p.check(&task.grants, exec.as_ref())
+                .map_err(|e| unreadable(format!("post_edit: {e}")))?;
+            Some(p)
+        }
+    };
     Ok(Inputs {
         spec: TaskSpec {
             task: TaskText::new(task.task),
@@ -353,6 +391,7 @@ pub(crate) fn inputs(
             lan_ports: lan,
             exec,
             presubmit,
+            post_edit,
             protected: task.protected,
             // P-39i: the CLI's verbs run coding sessions; the research
             // session's verbs arrive with the web slice (P-39j/§11).

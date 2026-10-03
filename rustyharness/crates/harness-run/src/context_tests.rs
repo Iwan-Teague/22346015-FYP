@@ -77,6 +77,7 @@ impl ToolProvider for Canned {
             read: None,
             edits: Vec::new(),
             exec: None,
+            mcp: None,
             web: None,
         })
     }
@@ -152,6 +153,7 @@ fn drive(
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_policy::SessionKind::Coding,
     };
@@ -213,7 +215,9 @@ fn drive(
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        post_edit: None,
         restore: Default::default(),
+        workspace_root: None,
         user: None,
     });
     let end = lp.drive(&mut w);

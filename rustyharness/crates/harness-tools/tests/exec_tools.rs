@@ -144,6 +144,7 @@ impl Rig {
                 lan_ports: Vec::new(),
                 read_window: None,
                 kind: SessionKind::Coding,
+                mode: harness_policy::SessionMode::Build,
             },
             &reg,
             &UserPolicy::new(&[], &[], &[EXEC_ID]).unwrap(),

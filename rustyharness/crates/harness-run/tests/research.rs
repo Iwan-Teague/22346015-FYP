@@ -124,6 +124,7 @@ fn research_spec(
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: SessionKind::Research(WebGrant {
             allowlist: allowlist.iter().map(|a| (*a).to_owned()).collect(),
@@ -143,6 +144,7 @@ fn coding_spec(grants: &[&str]) -> TaskSpec {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: SessionKind::Coding,
     }
@@ -592,7 +594,9 @@ fn coding_header_digest_unchanged() {
     let head = header_of(&recs);
     assert_eq!(head.get("session_kind"), None, "no kind key for coding");
     assert_eq!(head.get("web"), None, "no web key for coding");
-    assert_eq!(head["context_format"], Value::from("rh-context/6"));
+    // P-28: the session context is rh-context/7 (the mode line and the
+    // approved-plan block); the batch context stays rh-context/5.
+    assert_eq!(head["context_format"], Value::from("rh-context/7"));
     assert_eq!(head["mode"], Value::from("session"));
 }
 
@@ -686,7 +690,7 @@ fn research_context_format_is_rh_research_1() {
     assert_eq!(harness_model::context::CONTEXT_FORMAT, "rh-context/5");
     assert_eq!(
         harness_model::context::SESSION_CONTEXT_FORMAT,
-        "rh-context/6"
+        "rh-context/7"
     );
 
     let r = go_research(

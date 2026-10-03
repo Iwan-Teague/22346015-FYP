@@ -163,12 +163,14 @@ expect_refusal "harness-sandbox enables the journal's fault-injection seam" \
     "a normal dependency edge enables harness-journal/fault-injection"
 
 # The sandbox's own test-only remap seam (P-39f) must not be enabled by a
-# normal dependency either. Planted into harness-mcp: it has no normal edge
-# to harness-sandbox (no duplicate key), harness-sandbox does not depend
-# back (no cycle), mcp sits under no allowlist-checked tree, and the
-# content scans read source files, not manifests.
+# normal dependency. harness-mcp already depends on the sandbox (P-37h),
+# so the plant REWRITES that line to turn the feature on (no duplicate
+# key); the crate is under no allowlist-checked tree, and the content
+# scans read source files, not manifests.
 fresh
-awk '{ print } /^\[dependencies\]/ { print "harness-sandbox = { path = \"../harness-sandbox\", features = [\"remap\"] }" }' \
+awk '{ if ($0 ~ /^harness-sandbox[ \t]*=/)
+           print "harness-sandbox = { path = \"../harness-sandbox\", features = [\"remap\"] }"
+       else print }' \
     "$copy/crates/harness-mcp/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
     fail "awk failed planting a dependency"
 mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-mcp/Cargo.toml" || fail "mv failed"
@@ -176,6 +178,38 @@ grep -qF 'features = ["remap"]' "$copy/crates/harness-mcp/Cargo.toml" ||
     fail "remap plant did not land"
 expect_refusal "harness-mcp enables the sandbox's remap seam" \
     "a normal dependency edge enables harness-sandbox/remap"
+
+# The MCP provider's own test-only testing seam (P-37h) must not be enabled
+# by a normal dependency either. Planted into harness-run: it has no normal
+# edge to harness-mcp (no duplicate key), harness-mcp does not depend back
+# (no cycle).
+fresh
+awk '{ print } /^\[dependencies\]/ { print "harness-mcp = { path = \"../harness-mcp\", features = [\"testing\"] }" }' \
+    "$copy/crates/harness-run/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-run/Cargo.toml" || fail "mv failed"
+grep -qF 'features = ["testing"]' "$copy/crates/harness-run/Cargo.toml" ||
+    fail "testing plant did not land"
+expect_refusal "harness-run enables the provider's testing seam" \
+    "a normal dependency edge enables harness-mcp/testing"
+
+# ... and a workspace feature that FORWARDS to harness-mcp/testing (cargo
+# tree shows only active features).
+fresh
+printf '\n[features]\nmcp-chaos = ["harness-mcp/testing"]\n' >>"$copy/crates/harness-cli/Cargo.toml" ||
+    fail "could not plant the mcp-chaos feature"
+expect_refusal "a chaos feature forwards to harness-mcp/testing" \
+    "a workspace feature forwards to harness-mcp/testing"
+
+# ... and the seam rule fails closed if the feature is renamed away.
+fresh
+awk '!/^testing[ \t]*=/' "$copy/crates/harness-mcp/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed stripping the testing feature"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-mcp/Cargo.toml" || fail "mv failed"
+! grep -qE '^testing[ \t]*=' "$copy/crates/harness-mcp/Cargo.toml" ||
+    fail "testing feature strip did not land"
+expect_refusal "harness-mcp without its testing feature" \
+    "harness-mcp does not declare its test-only testing feature"
 
 # INV-24: a TLS crate in the default build is refused (planted as a local
 # crate named `rustls`, depended on by harness-model).

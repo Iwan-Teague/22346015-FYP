@@ -147,6 +147,7 @@ impl ToolProvider for FakeExec {
                 elapsed_ms: 5,
                 workspace: Some(self.tree.clone()),
             }),
+            mcp: None,
             web: None,
         })
     }
@@ -174,6 +175,7 @@ impl ToolProvider for Others {
             read: None,
             edits: Vec::new(),
             exec: None,
+            mcp: None,
             web: None,
         })
     }
@@ -279,6 +281,7 @@ fn spec_of(commands: &[&[&str]], max_rounds: u32) -> TaskSpec {
                 .collect(),
             max_rounds,
         }),
+        post_edit: None,
         kind: harness_policy::SessionKind::Coding,
     }
 }
@@ -410,6 +413,8 @@ fn drive(s: Setup<'_>) -> Done {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
+        post_edit: None,
+        workspace_root: None,
         restore: Default::default(),
         user: None,
     });
@@ -976,6 +981,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
                     elapsed_ms: 120_000,
                     workspace: Some(fixed_tree("slow")),
                 }),
+                mcp: None,
                 web: None,
             })
         }
@@ -1036,6 +1042,8 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&spec.presubmit),
+        post_edit: None,
+        workspace_root: None,
         restore: Default::default(),
         user: None,
     });

@@ -53,6 +53,7 @@ use crate::driver::{
     no_workspace_facts, prepare, Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop,
     LoopInit, NonceSource, PortsHeader, Prepared, RunConfig, RunRefused, RunReport, TaskSpec,
 };
+use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +137,13 @@ pub enum UserInputEvent {
     /// `/rewind N`, P-26). Handled between turns; a refusal journals
     /// nothing.
     Restore(crate::restore::RestoreCommand),
+    /// The user asked for plan mode (`/plan`, P-28): the session narrows to
+    /// the read-only plan set. Handled between turns.
+    Plan,
+    /// The user approved the pending plan (`/build`, P-28): the session
+    /// widens again and the plan's files may be edited without their ask.
+    /// Handled between turns; with no pending plan it journals nothing.
+    Build,
     /// The input ended; the session does too (`RunStopped`,
     /// cause `session_ended`).
     End(InputEnd),
@@ -175,6 +183,14 @@ pub(crate) enum RecordedInput {
         /// The tree digest the `Restored` record names.
         tree_digest: Digest,
     },
+    /// A recorded `ModeChanged` to plan mode (P-28): the handler re-derives
+    /// the narrow mode; the record's body is compared by the audit.
+    PlanMode,
+    /// A recorded `ModeChanged` to build mode (P-28): the replay re-derives
+    /// the pending plan from the re-driven plan call, re-applies the
+    /// approval (the trifecta recompute, the `plan.allow` rules) and names
+    /// the same digest — or the comparison fails.
+    BuildPlan,
 }
 
 /// The name a recorded `InputEnded` carries, back to the enum: anything
@@ -472,6 +488,8 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         todo: crate::driver::todo_for(&s.spec.grants),
         notices: BudgetNotices::live(s.config.run.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
+        post_edit: crate::postedit::PostEditState::of(&s.spec.post_edit),
+        workspace_root: Some(s.workspace.to_path_buf()),
         restore: Default::default(),
         user: Some(UserState {
             limits: s.config.turn,
@@ -500,6 +518,10 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
             journal_error: released.error,
             possibly_environmental: lp.pressure,
             presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
+            post_edit: lp
+                .post_edit
+                .as_ref()
+                .map(crate::postedit::PostEditState::report),
         },
         turns,
     })
@@ -651,6 +673,10 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         todo: crate::driver::todo_for(&s.spec.grants),
         notices: BudgetNotices::live(s.config.run.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
+        // A research session grants no exec, so `prepare` refused any
+        // post-edit checks (P-27); and there is no workspace to roll back.
+        post_edit: PostEditState::of(&s.spec.post_edit),
+        workspace_root: None,
         restore: Default::default(),
         user: Some(UserState {
             limits: s.config.turn,
@@ -681,6 +707,7 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
             journal_error: released.error,
             possibly_environmental: lp.pressure,
             presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
+            post_edit: lp.post_edit.as_ref().map(PostEditState::report),
         },
         turns,
     })
@@ -734,6 +761,8 @@ impl<'a> Loop<'a> {
                 to_step: u64,
                 tree_digest: Digest,
             },
+            PlanMode,
+            BuildPlan,
             End(InputEnd),
             Spent,
         }
@@ -798,6 +827,8 @@ impl<'a> Loop<'a> {
                             to_step,
                             tree_digest,
                         },
+                        Some(RecordedInput::PlanMode) => Next::PlanMode,
+                        Some(RecordedInput::BuildPlan) => Next::BuildPlan,
                         Some(RecordedInput::End(reason)) => Next::End(reason),
                         None => Next::Spent,
                     }
@@ -855,6 +886,30 @@ impl<'a> Loop<'a> {
                     tree_digest,
                 } => {
                     if let Err(cause) = self.recompute_restore(w, to_step, tree_digest) {
+                        return self.session_end(cause);
+                    }
+                    self.ui_drain(w);
+                    if w.is_poisoned() {
+                        return self.poisoned();
+                    }
+                    continue;
+                }
+                // P-28: `/plan` and `/build` run between turns, consume no
+                // step and open no turn. A `/build` with nothing pending
+                // (live) journals nothing; the loop asks for the next input
+                // afterwards either way.
+                Next::Live(UserInputEvent::Plan) | Next::PlanMode => {
+                    if let Err(cause) = self.plan_mode_enter(w) {
+                        return self.session_end(cause);
+                    }
+                    self.ui_drain(w);
+                    if w.is_poisoned() {
+                        return self.poisoned();
+                    }
+                    continue;
+                }
+                Next::Live(UserInputEvent::Build) | Next::BuildPlan => {
+                    if let Err(cause) = self.build_approve(w) {
                         return self.session_end(cause);
                     }
                     self.ui_drain(w);

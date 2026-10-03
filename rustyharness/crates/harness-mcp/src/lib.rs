@@ -1,16 +1,16 @@
 //! rustyharness MCP stdio client (design note `docs/slices/P-37-mcp-client.md`).
 //!
-//! This slice (P-37e) adds the client state machine ([`client`]) to the
-//! pure wire codec of P-37c ([`wire`]) and the pure response renderer of
-//! P-37f ([`render`]): the lifecycle (§3.3), id discipline (§3.2), noise
-//! caps and `-32601` refusals (§3.5), the bounds of §4, and the
-//! kill-on-any-fault rule, over two seams the caller supplies — a
-//! [`client::Clock`] for the deadlines and a [`client::Transport`] for
-//! the server's pipes. The provider, the connector seam and the confined
-//! connector are later slices of P-37; the fake server the client is
-//! tested against is the fixture crate, whose package hosts this slice's
-//! hostile-server suite (the purity gate scans every file of THIS
-//! package, so its pipes and clocks are named only from outside it).
+//! This slice (P-37h) adds the provider ([`provider`]) and the connector
+//! seam ([`connect`]) to the client state machine of P-37e ([`client`]),
+//! the pure wire codec of P-37c ([`wire`]) and the pure response renderer
+//! of P-37f ([`render`]): the admitted-call -> one `tools/call` exchange
+//! path of §7-§9, the pre-call relist and its quarantine rule (§7.2), and
+//! the wire facts the loop journals (`McpRecord`). A provider is generic
+//! over [`connect::McpConnector`], the one seam that touches the
+//! platform: the confined stdio connector is P-37l. The connector the
+//! tests drive is the fixture crate's, which also hosts this slice's
+//! provider suite (the purity gate scans every file of THIS package, so
+//! its pipes and clocks are named only from outside it).
 //!
 //! The scanned files (`scripts/ci/purity.sh` §2) are pure in the gate's
 //! sense: bytes are fed in and values come out, no facility of the I/O,
@@ -28,5 +28,9 @@
 )]
 
 pub mod client;
+pub mod connect;
+pub mod provider;
 pub mod render;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod wire;

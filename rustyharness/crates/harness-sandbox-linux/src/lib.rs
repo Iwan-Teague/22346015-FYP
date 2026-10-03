@@ -14,18 +14,17 @@
 //! §5), because wiring the Landlock and seccomp primitives of the default
 //! tier (Landlock ABI 4 for files and TCP, seccomp denying `socket()`
 //! families and namespace creation, and the process-group `kill` for the
-//! tree kill) needs FFI. S-La commits the crate with the decision logic
-//! only — no FFI site yet, so the purity.sh unsafe-site ratchet stands at
-//! **zero** and rises by review, one `// SAFETY:` comment per site, when
-//! S-Lb/S-Lc land the primitives behind the reviewed allowlist (landlock,
-//! rustix on its libc backend, enumflags2; see deny.toml and the purity.sh
-//! registry list).
-//!
-//! Since S-Lb the crate also builds the Landlock ruleset itself
+//! tree kill) needs FFI. S-La committed the crate with the decision logic
+//! only; since S-Lb the crate also builds the Landlock ruleset itself
 //! ([`landlock_rules`]): the portable rule planner compiles (and is
 //! unit-tested) on every OS; the syscall side — ruleset creation from
 //! `PathFd` handles and `apply()` — is Linux-only and refuses, never
 //! degrades, when the kernel's Landlock ABI is below what the grants need.
+//! S-Lc (the `seccomp` module) lands the first FFI site — the one filter
+//! apply, behind a `// SAFETY:` comment — with the purity.sh unsafe-site
+//! ratchet raised to the reviewed count (the allowlist behind it: landlock,
+//! rustix on its libc backend, enumflags2; see deny.toml and the purity.sh
+//! registry list).
 
 #![allow(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -33,6 +32,8 @@
     test,
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
+
+pub mod seccomp;
 
 /// What the host MEASURED about the confinement primitives of the default
 /// tier (read-only probes of `/proc` and `/sys`; a missing file is recorded

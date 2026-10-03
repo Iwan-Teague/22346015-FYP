@@ -106,6 +106,7 @@ dependencies = [
  "harness-core",
  "harness-journal",
  "harness-manifest",
+ "harness-mcp",
  "harness-model",
  "harness-policy",
  "harness-run",
@@ -163,6 +164,10 @@ name = "harness-mcp"
 version = "0.0.1"
 dependencies = [
  "harness-core",
+ "harness-journal",
+ "harness-manifest",
+ "harness-policy",
+ "harness-sandbox",
  "harness-tools",
  "serde_json",
  "thiserror",
@@ -172,7 +177,13 @@ dependencies = [
 name = "harness-mcp-fixture"
 version = "0.0.1"
 dependencies = [
+ "harness-core",
+ "harness-journal",
+ "harness-manifest",
  "harness-mcp",
+ "harness-policy",
+ "harness-sandbox",
+ "harness-tools",
  "serde_json",
 ]
 

@@ -197,6 +197,7 @@ fn spec(task: &str, grants: &[&str]) -> TaskSpec {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     }
@@ -974,6 +975,7 @@ mod live {
                 ..harness_run::ExecSpec::default()
             }),
             presubmit: None,
+            post_edit: None,
             protected: Vec::new(),
             kind: harness_run::SessionKind::Coding,
         };
@@ -1046,6 +1048,7 @@ mod live {
                 commands: vec![perl(NEEDS_FIXED)],
                 max_rounds: 2,
             }),
+            post_edit: None,
             protected: Vec::new(),
             kind: harness_run::SessionKind::Coding,
         };

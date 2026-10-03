@@ -209,6 +209,8 @@ impl UserInput for ChatInput<'_, '_> {
                     Slash::Continue => continue,
                     Slash::EndSession => return UserInputEvent::End(InputEnd::Exit),
                     Slash::Restore(cmd) => return UserInputEvent::Restore(cmd),
+                    Slash::Plan => return UserInputEvent::Plan,
+                    Slash::Build => return UserInputEvent::Build,
                 }
             } else {
                 first
@@ -235,6 +237,11 @@ enum Slash {
     /// A restore command whose pre-check passed (`/undo`, `/rewind`): the
     /// loop applies and journals it, re-verifying everything.
     Restore(RestoreCommand),
+    /// Plan mode (`/plan`, P-28): the loop narrows the session.
+    Plan,
+    /// The plan approval (`/build`, P-28): the loop widens the session if
+    /// a plan is pending.
+    Build,
 }
 
 impl ChatInput<'_, '_> {
@@ -339,6 +346,11 @@ impl ChatInput<'_, '_> {
                 }
                 return self.plan_restore(dir, &ws, steps, keep);
             }
+            // P-28: plan and build. The loop journals and applies them (a
+            // `/build` with nothing pending journals nothing); this side
+            // only hands them over.
+            ("/plan", _) => return Slash::Plan,
+            ("/build", _) => return Slash::Build,
             _ => note!(self.cx, "unknown command; {HELP}"),
         }
         Slash::Continue
@@ -433,7 +445,7 @@ fn mark_tree(m: &RestoreMark) -> Option<Digest> {
 }
 
 /// The slash commands, as `/help` prints them.
-const HELP: &str = "commands: /help /status /tools /policy /sessions /resume /todo /usage /diff /undo /rewind [N] [--force-keep-external] /clear /exit";
+const HELP: &str = "commands: /help /status /tools /policy /sessions /resume /todo /usage /diff /undo /rewind [N] [--force-keep-external] /plan /build /clear /exit";
 
 /// The terminal prompt for an ask, over the chat's own stdin feed (P-18):
 /// the request itself is shown by the sink's `[approve]` line, so this

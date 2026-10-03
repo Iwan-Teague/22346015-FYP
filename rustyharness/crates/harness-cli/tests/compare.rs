@@ -486,6 +486,7 @@ fn compare_each_arm_audits_clean() {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     };

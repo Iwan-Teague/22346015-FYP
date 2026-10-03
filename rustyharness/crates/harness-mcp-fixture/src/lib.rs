@@ -5,10 +5,13 @@
 //!
 //! The fixture is a TEST DOUBLE, not harness code: it is permissive about
 //! what it reads (a real server is, too), deterministic in what it writes,
-//! and `std + serde_json` only — no runtime, no process API, no network
-//! beyond the `confinement-probe` tool's own attempts. `harness-mcp`
-//! dev-depends on this lib and drives it through in-memory pipes; the
-//! `rh-mcp-fixture` binary serves stdin/stdout for the end-to-end tests.
+//! and (since P-37h moved the provider's connector seam here) std +
+//! `serde_json` + `harness-mcp` + `harness-sandbox` only — no runtime, no
+//! process API, no network beyond the `confinement-probe` tool's own
+//! attempts. `harness-mcp-fixture` publishes nothing and nothing shipped
+//! depends on it; `harness-mcp`'s tests and the provider suite drive it
+//! through in-memory pipes ([`connector`]); the `rh-mcp-fixture` binary
+//! serves stdin/stdout for the end-to-end tests.
 //!
 //! Framing (§3.1): one JSON-RPC message per line, UTF-8, `\n`-terminated,
 //! flushed after every message so pipe-driven tests never stall.
@@ -21,6 +24,7 @@
 //! | `ok` | two tools `echo`, `add`; fixed pins ([`tools::ok_pins`]) |
 //! | `drift-description` / `drift-schema` | wrong `echo` pin from the first list |
 //! | `rug-pull-after:<n>` / `vanish-after:<n>` | the list changes after n calls |
+//! | `new-tool-after:<n>` | an unlisted tool appears in the list after n calls (P-37h: counted, never quarantines) |
 //! | `list-changed-spam` | a `tools/list_changed` notification per exchange |
 //! | `malformed` | one non-JSON line after `initialize` |
 //! | `huge-frame` | one 2 MiB line per request after `initialize` |
@@ -39,6 +43,7 @@
 //! | `exit-midcall` | half a frame on the first call, then end |
 //! | `stderr-spam` | `ok` behaviour with junk on stderr |
 //! | `hang` | answers `initialize`, then never again |
+//! | `hang-after-connect` | answers connect-time list, hangs every relist and call |
 //! | `confinement-probe` | a tool that probes its confinement and reports |
 //!
 //! Hostile modes fire where a test can reach them over a normal connect:
@@ -52,6 +57,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod connector;
 pub mod mode;
 pub mod probe;
 pub mod tools;
@@ -163,10 +169,12 @@ impl std::fmt::Display for ServeError {
 impl std::error::Error for ServeError {}
 
 /// One serve session: the parsed mode plus the `tools/call` counter the
-/// `rug-pull-after` / `vanish-after` modes key on.
+/// `rug-pull-after` / `vanish-after` modes key on, and the `tools/list`
+/// counter `hang-after-connect` keys on.
 struct Session {
     mode: Mode,
     calls: u64,
+    lists: u64,
     server_requests: u64,
 }
 
@@ -175,6 +183,7 @@ impl Session {
         Session {
             mode,
             calls: 0,
+            lists: 0,
             server_requests: 0,
         }
     }
@@ -294,6 +303,14 @@ impl Session {
         if self.mode == Mode::Hang {
             return self.hang();
         }
+        if self.mode == Mode::HangAfterConnect {
+            // The connect-time list (the first) is answered; every later
+            // relist hangs, so a pre-call relist hits the wall.
+            self.lists += 1;
+            if self.lists >= 2 {
+                return self.hang();
+            }
+        }
         if self.mode == Mode::HugeFrame {
             let junk = vec![b'a'; HUGE_FRAME_BYTES];
             out.write_all(&junk).map_err(ServeError::Io)?;
@@ -363,6 +380,9 @@ impl Session {
         if self.mode == Mode::Hang {
             return self.hang();
         }
+        if self.mode == Mode::HangAfterConnect {
+            return self.hang();
+        }
         self.calls += 1;
         if self.mode == Mode::ExitMidcall {
             // Half a frame, WITHOUT the newline, then end of session: the
@@ -409,8 +429,9 @@ impl Session {
     }
 
     /// The tool table right now: `ok`'s two tools with the drift, rug
-    /// pull, vanish and duplicate-name modes applied. Order is stable:
-    /// `echo` first, then `add` (plus the duplicate after `echo`).
+    /// pull, vanish, duplicate-name and new-tool modes applied. Order is
+    /// stable: `echo` first, then `add` (plus the duplicate after `echo`,
+    /// plus `extra` appended last).
     fn tool_entries(&self) -> Vec<Value> {
         let mut entries: Vec<Value> = Vec::new();
         for tool in ok_tools() {
@@ -440,6 +461,17 @@ impl Session {
                     "inputSchema": schema,
                 }));
             }
+        }
+        if self.extra_listed() {
+            entries.push(json!({
+                "name": "extra",
+                "description": "Appeared later.",
+                "inputSchema": json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            }));
         }
         entries
     }
@@ -472,6 +504,15 @@ impl Session {
     fn echo_vanished(&self) -> bool {
         match self.mode {
             Mode::VanishAfter(n) => self.calls >= n,
+            _ => false,
+        }
+    }
+
+    /// Has the unlisted tool joined the list yet? (P-37h: `new-tool-after`
+    /// appears after the n-th call; the provider counts it and moves on.)
+    fn extra_listed(&self) -> bool {
+        match self.mode {
+            Mode::NewToolAfter(n) => self.calls >= n,
             _ => false,
         }
     }

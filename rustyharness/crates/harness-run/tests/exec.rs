@@ -106,6 +106,7 @@ fn spec_with(grants: &[&str], exec: Option<ExecSpec>) -> TaskSpec {
         lan_ports: Vec::new(),
         exec,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     }

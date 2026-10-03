@@ -80,6 +80,7 @@ impl Rig {
                 lan_ports: Vec::new(),
                 read_window: None,
                 kind: SessionKind::Coding,
+                mode: harness_policy::SessionMode::Build,
             },
             &reg,
             &UserPolicy::default(),
@@ -344,6 +345,26 @@ fn a_capability_it_does_not_serve_is_refused() {
             reason: RefusalKind::UnknownCapability
         }
     );
+}
+
+// P-37h: the mcp record is the MCP adapter's alone; a built-in result
+// carries none of it, whether it ran or was refused.
+#[test]
+fn builtin_results_have_no_mcp_record() {
+    let ws = scratch("no-mcp-record");
+    fs::write(ws.join("a.txt"), "hi\n").unwrap();
+    let mut r = Rig::new(&ws);
+    let out = r.call("harness.fs.read", json!({"path": "a.txt"}));
+    assert_eq!(out.status, ToolStatus::Ok);
+    assert!(out.mcp.is_none());
+    let refused = r.call("harness.task.submit", json!({"note": "x"}));
+    assert_eq!(
+        refused.status,
+        ToolStatus::Refused {
+            reason: RefusalKind::UnknownCapability
+        }
+    );
+    assert!(refused.mcp.is_none());
 }
 
 #[test]

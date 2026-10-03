@@ -84,6 +84,7 @@ impl ToolProvider for Spy {
             read: None,
             edits: Vec::new(),
             exec: None,
+            web: None,
         })
     }
 }

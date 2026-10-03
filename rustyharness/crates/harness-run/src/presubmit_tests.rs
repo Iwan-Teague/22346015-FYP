@@ -147,6 +147,7 @@ impl ToolProvider for FakeExec {
                 elapsed_ms: 5,
                 workspace: Some(self.tree.clone()),
             }),
+            web: None,
         })
     }
 }
@@ -173,6 +174,7 @@ impl ToolProvider for Others {
             read: None,
             edits: Vec::new(),
             exec: None,
+            web: None,
         })
     }
 }
@@ -970,6 +972,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
                     elapsed_ms: 120_000,
                     workspace: Some(fixed_tree("slow")),
                 }),
+                web: None,
             })
         }
     }

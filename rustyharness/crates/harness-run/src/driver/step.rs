@@ -945,6 +945,7 @@ impl<'a> Loop<'a> {
             step,
             deadline: Instant::now() + timeout.min(self.remaining_wall()),
             reads: &self.reads,
+            egress: None,
         };
         let mut fed_environment = None;
         let mut fed_edit_trees: Vec<Digest> = Vec::new();

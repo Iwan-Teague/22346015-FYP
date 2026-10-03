@@ -31,3 +31,7 @@ thiserror.workspace = true
 # The sealed JournalFile seam's fault-injecting file, for the INV-33 test.
 harness-journal = { path = "../harness-journal", features = ["fault-injection"] }
 gate-outcome = { path = "../gate-outcome" }
+# The in-process hop runner runs the fetcher library directly, in tests
+# only (design §5.1: harness-tools never depends on harness-fetch except
+# as a dev-dependency).
+harness-fetch = { path = "../harness-fetch" }

@@ -642,7 +642,7 @@ read -r capture_got _ <"$tmpdir/capture-sha" || fail "could not read the digest 
 # while the call runs (try_status/read/totals/stop), the control pipe closed
 # by a deadline closer; the three admitted programs, the stub and the frame
 # format are unchanged, and live bounds fail closed before the spawn.
-confine_spawn_sha256=575bd6d51d7815754c1217216533343bb28e021cf54df270fde067c86f92eeee
+confine_spawn_sha256=86c6709181a650304261739210858d4a11fbcd503eaaeafef84b33bfd2807be5
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum <"$confine_file" >"$tmpdir/confine-sha" || fail "sha256sum failed on $confine_file"
 else

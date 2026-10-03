@@ -257,6 +257,7 @@ version = "0.0.1"
 dependencies = [
  "gate-outcome",
  "harness-core",
+ "harness-fetch",
  "harness-journal",
  "harness-manifest",
  "harness-policy",

@@ -73,7 +73,15 @@
 //! Accepting `ESRCH` is deliberate: after a verified start the filter
 //! cannot have changed, and refusing to sweep when the harness has died
 //! would give up the one cleanup a crash still gets. Success, or any
-//! other error, reports `canary` and stops sweeping.
+//! other error, reports `canary` and stops sweeping — but a bare success
+//! is not believed at first sight: a parent SIGKILLed moments ago is a
+//! zombie until its own parent reaps it, and on Darwin `kill(0, zombie)`
+//! still succeeds. The stub re-checks a success every 50 ms for up to a
+//! second (the reap window) before canarying; a success that persists,
+//! or any other error, reports `canary` and stops sweeping. The delay
+//! cannot broaden the sweep: the filter was verified at start and a
+//! Seatbelt profile is fixed for life, so the check remains what stops
+//! a sweep, not what starts one.
 //!
 //! **Report.** The stub's last act is one line on stderr, `rh-stub/1
 //! <confirmed|unconverged|canary> status=<wait status>
@@ -151,7 +159,7 @@ close $ew;
 my $st=-1; my $why='exit'; my $poll=0;
 while(1){ my $w=waitpid($pid,1); if($w==$pid){$st=$?;last} my $rin='';vec($rin,fileno($c),1)=1; my $n=select(my $ro=$rin,undef,undef,0.02); if($n>0){$why='stop';last} if($np>0 && ++$poll>=12){$poll=0; my $mc=0; for my $q (2..99999){$mc++ if kill(0,$q)} if($mc-1>$np){$why='procs';last}} }
 my ($k,$res)=(0,'unconverged');
-my $t0=time; PASS: for my $p (1..1000){ my $hit=kill(0,$pp); my $en=$!+0; if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS} my $n=0; for my $q (2..99999){next if $q==$$; $n++ if kill('KILL',$q)} 1 while waitpid(-1,1)>0; $k+=$n; if($n==0){$res='confirmed';last PASS} last PASS if time-$t0>=$sw; my $w=0.005*$p; $w=0.05 if $w>0.05; select(undef,undef,undef,$w) }
+my $t0=time; PASS: for my $p (1..1000){ my $hit=kill(0,$pp); my $en=$!+0; my $z=0; while($hit && $z<20){select(undef,undef,undef,0.05); $z++; $hit=kill(0,$pp); $en=$!+0} if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS} my $n=0; for my $q (2..99999){next if $q==$$; $n++ if kill('KILL',$q)} 1 while waitpid(-1,1)>0; $k+=$n; if($n==0){$res='confirmed';last PASS} last PASS if time-$t0>=$sw; my $w=0.005*$p; $w=0.05 if $w>0.05; select(undef,undef,undef,$w) }
 my $ef=''; if($res eq 'confirmed'){sysread($er,$ef,1)}
 my $ex = $ef eq 'E' ? 'failed' : $ef eq 'L' ? 'limit' : 'ok';
 if($st==-1){$st=-2}
@@ -799,7 +807,11 @@ mod tests {
         let check = STUB.find("end=start").unwrap();
         assert!(check < STUB.find("open(my $c").unwrap());
         assert!(check < STUB.find("fork()").unwrap());
-        // Per pass: only EPERM (1) or ESRCH (3) lets a sweep pass run.
+        // Per pass: only EPERM (1) or ESRCH (3) lets a sweep pass run, and
+        // a bare success is re-checked through the reap window (a just
+        // SIGKILLed harness is a zombie that kill(0) still succeeds on)
+        // before it canaries.
+        assert!(STUB.contains("while($hit && $z<20)"));
         assert!(STUB.contains("if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS}"));
     }
 

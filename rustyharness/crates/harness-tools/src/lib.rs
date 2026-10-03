@@ -37,6 +37,7 @@ pub mod registry;
 pub mod restore;
 pub mod search;
 pub mod todo;
+pub mod web;
 // The pure glob matcher (H2e, P-08) lives in `harness-core`; re-exported so
 // `crate::glob::Glob` paths and the public `harness_tools::glob` keep working.
 pub use builtin::{workspace_tree, ReadTools, WorkspaceTree};
@@ -56,3 +57,7 @@ pub use provider::{
 };
 pub use restore::{recreate_file, restore_file, uncreate_file, RestoreError};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};
+pub use web::{
+    BoxConnector, ConfinedHopRunner, Egress, FetcherPin, HopRun, HopRunner, RunnerError,
+    WebBudgets, WebHop, WebRecord, WebSetupError, WebTools,
+};

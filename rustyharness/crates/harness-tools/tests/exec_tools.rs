@@ -201,6 +201,7 @@ impl Rig {
                     step: self.step,
                     deadline,
                     reads: &self.reads,
+                    egress: None,
                 },
             )
             .unwrap()

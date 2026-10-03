@@ -163,6 +163,27 @@ pub mod code {
     /// The MCP server answered with a JSON-RPC error object, or the line a
     /// response was expected on does not classify as one (P-37f).
     pub const MCP_RPC_ERROR: u16 = 26;
+    /// A web fetch's URL is malformed, off-allowlist, or the redirect
+    /// target is (P-39g).
+    pub const WEB_URL_REFUSED: u16 = 27;
+    /// A web response's content type is missing or not on the allowlist
+    /// (P-39g).
+    pub const WEB_CONTENT_TYPE: u16 = 28;
+    /// A web response declares a charset the harness cannot decode
+    /// (P-39g).
+    pub const WEB_CHARSET: u16 = 29;
+    /// A web response declared as text sniffs binary (NUL in the first
+    /// 8 KiB; P-39g).
+    pub const WEB_BINARY: u16 = 30;
+    /// Egress refused or unwired: no hop was opened (P-39g).
+    pub const WEB_EGRESS: u16 = 31;
+    /// More redirects than the cap in one fetch (P-39g).
+    pub const WEB_REDIRECT_LIMIT: u16 = 32;
+    /// A session web budget (fetches, bytes down) is exhausted (P-39g).
+    pub const WEB_BUDGET: u16 = 33;
+    /// The confined fetcher failed to run or returned a bad frame
+    /// (P-39g).
+    pub const WEB_FETCHER: u16 = 34;
 }
 
 const READ: &str = "harness.fs.read";
@@ -341,6 +362,7 @@ pub(crate) fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
         read: None,
         edits: Vec::new(),
         exec: None,
+        web: None,
     }
 }
 
@@ -365,6 +387,7 @@ pub(crate) fn finish(cap: &str, out: Out) -> ToolResult {
         read: out.read,
         edits: Vec::new(),
         exec: None,
+        web: None,
     }
 }
 

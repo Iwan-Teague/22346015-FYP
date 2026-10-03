@@ -30,6 +30,7 @@ use harness_journal::testing::{FaultFile, FaultPlan, MemBlobs};
 use harness_journal::{Clock, Event, EventKind, Header, Ident, JournalWriter};
 use harness_manifest::admission::{Registry, Tier};
 use harness_manifest::{builtin, SemVer, ValidationContext};
+use harness_model_core::endpoint::Endpoint;
 use harness_policy::web::Allowlist;
 use harness_policy::{
     Call, DenyReason, PolicyDecision, Session, SessionKind, SessionSpec, UserPolicy,
@@ -286,6 +287,34 @@ struct Rig<'a> {
 
 impl<'a> Rig<'a> {
     fn new(name: &str, responses: Vec<Vec<u8>>, budgets: WebBudgets) -> Self {
+        Self::build(
+            name,
+            responses,
+            budgets,
+            None::<&fn(u16) -> Endpoint>,
+            false,
+        )
+    }
+
+    /// A research session granted `harness.web.search` too, with the
+    /// provider wired to a loopback search endpoint on the fixture's
+    /// port (P-39h).
+    fn new_search(
+        name: &str,
+        responses: Vec<Vec<u8>>,
+        budgets: WebBudgets,
+        endpoint_for: impl Fn(u16) -> Endpoint,
+    ) -> Self {
+        Self::build(name, responses, budgets, Some(&endpoint_for), true)
+    }
+
+    fn build(
+        name: &str,
+        responses: Vec<Vec<u8>>,
+        budgets: WebBudgets,
+        search: Option<&impl Fn(u16) -> Endpoint>,
+        grants_search: bool,
+    ) -> Self {
         let ctx = ValidationContext::new(
             SemVer {
                 major: 0,
@@ -300,9 +329,13 @@ impl<'a> Rig<'a> {
             Tier::Builtin,
         )])
         .unwrap();
+        let mut grants = vec!["harness.web.fetch".to_string()];
+        if grants_search {
+            grants.push("harness.web.search".to_string());
+        }
         let s = Session::plan(
             &SessionSpec {
-                grants: vec!["harness.web.fetch".into()],
+                grants,
                 workspace: None,
                 approver_present: false,
                 personal_data_granted: false,
@@ -314,7 +347,7 @@ impl<'a> Rig<'a> {
                         "http://example.test:8080".into(),
                         "http://example.test:8081".into(),
                     ],
-                    search: false,
+                    search: grants_search,
                     confirmed: Some(WebConfirmation::Flag),
                 }),
             },
@@ -333,6 +366,7 @@ impl<'a> Rig<'a> {
         .unwrap();
         let dir = scratch(name);
         let fixture = fixture(responses);
+        let search = search.map(|f| f(fixture.addr.port()));
         let log = Arc::new(RecordingLog::new());
         let resolver = Arc::new(FakeResolver::new());
         let t = WebTools::new_with_runner(
@@ -344,6 +378,7 @@ impl<'a> Rig<'a> {
             .unwrap(),
             budgets,
             pinned_fetcher(&dir),
+            search,
             Box::new(InProcessHopRunner),
             Egress {
                 mode: EgressMode::UserProxy,
@@ -368,14 +403,23 @@ impl<'a> Rig<'a> {
     }
 
     fn call_egress(&mut self, args: Value, wired: bool) -> ToolResult {
+        self.call_cap("harness.web.fetch", args, wired)
+    }
+
+    /// A `harness.web.search` call through the same journal seam.
+    fn call_search(&mut self, args: Value) -> ToolResult {
+        self.call_cap("harness.web.search", args, true)
+    }
+
+    fn call_cap(&mut self, cap: &str, args: Value, wired: bool) -> ToolResult {
         self.step += 1;
         let a = self
             .s
             .authorize(Call {
-                capability: "harness.web.fetch".into(),
+                capability: cap.to_string(),
                 args,
             })
-            .expect("policy allows the fetch");
+            .expect("policy allows the call");
         let j = self
             .w
             .append_intent(self.step, Event::new(EventKind::ToolStarted), a)
@@ -740,6 +784,7 @@ fn fetch_refused_without_conformed() {
         Allowlist::load(&["http://example.test:8080".into()]).unwrap(),
         WebBudgets::default(),
         pin,
+        None,
         &nc,
         witness,
         Egress {
@@ -772,6 +817,7 @@ fn fetcher_digest_mismatch_refused() {
         Allowlist::load(&["http://example.test:8080".into()]).unwrap(),
         WebBudgets::default(),
         wrong,
+        None,
         Box::new(InProcessHopRunner),
         Egress {
             mode: EgressMode::UserProxy,
@@ -894,6 +940,7 @@ fn fetcher_runs_confined_end_to_end() {
         Allowlist::load(&["http://example.test:8080".into()]).unwrap(),
         WebBudgets::default(),
         pin,
+        None,
         &sys,
         witness.clone(),
         Egress {
@@ -937,4 +984,275 @@ fn fetcher_runs_confined_end_to_end() {
     ok_code(&r);
     assert!(text(&r).contains("confined end to end"), "{}", text(&r));
     assert_eq!(r.web.as_ref().unwrap().hops[0].ended, "relayed");
+}
+
+// ---------------------------------------------------------------------------
+// P-39h: harness.web.search over the loopback SearXNG endpoint.
+// ---------------------------------------------------------------------------
+
+/// A SearXNG-shaped JSON response body.
+fn searx(results: Value) -> Vec<u8> {
+    let mut doc = results;
+    doc.as_object_mut()
+        .unwrap()
+        .entry("results")
+        .or_insert_with(|| json!([]));
+    response(
+        Some("application/json"),
+        &[],
+        serde_json::to_vec(&doc).unwrap().as_slice(),
+    )
+}
+
+fn search_endpoint() -> impl Fn(u16) -> Endpoint {
+    |port| Endpoint::parse(&format!("http://127.0.0.1:{port}")).unwrap()
+}
+
+#[test]
+fn search_results_bounded_sanitised_and_marked_fetchable() {
+    // Hostile classes (§11): an ESC sequence and a bidi control in the
+    // payload fields, overlong title and snippet.
+    let title = format!("{}\u{1b}[31m injected", "x".repeat(130));
+    let snippet = format!("{}\u{1b}[2K\u{200B}tail", "y".repeat(310));
+    let results = json!({
+        "query": "tokio",
+        "results": [
+            {"url": "not a url at all", "title": "dropped me", "content": "dropped"},
+            {"url": "http://example.test:8080/a", "title": title, "content": snippet},
+            {"url": "http://example.test:8081/b", "title": "Second", "content": "second snippet"},
+            {"url": "http://off.test:80/c", "title": "Third off", "content": "third snippet"},
+            {"url": "http://off.test:80/d", "title": "Fourth off", "content": ""},
+            {"url": "http://off.test:80/e", "title": "Fifth off"},
+            {"url": "http://off.test:80/f", "title": "Sixth — past the cap"}
+        ],
+        "infobox": {"secret": "RAW_JSON_MARKER"}
+    });
+    let mut rig = Rig::new_search(
+        "search-bounded",
+        vec![searx(results)],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r = rig.call_search(json!({"query": "tokio scheduling"}));
+    ok_code(&r);
+    let t = text(&r);
+    assert!(
+        t.starts_with("search \"tokio scheduling\": 5 results (1 dropped: bad URL)\n"),
+        "{t}"
+    );
+    assert!(!t.contains('\u{1b}'), "raw ESC leaked: {t:?}");
+    assert!(!t.contains('\u{200B}'), "raw zero-width leaked: {t:?}");
+    assert!(!t.contains('\u{202E}'), "raw bidi leaked: {t:?}");
+    // The unlisted host is shown but marked: a search never widens the
+    // allowlist.
+    assert!(t.contains("1. [fetchable] example.test:8080/a — "), "{t}");
+    assert!(
+        t.contains("2. [fetchable] example.test:8081/b — Second"),
+        "{t}"
+    );
+    assert!(
+        t.contains("3. [not on allowlist] off.test:80/c — Third off"),
+        "{t}"
+    );
+    assert!(
+        t.contains("5. [not on allowlist] off.test:80/e — Fifth off"),
+        "{t}"
+    );
+    // Cut to 120 title / 300 snippet characters, on a char boundary.
+    assert!(!t.contains(&"x".repeat(130)), "title not cut: {t:?}");
+    assert!(t.contains(&"x".repeat(120)), "{t}");
+    assert!(!t.contains(&"y".repeat(310)), "snippet not cut: {t:?}");
+    assert!(t.contains(&"y".repeat(300)), "{t}");
+    // Result six is past `max_results` (default 5) and is never shown;
+    // the dropped one is counted, not rendered.
+    assert!(!t.contains("Sixth"), "{t}");
+    assert!(!t.contains("dropped me"), "{t}");
+    // Raw JSON — including unknown fields — never reaches the context.
+    assert!(!t.contains("RAW_JSON_MARKER"), "{t}");
+    assert!(!t.contains("infobox"), "{t}");
+}
+
+#[test]
+fn search_raw_json_never_in_output() {
+    let results = json!({
+        "results": [
+            {"url": "http://example.test:8080/r", "title": "TITLE_MARKER", "content": "SNIP_MARKER",
+             "thumbnail": "FIELD_MARKER", "publishedDate": "2026-01-01"}
+        ]
+    });
+    let mut rig = Rig::new_search(
+        "search-raw-json",
+        vec![searx(results)],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r = rig.call_search(json!({"query": "q"}));
+    ok_code(&r);
+    let t = text(&r);
+    assert!(
+        t.contains("TITLE_MARKER") && t.contains("SNIP_MARKER"),
+        "{t}"
+    );
+    assert!(!t.contains("FIELD_MARKER"), "unknown field leaked: {t}");
+    assert!(!t.contains("publishedDate"), "{t}");
+    assert!(
+        !t.contains('{'),
+        "no raw JSON syntax in the observation: {t:?}"
+    );
+    // The URL is rendered through parse_url, not as a raw JSON string.
+    assert!(
+        t.contains("1. [fetchable] example.test:8080/r — TITLE_MARKER"),
+        "{t}"
+    );
+}
+
+#[test]
+fn search_endpoint_must_be_loopback() {
+    use harness_model_core::endpoint::EndpointRefused;
+    let e = Endpoint::parse("http://10.0.0.5:8888").unwrap_err();
+    assert!(matches!(e, EndpointRefused::NotLoopback), "{e:?}");
+    let e = Endpoint::parse("http://search.example.test:80").unwrap_err();
+    assert!(matches!(e, EndpointRefused::NotLoopback), "{e:?}");
+    // https is refused on the same rule as the model endpoint: the
+    // loopback trust base is plain http on the user's machine.
+    let e = Endpoint::parse("https://127.0.0.1:8888").unwrap_err();
+    assert!(matches!(e, EndpointRefused::NeedsHosted), "{e:?}");
+    // `localhost` maps to loopback without a DNS lookup.
+    let ok = Endpoint::parse("http://localhost:8888/searx").unwrap();
+    assert_eq!(ok.port, 8888);
+}
+
+#[test]
+fn search_query_journaled_in_egress() {
+    let mut rig = Rig::new_search(
+        "search-journal",
+        vec![searx(json!({"results": [
+            {"url": "http://example.test:8080/r", "title": "R", "content": "c"}
+        ]}))],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r = rig.call_search(json!({"query": "tokio current_thread scheduling"}));
+    ok_code(&r);
+    let records = rig.log.records.lock().unwrap();
+    assert_eq!(records.len(), 1, "one search, one egress record");
+    let rec = &records[0];
+    // INV-43: the allow decision, journaled with the full request URL —
+    // the query is in the journal before any byte moved.
+    assert_eq!(rec.decision, harness_sandbox::egress::EgressDecision::Allow);
+    assert_eq!(rec.purpose, harness_sandbox::egress::EgressPurpose::Search);
+    assert_eq!(rec.mode, EgressMode::SearchEndpoint);
+    assert_eq!(rec.host, "127.0.0.1");
+    assert_eq!(rec.port, rig.fixture.addr.port());
+    assert!(rec.resolved.is_empty(), "search endpoints are not resolved");
+    assert_eq!(rec.ip, Some(IpAddr::from([127, 0, 0, 1])));
+    let port = rig.fixture.addr.port();
+    assert_eq!(
+        rec.url,
+        format!(
+            "http://127.0.0.1:{port}/search?q=tokio%20current_thread%20scheduling&format=json&pageno=1&safesearch=1"
+        )
+    );
+    let hop_no = rec.hop;
+    drop(records);
+    assert_eq!(accepts(&rig.fixture), 1, "the hop dialed the endpoint");
+    // The ToolFinished hop record pairs with the egress entry (P-39j).
+    let web = r.web.as_ref().unwrap();
+    assert_eq!(web.hops.len(), 1);
+    assert_eq!(web.hops[0].hop, hop_no);
+    assert_eq!(web.hops[0].mode, "search-endpoint");
+    assert_eq!(web.hops[0].ended, "relayed");
+    assert_eq!(web.final_url, rec_url_placeholder(port));
+}
+
+fn rec_url_placeholder(port: u16) -> String {
+    format!(
+        "http://127.0.0.1:{port}/search?q=tokio%20current_thread%20scheduling&format=json&pageno=1&safesearch=1"
+    )
+}
+
+#[test]
+fn search_budget_exhausted_refused() {
+    let body = json!({"results": [
+        {"url": "http://example.test:8080/r", "title": "R"}
+    ]});
+    let budgets = WebBudgets {
+        searches: 1,
+        ..WebBudgets::default()
+    };
+    let mut rig = Rig::new_search(
+        "search-budget",
+        vec![searx(body.clone()), searx(body)],
+        budgets,
+        search_endpoint(),
+    );
+    let r1 = rig.call_search(json!({"query": "first"}));
+    ok_code(&r1);
+    let r2 = rig.call_search(json!({"query": "second"}));
+    assert_eq!(err_code(&r2), code::WEB_BUDGET);
+    assert!(
+        text(&r2).contains("search budget exhausted"),
+        "{}",
+        text(&r2)
+    );
+    assert_eq!(accepts(&rig.fixture), 1, "the refused search opened no hop");
+    assert_eq!(rig.log.len(), 1, "only the allowed search journaled egress");
+}
+
+#[test]
+fn searxng_garbage_json_typed_error() {
+    let mut rig = Rig::new_search(
+        "search-garbage",
+        vec![response(Some("application/json"), &[], b"this is not json")],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r = rig.call_search(json!({"query": "x"}));
+    assert_eq!(err_code(&r), code::WEB_SEARCH_PARSE);
+    // A non-200 answer is the same typed refusal, not a parse crash.
+    let mut rig2 = Rig::new_search(
+        "search-502",
+        vec![
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r2 = rig2.call_search(json!({"query": "x"}));
+    assert_eq!(err_code(&r2), code::WEB_SEARCH_PARSE);
+    assert!(text(&r2).contains("502"), "{}", text(&r2));
+    // JSON without a results array is refused the same way (raw body, so
+    // the test helper cannot add one).
+    let mut rig3 = Rig::new_search(
+        "search-no-results",
+        vec![response(Some("application/json"), &[], br#"{"query":"x"}"#)],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r3 = rig3.call_search(json!({"query": "x"}));
+    assert_eq!(err_code(&r3), code::WEB_SEARCH_PARSE);
+}
+
+#[test]
+fn javascript_url_result_dropped_and_counted() {
+    let body = json!({"results": [
+        {"url": "javascript:alert(1)", "title": "Evil", "content": "pwn"},
+        {"url": "http://example.test:8080/ok", "title": "Fine", "content": "fine"}
+    ]});
+    let mut rig = Rig::new_search(
+        "search-js-url",
+        vec![searx(body)],
+        WebBudgets::default(),
+        search_endpoint(),
+    );
+    let r = rig.call_search(json!({"query": "evil"}));
+    ok_code(&r);
+    let t = text(&r);
+    assert!(t.contains("1 results (1 dropped: bad URL)"), "{t}");
+    assert!(!t.contains("javascript"), "{t}");
+    assert!(!t.contains("Evil"), "{t}");
+    assert!(
+        t.contains("1. [fetchable] example.test:8080/ok — Fine"),
+        "{t}"
+    );
 }

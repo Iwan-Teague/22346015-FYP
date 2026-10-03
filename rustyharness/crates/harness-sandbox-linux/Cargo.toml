@@ -16,6 +16,15 @@ license.workspace = true
 unsafe_code = "allow"
 missing_docs = "warn"
 
+[dependencies]
+
+# The landlock crate pokes Linux-only libc items (prctl, O_PATH) and does
+# not compile on other targets; the pure rule-planning layer of
+# landlock_rules.rs must not need it, so it stays target-gated and the
+# module's portable half compiles (and unit-tests) everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+
 [lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"

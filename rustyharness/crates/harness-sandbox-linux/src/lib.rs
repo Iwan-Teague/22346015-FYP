@@ -20,6 +20,12 @@
 //! S-Lb/S-Lc land the primitives behind the reviewed allowlist (landlock,
 //! rustix on its libc backend, enumflags2; see deny.toml and the purity.sh
 //! registry list).
+//!
+//! Since S-Lb the crate also builds the Landlock ruleset itself
+//! ([`landlock_rules`]): the portable rule planner compiles (and is
+//! unit-tested) on every OS; the syscall side — ruleset creation from
+//! `PathFd` handles and `apply()` — is Linux-only and refuses, never
+//! degrades, when the kernel's Landlock ABI is below what the grants need.
 
 #![allow(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -47,6 +53,8 @@ pub struct Primitives {
 /// The Linux backend's primitive decision (the crate's one job).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxBackend;
+
+pub mod landlock_rules;
 
 impl LinuxBackend {
     /// The FIRST confinement primitive the default tier is missing, in

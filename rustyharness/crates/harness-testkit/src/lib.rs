@@ -124,6 +124,8 @@ pub fn read_spec(task: &str) -> TaskSpec {
             "harness.fs.list".into(),
         ],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

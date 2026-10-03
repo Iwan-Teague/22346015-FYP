@@ -78,6 +78,7 @@ impl Rig {
                 personal_data_granted: false,
                 conformed: false,
                 exec_programs: Vec::new(),
+                lan_ports: Vec::new(),
                 read_window: None,
                 kind: SessionKind::Coding,
             },

@@ -173,11 +173,14 @@ fn fixture_manifest_validates() {
 
 /// The manifest sha is written into journal headers; a byte of drift would
 /// make old journals read as "another build". Pin the exact bytes.
+///
+/// P-36g changed the bytes once: the three background tools joined the
+/// manifest, so journals from before that build are refused by name.
 #[test]
 fn builtin_manifest_bytes_unchanged() {
     assert_eq!(
         harness_core::sha256(builtin::builtin_manifest_json().as_bytes()).to_string(),
-        "1f681b35eb67ecfa8cd0d6e39e2bf51260a3db5cb91d9b7ac35bea5e234bd407"
+        "9284d521e12303570412f49ed32118dced2b18bec967ecf84dfa9b3eb1c8b115"
     );
 }
 
@@ -253,6 +256,92 @@ fn research_manifest_declares_exactly_the_web_tools_and_the_task_sentinels() {
     assert_eq!(props["max_results"]["maximum"], 10);
 }
 
+/// P-36g: the background tools are declared with the labels §9's table
+/// gives them, and `exec.start`'s schema carries the port arguments.
+#[test]
+fn builtin_manifest_lists_bg_tools() {
+    let m = builtin::manifest(&ctx()).unwrap();
+    let start = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id.as_str() == "harness.exec.start")
+        .expect("harness.exec.start in the built-in manifest");
+    assert_eq!(
+        (
+            start.effect,
+            start.sensitivity,
+            start.blast_radius,
+            start.egress
+        ),
+        (
+            Effect::Execute,
+            Sensitivity::Operational,
+            BlastRadius::Own,
+            Egress::None
+        )
+    );
+    assert_eq!(
+        (start.content, start.confirmation),
+        (Content::ThirdParty, Confirmation::None)
+    );
+    let read = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id.as_str() == "harness.exec.read")
+        .expect("harness.exec.read in the built-in manifest");
+    assert_eq!(
+        (
+            read.effect,
+            read.sensitivity,
+            read.blast_radius,
+            read.egress
+        ),
+        (
+            Effect::Read,
+            Sensitivity::Operational,
+            BlastRadius::Own,
+            Egress::None
+        )
+    );
+    assert_eq!(
+        (read.content, read.confirmation),
+        (Content::ThirdParty, Confirmation::None)
+    );
+    let stop = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id.as_str() == "harness.exec.stop")
+        .expect("harness.exec.stop in the built-in manifest");
+    assert_eq!(
+        (
+            stop.effect,
+            stop.sensitivity,
+            stop.blast_radius,
+            stop.egress
+        ),
+        (
+            Effect::Write,
+            Sensitivity::Operational,
+            BlastRadius::Own,
+            Egress::None
+        )
+    );
+    assert_eq!(
+        (stop.content, stop.confirmation),
+        (Content::Own, Confirmation::None)
+    );
+    // The start schema names the port arguments (§6.1); ports are bound to
+    // the unprivileged range the same way the sandbox binds them.
+    let props = start.input_schema().as_json()["properties"].clone();
+    assert_eq!(props["ports"]["items"]["minimum"], 1024);
+    assert_eq!(props["ports"]["items"]["maximum"], 65535);
+    assert_eq!(
+        props["scope"]["enum"],
+        serde_json::json!(["turn", "session"])
+    );
+    assert_eq!(props["ready"]["properties"]["port"]["minimum"], 1024);
+}
+
 /// P-53: the terse table has an entry for every built-in capability, and
 /// none for anything outside it (a provider capability keeps its summary).
 #[test]
@@ -308,6 +397,9 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "harness.edit.delete",
             "harness.edit.move",
             "harness.exec.run",
+            "harness.exec.start",
+            "harness.exec.read",
+            "harness.exec.stop",
             "harness.task.todo",
             "harness.task.delegate",
             "harness.task.submit"

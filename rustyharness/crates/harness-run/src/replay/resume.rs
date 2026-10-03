@@ -24,8 +24,8 @@ use crate::approve::{Approver, RecordedApproval};
 use crate::driver::step::UserState;
 use crate::driver::{
     attempt_check, commit, exec_tools, header, loop_facts, new_meter_resumed, prepare, todo_for,
-    Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, Prepared,
-    ReadLog, WorkspaceModeRecord,
+    Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader,
+    Prepared, ReadLog, WorkspaceModeRecord,
 };
 use crate::presubmit::PresubmitState;
 use crate::session::{
@@ -161,6 +161,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         r.config,
         r.approver.is_some(),
         r.confinement,
+        r.backend.identity().endpoint,
     )?;
     let run_dir = layout::run_dir(&pre.state_root, r.run);
     match std::fs::symlink_metadata(&run_dir) {
@@ -179,7 +180,11 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         .first()
         .ok_or(not_resumable("the last attempt has no header"))?;
     // The limits included: a resume runs under the caller's limits, which
-    // must be the recorded ones (H1 phase-exit review F-1).
+    // must be the recorded ones (H1 phase-exit review F-1). The port grant
+    // (P-36g §6.1) is recomputed with a fresh probe: the ports and the
+    // reserved list must match the recorded ones, and so must what the
+    // probe observes now.
+    let ports_header = PortsHeader::of(r.spec, r.config, pre.ports.as_ref());
     check_header(
         head,
         &expected_inputs(
@@ -189,6 +194,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             r.profile,
             &r.config.limits,
             None,
+            ports_header.as_ref(),
         ),
     )
     .map_err(|d| not_resumable(d.why))?;
@@ -310,6 +316,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             .exec
             .as_ref()
             .map(|(p, w)| ExecHeader::live(p, w, r.config)),
+        ports: ports_header,
         workspace_mode: workspace_mode.as_ref(),
     })?;
     let exec = exec_tools(&pre, &run_dir, r.confinement, r.config)?;
@@ -467,6 +474,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         &r.config.run,
         r.approver.is_some(),
         r.confinement,
+        r.backend.identity().endpoint,
     )?;
     let run_dir = layout::run_dir(&pre.state_root, r.run);
     match std::fs::symlink_metadata(&run_dir) {
@@ -521,6 +529,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
     let head = records
         .first()
         .ok_or(not_resumable("the last attempt has no header"))?;
+    let ports_header = PortsHeader::of(r.spec, &r.config.run, pre.ports.as_ref());
     check_header(
         head,
         &expected_inputs(
@@ -530,6 +539,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             r.profile,
             &limits,
             Some(&r.config.turn),
+            ports_header.as_ref(),
         ),
     )
     .map_err(|d| not_resumable(d.why))?;
@@ -681,6 +691,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             .exec
             .as_ref()
             .map(|(p, w)| ExecHeader::live(p, w, &r.config.run)),
+        ports: ports_header,
         workspace_mode: workspace_mode.as_ref(),
     })?;
     let exec = exec_tools(&pre, &run_dir, r.confinement, &r.config.run)?;

@@ -25,7 +25,8 @@ use crate::approve::RecordedApproval;
 use crate::driver::step::UserState;
 use crate::driver::{
     commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ExecHeader,
-    HeaderInputs, Loop, LoopInit, NonceSource, ReadLog, SandboxRecord, WorkspaceModeRecord,
+    HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader, ReadLog, SandboxRecord,
+    WorkspaceModeRecord,
 };
 use crate::presubmit::PresubmitState;
 use crate::sample;
@@ -255,9 +256,35 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
     let Some(head) = v.records.first() else {
         return Ok(failed(diverge(0, 0, "the journal is empty"), None));
     };
+    // The task's port grants (P-36g §6.1): the probe's observation is a
+    // past host's, not recomputable, so it is re-stated; the granted lists
+    // in it are still checked against the inputs given, by `check_header`
+    // below. A task with ports whose journal does not hold the object, or
+    // holds one this build does not write, is refused by name.
+    let recorded_ports = if a.spec.ports.is_empty() {
+        None
+    } else {
+        match head.body.get("ports").and_then(PortsHeader::parse) {
+            Some(p) => Some(p),
+            None => {
+                return Ok(failed(
+                    diverge(0, 0, "the header does not record the run's port grants"),
+                    None,
+                ))
+            }
+        }
+    };
     if let Err(d) = check_header(
         head,
-        &expected_inputs(a.spec, a.registry, a.policy, a.profile, a.limits, turn),
+        &expected_inputs(
+            a.spec,
+            a.registry,
+            a.policy,
+            a.profile,
+            a.limits,
+            turn,
+            recorded_ports.as_ref(),
+        ),
     ) {
         return Ok(failed(d, None));
     }
@@ -375,6 +402,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         approver_present,
         session: turn.copied(),
         exec: exec_header,
+        ports: recorded_ports,
         workspace_mode: workspace_mode.as_ref(),
     })
     .map_err(AuditRefused::Plan)?;

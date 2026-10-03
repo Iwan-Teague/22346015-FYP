@@ -51,7 +51,7 @@ use crate::driver::stop::End;
 use crate::driver::{
     attempt_check, commit, create_run, exec_tools, header, loop_facts, new_meter,
     no_workspace_facts, prepare, Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop,
-    LoopInit, NonceSource, Prepared, RunConfig, RunRefused, RunReport, TaskSpec,
+    LoopInit, NonceSource, PortsHeader, Prepared, RunConfig, RunRefused, RunReport, TaskSpec,
 };
 use crate::presubmit::PresubmitState;
 
@@ -389,6 +389,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         &s.config.run,
         s.approver.is_some(),
         s.confinement,
+        s.backend.identity().endpoint,
     )?;
     let facts = pre.facts;
 
@@ -402,6 +403,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         .as_ref()
         .map(|(p, w)| ExecHeader::live(p, w, &s.config.run));
     let exec_tools = exec_tools(&pre, &run_dir, s.confinement, &s.config.run)?;
+    let ports_header = PortsHeader::of(s.spec, &s.config.run, pre.ports.as_ref());
     let header = header(&HeaderInputs {
         spec: s.spec,
         registry: s.registry,
@@ -416,6 +418,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         approver_present: s.approver.is_some(),
         session: Some(s.config.turn),
         exec: exec_header,
+        ports: ports_header,
         workspace_mode: s.config.run.workspace_mode.as_ref(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
@@ -570,6 +573,7 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         &s.config.run,
         s.approver.is_some(),
         s.confinement,
+        s.backend.identity().endpoint,
     )?;
     let facts = pre.facts;
 
@@ -579,7 +583,8 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         locality::check(s.probe, str)?;
     }
     // No exec grant is possible (prepare refused the exec section), so no
-    // exec header and no exec tools.
+    // exec header and no exec tools; no port grant either (P-36g: prepare
+    // refused it), so no ports header.
     let header = header(&HeaderInputs {
         spec: s.spec,
         registry: s.registry,
@@ -594,6 +599,7 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         approver_present: s.approver.is_some(),
         session: Some(s.config.turn),
         exec: None,
+        ports: None,
         workspace_mode: s.config.run.workspace_mode.as_ref(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(

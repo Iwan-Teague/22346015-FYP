@@ -24,6 +24,8 @@ fn edit_spec(task: &str) -> harness_run::TaskSpec {
         task: harness_model::TaskText::new(task.into()),
         grants: vec!["harness.fs.read".into(), "harness.edit.write".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

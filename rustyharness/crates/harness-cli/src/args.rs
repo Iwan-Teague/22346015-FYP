@@ -16,13 +16,15 @@ pub(crate) const USAGE: &str = "usage:
                        [--policy <policy.json>] [--gate <gate-id>] [--output stream-json]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
                        [--no-default-denies]
-  rustyharness resume --run <run-id> + the run options
+                       [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>] [--bg-persist]
+   rustyharness resume --run <run-id> + the run options
   rustyharness replay --run <run-id> --task <task.json> --state-root <dir>
                        --profile <profile.json> [--attempt <n>] [--anchor <sha256>]
                        [--policy <policy.json>] [--gate <gate-id>]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
                        [--no-default-denies]
-  rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
+                       [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>]
+   rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
   rustyharness review --run <run-id> --workspace <dir> [--state-root <dir>]
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
@@ -99,7 +101,17 @@ exec by name (P-11): for a task that grants harness.exec.run but has no
   and variables (rust needs cargo on --allow-exec); --shell adds sh (the
   header stamps shell_enabled). A task file with its own exec section
   takes none of them. replay and resume must be given the same flags the
-  run was given, so the audit re-resolves the same allowlist.";
+  run was given, so the audit re-resolves the same allowlist.
+
+ports (P-36g): a task file's exec section may hold ports (loopback ports
+  harness.exec.start may bind) and lan_ports (the subset reachable from
+  the LAN); --allow-port and --allow-lan-port give the same lists when the
+  task file has none. At most 8 ports, each 1024 or above, no duplicates
+  in a list, lan_ports inside ports. The model endpoint's own port (from
+  --endpoint or the config when it is a 127.0.0.1/localhost URL) is
+  refused as a grant and recorded as reserved instead. Starting a process
+  that binds a LAN port is a protected action: it asks every time and a
+  session grant never covers it.";
 
 /// Parse `--key value` pairs; a repeated or unknown key is a usage error.
 /// A key in `valueless` is a flag: it takes no value (`--shell`), and a
@@ -179,13 +191,15 @@ mod tests {
                        [--policy <policy.json>] [--gate <gate-id>] [--output stream-json]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
                        [--no-default-denies]
-  rustyharness resume --run <run-id> + the run options
+                       [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>] [--bg-persist]
+   rustyharness resume --run <run-id> + the run options
   rustyharness replay --run <run-id> --task <task.json> --state-root <dir>
                        --profile <profile.json> [--attempt <n>] [--anchor <sha256>]
                        [--policy <policy.json>] [--gate <gate-id>]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
                        [--no-default-denies]
-  rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
+                       [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>]
+   rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
   rustyharness review --run <run-id> --workspace <dir> [--state-root <dir>]
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
@@ -262,7 +276,17 @@ exec by name (P-11): for a task that grants harness.exec.run but has no
   and variables (rust needs cargo on --allow-exec); --shell adds sh (the
   header stamps shell_enabled). A task file with its own exec section
   takes none of them. replay and resume must be given the same flags the
-  run was given, so the audit re-resolves the same allowlist."
+  run was given, so the audit re-resolves the same allowlist.
+
+ports (P-36g): a task file's exec section may hold ports (loopback ports
+  harness.exec.start may bind) and lan_ports (the subset reachable from
+  the LAN); --allow-port and --allow-lan-port give the same lists when the
+  task file has none. At most 8 ports, each 1024 or above, no duplicates
+  in a list, lan_ports inside ports. The model endpoint's own port (from
+  --endpoint or the config when it is a 127.0.0.1/localhost URL) is
+  refused as a grant and recorded as reserved instead. Starting a process
+  that binds a LAN port is a protected action: it asks every time and a
+  session grant never covers it."
         );
     }
 }

@@ -482,6 +482,8 @@ fn compare_each_arm_audits_clean() {
         task: harness_model::TaskText::new("What does a.txt say?".to_owned()),
         grants: vec!["harness.fs.read".to_owned(), "harness.fs.list".to_owned()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

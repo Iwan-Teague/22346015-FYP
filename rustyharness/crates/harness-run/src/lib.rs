@@ -67,6 +67,7 @@ pub mod session;
 pub use approve::{ApprovalAnswer, Approver, ApproverKind};
 pub use driver::{
     run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec, WorkspaceModeRecord,
+    PORTS_PER_TASK,
 };
 /// Re-exported: a `TaskSpec`'s `kind` field names it (P-39i), so an
 /// embedder builds specs without a direct `harness-policy` dependency.

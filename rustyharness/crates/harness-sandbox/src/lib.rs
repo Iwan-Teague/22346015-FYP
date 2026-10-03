@@ -63,7 +63,7 @@ use conformance::{Case, MatrixRow};
 pub use ring::{Chunk, Mode, Stream, StreamTotals};
 pub use spec::{
     Approved, ChildStatus, ConfinedExit, ConfinedSpec, DomainCleanup, Limits, Network, Ports,
-    SpecError,
+    PortsWitness, SpecError, PORT_MIN,
 };
 use std::time::Duration;
 
@@ -608,6 +608,25 @@ pub trait Confinement {
     ) -> Result<ConfinedChild, SpawnError> {
         Err(SpawnError::Io("no confinement is available".into()))
     }
+    /// The live port probe (§4.4, P-36g): over the granted bind ports and
+    /// the reserved (model) ports, once the witness `ev` is held. Refusing
+    /// by default: a backend without a port probe refuses, and a task that
+    /// granted ports is then refused whole — fail closed, never run with
+    /// unprobed ports.
+    fn probe_ports(
+        &self,
+        _ev: &Conformed,
+        _bind: &[u16],
+        _reserved: &[u16],
+    ) -> Result<PortsWitness, Unavailable> {
+        Err(Unavailable {
+            backend: None,
+            reason: UnavailableReason::LiveProbeFailed {
+                probe: "ports-witness",
+                observed: "this platform has no port probe; a port grant is refused".into(),
+            },
+        })
+    }
 }
 
 /// The production confinement: [`require`], and the backend of this
@@ -653,6 +672,19 @@ impl Confinement for SystemConfinement {
         {
             linux::Linux.spawn_live(spec, ev, live)
         }
+    }
+
+    // macOS only: Windows and Linux have no port probe yet, so the trait's
+    // default refusal stands there (a task granting ports is refused,
+    // fail closed).
+    #[cfg(target_os = "macos")]
+    fn probe_ports(
+        &self,
+        ev: &Conformed,
+        bind: &[u16],
+        reserved: &[u16],
+    ) -> Result<PortsWitness, Unavailable> {
+        seatbelt::Seatbelt::new().probe_ports(ev, bind, reserved)
     }
 }
 

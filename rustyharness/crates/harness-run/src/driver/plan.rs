@@ -12,20 +12,21 @@ use harness_journal::layout;
 use harness_manifest::admission::{Registry, Resolved};
 use harness_model::context::{self, Fact, FactValue};
 use harness_model::profile::Profile;
-use harness_model::ToolSpec;
+use harness_model::{EndpointClass, ToolSpec};
 use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::{
-    Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionSpec, UserPolicy,
-    WorkspaceDecl, EXEC_ID, SUBMIT_ID, TODO_ID, WEB_FETCH_ID, WEB_SEARCH_ID,
+    is_bg_id, Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionSpec,
+    UserPolicy, WorkspaceDecl, EXEC_ID, EXEC_START_ID, SUBMIT_ID, TODO_ID, WEB_FETCH_ID,
+    WEB_SEARCH_ID,
 };
-use harness_sandbox::{Confinement, Conformed};
+use harness_sandbox::{Confinement, Conformed, PortsWitness};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
 use harness_tools::protected::{Protected, ProtectedError, DEFAULT_ASK};
 use harness_tools::{
     EditTools, ExecSpec, ExecTools, PatchTools, Pinned, ReadTools, TodoList, ToolProvider,
 };
 
-use super::{new_run_id, RunConfig, RunRefused, TaskSpec};
+use super::{new_run_id, RunConfig, RunRefused, TaskSpec, PORTS_PER_TASK};
 use crate::presubmit::PresubmitRefused;
 
 /// What `prepare` established before anything was written.
@@ -49,6 +50,9 @@ pub(crate) struct Prepared {
     /// before anything was written. None for a research session (P-39i: it
     /// grants no exec).
     pub(crate) exec: Option<(Pinned, Conformed)>,
+    /// For a port grant (P-36g §6.1): the ports witness, probed before
+    /// anything was written; `Some` exactly when the task holds ports.
+    pub(crate) ports: Option<PortsWitness>,
     /// The merged protected-path deny sources (P-29): the build's
     /// [`DEFAULT_DENY`] plus the task's declared list, compiled. Empty for
     /// a research session (P-39i: no workspace, no protected paths).
@@ -102,6 +106,7 @@ pub(crate) fn prepare(
     config: &RunConfig,
     approver_present: bool,
     confinement: Option<&dyn Confinement>,
+    endpoint: EndpointClass,
 ) -> Result<Prepared, RunRefused> {
     match &spec.kind {
         SessionKind::Research(_) => {
@@ -157,6 +162,7 @@ pub(crate) fn prepare(
                 facts: no_workspace_facts(),
                 tree: None,
                 exec: None,
+                ports: None,
                 protected: Protected::new(&[])
                     .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
             })
@@ -170,7 +176,11 @@ pub(crate) fn prepare(
             };
             // The exec grant and its setup agree, and the setup pins (H2d),
             // before the session is planned with the witness it will need.
+            // P-36g: the background tools ride the exec setup, and a port
+            // grant needs `harness.exec.start`; then the port list itself is
+            // checked, and the model's own ports are known.
             let pinned = exec_setup(spec)?;
+            check_ports(spec, config, endpoint)?;
             let (session, tools) = plan(
                 spec,
                 registry,
@@ -217,15 +227,35 @@ pub(crate) fn prepare(
                 .map_err(RunRefused::Facts)?;
             // INV-6: the witness, last, before anything is written; no
             // confinement, or a refusal, refuses the run (there is no
-            // unconfined fallback).
+            // unconfined fallback). A port grant (P-36g §6.1) probes the
+            // same way, after the checks above, and keeps its own witness
+            // for the header.
+            let mut witness: Option<Conformed> = None;
             let exec = match pinned {
                 None => None,
                 Some(p) => {
                     let c = confinement.ok_or(RunRefused::ExecGrant(
                         "harness.exec.run is granted but the run was given no confinement",
                     ))?;
-                    Some((p, c.require().map_err(RunRefused::Confinement)?))
+                    let w = c.require().map_err(RunRefused::Confinement)?;
+                    witness = Some(w.clone());
+                    Some((p, w))
                 }
+            };
+            let ports = if spec.ports.is_empty() {
+                None
+            } else {
+                let c = confinement.ok_or(RunRefused::ExecGrant(
+                    "ports are granted but the run was given no confinement",
+                ))?;
+                let w = match witness {
+                    Some(w) => w,
+                    None => c.require().map_err(RunRefused::Confinement)?,
+                };
+                Some(
+                    c.probe_ports(&w, &spec.ports, &config.reserved_ports)
+                        .map_err(|e| RunRefused::Confinement(harness_sandbox::Refused(e)))?,
+                )
             };
             Ok(Prepared {
                 session,
@@ -237,6 +267,7 @@ pub(crate) fn prepare(
                 facts: tree.facts(),
                 tree: Some(tree),
                 exec,
+                ports,
                 protected: Protected::new(&spec.protected)
                     .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
             })
@@ -265,6 +296,14 @@ pub(crate) fn check_research_spec(spec: &TaskSpec) -> Result<(), RunRefused> {
     if spec.exec.is_some() {
         return Err(RunRefused::Research(
             "a research session takes no exec section",
+        ));
+    }
+    // P-36g, fail closed: a port grant needs `harness.exec.start` and a
+    // sandbox to bind in; a research session takes neither, so a port
+    // grant is refused rather than silently dropped.
+    if !spec.ports.is_empty() || !spec.lan_ports.is_empty() {
+        return Err(RunRefused::Research(
+            "a research session grants no ports (it runs no commands to bind them)",
         ));
     }
     if spec.presubmit.is_some() {
@@ -331,9 +370,30 @@ pub(crate) fn protected_policy(user: &UserPolicy) -> Result<UserPolicy, RunRefus
 
 /// The exec setup of a task (H2d): `None` without an exec grant; the pinned
 /// setup with one. A grant without an exec section, or a section without
-/// the grant, is refused.
+/// the grant, is refused. The P-36g background tools ride the same setup:
+/// they are refused without the `harness.exec.run` grant and section they
+/// run under, and a port grant is refused without `harness.exec.start`, the
+/// tool that would use the ports (§3, §6.1).
 pub(crate) fn exec_setup(spec: &TaskSpec) -> Result<Option<Pinned>, RunRefused> {
     let granted = spec.grants.iter().any(|g| g == EXEC_ID);
+    let bg = spec.grants.iter().any(|g| is_bg_id(g));
+    if bg && !granted {
+        return Err(RunRefused::ExecGrant(
+            "a background exec tool is granted but harness.exec.run is not",
+        ));
+    }
+    if bg && spec.exec.is_none() {
+        return Err(RunRefused::ExecGrant(
+            "a background exec tool is granted but the task has no exec section (its allowlist)",
+        ));
+    }
+    if (!spec.ports.is_empty() || !spec.lan_ports.is_empty())
+        && !spec.grants.iter().any(|g| g == EXEC_START_ID)
+    {
+        return Err(RunRefused::ExecGrant(
+            "ports are granted but harness.exec.start is not",
+        ));
+    }
     match (granted, &spec.exec) {
         (false, None) => Ok(None),
         (true, None) => Err(RunRefused::ExecGrant(
@@ -344,6 +404,59 @@ pub(crate) fn exec_setup(spec: &TaskSpec) -> Result<Option<Pinned>, RunRefused> 
         )),
         (true, Some(e)) => Ok(Some(Pinned::check(e)?)),
     }
+}
+
+/// The port grant of a task (P-36g §6.1): bounded, each port a real
+/// high port, no duplicates, the LAN subset inside it, and never one of the
+/// model's own reserved ports. With a loopback endpoint and no reserved
+/// ports the harness cannot tell a granted port from the model server's,
+/// so it refuses ([`RunRefused::ModelPortUnknown`]) rather than guess.
+fn check_ports(
+    spec: &TaskSpec,
+    config: &RunConfig,
+    endpoint: EndpointClass,
+) -> Result<(), RunRefused> {
+    if spec.ports.len() > PORTS_PER_TASK {
+        return Err(RunRefused::ExecGrant(
+            "more ports are granted than a task may hold",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for p in &spec.ports {
+        if *p < harness_sandbox::PORT_MIN {
+            return Err(RunRefused::ExecGrant(
+                "a granted port is below 1024 (the reserved range)",
+            ));
+        }
+        if !seen.insert(*p) {
+            return Err(RunRefused::ExecGrant("a port is granted twice"));
+        }
+    }
+    // No duplicates within the LAN list either; a LAN port is one of the
+    // ports again (their subset), which is not a duplicate.
+    let mut seen_lan = std::collections::BTreeSet::new();
+    for p in &spec.lan_ports {
+        if !spec.ports.contains(p) {
+            return Err(RunRefused::ExecGrant(
+                "a lan port is granted that is not among the task's ports",
+            ));
+        }
+        if !seen_lan.insert(*p) {
+            return Err(RunRefused::ExecGrant("a lan port is granted twice"));
+        }
+    }
+    if spec.ports.is_empty() {
+        return Ok(());
+    }
+    if endpoint == EndpointClass::Loopback && config.reserved_ports.is_empty() {
+        return Err(RunRefused::ModelPortUnknown);
+    }
+    if config.reserved_ports.iter().any(|r| spec.ports.contains(r)) {
+        return Err(RunRefused::ExecGrant(
+            "a granted port is a reserved (model) port",
+        ));
+    }
+    Ok(())
 }
 
 /// The locality check run on each new attempt directory (§2.8).
@@ -454,6 +567,8 @@ pub(crate) fn plan(
             personal_data_granted: false,
             conformed,
             exec_programs: spec.exec.as_ref().map(ExecSpec::names).unwrap_or_default(),
+            // P-36g: the ports that make an exec.start a protected ask.
+            lan_ports: spec.lan_ports.clone(),
             // The run's read window bounds a read's lines (H2e); a research
             // session (P-39i) has no read tools, so no window.
             read_window: (!research).then(|| profile.read_window().lines),

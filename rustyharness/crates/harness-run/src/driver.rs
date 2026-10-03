@@ -67,7 +67,7 @@ pub(crate) use approvals::Approvals;
 pub use header::WorkspaceModeRecord;
 pub(crate) use header::{
     builtin_manifest_sha256, header, limits_fields, protected_task_digest, terse_table_sha256,
-    web_grant_digest, ExecHeader, HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
+    web_grant_digest, ExecHeader, HeaderInputs, PortsHeader, SandboxRecord, HEADER_INPUT_KEYS,
 };
 pub(crate) use plan::{
     attempt_check, create_run, loop_facts, no_workspace_facts, plan, prepare, todo_for, Prepared,
@@ -90,6 +90,14 @@ pub struct TaskSpec {
     pub grants: Vec<String>,
     /// The task declared the workspace public (§5.4).
     pub workspace_public: bool,
+    /// Ports the task may bind on loopback (P-36g §6.1): at most
+    /// [`PORTS_PER_TASK`], each [`harness_sandbox::PORT_MIN`] or above, no
+    /// duplicates, never a reserved (model) port. Empty: no port grant.
+    pub ports: Vec<u16>,
+    /// Of those ports, the ones reachable from the LAN (P-36g §6.3): a
+    /// subset of [`TaskSpec::ports`]. Each such port's `harness.exec.start`
+    /// is a `protected_action` ask, every time.
+    pub lan_ports: Vec<u16>,
     /// The command runner's setup (§4.8, H2d): the exec allowlist and what
     /// a command needs besides the workspace. Present exactly when the
     /// grants include `harness.exec.run`.
@@ -138,6 +146,15 @@ pub struct RunConfig {
     /// in-place (the default, unchanged). Recorded in the journal header,
     /// never compared by an audit (see [`WorkspaceModeRecord`]).
     pub workspace_mode: Option<WorkspaceModeRecord>,
+    /// The model's own ports (P-36g §6.1): what a port grant may never
+    /// include. The CLI derives the endpoint's port; a library caller
+    /// passes its own. A port grant with a loopback endpoint and no
+    /// reserved ports is refused ([`RunRefused::ModelPortUnknown`]).
+    pub reserved_ports: Vec<u16>,
+    /// Whether background processes survive the run (P-36 spec §3.5,
+    /// `--bg-persist`). Parsed and recorded; the persist path lands with
+    /// the background tooling itself (P-36i).
+    pub bg_persist: bool,
 }
 
 impl RunConfig {
@@ -159,9 +176,16 @@ impl RunConfig {
             approval_timeout: Duration::from_secs(15 * 60),
             allow_session_grants: false,
             workspace_mode: None,
+            reserved_ports: Vec::new(),
+            bg_persist: false,
         }
     }
 }
+
+/// The most ports one task may hold (P-36 spec §6.1): a bound the loader
+/// checks before anything runs. The tools layer carries the same bound for
+/// its own parsing (P-36i).
+pub const PORTS_PER_TASK: usize = 8;
 
 /// Everything [`run`] needs.
 pub struct Run<'a> {
@@ -263,6 +287,13 @@ pub enum RunRefused {
     /// The session's turn limits are out of range (P-05 §4); nothing ran.
     #[error("turn limits refused: {0}")]
     TurnLimits(&'static str),
+    /// A port grant with a loopback endpoint and no reserved ports (P-36g
+    /// §6.1): the harness cannot tell a granted port from the model
+    /// server's own port, so it refuses rather than guess. The CLI always
+    /// knows (it derives the port from the endpoint); a library caller
+    /// passes `RunConfig::reserved_ports`.
+    #[error("ports are granted but no reserved (model) ports are known: a loopback endpoint's port is never a granted port, and none was given")]
+    ModelPortUnknown,
     /// A research session's spec is refused (P-39i, fail closed): web
     /// capabilities this build does not wire, an exec section, pre-submit
     /// commands, protected paths, a workspace, no confinement, a witness
@@ -342,6 +373,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         r.config,
         r.approver.is_some(),
         r.confinement,
+        r.backend.identity().endpoint,
     )?;
     let facts = pre.facts;
 
@@ -356,6 +388,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         .as_ref()
         .map(|(p, w)| ExecHeader::live(p, w, r.config));
     let exec_tools = exec_tools(&pre, &run_dir, r.confinement, r.config)?;
+    let ports_header = PortsHeader::of(r.spec, r.config, pre.ports.as_ref());
     let header = header(&HeaderInputs {
         spec: r.spec,
         registry: r.registry,
@@ -370,6 +403,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         approver_present: r.approver.is_some(),
         session: None,
         exec: exec_header,
+        ports: ports_header,
         workspace_mode: r.config.workspace_mode.as_ref(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(

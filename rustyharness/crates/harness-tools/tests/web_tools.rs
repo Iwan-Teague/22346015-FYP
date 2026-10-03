@@ -341,6 +341,7 @@ impl<'a> Rig<'a> {
                 personal_data_granted: false,
                 conformed: false,
                 exec_programs: Vec::new(),
+                lan_ports: Vec::new(),
                 read_window: None,
                 kind: SessionKind::Research(WebGrant {
                     allowlist: vec![
@@ -478,6 +479,7 @@ fn research_session(allowlist: &[&str]) -> Session {
             personal_data_granted: false,
             conformed: false,
             exec_programs: Vec::new(),
+            lan_ports: Vec::new(),
             read_window: None,
             kind: SessionKind::Research(WebGrant {
                 allowlist: allowlist.iter().map(|s| (*s).to_string()).collect(),

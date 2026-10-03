@@ -1,8 +1,10 @@
 //! The built-in dispatch table (P-02): the manifest, the tools dispatch
-//! table and the policy registration table must list the same fifteen coding
-//! tools in the same order (the policy table adds the two research-only web
-//! ids, P-39b), and the workspace-constructed entries must build a provider
-//! that serves its id over a real workspace root.
+//! table and the policy registration table must agree on the coding tools'
+//! order (the policy table adds the two research-only web ids, P-39b), and
+//! the workspace-constructed entries must build a provider that serves its
+//! id over a real workspace root. Since P-36g the manifest and the policy
+//! table also declare the background trio, whose dispatch arrives with
+//! P-36i: declared and registered, but no tools-crate entry yet.
 
 #![allow(
     clippy::unwrap_used,
@@ -38,22 +40,37 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// All three tables agree: fifteen coding tools, manifest order. The policy
-/// registration table is the union (P-39b): the same fifteen in order, then
-/// the two web ids the research manifest declares, which no tool provider
-/// serves yet. A new built-in registers in all of them or the run cannot
-/// dispatch what it grants.
+/// The background trio (P-36g §3): in the manifest and the policy table,
+/// dispatched by the run loop only from P-36i on, so the tools dispatch
+/// table does not list them yet.
+const BG_IDS: [&str; 3] = [
+    "harness.exec.start",
+    "harness.exec.read",
+    "harness.exec.stop",
+];
+
+/// All three tables agree: eighteen coding capabilities, manifest order.
+/// The dispatch table serves the fifteen non-background ones (manifest
+/// order minus the P-36g trio). The policy registration table is the union
+/// (P-39b): the same eighteen in order, then the two web ids the research
+/// manifest declares, which no tool provider serves yet. A new built-in
+/// registers in all of them or the run cannot dispatch what it grants.
 #[test]
-fn builtin_registry_lists_fifteen_tools_in_order() {
+fn builtin_registry_tables_agree_in_order() {
     let m = manifest_builtin::manifest(&ctx()).unwrap();
     let manifest_ids: Vec<&str> = m.capabilities().iter().map(|c| c.id().as_str()).collect();
     let policy_ids: Vec<&str> = policy_builtin::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
     let tool_ids: Vec<&str> = registry::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
-    assert_eq!(manifest_ids.len(), 15);
-    assert_eq!(tool_ids, manifest_ids);
-    assert_eq!(&policy_ids[..15], manifest_ids.as_slice());
+    assert_eq!(manifest_ids.len(), 18);
+    let served: Vec<&str> = manifest_ids
+        .iter()
+        .copied()
+        .filter(|id| !BG_IDS.contains(id))
+        .collect();
+    assert_eq!(tool_ids, served);
+    assert_eq!(&policy_ids[..18], manifest_ids.as_slice());
     assert_eq!(
-        &policy_ids[15..],
+        &policy_ids[18..],
         ["harness.web.fetch", "harness.web.search"]
     );
 

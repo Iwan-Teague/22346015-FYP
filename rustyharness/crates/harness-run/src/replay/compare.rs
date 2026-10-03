@@ -13,7 +13,8 @@ use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
 use serde_json::{Map, Value};
 
 use crate::driver::{
-    builtin_manifest_sha256, limits_fields, protected_task_digest, TaskSpec, HEADER_INPUT_KEYS,
+    builtin_manifest_sha256, limits_fields, protected_task_digest, PortsHeader, TaskSpec,
+    HEADER_INPUT_KEYS,
 };
 
 /// Where a journal and the replay first disagree.
@@ -35,7 +36,10 @@ pub(crate) fn diverge(seq: u64, step: u64, why: &'static str) -> Divergence {
 /// (task grants, workspace declaration, protocol, profile, policy, number
 /// of checks, budget limits), as the header writes them. `session` is the
 /// session's turn limits (P-05 §1.4); `None` recomputes a batch header,
-/// which carries neither `mode` nor `turn_limits`.
+/// which carries neither `mode` nor `turn_limits`. `ports` is the task's
+/// port grant (P-36g §6.1); a resume recomputes it with a fresh probe, an
+/// audit re-states the recorded one (the probe's observation is a past
+/// host's), and `None` recomputes a header without ports.
 pub(crate) fn expected_inputs(
     spec: &TaskSpec,
     registry: &Registry,
@@ -43,6 +47,7 @@ pub(crate) fn expected_inputs(
     profile: &Profile,
     limits: &MeterLimits,
     session: Option<&crate::session::TurnLimits>,
+    ports: Option<&PortsHeader>,
 ) -> Map<String, Value> {
     let mut grants: Vec<Value> = Vec::new();
     let mut names: Vec<&str> = spec.grants.iter().map(String::as_str).collect();
@@ -121,6 +126,23 @@ pub(crate) fn expected_inputs(
         o.insert("spec".into(), Value::from(e.digest().to_string()));
         o.insert("programs".into(), Value::from(e.programs.len() as u64));
         m.insert("exec".into(), Value::Object(o));
+    }
+    // The port grant (P-36g §6.1), as the header writes it: the granted
+    // ports, their LAN subset, the model's reserved ports and the probe's
+    // digest; no key without a grant.
+    if let Some(p) = ports {
+        let nums = |v: &[u16]| Value::Array(v.iter().map(|x| Value::from(u64::from(*x))).collect());
+        m.insert(
+            "ports".into(),
+            Value::Object({
+                let mut o = Map::new();
+                o.insert("loopback".into(), nums(&p.loopback));
+                o.insert("lan".into(), nums(&p.lan));
+                o.insert("reserved".into(), nums(&p.reserved));
+                o.insert("probe".into(), Value::from(p.probe.to_string()));
+                o
+            }),
+        );
     }
     // The pre-submit checks (H3a): no key without them, as the header writes it.
     if let Some(p) = &spec.presubmit {
@@ -208,6 +230,10 @@ fn header_mismatch(key: &str) -> &'static str {
             "another harness build wrote this journal (its built-in manifest differs)"
         }
         "shell_enabled" | "exec" => "the exec allowlist given differs from the recorded header",
+        "ports" => {
+            "the port grants (loopback, lan, reserved or the probe's ports) differ from the \
+             recorded header"
+        }
         "presubmit" => "the pre-submit checks given differ from the recorded header",
         "protected" => {
             "the protected-path lists (task-declared or this build's defaults) differ from the \

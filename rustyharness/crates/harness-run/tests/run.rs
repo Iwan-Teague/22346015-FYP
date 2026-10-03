@@ -247,6 +247,8 @@ fn an_unknown_grant_refuses_the_session() {
         task: TaskText::new("t".into()),
         grants: vec!["harness.nope.run".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),
@@ -317,6 +319,8 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         task: TaskText::new("t".into()),
         grants: vec!["harness.fs.read".into(), "harness.task.submit".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),
@@ -359,7 +363,8 @@ fn the_header_records_the_host_the_manifest_and_the_environment() {
     // Derived from the session since H2d (they were constants in H1, H1f-3
     // review F-10): this session holds no command runner, so no sandbox
     // was required and no shell can be on its exec allowlist. The runner
-    // is the one execute-class built-in.
+    // and, since P-36g, the background starter are the execute-class
+    // built-ins.
     let reg = harness_testkit::registry().unwrap();
     let m = match reg.resolve("harness.fs.read") {
         Resolved::One { manifest, .. } => manifest.clone(),
@@ -370,7 +375,7 @@ fn the_header_records_the_host_the_manifest_and_the_environment() {
         .iter()
         .filter(|c| c.effect() >= harness_manifest::Effect::Execute)
         .map(|c| c.id().as_str())
-        .eq(["harness.exec.run"]));
+        .eq(["harness.exec.run", "harness.exec.start"]));
     let env = h["environment"].as_object().unwrap();
     assert_eq!(env.len(), 5);
     for (key, v) in env {

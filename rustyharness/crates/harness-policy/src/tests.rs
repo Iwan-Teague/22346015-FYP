@@ -38,6 +38,7 @@ fn spec(grants: &[&str]) -> SessionSpec {
         // asserted explicitly in the tests that are about it.
         conformed: true,
         exec_programs: Vec::new(),
+        lan_ports: Vec::new(),
         read_window: None,
         kind: SessionKind::Coding,
     }
@@ -335,6 +336,9 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             edit: false,
             exec: false,
             web_fetch: false,
+            exec_start: false,
+            exec_read: false,
+            exec_stop: false,
             web_search: false,
             mcp: false,
         },
@@ -346,6 +350,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
         personal_granted: true,
         conformed: false,
         exec_programs: BTreeSet::new(),
+        lan_ports: BTreeSet::new(),
         read_window: None,
         session_deny: BTreeMap::new(),
         session_allow: BTreeMap::new(),
@@ -1957,7 +1962,7 @@ fn policy_default_table_unchanged() {
 /// (P-39b), todo and the sentinel in both manifests.
 #[test]
 fn tool_count_policy_default_read_allow() {
-    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 17);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 20);
     let reg = builtin_registry();
     let research = research_registry();
     for t in crate::builtin::BUILTIN_TOOLS {
@@ -2954,6 +2959,186 @@ fn session_grant_never_covers_protected_action() {
     assert!(s.authorize(c).is_err());
 }
 
+// ---- P-36g: the background exec tools and port grants --------------------------
+
+const BG_GRANTS: [&str; 4] = [EXEC_ID, EXEC_START_ID, EXEC_READ_ID, EXEC_STOP_ID];
+
+/// The background tools ride the command runner's exec setup: like
+/// `harness.exec.run`, an `exec.start` call's argv is checked against the
+/// task's allowlist (H2d), so the fixture names its programs.
+fn bg_spec() -> SessionSpec {
+    let mut sp = spec(&BG_GRANTS);
+    sp.exec_programs = vec!["cargo".to_owned(), "serve".to_owned()];
+    sp
+}
+
+/// The default table (P-36 spec §9): the background tools ride the exec
+/// grant; `exec.start` asks like the command runner, `exec.read` and
+/// `exec.stop` are allowed without an approver.
+#[test]
+fn policy_default_start_asks_read_and_stop_allow() {
+    let mut with = bg_spec();
+    with.approver_present = true;
+    let s = Session::plan(&with, &builtin_registry(), &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call(EXEC_START_ID, json!({"argv": ["cargo", "test"]}))),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+        }
+    );
+    assert_eq!(
+        s.decide(&call(EXEC_READ_ID, json!({"id": 1}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin(BG_READ_RULE),
+        }
+    );
+    assert_eq!(
+        s.decide(&call(EXEC_STOP_ID, json!({"id": 1}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin(BG_STOP_RULE),
+        }
+    );
+    // No approver: the start's ask is a deny, the allow decisions stand.
+    let without = bg_spec();
+    let s = Session::plan(&without, &builtin_registry(), &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call(EXEC_START_ID, json!({"argv": ["cargo", "test"]}))),
+        PolicyDecision::Deny {
+            reason: DenyReason::NoApprover,
+            rule: RuleId::Builtin("deny.no-approver"),
+        }
+    );
+    assert!(matches!(
+        s.decide(&call(EXEC_READ_ID, json!({"id": 1}))),
+        PolicyDecision::Allow { .. }
+    ));
+}
+
+/// A LAN port makes `exec.start` a `protected_action` ask, every time
+/// (P-36 spec §6.3): never a session grant, never lowered by a user allow.
+#[test]
+fn lan_port_start_asks_every_time_protected_action() {
+    let mut sp = bg_spec();
+    sp.approver_present = true;
+    sp.lan_ports = vec![8000];
+    sp.workspace = Some(WorkspaceDecl {
+        declared_public: true,
+    });
+    let s = Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+    let c = call(EXEC_START_ID, json!({"argv": ["serve"], "ports": [8000]}));
+    assert_eq!(
+        s.decide(&c),
+        PolicyDecision::Ask {
+            tier: Confirmation::ProtectedAction,
+            rule: RuleId::Builtin(LAN_BIND_RULE),
+        }
+    );
+    // A user allow rule does not lower the floor: the same call asks again.
+    let policy = UserPolicy::new(&[], &[], &[EXEC_START_ID]).unwrap();
+    let allowed = Session::plan(&sp, &builtin_registry(), &policy).unwrap();
+    assert_eq!(
+        allowed.decide(&c),
+        PolicyDecision::Ask {
+            tier: Confirmation::ProtectedAction,
+            rule: RuleId::Builtin(LAN_BIND_RULE),
+        }
+    );
+    // The same tool without a LAN port takes the ordinary path: the
+    // default policy's ask, and the user allow's rule where granted.
+    let plain = call(EXEC_START_ID, json!({"argv": ["cargo", "test"]}));
+    assert_eq!(
+        s.decide(&plain),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+        }
+    );
+    assert_eq!(
+        allowed.decide(&plain),
+        PolicyDecision::Allow {
+            rule: RuleId::User {
+                list: RuleList::Allow,
+                index: 0,
+            },
+        }
+    );
+}
+
+/// The LAN grant folds an E label into the trifecta (P-36 spec §6.3) even
+/// though every granted capability keeps `egress: none`: with the default
+/// private workspace P∧U∧E holds and the session is refused, naming the
+/// LAN grant as the egress source (INV-9: no override).
+#[test]
+fn lan_ports_label_egress_for_trifecta() {
+    let mut sp = bg_spec();
+    sp.lan_ports = vec![8000];
+    assert_eq!(
+        Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Trifecta {
+            private: "workspace".into(),
+            untrusted: EXEC_ID.into(),
+            egress: "exec.lan_ports".into(),
+        }
+    );
+}
+
+/// With a public workspace the trifecta is satisfied without the LAN
+/// label, so the session plans; binding the port still asks, every time.
+#[test]
+fn lan_ports_allowed_with_public_workspace_and_ask() {
+    let mut sp = bg_spec();
+    sp.approver_present = true;
+    sp.lan_ports = vec![8000];
+    assert!(matches!(
+        Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Trifecta { .. }
+    ));
+    sp.workspace = Some(WorkspaceDecl {
+        declared_public: true,
+    });
+    let s = Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call(
+            EXEC_START_ID,
+            json!({"argv": ["serve"], "ports": [8000]})
+        )),
+        PolicyDecision::Ask {
+            tier: Confirmation::ProtectedAction,
+            rule: RuleId::Builtin(LAN_BIND_RULE),
+        }
+    );
+}
+
+/// A session grant stands below the LAN floor (P-36 spec §6.3, like the
+/// confirmation floor): answering `a` at the prompt can never answer for a
+/// LAN bind.
+#[test]
+fn session_grant_never_covers_lan_start() {
+    let mut sp = bg_spec();
+    sp.approver_present = true;
+    sp.lan_ports = vec![8000];
+    sp.workspace = Some(WorkspaceDecl {
+        declared_public: true,
+    });
+    let mut s = Session::plan(&sp, &builtin_registry(), &UserPolicy::default()).unwrap();
+    s.grant(
+        RuleList::Allow,
+        &CapId::new(EXEC_START_ID).unwrap(),
+        Matcher::path_glob("**").unwrap(),
+    );
+    assert_eq!(
+        s.decide(&call(
+            EXEC_START_ID,
+            json!({"argv": ["serve"], "ports": [8000]})
+        )),
+        PolicyDecision::Ask {
+            tier: Confirmation::ProtectedAction,
+            rule: RuleId::Builtin(LAN_BIND_RULE),
+        }
+    );
+}
+
 /// A session deny grant blocks a call a user allow matcher would let
 /// through, and its decision names the session rule; outside the denied
 /// pattern the allow still applies.
@@ -3040,6 +3225,7 @@ fn research_spec(grants: &[&str]) -> SessionSpec {
         personal_data_granted: false,
         conformed: false,
         exec_programs: Vec::new(),
+        lan_ports: Vec::new(),
         read_window: None,
         kind: SessionKind::Research(WebGrant {
             allowlist: vec!["example.com".to_owned()],
@@ -3363,12 +3549,13 @@ fn egress_still_out_of_scope_in_coding_sessions() {
 
 /// The registration table (P-39b): the web entries append after the coding
 /// table, which keeps its ids and kinds (the delegate row sits between todo
-/// and submit, P-38; the default decisions themselves are pinned by
+/// and submit, P-38; the P-36g background tools sit between the command
+/// runner and todo; the default decisions themselves are pinned by
 /// `policy_default_table_unchanged`, which iterates the twelve coding ids),
 /// and the default deny table is untouched.
 #[test]
 fn web_entries_append_after_the_coding_table() {
-    const WANT: [(&str, crate::builtin::ToolKind); 15] = [
+    const WANT: [(&str, crate::builtin::ToolKind); 18] = [
         ("harness.fs.read", crate::builtin::ToolKind::Fs),
         ("harness.fs.search", crate::builtin::ToolKind::Fs),
         ("harness.fs.glob", crate::builtin::ToolKind::Fs),
@@ -3381,6 +3568,9 @@ fn web_entries_append_after_the_coding_table() {
         ("harness.edit.delete", crate::builtin::ToolKind::Edit),
         ("harness.edit.move", crate::builtin::ToolKind::Edit),
         ("harness.exec.run", crate::builtin::ToolKind::Exec),
+        ("harness.exec.start", crate::builtin::ToolKind::ExecBg),
+        ("harness.exec.read", crate::builtin::ToolKind::ExecBg),
+        ("harness.exec.stop", crate::builtin::ToolKind::ExecBg),
         ("harness.task.todo", crate::builtin::ToolKind::Todo),
         ("harness.task.delegate", crate::builtin::ToolKind::Delegate),
         ("harness.task.submit", crate::builtin::ToolKind::Submit),
@@ -3389,15 +3579,15 @@ fn web_entries_append_after_the_coding_table() {
         assert_eq!(t.id, want.0);
         assert_eq!(t.kind, want.1);
     }
-    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 17);
-    assert_eq!(crate::builtin::BUILTIN_TOOLS[15].id, WEB_FETCH_ID);
-    assert_eq!(crate::builtin::BUILTIN_TOOLS[16].id, WEB_SEARCH_ID);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 20);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS[18].id, WEB_FETCH_ID);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS[19].id, WEB_SEARCH_ID);
     assert!(matches!(
-        crate::builtin::BUILTIN_TOOLS[15].kind,
+        crate::builtin::BUILTIN_TOOLS[18].kind,
         crate::builtin::ToolKind::Web
     ));
     assert!(matches!(
-        crate::builtin::BUILTIN_TOOLS[16].kind,
+        crate::builtin::BUILTIN_TOOLS[19].kind,
         crate::builtin::ToolKind::Web
     ));
     assert_eq!(DEFAULT_DENY_GLOBS.len(), 10);
@@ -3828,6 +4018,9 @@ fn quarantine_recomputes_trifecta_and_never_widens() {
                 edit: false,
                 exec: false,
                 web_fetch: false,
+                exec_start: false,
+                exec_read: false,
+                exec_stop: false,
                 web_search: false,
                 mcp: false,
             },
@@ -3840,6 +4033,7 @@ fn quarantine_recomputes_trifecta_and_never_widens() {
         personal_granted: true,
         conformed: true,
         exec_programs: BTreeSet::new(),
+        lan_ports: BTreeSet::new(),
         read_window: None,
         session_deny: BTreeMap::new(),
         session_allow: BTreeMap::new(),

@@ -268,6 +268,8 @@ fn spec_of(commands: &[&[&str]], max_rounds: u32) -> TaskSpec {
         task: TaskText::new("Make the tests pass.".into()),
         grants: vec!["harness.fs.read".into(), EXEC_ID.into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: Some(exec_spec()),
         protected: Vec::new(),
         presubmit: Some(PresubmitSpec {

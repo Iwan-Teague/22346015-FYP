@@ -3,6 +3,7 @@
 //! the public `run` are in `tests/run.rs`.
 
 use std::cell::Cell;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -15,18 +16,22 @@ use harness_manifest::admission::{Registry, Tier};
 use harness_manifest::{builtin, ProviderName, SemVer, ValidationContext};
 use harness_model::profile::Profile;
 use harness_model::scripted::{text_reply, ScriptedBackend};
-use harness_model::{Completion, ModelError, ServerUsage, TaskText, Unavailable};
+use harness_model::{
+    Completion, EndpointClass, ModelError, ModelIdentity, ServerUsage, TaskText, Unavailable,
+};
+use harness_policy::locality::NoProbe;
 use harness_policy::{Authorized, Call, UserPolicy};
+use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 
 use crate::driver::approvals::Approvals;
-use crate::driver::plan::plan;
+use crate::driver::plan::{plan, prepare};
 use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
 use crate::driver::stop::{commit, End};
 use crate::driver::tools::{bg_fields, exec_fields, parse_bg, parse_exec};
-use crate::driver::{new_meter, new_nonce, new_run_id, ReadLog};
+use crate::driver::{header, new_meter, new_nonce, new_run_id, HeaderInputs, PortsHeader, ReadLog};
 
-use crate::{RunConfig, TaskSpec};
+use crate::{RunConfig, RunRefused, TaskSpec};
 
 struct Tick(Cell<u64>);
 impl Clock for Tick {
@@ -159,6 +164,8 @@ fn drive_full(
         task: TaskText::new("What is in a.txt?".into()),
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),
@@ -875,6 +882,8 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         task: TaskText::new("Edit a.txt.".into()),
         grants: vec!["harness.edit.replace".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),
@@ -1377,5 +1386,305 @@ fn tool_finished_bg_record_round_trip_every_op() {
         ("a state the loop never writes", bad_state),
     ] {
         assert!(parse_bg(&bad).is_none(), "{what}: {bad}");
+    }
+}
+
+// ---- P-36g: port grants and the background exec tools ----
+//
+// The planning refusals fire before anything touches the workspace or the
+// state root, so these tests run `prepare` against paths that do not exist
+// and read the refusal instead.
+
+/// A task spec for the planning refusals: no ports, no exec section.
+fn refusal_spec(grants: &[&str]) -> TaskSpec {
+    TaskSpec {
+        task: TaskText::new("hold a port".into()),
+        grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+        workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
+        exec: None,
+        presubmit: None,
+        protected: Vec::new(),
+        kind: harness_policy::SessionKind::Coding,
+    }
+}
+
+const NOWHERE: (&str, &str) = ("/no-such-workspace", "/no-such-state");
+
+#[test]
+fn port_grant_library_requires_reserved_ports_with_loopback_endpoint() {
+    let reg = registry();
+    let profile = Profile::conservative_default("m");
+    let policy = UserPolicy::default();
+    let mut spec = refusal_spec(&["harness.exec.run", "harness.exec.start"]);
+    spec.ports = vec![5173];
+    let exe = std::env::current_exe().unwrap();
+    let mut exec = harness_tools::ExecSpec {
+        programs: vec![harness_tools::ExecProgram {
+            name: "cargo".into(),
+            path: exe.clone(),
+        }],
+        ..harness_tools::ExecSpec::default()
+    };
+    exec.read_only = vec![exe.parent().unwrap().to_path_buf()];
+    spec.exec = Some(exec);
+    let cfg = RunConfig::defaults(1_000_000);
+    // A loopback endpoint and no reserved ports: the harness cannot tell a
+    // granted port from the model server's own, so it refuses.
+    let Err(err) = prepare(
+        &spec,
+        &reg,
+        &policy,
+        &profile,
+        Some(Path::new(NOWHERE.0)),
+        Path::new(NOWHERE.1),
+        &NoProbe,
+        &cfg,
+        false,
+        None,
+        EndpointClass::Loopback,
+    ) else {
+        panic!("prepare should refuse");
+    };
+    assert!(
+        matches!(err, RunRefused::ModelPortUnknown),
+        "expected ModelPortUnknown, got {err:?}"
+    );
+    // With the model's port reserved the check passes (the run then
+    // refuses later, on the workspace that does not exist here).
+    let mut cfg = RunConfig::defaults(1_000_000);
+    cfg.reserved_ports = vec![8080];
+    let Err(err) = prepare(
+        &spec,
+        &reg,
+        &policy,
+        &profile,
+        Some(Path::new(NOWHERE.0)),
+        Path::new(NOWHERE.1),
+        &NoProbe,
+        &cfg,
+        false,
+        None,
+        EndpointClass::Loopback,
+    ) else {
+        panic!("prepare should refuse");
+    };
+    assert!(
+        !matches!(err, RunRefused::ModelPortUnknown),
+        "the reserved ports were known: got {err:?}"
+    );
+}
+
+#[test]
+fn bg_grant_without_exec_setup_refused() {
+    let reg = registry();
+    let profile = Profile::conservative_default("m");
+    let policy = UserPolicy::default();
+    let cfg = RunConfig::defaults(1_000_000);
+    let spec = refusal_spec(&[
+        "harness.exec.start",
+        "harness.exec.read",
+        "harness.exec.stop",
+    ]);
+    let Err(err) = prepare(
+        &spec,
+        &reg,
+        &policy,
+        &profile,
+        Some(Path::new(NOWHERE.0)),
+        Path::new(NOWHERE.1),
+        &NoProbe,
+        &cfg,
+        false,
+        None,
+        EndpointClass::Scripted,
+    ) else {
+        panic!("prepare should refuse");
+    };
+    assert!(
+        matches!(
+            err,
+            RunRefused::ExecGrant("a background exec tool is granted but harness.exec.run is not")
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn ports_granted_without_exec_start_refused() {
+    let reg = registry();
+    let profile = Profile::conservative_default("m");
+    let policy = UserPolicy::default();
+    let cfg = RunConfig::defaults(1_000_000);
+    let mut spec = refusal_spec(&["harness.fs.read"]);
+    spec.ports = vec![5173];
+    let Err(err) = prepare(
+        &spec,
+        &reg,
+        &policy,
+        &profile,
+        Some(Path::new(NOWHERE.0)),
+        Path::new(NOWHERE.1),
+        &NoProbe,
+        &cfg,
+        false,
+        None,
+        EndpointClass::Scripted,
+    ) else {
+        panic!("prepare should refuse");
+    };
+    assert!(
+        matches!(
+            err,
+            RunRefused::ExecGrant("ports are granted but harness.exec.start is not")
+        ),
+        "got {err:?}"
+    );
+    // The LAN subset alone is a port grant too.
+    let mut spec = refusal_spec(&["harness.fs.read"]);
+    spec.lan_ports = vec![8000];
+    let Err(err) = prepare(
+        &spec,
+        &reg,
+        &policy,
+        &profile,
+        Some(Path::new(NOWHERE.0)),
+        Path::new(NOWHERE.1),
+        &NoProbe,
+        &cfg,
+        false,
+        None,
+        EndpointClass::Scripted,
+    ) else {
+        panic!("prepare should refuse");
+    };
+    assert!(
+        matches!(
+            err,
+            RunRefused::ExecGrant("ports are granted but harness.exec.start is not")
+        ),
+        "got {err:?}"
+    );
+}
+
+/// What the header knows about the model of a loopback run.
+fn loopback_identity() -> ModelIdentity {
+    ModelIdentity {
+        endpoint: EndpointClass::Loopback,
+        profile_id: "m".to_owned(),
+        profile_sha256: None,
+        profile_validated: false,
+        profile_stamp_sha256: None,
+        api_key_handle: None,
+        claimed: Default::default(),
+    }
+}
+
+/// Journal a built header and return its body (record 0).
+fn header_body(hdr: Header) -> serde_json::Map<String, serde_json::Value> {
+    let file = FaultFile::new(FaultPlan::default());
+    let buf = file.buf.clone();
+    let blobs = MemBlobs::default();
+    JournalWriter::start(
+        file,
+        blobs.clone(),
+        Tick(Cell::new(0)),
+        RunId::new(9, [1; 10]),
+        1,
+        hdr,
+    )
+    .unwrap();
+    let journal = buf.borrow().clone();
+    verify(&journal, &blobs).unwrap().records.remove(0).body
+}
+
+#[test]
+fn header_records_the_port_grant_only_when_ports_are_granted() {
+    let reg = registry();
+    let profile = Profile::conservative_default("m");
+    let policy = UserPolicy::default();
+    let spec = refusal_spec(&["harness.fs.read"]);
+    let cfg = RunConfig::defaults(1_000_000);
+    let identity = loopback_identity();
+
+    let inputs = |ports: Option<PortsHeader>| HeaderInputs {
+        spec: &spec,
+        registry: &reg,
+        policy: &policy,
+        profile: &profile,
+        identity: &identity,
+        facts: WorkspaceFacts {
+            tree: sha256(b"tree"),
+            files: 1,
+            oversize: 0,
+        },
+        limits: &cfg.limits,
+        resumed_from: None,
+        environment: EnvSample::unmeasured(Unmeasured::NoSafeApi),
+        environment_recorded: false,
+        approver_present: false,
+        session: None,
+        exec: None,
+        ports,
+        workspace_mode: None,
+    };
+
+    let body = header_body(header(&inputs(None)).unwrap());
+    assert!(
+        !body.contains_key("ports"),
+        "a task without ports gains no ports key: {body:?}"
+    );
+
+    let ports = PortsHeader {
+        loopback: vec![5173, 8000],
+        lan: vec![8000],
+        reserved: vec![8080],
+        probe: sha256(b"probe"),
+    };
+    let body = header_body(header(&inputs(Some(ports))).unwrap());
+    assert_eq!(
+        body.get("ports"),
+        Some(&serde_json::json!({
+            "loopback": [5173, 8000],
+            "lan": [8000],
+            "reserved": [8080],
+            "probe": sha256(b"probe").to_string(),
+        }))
+    );
+}
+
+#[test]
+fn ports_header_parses_back() {
+    let p = PortsHeader {
+        loopback: vec![5173, 8000],
+        lan: vec![8000],
+        reserved: vec![8080],
+        probe: sha256(b"probe"),
+    };
+    let json = serde_json::json!({
+        "loopback": [5173, 8000],
+        "lan": [8000],
+        "reserved": [8080],
+        "probe": sha256(b"probe").to_string(),
+    });
+    assert_eq!(PortsHeader::parse(&json), Some(p));
+    // Shapes this build never writes.
+    for bad in [
+        serde_json::json!({"loopback": []}),
+        serde_json::json!({
+            "loopback": [5173],
+            "lan": [8000],
+            "reserved": [8080],
+            "probe": "not-a-port-probe",
+        }),
+        serde_json::json!({
+            "loopback": [70000],
+            "lan": [],
+            "reserved": [],
+            "probe": sha256(b"probe").to_string(),
+        }),
+    ] {
+        assert!(PortsHeader::parse(&bad).is_none(), "{bad}");
     }
 }

@@ -235,6 +235,8 @@ fn edit_fixture(label: &str) -> Fixture {
         task: TaskText::new("Change 'answer' to 'reply' in a.txt.".into()),
         grants: vec!["harness.fs.read".into(), "harness.edit.replace".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

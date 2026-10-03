@@ -23,6 +23,7 @@ pub(crate) const USAGE: &str = "usage:
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
                        [--no-default-denies]
   rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
+  rustyharness review --run <run-id> --workspace <dir> [--state-root <dir>]
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
   rustyharness sessions [--state-root <dir>] [--run <run-id>]
@@ -31,6 +32,14 @@ pub(crate) const USAGE: &str = "usage:
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
                         [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
                         [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
+  rustyharness acp    --task <task.json> --profile <profile.json> [--endpoint <url>]
+                        --state-root <dir> [--policy <policy.json>] [--gate <gate-id>]
+                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
+                        [--shell] [--no-default-denies] [--allow-session-grants]
+                        [--accept-edits]
+                        Agent Client Protocol v1 over stdio (P-35): JSON-RPC on stdin/stdout;
+                        each session/new brings its own workspace (cwd); notes and the gate
+                        report go to stderr.
   rustyharness schedule add --name <name> --task <task.json>
                         (--daily <HH:MM> | --every <Nh>)
                         [--profile <profile.json>] [--policy <policy.json>] [--endpoint <url>]
@@ -38,6 +47,19 @@ pub(crate) const USAGE: &str = "usage:
   rustyharness schedule list      [--state-root <dir>]
   rustyharness schedule remove    --name <name> [--state-root <dir>]
   rustyharness schedule run-now   --name <name> [--state-root <dir>]
+  rustyharness compare --task <task.json> --workspace <dir> --state-root <dir>
+                       (--profile <profile.json> --endpoint <url>){2..4}
+                       [--policy <policy.json>] [--gate <gate-id>] [--no-default-denies]
+  rustyharness compare reveal --report <report.json> [--winner <A|B|C|D>]
+
+compare (P-48): runs the same task on 2-4 profiles one after another,
+  each from a fresh scratch copy under <state-root>/compare/<stamp>/; the
+  report lists facts only (steps, tokens, wall, format errors, tool
+  counts, final diff, pre-submit result, chain head) with arms labelled in
+  a recorded random order — no score, no winner from the harness (OD-3).
+  The label→model map sits in mapping.json (0600) and is printed only by
+  `compare reveal` after --winner records the pick in report.json; every
+  arm replays with `replay --run`.
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json
@@ -164,6 +186,7 @@ mod tests {
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
                        [--no-default-denies]
   rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
+  rustyharness review --run <run-id> --workspace <dir> [--state-root <dir>]
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
   rustyharness sessions [--state-root <dir>] [--run <run-id>]
@@ -172,6 +195,14 @@ mod tests {
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
                         [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
                         [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
+  rustyharness acp    --task <task.json> --profile <profile.json> [--endpoint <url>]
+                        --state-root <dir> [--policy <policy.json>] [--gate <gate-id>]
+                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
+                        [--shell] [--no-default-denies] [--allow-session-grants]
+                        [--accept-edits]
+                        Agent Client Protocol v1 over stdio (P-35): JSON-RPC on stdin/stdout;
+                        each session/new brings its own workspace (cwd); notes and the gate
+                        report go to stderr.
   rustyharness schedule add --name <name> --task <task.json>
                         (--daily <HH:MM> | --every <Nh>)
                         [--profile <profile.json>] [--policy <policy.json>] [--endpoint <url>]
@@ -179,6 +210,19 @@ mod tests {
   rustyharness schedule list      [--state-root <dir>]
   rustyharness schedule remove    --name <name> [--state-root <dir>]
   rustyharness schedule run-now   --name <name> [--state-root <dir>]
+  rustyharness compare --task <task.json> --workspace <dir> --state-root <dir>
+                       (--profile <profile.json> --endpoint <url>){2..4}
+                       [--policy <policy.json>] [--gate <gate-id>] [--no-default-denies]
+  rustyharness compare reveal --report <report.json> [--winner <A|B|C|D>]
+
+compare (P-48): runs the same task on 2-4 profiles one after another,
+  each from a fresh scratch copy under <state-root>/compare/<stamp>/; the
+  report lists facts only (steps, tokens, wall, format errors, tool
+  counts, final diff, pre-submit result, chain head) with arms labelled in
+  a recorded random order — no score, no winner from the harness (OD-3).
+  The label→model map sits in mapping.json (0600) and is printed only by
+  `compare reveal` after --winner records the pick in report.json; every
+  arm replays with `replay --run`.
 
 defaults (P-07): --workspace is the current directory; --state-root, the
   profile, the policy and the endpoint come from <config dir>/config.json

@@ -24,11 +24,15 @@
 //!   rather than escaped.
 //! - `protected` paths exist and lie inside a read-write root.
 //! - `cwd` exists and lies inside a root.
-//! - `network` is `None`, or `Proxy { port }` with a nonzero port where the
+//! - `network` is `None`, `Proxy { port }` with a nonzero port where the
 //!   backend can express a loopback-only outbound allow (the Seatbelt
-//!   profile's `localhost:port` remote; §5.3, measured on this host). A
-//!   proxy grant where the backend cannot express it, or a zero port, is
-//!   refused here.
+//!   profile's `localhost:port` remote; §5.3, measured on this host), or
+//!   `Loopback` with validated port lists (P-36a, §4.3): every port is at
+//!   least 1024, not in the context's reserved ports (the model port at
+//!   least, INV-41), not duplicated, at most `PORTS_PER_START` binds, and
+//!   `lan` a subset of `bind`; the whole grant is refused where the
+//!   backend's witness does not cover the port conformance cases. A proxy
+//!   grant where the backend cannot express the allow is refused here too.
 //! - `limits`: a wall clock is required; CPU, file size, memory
 //!   (address-space budget) and process count are optional and bounded to
 //!   what the backend's launch protocol accepts (LOW-1). Memory and
@@ -58,6 +62,13 @@ pub const MAX_PROCESSES: u32 = 100_000;
 pub const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest total size of argv plus env (they travel over a pipe, §6.3).
 pub const MAX_ARGV_ENV_BYTES: usize = 1024 * 1024;
+/// The lowest port a `Loopback` grant may name (§4.3, §3.4 `PORT_MIN`):
+/// since macOS 10.14 any user may bind below 1024, so the floor is ours,
+/// not the kernel's.
+pub const PORT_MIN: u16 = 1024;
+/// The most ports one spec may bind (§4.3, §3.4 `PORTS_PER_START`); the
+/// task-level grant is bounded again by the tools layer.
+pub const PORTS_PER_START: usize = 4;
 
 /// A request to run one program confined (design §6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +104,22 @@ pub enum Network {
     Proxy {
         /// The harness pump's loopback port.
         port: u16,
+    },
+    /// Loopback ports only (P-36a, §4.3): the child may bind the `bind`
+    /// ports (as `localhost:<p>`, or `*:<p>` for the `lan` members) and
+    /// connect to the `connect` ports (other live background processes'
+    /// ports of the same run). Everything else — other loopback ports,
+    /// unix sockets, the resolver, routable addresses — stays denied.
+    /// Refused where the backend's witness does not cover the port
+    /// conformance cases.
+    Loopback {
+        /// Ports the child may bind and listen on.
+        bind: Vec<u16>,
+        /// Loopback ports the child may connect to.
+        connect: Vec<u16>,
+        /// The members of `bind` granted LAN-visible (`*:<p>` instead of
+        /// `localhost:<p>`); must be a subset of `bind`.
+        lan: Vec<u16>,
     },
 }
 
@@ -174,6 +201,14 @@ pub enum SpecError {
     /// A limit is out of range.
     #[error("limit out of range: {0}")]
     Limit(&'static str),
+    /// A `Loopback` port grant is refused (§4.3).
+    #[error("port {port} refused: {why}")]
+    Port {
+        /// The offending port.
+        port: u16,
+        /// Why it is refused.
+        why: &'static str,
+    },
 }
 
 /// Which limits a backend can enforce.
@@ -205,6 +240,31 @@ pub struct Validated {
     pub limits: Limits,
 }
 
+/// The loopback-port grants [`validate`] approved (§4.3): each list is
+/// free of duplicates, above `PORT_MIN`, clear of the context's reserved
+/// ports, `lan` ⊆ `bind`, and at most `PORTS_PER_START` binds. Only these
+/// lists reach profile rendering, never the raw request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Ports {
+    /// Ports the child may bind and listen on.
+    pub bind: Vec<u16>,
+    /// Loopback ports the child may connect to.
+    pub connect: Vec<u16>,
+    /// The `bind` members granted LAN-visible.
+    pub lan: Vec<u16>,
+}
+
+/// What [`validate`] approved: the canonical spec plus the loopback-port
+/// grants the profile may render (§4.3). Every byte of generated policy
+/// comes from here, never from the raw request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approved {
+    /// Paths, argv and env, canonical.
+    pub spec: Validated,
+    /// Loopback-port grants; empty unless `Network::Loopback` validated.
+    pub ports: Ports,
+}
+
 /// The environment the backend validates against.
 #[derive(Debug, Clone)]
 pub struct Context<'a> {
@@ -216,14 +276,22 @@ pub struct Context<'a> {
     pub private_dir: &'a Path,
     /// What the backend can enforce.
     pub enforce: Enforceable,
+    /// Ports no grant may name and no profile may allow (§4.3): the model
+    /// port at least (INV-41). Empty is allowed only while nothing asks
+    /// for ports; a library caller that grants ports must pass them.
+    pub reserved_ports: &'a [u16],
+    /// Whether this backend's witness covers the port conformance cases
+    /// (`PORTS_CASES`); `Network::Loopback` is refused when it does not.
+    pub ports_conformed: bool,
     /// Whether the backend can grant [`Network::Proxy`] (the Seatbelt
     /// loopback-only outbound allow; §5.3). A proxy grant is refused where
     /// this is false.
     pub proxy: bool,
 }
 
-/// Validate `spec` (see the module docs).
-pub fn validate(spec: &ConfinedSpec, cx: &Context<'_>) -> Result<Validated, SpecError> {
+/// Validate `spec` (see the module docs) and return what may be used: the
+/// canonical spec and the loopback-port grants the profile may render.
+pub fn validate(spec: &ConfinedSpec, cx: &Context<'_>) -> Result<Approved, SpecError> {
     let argv = check_argv(&spec.argv)?;
     let env = check_env(&spec.env)?;
     let total: usize = argv.iter().chain(env.iter()).map(|b| b.len() + 16).sum();
@@ -261,11 +329,12 @@ pub fn validate(spec: &ConfinedSpec, cx: &Context<'_>) -> Result<Validated, Spec
     {
         return Err(path_err("cwd", &spec.cwd, "is not inside a root"));
     }
-    // The proxy grant's refusals (§5.3): a zero port is a spec error; a
-    // grant on a backend that cannot express the loopback-only allow is
-    // unsupported. What remains validates; the caller renders the port.
-    match spec.network {
-        Network::None => {}
+    // The network grants (§5.3, §4.3). A proxy grant needs a nonzero port
+    // and a backend that can express the loopback-only allow; a loopback
+    // grant needs a witness covering the port conformance cases. What
+    // remains validates; the caller renders the ports.
+    let ports = match &spec.network {
+        Network::None => Ports::default(),
         Network::Proxy { port: 0 } => {
             return Err(SpecError::Limit("proxy port must not be 0"));
         }
@@ -274,17 +343,109 @@ pub fn validate(spec: &ConfinedSpec, cx: &Context<'_>) -> Result<Validated, Spec
                 "a proxy network grant (Seatbelt only; §5.3)",
             ));
         }
-        Network::Proxy { .. } => {}
-    }
+        Network::Proxy { .. } => Ports::default(),
+        Network::Loopback { bind, connect, lan } => {
+            if !cx.ports_conformed {
+                return Err(SpecError::Unsupported(
+                    "loopback ports (not conformed on this host)",
+                ));
+            }
+            check_ports(bind, connect, lan, cx.reserved_ports)?
+        }
+    };
     check_limits(&spec.limits, cx.enforce)?;
-    Ok(Validated {
-        argv,
-        env,
-        cwd,
-        read_only,
-        read_write,
-        protected,
-        limits: spec.limits.clone(),
+    Ok(Approved {
+        spec: Validated {
+            argv,
+            env,
+            cwd,
+            read_only,
+            read_write,
+            protected,
+            limits: spec.limits.clone(),
+        },
+        ports,
+    })
+}
+
+/// The `Loopback` grant checks (§4.3): at least `PORT_MIN`, never a
+/// reserved port, never duplicated, at most `PORTS_PER_START` binds, and
+/// `lan` a subset of `bind`. `connect` meets the same floor and reserved
+/// checks (a connect below 1024 would reach the host's own loopback
+/// services, which §6.2 never grants).
+fn check_ports(
+    bind: &[u16],
+    connect: &[u16],
+    lan: &[u16],
+    reserved: &[u16],
+) -> Result<Ports, SpecError> {
+    if bind.len() > PORTS_PER_START {
+        return Err(SpecError::Limit("more than PORTS_PER_START bind ports (4)"));
+    }
+    let mut b = Vec::with_capacity(bind.len());
+    for &p in bind {
+        if p < PORT_MIN {
+            return Err(SpecError::Port {
+                port: p,
+                why: "below 1024",
+            });
+        }
+        if reserved.contains(&p) {
+            return Err(SpecError::Port {
+                port: p,
+                why: "reserved (the model port, INV-41)",
+            });
+        }
+        if b.contains(&p) {
+            return Err(SpecError::Port {
+                port: p,
+                why: "duplicated",
+            });
+        }
+        b.push(p);
+    }
+    let mut l = Vec::with_capacity(lan.len());
+    for &p in lan {
+        if !b.contains(&p) {
+            return Err(SpecError::Port {
+                port: p,
+                why: "not a granted bind port (lan must be a subset of bind)",
+            });
+        }
+        if l.contains(&p) {
+            return Err(SpecError::Port {
+                port: p,
+                why: "duplicated",
+            });
+        }
+        l.push(p);
+    }
+    let mut c = Vec::with_capacity(connect.len());
+    for &p in connect {
+        if p < PORT_MIN {
+            return Err(SpecError::Port {
+                port: p,
+                why: "below 1024",
+            });
+        }
+        if reserved.contains(&p) {
+            return Err(SpecError::Port {
+                port: p,
+                why: "reserved (the model port, INV-41)",
+            });
+        }
+        if c.contains(&p) {
+            return Err(SpecError::Port {
+                port: p,
+                why: "duplicated",
+            });
+        }
+        c.push(p);
+    }
+    Ok(Ports {
+        bind: b,
+        connect: c,
+        lan: l,
     })
 }
 
@@ -553,22 +714,28 @@ mod tests {
         processes: false,
     };
 
+    fn mk_cx<'a>(home: Option<&'a Path>, private: &'a Path) -> Context<'a> {
+        Context {
+            home,
+            private_dir: private,
+            enforce: ENF,
+            reserved_ports: &[],
+            ports_conformed: false,
+            proxy: false,
+        }
+    }
+
     #[test]
     fn a_plain_spec_validates_with_canonical_paths() {
         let ws = tmp("ok");
         let private = tmp("private");
         let privc = std::fs::canonicalize(&private).unwrap();
-        let cx = Context {
-            home: None,
-            private_dir: &privc,
-            enforce: ENF,
-            proxy: false,
-        };
-        let v = validate(&base(&ws), &cx).unwrap();
+        let a = validate(&base(&ws), &mk_cx(None, &privc)).unwrap();
         let c = std::fs::canonicalize(&ws).unwrap();
-        assert_eq!(v.read_write, vec![c.to_str().unwrap().to_string()]);
-        assert_eq!(v.cwd, c.to_str().unwrap());
-        assert_eq!(v.env, vec![b"PATH=/usr/bin:/bin".to_vec()]);
+        assert_eq!(a.spec.read_write, vec![c.to_str().unwrap().to_string()]);
+        assert_eq!(a.spec.cwd, c.to_str().unwrap());
+        assert_eq!(a.spec.env, vec![b"PATH=/usr/bin:/bin".to_vec()]);
+        assert_eq!(a.ports, Ports::default(), "None grants no ports");
     }
 
     #[test]
@@ -579,18 +746,8 @@ mod tests {
         let privc = std::fs::canonicalize(&private).unwrap();
         let home = wsc.join("sub");
         std::fs::create_dir_all(&home).unwrap();
-        let cx = Context {
-            home: Some(&home),
-            private_dir: &privc,
-            enforce: ENF,
-            proxy: false,
-        };
-        let cx_nohome = Context {
-            home: None,
-            private_dir: &privc,
-            enforce: ENF,
-            proxy: false,
-        };
+        let cx = mk_cx(Some(&home), &privc);
+        let cx_nohome = mk_cx(None, &privc);
         let check = |f: &dyn Fn(&mut ConfinedSpec), cx: &Context<'_>, want: &str| {
             let mut s = base(&ws);
             f(&mut s);
@@ -675,6 +832,8 @@ mod tests {
             home: None,
             private_dir: &privc,
             enforce: ENF,
+            reserved_ports: &[],
+            ports_conformed: false,
             proxy: true,
         };
         let mut s = base(&ws);
@@ -691,6 +850,8 @@ mod tests {
             home: None,
             private_dir: &privc,
             enforce: ENF,
+            reserved_ports: &[],
+            ports_conformed: false,
             proxy: false,
         };
         let mut s = base(&ws);
@@ -707,6 +868,8 @@ mod tests {
             home: None,
             private_dir: &privc,
             enforce: ENF,
+            reserved_ports: &[],
+            ports_conformed: false,
             proxy: true,
         };
         let mut s = base(&ws);
@@ -726,6 +889,8 @@ mod tests {
                 memory: true,
                 processes: true,
             },
+            reserved_ports: &[],
+            ports_conformed: false,
             proxy: false,
         };
         let check = |f: &dyn Fn(&mut ConfinedSpec), cx: &Context<'_>, want: &str| {
@@ -780,5 +945,103 @@ mod tests {
         assert!(!policy_safe("rel"));
         assert!(!policy_safe("/a\nb"));
         assert!(policy_safe("/a b/c"));
+    }
+
+    /// A spec like `base` with a `Loopback` grant.
+    fn loopback(ws: &Path, bind: Vec<u16>, connect: Vec<u16>, lan: Vec<u16>) -> ConfinedSpec {
+        let mut s = base(ws);
+        s.network = Network::Loopback { bind, connect, lan };
+        s
+    }
+
+    #[test]
+    fn validate_refuses_port_below_1024_and_reserved() {
+        let ws = tmp("ports");
+        let privc = std::fs::canonicalize(tmp("ports-priv")).unwrap();
+        let model = 11434u16; // the model-port stand-in (INV-41)
+        let ok = Context {
+            home: None,
+            private_dir: &privc,
+            enforce: ENF,
+            reserved_ports: &[model],
+            ports_conformed: true,
+            proxy: false,
+        };
+        // A well-formed grant validates and comes back canonical.
+        let a = validate(&loopback(&ws, vec![5173], vec![5173], vec![]), &ok).unwrap();
+        assert_eq!(
+            a.ports,
+            Ports {
+                bind: vec![5173],
+                connect: vec![5173],
+                lan: vec![]
+            }
+        );
+        let check = |bind: &[u16], connect: &[u16], lan: &[u16], want: &str| {
+            let e = validate(
+                &loopback(&ws, bind.to_vec(), connect.to_vec(), lan.to_vec()),
+                &ok,
+            )
+            .unwrap_err();
+            assert!(e.to_string().contains(want), "{e} (wanted {want})");
+        };
+        check(&[80], &[], &[], "below 1024");
+        check(&[], &[PORT_MIN - 1], &[], "below 1024");
+        check(&[model], &[], &[], "reserved");
+        check(&[], &[model], &[], "reserved");
+        check(&[5173, 5173], &[], &[], "duplicated");
+        check(&[], &[5173, 5173], &[], "duplicated");
+        check(&[5173, 8000, 9000, 9001, 9002], &[], &[], "PORTS_PER_START");
+        // The same floor and reserved rules hold while the backend's
+        // witness does not cover the port cases: the whole grant is
+        // refused, whatever its ports.
+        let unconformed = Context {
+            ports_conformed: false,
+            ..ok
+        };
+        let e = validate(&loopback(&ws, vec![5173], vec![], vec![]), &unconformed).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("loopback ports (not conformed on this host)"),
+            "{e}"
+        );
+        // A proxy grant stays refused where the backend cannot express the
+        // loopback-only allow (`ok` has `proxy: false`), ports or not.
+        let mut proxy = base(&ws);
+        proxy.network = Network::Proxy { port: 8080 };
+        assert!(validate(&proxy, &ok)
+            .unwrap_err()
+            .to_string()
+            .contains("proxy"));
+    }
+
+    #[test]
+    fn validate_refuses_lan_not_subset_of_bind() {
+        // A LAN-visible bind is its own grant (P-36 D6); a port that is not
+        // a granted bind port must never reach the profile as `*:<p>`.
+        let ws = tmp("lan");
+        let privc = std::fs::canonicalize(tmp("lan-priv")).unwrap();
+        let ok = Context {
+            home: None,
+            private_dir: &privc,
+            enforce: ENF,
+            reserved_ports: &[],
+            ports_conformed: true,
+            proxy: false,
+        };
+        let e = validate(
+            &loopback(&ws, vec![5173, 8000], vec![], vec![8000, 9000]),
+            &ok,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains(
+                "port 9000 refused: not a granted bind port (lan must be a subset of bind)"
+            ),
+            "{e}"
+        );
+        // A subset, by contrast, validates with the lan list kept.
+        let a = validate(&loopback(&ws, vec![5173, 8000], vec![], vec![8000]), &ok).unwrap();
+        assert_eq!(a.ports.lan, vec![8000]);
     }
 }

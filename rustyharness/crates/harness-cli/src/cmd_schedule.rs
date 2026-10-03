@@ -538,8 +538,10 @@ fn add(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         inputs::task_text(&task_bytes).map(|t| harness_core::sha256(t.as_bytes())),
         inputs::profile_digest(&profile_bytes),
         match &policy_bytes {
-            Some(b) => inputs::policy_digest(b, overlay),
-            None => inputs::default_policy(!overlay).map(|p| p.digest()),
+            // A schedule is unattended (P-47): no accept-edits overlay
+            // (P-23) and no session grants can ever be set for one.
+            Some(b) => inputs::policy_digest(b, overlay, false),
+            None => inputs::default_policy(!overlay, false).map(|p| p.digest()),
         },
     );
     let check = |what: &str,
@@ -1110,8 +1112,10 @@ fn run_now(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         inputs::task_text(&task_bytes).map(|t| harness_core::sha256(t.as_bytes())),
         inputs::profile_digest(&profile_bytes),
         match &policy_bytes {
-            Some(b) => inputs::policy_digest(b, overlay),
-            None => inputs::default_policy(!overlay).map(|p| p.digest()),
+            // Stored the way the schedule recorded it (no overlays beyond
+            // the deny default; see the `schedule` write above).
+            Some(b) => inputs::policy_digest(b, overlay, false),
+            None => inputs::default_policy(!overlay, false).map(|p| p.digest()),
         },
     );
     let (rt, rp, rl) = match recorded {

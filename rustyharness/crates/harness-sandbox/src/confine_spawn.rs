@@ -98,10 +98,13 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ring::{Chunk, Mode, Ring, Stream, StreamTotals};
 use crate::spec::{ChildStatus, ConfinedExit, DomainCleanup, Validated};
+use crate::LiveOpts;
 
 /// The sweep deadline a call asks for unless it says otherwise: the stub
 /// sweeps for at most this long (P-41: the live probe's one retry of a
@@ -114,8 +117,9 @@ pub const SWEEP_DEADLINE: Duration = Duration::from_secs(3);
 const SWEEP_GRACE_MARGIN: Duration = Duration::from_secs(2);
 /// How long the readers may take to reach end of file after the stub ended.
 pub const READ_GRACE: Duration = Duration::from_secs(2);
-/// Bytes of stderr's end kept to find the stub's report.
-const TAIL_BYTES: usize = 4096;
+/// How often the deadline closer re-checks whether its moment has come or
+/// the pipe was taken from it already (a stop, a collect, or a drop).
+const LIVE_TICK: Duration = Duration::from_millis(50);
 
 /// The domain stub, run by `/usr/bin/perl -e` inside the sandbox (see the
 /// module docs). No double quote appears in it, so the gate's program-literal
@@ -155,38 +159,48 @@ print STDERR qq{\nrh-stub/1 $res status=$st end=$why kills=$k exec=$ex\n};
 exit($res eq 'confirmed' ? 0 : 3);
 "#;
 
-#[derive(Default)]
-struct Cap {
-    head: Vec<u8>,
-    total: u64,
-    tail: Vec<u8>,
-}
-
 /// One running confined call.
 pub(crate) struct Running {
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
-    out: Arc<Mutex<Cap>>,
-    err: Arc<Mutex<Cap>>,
+    /// The control pipe, shared with the deadline closer (live calls): the
+    /// closer drops it when the lifetime is up, and every ending path takes
+    /// it, which also ends the closer.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    out: Arc<Mutex<Ring>>,
+    err: Arc<Mutex<Ring>>,
     out_done: mpsc::Receiver<()>,
     err_done: mpsc::Receiver<()>,
+    /// Set by the readers at end of file: live reads strip the stub's exit
+    /// report from stderr only once its stream is finished (§3.2).
+    out_set: Arc<AtomicBool>,
+    err_set: Arc<AtomicBool>,
     started: Instant,
     deadline: Instant,
     sweep: Duration,
     cleanup_dir: Option<PathBuf>,
+    /// The collected exit of an already-ended call (`try_status` is
+    /// idempotent; `wait` and `stop` return it instead of collecting twice).
+    finished: Option<ConfinedExit>,
 }
 
-fn lock(m: &Mutex<Cap>) -> std::sync::MutexGuard<'_, Cap> {
+fn lock(m: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn reader(
-    mut from: impl Read + Send + 'static,
-    cap: u64,
-) -> std::io::Result<(Arc<Mutex<Cap>>, mpsc::Receiver<()>)> {
-    let buf = Arc::new(Mutex::new(Cap::default()));
+fn lock_stdin(m: &Mutex<Option<ChildStdin>>) -> std::sync::MutexGuard<'_, Option<ChildStdin>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What a stream reader hands back: the bounded ring it fills, a receiver
+/// that fires once at end of file, and the end-of-file flag (§3.2).
+type Reader = (Arc<Mutex<Ring>>, mpsc::Receiver<()>, Arc<AtomicBool>);
+
+fn reader(mut from: impl Read + Send + 'static, cap: u64) -> std::io::Result<Reader> {
+    let buf = Arc::new(Mutex::new(Ring::new(cap)));
     let (tx, rx) = mpsc::channel();
+    let set = Arc::new(AtomicBool::new(false));
     let b = Arc::clone(&buf);
+    let s = Arc::clone(&set);
     std::thread::Builder::new().spawn(move || {
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
@@ -194,22 +208,14 @@ fn reader(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = chunk.get(..n).unwrap_or_default();
-                    let mut c = lock(&b);
-                    let room = cap.saturating_sub(c.head.len() as u64) as usize;
-                    c.head
-                        .extend_from_slice(data.get(..room.min(n)).unwrap_or_default());
-                    c.total += n as u64;
-                    c.tail.extend_from_slice(data);
-                    if c.tail.len() > TAIL_BYTES {
-                        let cut = c.tail.len() - TAIL_BYTES;
-                        c.tail.drain(..cut);
-                    }
+                    lock(&b).push(data);
                 }
             }
         }
+        s.store(true, Ordering::Release);
         let _ = tx.send(());
     })?;
-    Ok((buf, rx))
+    Ok((buf, rx, set))
 }
 
 fn frame(v: &Validated, sweep: Duration) -> Vec<u8> {
@@ -252,6 +258,45 @@ pub(crate) fn spawn(
     sweep: Duration,
     cleanup_dir: Option<PathBuf>,
 ) -> std::io::Result<Running> {
+    launch(profile, v, sweep, cleanup_dir, v.limits.output_bytes, None)
+}
+
+/// Start `v` under the profile as a live call: output is readable from
+/// bounded rings of `live.ring_bytes` while the program runs, and the
+/// control pipe closes by itself once `live.lifetime` has passed since the
+/// spawn, so a caller that stops reading (or dies) still gets a swept
+/// domain (§4.2). Fails closed on a ring or lifetime outside its bound.
+pub(crate) fn spawn_live(
+    profile: &Path,
+    v: &Validated,
+    sweep: Duration,
+    cleanup_dir: Option<PathBuf>,
+    live: &LiveOpts,
+) -> std::io::Result<Running> {
+    if live.ring_bytes == 0 || live.ring_bytes > crate::spec::MAX_OUTPUT_BYTES {
+        return Err(std::io::Error::other(
+            "live ring_bytes must be within 1..=MAX_OUTPUT_BYTES",
+        ));
+    }
+    if live.lifetime.is_zero() || live.lifetime > crate::spec::MAX_WALL {
+        return Err(std::io::Error::other(
+            "live lifetime must be nonzero and within MAX_WALL",
+        ));
+    }
+    launch(profile, v, sweep, cleanup_dir, live.ring_bytes, Some(live))
+}
+
+/// The one launch path (§6.3): every confined child comes from here, live
+/// or not. `ring_bytes` sizes both stream rings; for a plain call it is the
+/// spec's output cap, so `wait` keeps the head semantics it always had.
+fn launch(
+    profile: &Path,
+    v: &Validated,
+    sweep: Duration,
+    cleanup_dir: Option<PathBuf>,
+    ring_bytes: u64,
+    live: Option<&LiveOpts>,
+) -> std::io::Result<Running> {
     let started = Instant::now();
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-f")
@@ -265,13 +310,41 @@ pub(crate) fn spawn(
         .process_group(0);
     let mut child = cmd.spawn()?;
     let parts = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    let (Some(mut stdin), Some(stdout), Some(stderr)) = parts else {
+    let (Some(stdin), Some(stdout), Some(stderr)) = parts else {
         kill_now(&mut child);
         return Err(std::io::Error::other("missing a pipe"));
     };
-    let readers = reader(stdout, v.limits.output_bytes)
-        .and_then(|o| reader(stderr, v.limits.output_bytes).map(|e| (o, e)));
-    let ((out, out_done), (err, err_done)) = match readers {
+    let stdin = Arc::new(Mutex::new(Some(stdin)));
+    if let Some(live) = live {
+        // The deadline closer (§4.2): when the lifetime is up since the
+        // spawn, drop the control pipe; the stub then stops the program and
+        // sweeps. A stop, a collect, or a drop that takes the pipe first
+        // ends this thread within one tick.
+        let closer_stdin = Arc::clone(&stdin);
+        let closer_at = started + live.lifetime;
+        let closer = move || {
+            loop {
+                if Instant::now() >= closer_at {
+                    break;
+                }
+                if lock_stdin(&closer_stdin).is_none() {
+                    return;
+                }
+                std::thread::sleep(LIVE_TICK);
+            }
+            // Lifetime up: close the control pipe (§4.2). The stub then
+            // stops the program and sweeps. If the pipe is already gone,
+            // the call was ended by its caller above.
+            drop(lock_stdin(&closer_stdin).take());
+        };
+        if let Err(e) = std::thread::Builder::new().spawn(closer) {
+            kill_now(&mut child);
+            return Err(e);
+        }
+    }
+    let readers =
+        reader(stdout, ring_bytes).and_then(|o| reader(stderr, ring_bytes).map(|e| (o, e)));
+    let ((out, out_done, out_set), (err, err_done, err_set)) = match readers {
         Ok(r) => r,
         Err(e) => {
             kill_now(&mut child);
@@ -279,20 +352,26 @@ pub(crate) fn spawn(
         }
     };
     // A stub that already died gives EPIPE here; the wait reports it.
-    let _ = stdin
-        .write_all(&frame(v, sweep))
-        .and_then(|()| stdin.flush());
+    {
+        let mut pipe = lock_stdin(&stdin);
+        if let Some(pipe) = pipe.as_mut() {
+            let _ = pipe.write_all(&frame(v, sweep)).and_then(|()| pipe.flush());
+        }
+    }
     Ok(Running {
         child: Some(child),
-        stdin: Some(stdin),
+        stdin,
         out,
         err,
         out_done,
         err_done,
+        out_set,
+        err_set,
         started,
         deadline: started + v.limits.wall,
         sweep,
         cleanup_dir,
+        finished: None,
     })
 }
 
@@ -380,6 +459,9 @@ impl Running {
     /// Wait for the call to end (program exit or deadline), let the stub
     /// sweep, and collect what it left.
     pub(crate) fn wait(mut self) -> ConfinedExit {
+        if let Some(done) = self.finished.take() {
+            return done;
+        }
         let mut timed_out = false;
         let mut stub = None;
         let Some(mut child) = self.child.take() else {
@@ -398,7 +480,7 @@ impl Running {
         if stub.is_none() {
             timed_out = Instant::now() >= self.deadline;
             // Close the control pipe: the stub stops the program and sweeps.
-            drop(self.stdin.take());
+            drop(lock_stdin(&self.stdin).take());
             let until = Instant::now() + self.grace();
             while stub.is_none() && Instant::now() < until {
                 match child.try_wait() {
@@ -408,7 +490,7 @@ impl Running {
                 }
             }
         }
-        drop(self.stdin.take());
+        drop(lock_stdin(&self.stdin).take());
         let Some(stub) = stub else {
             kill_now(&mut child);
             let mut exit = self.collect(timed_out, None);
@@ -448,12 +530,12 @@ impl Running {
         let _ = self.out_done.recv_timeout(READ_GRACE);
         let _ = self.err_done.recv_timeout(READ_GRACE);
         let (stdout, out_total) = {
-            let c = lock(&self.out);
-            (c.head.clone(), c.total)
+            let r = lock(&self.out);
+            (r.head(), r.total())
         };
         let (mut stderr, err_total, tail) = {
-            let c = lock(&self.err);
-            (c.head.clone(), c.total, c.tail.clone())
+            let r = lock(&self.err);
+            (r.head(), r.total(), r.tail().to_vec())
         };
         let stdout_truncated = out_total > stdout.len() as u64;
         let report = parse_report(&tail);
@@ -524,6 +606,107 @@ impl Running {
         e.domain = DomainCleanup::Unconfirmed(why.into());
         e
     }
+
+    /// Close the control pipe now. To the stub this is the stop signal: it
+    /// halts the program, sweeps, and reports. It also ends the deadline
+    /// closer within one tick, and it is idempotent.
+    fn close_pipe(&self) {
+        drop(lock_stdin(&self.stdin).take());
+    }
+
+    /// Poll a live call without blocking (§4.2): `None` while it runs,
+    /// `Some` once the stub has exited, been collected, and swept. Later
+    /// calls return the same exit.
+    pub(crate) fn try_status(&mut self) -> Option<ConfinedExit> {
+        if let Some(done) = &self.finished {
+            return Some(done.clone());
+        }
+        let stub = match self.child.as_mut() {
+            Some(child) => child.try_wait().ok().flatten(),
+            None => None,
+        }?;
+        self.close_pipe();
+        let exit = self.collect(false, Some(stub));
+        if matches!(exit.domain, DomainCleanup::Unconfirmed(_)) && members_may_remain(stub) {
+            if let Some(pgid) = self.child.as_ref().map(Child::id) {
+                group_kill(pgid);
+            }
+        }
+        self.child = None;
+        self.finished = Some(exit.clone());
+        Some(exit)
+    }
+
+    /// Read a bounded window of a live stream (§3.2). `since` is an
+    /// absolute offset; the chunk's `to` is the next `since`. While the
+    /// stub runs, everything it writes is delivered as-is; after it has
+    /// exited, its final stderr report is never delivered: reads end where
+    /// the report begins.
+    pub(crate) fn read(&self, stream: Stream, since: u64, cap: usize, mode: Mode) -> Chunk {
+        let (ring, done) = match stream {
+            Stream::Out => (&self.out, &self.out_set),
+            Stream::Err => (&self.err, &self.err_set),
+        };
+        let ring = lock(ring);
+        let limit = if stream == Stream::Err && done.load(Ordering::Acquire) {
+            let tail = ring.tail();
+            parse_report(tail).map(|(_, at)| ring.total().saturating_sub((tail.len() - at) as u64))
+        } else {
+            None
+        };
+        ring.chunk_until(since, cap, mode, limit)
+    }
+
+    /// Total bytes and the running SHA-256 of each stream, retained bytes
+    /// or not (§4.2).
+    pub(crate) fn totals(&self) -> StreamTotals {
+        let out = lock(&self.out);
+        let err = lock(&self.err);
+        StreamTotals {
+            out_total: out.total(),
+            out_sha: out.digest(),
+            err_total: err.total(),
+            err_sha: err.digest(),
+        }
+    }
+
+    /// Stop a live call (§4.2): close the control pipe, give the stub its
+    /// sweep grace, and collect. A call that will not finish in the grace
+    /// is killed with its group and reported unconfirmed. Stopping an
+    /// already-ended call returns the collected exit.
+    pub(crate) fn stop(mut self) -> ConfinedExit {
+        if let Some(done) = self.finished.take() {
+            return done;
+        }
+        self.close_pipe();
+        let Some(mut child) = self.child.take() else {
+            return self.lost("no child");
+        };
+        let mut stub = None;
+        let until = Instant::now() + self.grace();
+        while stub.is_none() && Instant::now() < until {
+            match child.try_wait() {
+                Ok(Some(s)) => stub = Some(s),
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+        let Some(stub) = stub else {
+            kill_now(&mut child);
+            let mut exit = self.collect(false, None);
+            exit.domain = DomainCleanup::Unconfirmed(
+                "the domain stub did not finish its sweep in time; the process group was killed"
+                    .into(),
+            );
+            return exit;
+        };
+        let pgid = child.id();
+        let exit = self.collect(false, Some(stub));
+        if matches!(exit.domain, DomainCleanup::Unconfirmed(_)) && members_may_remain(stub) {
+            group_kill(pgid);
+        }
+        exit
+    }
 }
 
 fn status_of(r: &Report, timed_out: bool) -> ChildStatus {
@@ -554,7 +737,7 @@ fn status_of(r: &Report, timed_out: bool) -> ChildStatus {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        drop(self.stdin.take());
+        drop(lock_stdin(&self.stdin).take());
         if let Some(mut child) = self.child.take() {
             let pgid = child.id();
             let until = Instant::now() + self.grace();

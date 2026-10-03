@@ -67,6 +67,25 @@ impl Usage {
         u
     }
 
+    /// The counts, for a report that lists an arm's facts (P-48 `compare`):
+    /// the same numbers the footer words say, without the words. (`steps`
+    /// is not here: the run report's own count is the fact.)
+    pub(crate) fn tokens_in(&self) -> u64 {
+        self.tokens_in
+    }
+
+    pub(crate) fn tokens_out(&self) -> u64 {
+        self.tokens_out
+    }
+
+    pub(crate) fn wall_ms(&self) -> u64 {
+        self.wall_ms
+    }
+
+    pub(crate) fn tools(&self) -> &BTreeMap<String, u64> {
+        &self.tools
+    }
+
     /// The footer as one compact JSON object, e.g.
     /// `{"model_calls":2,"steps":3,"tokens":{"cached":64,"in":200,"out":20},"tools":{"harness.fs.read":1},"wall_ms":150}`.
     /// (`cached` appears only when some reply claimed cached tokens; keys

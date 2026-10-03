@@ -21,6 +21,8 @@ workspace = true
 # The CLI is a gate child (design §7.7): its last stdout line is a
 # GateReport, so it needs gate-outcome's wire form.
 gate-outcome = { path = "../gate-outcome", features = ["json"] }
+# The `acp` verb's server (P-35): the ACP v1 stdio protocol.
+harness-acp = { path = "../harness-acp" }
 harness-core = { path = "../harness-core" }
 harness-journal = { path = "../harness-journal" }
 harness-manifest = { path = "../harness-manifest" }
@@ -28,6 +30,7 @@ harness-model = { path = "../harness-model" }
 harness-policy = { path = "../harness-policy" }
 harness-run = { path = "../harness-run" }
 harness-sandbox = { path = "../harness-sandbox" }
+harness-tools = { path = "../harness-tools" }
 serde.workspace = true
 serde_json.workspace = true
 

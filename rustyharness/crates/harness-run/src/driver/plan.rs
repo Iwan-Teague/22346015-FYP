@@ -15,13 +15,15 @@ use harness_model::profile::Profile;
 use harness_model::ToolSpec;
 use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::{
-    Matcher, PolicyDecision, Rule, Selector, Session, SessionSpec, UserPolicy, WorkspaceDecl,
-    EXEC_ID, SUBMIT_ID, TODO_ID,
+    Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionSpec, UserPolicy,
+    WorkspaceDecl, EXEC_ID, SUBMIT_ID, TODO_ID,
 };
 use harness_sandbox::{Confinement, Conformed};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
 use harness_tools::protected::{Protected, ProtectedError, DEFAULT_ASK};
-use harness_tools::{EditTools, ExecSpec, ExecTools, Pinned, ReadTools, TodoList, ToolProvider};
+use harness_tools::{
+    EditTools, ExecSpec, ExecTools, PatchTools, Pinned, ReadTools, TodoList, ToolProvider,
+};
 
 use super::{new_run_id, RunConfig, RunRefused, TaskSpec};
 use crate::presubmit::PresubmitRefused;
@@ -32,6 +34,7 @@ pub(crate) struct Prepared {
     pub(crate) tools: Vec<ToolSpec>,
     pub(crate) read_tools: ReadTools,
     pub(crate) edit_tools: EditTools,
+    pub(crate) patch_tools: PatchTools,
     pub(crate) state_root: PathBuf,
     pub(crate) facts: WorkspaceFacts,
     /// The listing the facts were measured over, kept so the tree digest
@@ -46,15 +49,18 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    /// The built-in providers: the read tools, the edit tools and, with an
-    /// exec grant, the command runner, which share the `harness` namespace
-    /// and split it by verb (H2b, H2d).
+    /// The built-in providers: the read tools, the edit tools, the P-25
+    /// patch/delete/move provider and, with an exec grant, the command
+    /// runner, which share the `harness` namespace and split it by verb
+    /// (H2b, H2d, P-25).
     pub(crate) fn providers<'p>(
         read: ReadTools,
         edit: EditTools,
+        patch: PatchTools,
         exec: Option<ExecTools<'p>>,
     ) -> Vec<Box<dyn ToolProvider + 'p>> {
-        let mut v: Vec<Box<dyn ToolProvider + 'p>> = vec![Box::new(read), Box::new(edit)];
+        let mut v: Vec<Box<dyn ToolProvider + 'p>> =
+            vec![Box::new(read), Box::new(edit), Box::new(patch)];
         if let Some(x) = exec {
             v.push(Box::new(x));
         }
@@ -107,6 +113,10 @@ pub(crate) fn prepare(
         Protected::new(&spec.protected)
             .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
     );
+    let patch_tools = PatchTools::new(workspace)?.with_protected(
+        Protected::new(&spec.protected)
+            .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+    );
     let ws = read_tools.root().to_path_buf();
     let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
     if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
@@ -137,6 +147,7 @@ pub(crate) fn prepare(
         tools,
         read_tools,
         edit_tools,
+        patch_tools,
         state_root,
         facts: tree.facts(),
         tree,
@@ -147,11 +158,14 @@ pub(crate) fn prepare(
 }
 
 /// The capabilities the ask floor covers (P-29): every edit cap, the only
-/// write path a model has today.
-const EDIT_CAPS: [&str; 3] = [
+/// write path a model has today (P-25: the patch script joins it; the
+/// delete/move file operations declare `user_confirm`, so the confirmation
+/// floor already asks for them everywhere, protected paths included).
+const EDIT_CAPS: [&str; 4] = [
     "harness.edit.replace",
     "harness.edit.write",
     "harness.edit.multi",
+    "harness.edit.patch",
 ];
 
 /// The P-29 ask floor: [`DEFAULT_ASK`] globs over every edit cap, appended
@@ -277,6 +291,9 @@ pub(crate) fn plan(
             exec_programs: spec.exec.as_ref().map(ExecSpec::names).unwrap_or_default(),
             // The run's read window bounds a read's lines (H2e).
             read_window: Some(profile.read_window().lines),
+            // P-39b: the driver plans coding sessions; the web airlock has
+            // no driver path yet.
+            kind: SessionKind::Coding,
         },
         registry,
         &policy,

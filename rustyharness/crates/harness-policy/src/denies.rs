@@ -49,11 +49,12 @@ pub const DEFAULT_DENY_GLOBS: [&str; 10] = [
 ];
 
 /// The capabilities the default list denies these paths on: the five
-/// content-surfacing read tools and the three workspace edits. Write-class
-/// tools that do not name a workspace path (the submit sentinel, the
-/// checklist, exec) are out of scope — a denied edit covers the same paths
-/// as a denied read.
-const DEFAULT_DENY_CAPABILITIES: [&str; 8] = [
+/// content-surfacing read tools and the six workspace edits (including the
+/// P-25 patch script and delete/move file operations, whose `to` path is
+/// denied through policy's move-target shadow). Write-class tools that do
+/// not name a workspace path (the submit sentinel, the checklist, exec) are
+/// out of scope — a denied edit covers the same paths as a denied read.
+const DEFAULT_DENY_CAPABILITIES: [&str; 11] = [
     READ_ID,
     SEARCH_ID,
     GLOB_ID,
@@ -62,6 +63,9 @@ const DEFAULT_DENY_CAPABILITIES: [&str; 8] = [
     EDIT_IDS[0],
     EDIT_IDS[1],
     EDIT_IDS[2],
+    EDIT_IDS[3],
+    EDIT_IDS[4],
+    EDIT_IDS[5],
 ];
 
 /// One deny rule per capability × glob, in the stable order.
@@ -87,7 +91,7 @@ fn path_glob_matcher(glob: &str) -> Result<Matcher, PolicyConfigError> {
     })
 }
 
-/// The default-deny policy on its own: 8 capabilities × 10 globs of deny
+/// The default-deny policy on its own: 11 capabilities × 10 globs of deny
 /// rules with `path_glob` matchers, empty ask and allow. A library embedder
 /// that wants this behaviour calls this and passes it as the run's policy
 /// (the run itself never applies defaults — OD-2).
@@ -120,6 +124,43 @@ pub fn overlay_default_denies(mut policy: UserPolicy) -> Result<UserPolicy, Poli
             return Err(PolicyConfigError::Ambiguous(key));
         }
         policy.deny.push(rule);
+    }
+    Ok(policy)
+}
+
+/// Overlay an allow rule per workspace edit capability (P-23's
+/// `--accept-edits`): `**` on each of the edit tools, appended after
+/// the user's own allow rules. The P-22 pre-image store makes every edit
+/// undoable, which is what licenses a blanket allow. Idempotent: a rule
+/// already present (the bundle's effective policy already overlaid it) is
+/// skipped, not refused — replay and audit re-apply the overlay. Refused
+/// outright when the pre-image store is missing: an undoable-only default
+/// must not silently become a non-undoable one.
+pub fn overlay_accept_edits(
+    mut policy: UserPolicy,
+    pre_image_store: bool,
+) -> Result<UserPolicy, PolicyConfigError> {
+    if !pre_image_store {
+        return Err(PolicyConfigError::BadRule(
+            "the edit pre-image store is missing, so --accept-edits is refused".to_owned(),
+        ));
+    }
+    let mut seen: BTreeSet<String> = policy
+        .deny
+        .iter()
+        .chain(policy.ask.iter())
+        .chain(policy.allow.iter())
+        .map(Rule::key)
+        .collect();
+    for cap in EDIT_IDS {
+        let rule = Rule {
+            selector: Selector::parse(cap)?,
+            matcher: Some(path_glob_matcher("**")?),
+        };
+        let key = rule.key();
+        if seen.insert(key) {
+            policy.allow.push(rule);
+        }
     }
     Ok(policy)
 }

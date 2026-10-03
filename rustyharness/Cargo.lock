@@ -63,10 +63,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "harness-cli"
+name = "harness-acp"
 version = "0.0.1"
 dependencies = [
- "gate-outcome",
  "harness-core",
  "harness-journal",
  "harness-manifest",
@@ -75,6 +74,24 @@ dependencies = [
  "harness-run",
  "harness-sandbox",
  "harness-testkit",
+ "serde_json",
+]
+
+[[package]]
+name = "harness-cli"
+version = "0.0.1"
+dependencies = [
+ "gate-outcome",
+ "harness-acp",
+ "harness-core",
+ "harness-journal",
+ "harness-manifest",
+ "harness-model",
+ "harness-policy",
+ "harness-run",
+ "harness-sandbox",
+ "harness-testkit",
+ "harness-tools",
  "serde",
  "serde_json",
 ]
@@ -88,6 +105,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "harness-fetch"
+version = "0.0.1"
+dependencies = [
+ "harness-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -127,6 +152,7 @@ dependencies = [
 name = "harness-mcp-fixture"
 version = "0.0.1"
 dependencies = [
+ "harness-mcp",
  "serde_json",
 ]
 
@@ -203,6 +229,7 @@ name = "harness-sandbox"
 version = "0.0.1"
 dependencies = [
  "harness-core",
+ "harness-fetch",
  "harness-policy",
  "thiserror",
 ]

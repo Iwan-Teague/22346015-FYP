@@ -7,7 +7,9 @@ use harness_core::{LoopEvent, LoopKind, LoopSignal, StopCause, Untrusted};
 use harness_journal::{BlobSink, Clock, Event, EventKind, JournalFile, JournalWriter, Trusted};
 use harness_model::context::{Feedback, ShownCall, Turn};
 use harness_model::{HarnessText, ToolSpec};
-use harness_policy::{DenyReason, ExecRefused, PathRefused, PolicyDecision, RuleId, RuleList};
+use harness_policy::{
+    DenyReason, ExecRefused, PathRefused, PolicyDecision, RuleId, RuleList, WebCallRefused,
+};
 
 use super::step::{journal, Flow, Loop};
 
@@ -50,6 +52,18 @@ pub(crate) fn decided(d: &PolicyDecision) -> Event {
                 }),
             ),
             ("index", Trusted::U64(index as u64)),
+        ]),
+        RuleId::Session { list, index } => Trusted::Obj(vec![
+            (
+                "list",
+                Trusted::Text(match list {
+                    RuleList::Deny => "deny",
+                    RuleList::Ask => "ask",
+                    RuleList::Allow => "allow",
+                }),
+            ),
+            ("index", Trusted::U64(index as u64)),
+            ("source", Trusted::Text("session")),
         ]),
     };
     let mut ev = Event::new(EventKind::PolicyDecided)
@@ -135,12 +149,21 @@ fn deny_name(r: &DenyReason) -> &'static str {
         DenyReason::NoConformed => "no_conformed",
         DenyReason::PersonalNotGranted => "personal_not_granted",
         DenyReason::UserDenied => "user_denied",
+        DenyReason::SessionDenied => "session_denied",
         DenyReason::Args(_) => "args_schema",
         DenyReason::Path(_) => "path_outside_workspace",
         DenyReason::Exec(ExecRefused::EmptyArgv | ExecRefused::NotAllowlisted) => {
             "exec_not_allowlisted"
         }
         DenyReason::Exec(ExecRefused::TooManyArgs | ExecRefused::Nul) => "exec_argv",
+        DenyReason::Web(
+            WebCallRefused::Url(_)
+            | WebCallRefused::HostNotAllowlisted
+            | WebCallRefused::Scheme
+            | WebCallRefused::Port,
+        ) => "web_allowlist",
+        DenyReason::Web(WebCallRefused::Query) => "web_query",
+        DenyReason::Web(WebCallRefused::NoSearchEndpoint) => "web_no_search_endpoint",
         DenyReason::NoApprover => "no_approver",
         DenyReason::NoRuleMatched => "no_rule_matched",
     }
@@ -238,6 +261,12 @@ pub(crate) fn denied_text(
             ..
         } => {
             "Policy denied the call: it needs a person's approval, and no approver is present in this run. It did not run."
+        }
+        PolicyDecision::Deny {
+            reason: DenyReason::SessionDenied,
+            ..
+        } => {
+            "Policy denied the call: the pattern was denied for this session (d at an approval prompt). It did not run."
         }
         _ => "Policy denied the call.",
     })

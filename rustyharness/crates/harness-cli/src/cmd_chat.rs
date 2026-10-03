@@ -50,6 +50,8 @@ const ALLOWED: &[&str] = &[
     "preset",
     "shell",
     "no-default-denies",
+    "allow-session-grants",
+    "accept-edits",
     "workspace-mode",
 ];
 
@@ -427,7 +429,10 @@ fn run_sessions(
         }
     };
     // The session budgets are the P-05 defaults (see the module docs).
-    let session_config = SessionConfig::defaults(TOKEN_BUDGET);
+    let mut session_config = SessionConfig::defaults(TOKEN_BUDGET);
+    // Session-scoped grants (P-23, Q-4): default off; the flag lets the
+    // person answer `a`/`d` at an approval prompt.
+    session_config.run.allow_session_grants = o.contains_key("allow-session-grants");
     let report = loop {
         match run_session(SessionRun {
             state_root,
@@ -496,9 +501,11 @@ fn run_sessions(
         crate::config::value(o, cfg, "endpoint").unwrap_or("(a backend given to the library)"),
         workspace,
         &inp.digests,
-        // The policy was digested under the run's own overlay setting
-        // (P-12); the bundle self-check must digest it the same way.
+        // The policy was digested under the run's own overlay settings
+        // (P-12 default denies; P-23 accept-edits); the bundle self-check
+        // must digest it the same way.
         !o.contains_key("no-default-denies"),
+        o.contains_key("accept-edits"),
     ) {
         note!(cx, "run bundle not written: {e}");
     }

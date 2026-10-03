@@ -135,6 +135,33 @@ impl fmt::Display for Ident {
 /// - `InputEnded` (fsynced; the user's input ended the session):
 ///   `reason` (Text `eof` | `exit` | `timeout`), `turn` (U64).
 ///
+/// **MCP kinds (P-37g, hotspot H-E).** Defined now with their canonical
+/// field lists (the bodies are written by the driver wiring, P-37i;
+/// replay's `recorded()` rules are P-37j):
+///
+/// - `McpConnected` (fsynced; step 0, after `RunStarted`, before the first
+///   `ContextBuilt`): `provider` (Id), `protocol` (Text, the negotiated
+///   version), `server_info` (UntrustedBlob, `initialize`'s `serverInfo`
+///   plus `instructions`), `tools` (UntrustedBlob, the baseline list),
+///   `tools_sha256` (Digest of `tools`), `pins` (Obj, capability id →
+///   `ok` | `description` | `schema` | `missing`), `dropped` (U64).
+/// - `McpDrift` (fsynced; the step of the call that found it): `provider`
+///   (Id), `tools` (UntrustedBlob, the new list), `tools_sha256` (Digest),
+///   `quarantined` (Obj, capability id → `entry_changed` | `removed`),
+///   `added` (U64).
+/// - `McpStopped` (fsynced): `provider` (Id), `reason` (Text `run_end` |
+///   `violation:<kind>` | `timeout` | `exited` | `eof`), `cleanup` (Text
+///   `confirmed` | `unconfirmed`), `kills` (U64), `stderr` (UntrustedBlob,
+///   the kept tail), `stderr_dropped` (U64).
+///
+/// A `ToolFinished` of an MCP capability gains, beside its usual fields:
+/// `mcp_request_id` (U64), `mcp_request` (Digest of the exact request
+/// line), `mcp_list` (Digest of the pre-call list), `mcp_noise` (U64) and,
+/// when a response arrived, `mcp_response` (UntrustedBlob, the raw response
+/// line). Every other capability's record has none of them; whether the
+/// fields sit only where they belong is replay's rule (P-37j), not the
+/// reader's.
+///
 /// **Web airlock kinds (P-39c, hotspot H-E: defined once, here).** The
 /// `Egress` name was reserved with the first wave and is fsynced (§4.5:
 /// appended before any bytes are forwarded); the two research-note kinds
@@ -167,6 +194,23 @@ impl fmt::Display for Ident {
 /// - Reserved: `ModeChanged` (P-28), `RuleGranted` (P-23), `Restored`
 ///   (P-22/P-26), `InstructionsLoaded` (P-30), `ForkedFrom` (P-32),
 ///   `ChildRun` (P-38). No code writes them in this wave.
+///
+/// **Background-process kinds (P-36h; H-E's last additions, design P-36
+/// §10.1).** Both fsynced: they are measurements the audit re-feeds, and
+/// resume keys on the stops. Canonical bodies:
+///
+/// - `BgStopped` (one per background process id, exactly its last record):
+///   `cleanup` (Text `unconfirmed` | Obj `{"confirmed": kills}`),
+///   `end` (Obj, as the exec record's `end`), `err_sha` (Digest, every
+///   byte the stream ever carried), `err_total` (U64), `id` (U64),
+///   `out_sha` (Digest), `out_total` (U64), `reason` (Text `exited` |
+///   `lifetime` | `turn_end` | `session_end` | `run_end` | `budget` |
+///   `sandbox_lost` | `user`).
+/// - `OrphanCheck` (after `RunStarted`, before the first step, only when
+///   markers were found): `action` (Text `none` | `refused`),
+///   `clear` (U64), `markers` (U64), `suspect` (list of
+///   `{id: U64, lease: Text `held` | `free` | `unknown`, ports_busy:
+///   [U64], run: Id}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(missing_docs)] // names are the §7.2 table, verbatim
 pub enum EventKind {
@@ -208,6 +252,11 @@ pub enum EventKind {
     InstructionsLoaded,
     ForkedFrom,
     ChildRun,
+    BgStopped,
+    OrphanCheck,
+    McpConnected,
+    McpDrift,
+    McpStopped,
     NoteSaved,
     NoteImported,
 }
@@ -251,6 +300,11 @@ const KINDS: &[(EventKind, &str)] = &[
     (EventKind::InstructionsLoaded, "InstructionsLoaded"),
     (EventKind::ForkedFrom, "ForkedFrom"),
     (EventKind::ChildRun, "ChildRun"),
+    (EventKind::BgStopped, "BgStopped"),
+    (EventKind::OrphanCheck, "OrphanCheck"),
+    (EventKind::McpConnected, "McpConnected"),
+    (EventKind::McpDrift, "McpDrift"),
+    (EventKind::McpStopped, "McpStopped"),
     (EventKind::NoteSaved, "NoteSaved"),
     (EventKind::NoteImported, "NoteImported"),
 ];
@@ -274,11 +328,14 @@ impl EventKind {
     /// `append_intent`) and result (`ToolFinished`), `Egress` (appended
     /// before forwarding), the verification events and `RunStopped`. The
     /// session kinds (P-05/P-10) are all fsynced: they are inputs or turn
-    /// boundaries, and resume keys on them. The web airlock kinds (P-39c)
-    /// are fsynced for the same reason: `Egress` is appended before any
-    /// bytes are forwarded (§4.5), and the research notes (§6, §7) are
-    /// evidence a resume reads back. Decided once, here, so owners never
-    /// touch `canon.rs` again.
+    /// boundaries, and resume keys on them. The background-process kinds
+    /// (P-36h) are fsynced too: they are measurements the audit re-feeds,
+    /// and resume keys on the stops. The MCP kinds (P-37g) likewise: they
+    /// are inputs or provider-state changes resume keys on (P-37 §11).
+    /// The web airlock kinds (P-39c) are fsynced for the same reason:
+    /// `Egress` is appended before any bytes are forwarded (§4.5), and
+    /// the research notes (§6, §7) are evidence a resume reads back.
+    /// Decided once, here, so owners never touch `canon.rs` again.
     pub fn needs_fsync(self) -> bool {
         matches!(
             self,
@@ -299,6 +356,11 @@ impl EventKind {
                 | EventKind::InstructionsLoaded
                 | EventKind::ForkedFrom
                 | EventKind::ChildRun
+                | EventKind::BgStopped
+                | EventKind::OrphanCheck
+                | EventKind::McpConnected
+                | EventKind::McpDrift
+                | EventKind::McpStopped
                 | EventKind::NoteSaved
                 | EventKind::NoteImported
         )

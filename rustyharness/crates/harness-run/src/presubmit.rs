@@ -452,7 +452,9 @@ impl<'a> Loop<'a> {
                     if let (None, Some(listing)) = (fed_tree, &x.workspace) {
                         self.workspace = Some(listing.clone());
                     }
-                    ev = ev.field("exec", exec_fields(x));
+                    // No background process exists yet (P-36i): no
+                    // `connect` ports (P-36 §6.2), as in the loop.
+                    ev = ev.field("exec", exec_fields(x, &[]));
                     if let Some(t) = tree {
                         ev = ev.field("workspace_tree", Trusted::Digest(t));
                         changed = t != self.tree;

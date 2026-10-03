@@ -121,6 +121,12 @@ pub struct RunConfig {
     /// Longest an approver may take to answer (§2.4: 15 min; past it the
     /// request is a deny, §5.3). Not charged to the wall budget.
     pub approval_timeout: Duration,
+    /// Whether an approver may grant a session-scoped rule at the prompt
+    /// (P-23): answering `a`/`d` allows or denies one call's minimal
+    /// pattern (exec argv prefix, the edited file, the read directory) for
+    /// the rest of the session. Default false (Q-4): an explicit opt-in,
+    /// and a `protected_action` ask is never lowered either way.
+    pub allow_session_grants: bool,
     /// The workspace-mode record (P-52): set when the CLI, as trust base,
     /// copied the workspace to a scratch directory before the run; `None`
     /// in-place (the default, unchanged). Recorded in the journal header,
@@ -145,6 +151,7 @@ impl RunConfig {
             exec_call_timeout: Duration::from_secs(120),
             facts_timeout: Duration::from_secs(120),
             approval_timeout: Duration::from_secs(15 * 60),
+            allow_session_grants: false,
             workspace_mode: None,
         }
     }
@@ -355,6 +362,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
 
     // ---- The loop. ----
     let meter = new_meter(r.config.limits.clone(), Box::new(SystemClock::default()));
+    let edit_tools = pre.edit_tools.clone();
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: r.registry,
@@ -363,7 +371,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         facts: loop_facts(&facts, r.spec),
         profile: r.profile,
         backend: r.backend,
-        providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec_tools),
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools, pre.patch_tools, exec_tools),
         meter,
         detector: LoopDetector::new(),
         turns: Vec::new(),
@@ -379,7 +387,9 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
             attempt,
             r.approver,
             std::collections::VecDeque::new(),
-        ),
+        )
+        .may_grant(r.config.allow_session_grants)
+        .with_edits(Some(edit_tools)),
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),

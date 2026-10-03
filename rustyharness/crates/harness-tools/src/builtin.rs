@@ -339,7 +339,7 @@ pub(crate) fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
         output: Untrusted::new(text, Source::Tool(cap.to_owned())),
         truncated: false,
         read: None,
-        edit: None,
+        edits: Vec::new(),
         exec: None,
     }
 }
@@ -363,7 +363,7 @@ pub(crate) fn finish(cap: &str, out: Out) -> ToolResult {
         truncated,
         digest,
         read: out.read,
-        edit: None,
+        edits: Vec::new(),
         exec: None,
     }
 }
@@ -1022,6 +1022,34 @@ impl WorkspaceTree {
                     },
                 );
                 self.files = self.files.saturating_add(1);
+            }
+        }
+        self.tree = self.digest_entries();
+        self.tree
+    }
+
+    /// Record the run's own deletion (P-25): `path`'s file entry leaves
+    /// the listing, so the tree digest moves. The tool refused a missing
+    /// path, so an entry of a file kind is there (a directory entry stays:
+    /// the facts walk keeps directories). An oversize file (`F`, counted
+    /// in `files` and `oversize`) leaves both counts.
+    /// Returns the new tree digest.
+    pub fn record_delete(&mut self, path: &WorkspacePath) -> Digest {
+        let rel = path.as_str();
+        let at = self
+            .entries
+            .partition_point(|e| walk_order(&e.rel, rel) == std::cmp::Ordering::Less);
+        if let Some(e) = self.entries.get(at) {
+            if e.rel == rel {
+                match e.kind {
+                    b'f' => self.files = self.files.saturating_sub(1),
+                    b'F' => {
+                        self.files = self.files.saturating_sub(1);
+                        self.oversize = self.oversize.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.entries.remove(at);
             }
         }
         self.tree = self.digest_entries();

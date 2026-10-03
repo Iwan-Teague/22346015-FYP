@@ -17,7 +17,9 @@ use crate::inputs::{inputs, required};
 use crate::report::{exit, info, refused, Outcome};
 use crate::Cx;
 
-fn from_refusal(cx: &Cx<'_>, e: &RunRefused) -> Outcome {
+/// How a run that never started becomes an outcome — shared with
+/// `compare` (P-48), whose arms are ordinary runs.
+pub(crate) fn from_refusal(cx: &Cx<'_>, e: &RunRefused) -> Outcome {
     note!(cx, "the run did not start: {e}");
     // No conformed sandbox for a task that executes (INV-6): its own exit.
     let code = match e {
@@ -298,9 +300,11 @@ fn try_run(
         endpoint,
         workspace.as_ref(),
         &inp.digests,
-        // The policy was digested under the run's own overlay setting
-        // (P-12); the bundle self-check must digest it the same way.
+        // The policy was digested under the run's own overlay settings
+        // (P-12 default denies; P-23 accept-edits); the bundle self-check
+        // must digest it the same way.
         !o.contains_key("no-default-denies"),
+        o.contains_key("accept-edits"),
     ) {
         note!(cx, "run bundle not written: {e}");
         if let Ok(f) = Finding::new(

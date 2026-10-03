@@ -45,20 +45,25 @@ mod capture;
 #[cfg(target_os = "macos")]
 mod confine_spawn;
 pub mod conformance;
+pub mod egress;
 pub mod environment;
 pub mod fileop;
 pub mod linux;
 pub mod locality;
 pub mod profile;
+pub mod ring;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 pub mod spec;
 pub mod windows;
 
 use conformance::{Case, MatrixRow};
+pub use ring::{Chunk, Mode, Stream, StreamTotals};
 pub use spec::{
-    ChildStatus, ConfinedExit, ConfinedSpec, DomainCleanup, Limits, Network, SpecError,
+    Approved, ChildStatus, ConfinedExit, ConfinedSpec, DomainCleanup, Limits, Network, Ports,
+    SpecError,
 };
+use std::time::Duration;
 
 /// A confinement backend family. Mechanism-agnostic on purpose: which
 /// primitives a backend uses is recorded in [`NetworkMechanism`] and
@@ -386,6 +391,19 @@ pub enum SpawnError {
     Io(String),
 }
 
+/// Options for a live confined child (`spawn_live`, §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveOpts {
+    /// Bytes kept per stream for [`ConfinedChild::read`] while the child
+    /// runs: the ring forgets its oldest bytes past this. [`ConfinedChild::
+    /// totals`] counts and digests every byte ever written regardless.
+    pub ring_bytes: u64,
+    /// How long the child may run after its spawn before the harness
+    /// closes the control pipe (the deadline closer, §4.2); the stub then
+    /// stops the program and sweeps. Bounded by `spec::MAX_WALL`.
+    pub lifetime: Duration,
+}
+
 /// A running confined call.
 pub struct ConfinedChild {
     #[cfg(target_os = "macos")]
@@ -413,6 +431,64 @@ impl ConfinedChild {
             match self.inner {}
         }
     }
+
+    /// Poll the call without blocking (§4.2): `None` while it runs, `Some`
+    /// once the stub has exited and been collected. Later calls return the
+    /// same exit.
+    pub fn try_status(&mut self) -> Option<ConfinedExit> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.try_status()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self.inner {}
+        }
+    }
+
+    /// Read a bounded window of a live stream (§3.2). `since` is an
+    /// absolute byte offset; the returned chunk's `to` is the cursor to
+    /// pass next time. Bytes the ring already dropped are counted in
+    /// `dropped`; a [`Mode::Tail`] read counts its jump in `skipped`. While
+    /// the stub runs everything is delivered as written; after it has
+    /// exited, its final stderr report is never delivered.
+    pub fn read(&self, stream: Stream, since: u64, cap: usize, mode: Mode) -> Chunk {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.read(stream, since, cap, mode)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self.inner {}
+        }
+    }
+
+    /// Total bytes and the running SHA-256 of each stream (§4.2), covering
+    /// every byte ever written whether the ring still holds it or not.
+    pub fn totals(&self) -> StreamTotals {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.totals()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self.inner {}
+        }
+    }
+
+    /// Stop a live call (§4.2): close the control pipe, give the stub its
+    /// sweep grace, and collect. A stub that will not finish in the grace
+    /// is killed with its group and reported unconfirmed.
+    pub fn stop(self) -> ConfinedExit {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.stop()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self.inner {}
+        }
+    }
 }
 
 /// The fail-closed backend trait (§6.1).
@@ -424,6 +500,18 @@ pub trait Backend {
     fn probe(&self) -> Result<Conformed, Unavailable>;
     /// Start `spec` confined. Needs this backend's witness.
     fn spawn(&self, spec: &ConfinedSpec, ev: &Conformed) -> Result<ConfinedChild, SpawnError>;
+    /// Start `spec` confined as a live child (§4.2). Backends that cannot
+    /// keep a child readable refuse; nothing here runs unconfined.
+    fn spawn_live(
+        &self,
+        _spec: &ConfinedSpec,
+        _ev: &Conformed,
+        _live: &LiveOpts,
+    ) -> Result<ConfinedChild, SpawnError> {
+        Err(SpawnError::Io(
+            "live children are not supported by this backend".into(),
+        ))
+    }
 }
 
 /// What confinement this platform can establish (for reporting).
@@ -508,6 +596,16 @@ pub trait Confinement {
     fn require(&self) -> Result<Conformed, Refused>;
     /// Start `spec` confined, under the witness `ev`.
     fn spawn(&self, spec: &ConfinedSpec, ev: &Conformed) -> Result<ConfinedChild, SpawnError>;
+    /// Start `spec` confined as a live child (§4.2). Refusing by default:
+    /// a confinement that forwards must do so explicitly.
+    fn spawn_live(
+        &self,
+        _spec: &ConfinedSpec,
+        _ev: &Conformed,
+        _live: &LiveOpts,
+    ) -> Result<ConfinedChild, SpawnError> {
+        Err(SpawnError::Io("no confinement is available".into()))
+    }
 }
 
 /// The production confinement: [`require`], and the backend of this
@@ -532,6 +630,26 @@ impl Confinement for SystemConfinement {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             linux::Linux.spawn(spec, ev)
+        }
+    }
+
+    fn spawn_live(
+        &self,
+        spec: &ConfinedSpec,
+        ev: &Conformed,
+        live: &LiveOpts,
+    ) -> Result<ConfinedChild, SpawnError> {
+        #[cfg(target_os = "macos")]
+        {
+            seatbelt::Seatbelt::new().spawn_live(spec, ev, live)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::Windows.spawn_live(spec, ev, live)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            linux::Linux.spawn_live(spec, ev, live)
         }
     }
 }

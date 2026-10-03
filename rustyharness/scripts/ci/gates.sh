@@ -29,11 +29,18 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 # F-1).
 printf '%s\n' '--- clippy on gate-outcome alone, without its json feature ---'
 cargo clippy --locked -p gate-outcome --all-targets -- -D warnings
+# P-39f: the net build of the sandbox exists in no workspace unification
+# (no crate enables the feature), so the airlock's direct-egress code
+# (DirectConnector, INV-52 feature posture) is clippy-checked explicitly.
+printf '%s\n' '--- clippy on harness-sandbox with its net feature ---'
+cargo clippy --locked -p harness-sandbox --features net --all-targets -- -D warnings
 
 printf '=== 5/5 cargo test --workspace ===\n'
 cargo test --locked --workspace --no-fail-fast
 printf '%s\n' '--- tests on gate-outcome alone, without its json feature ---'
 cargo test --locked -p gate-outcome --no-fail-fast
+printf '%s\n' '--- tests on harness-sandbox with its net feature ---'
+cargo test --locked -p harness-sandbox --features net --no-fail-fast
 printf '%s\n' '--- compile-fail doctests with their expected error codes enforced ---'
 # Stable rustdoc accepts `compile_fail,E0451` but checks the code only when
 # it believes it is a nightly build; RUSTC_BOOTSTRAP=1 turns that check on

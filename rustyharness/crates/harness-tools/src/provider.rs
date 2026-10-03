@@ -105,11 +105,13 @@ pub struct ToolResult {
     /// content when read (§2.3 "Stale reads"; the run keeps these so an
     /// edit can refuse a file that changed since it was read).
     pub read: Option<ReadRecord>,
-    /// For a successful, verified edit (§4.9 step 5, H2b): which file, its
-    /// digest before (absent for a create) and after. The run journals it
-    /// (`EditApplied`), records the after digest as the file's latest read,
-    /// and keeps its workspace tree digest current with it.
-    pub edit: Option<EditRecord>,
+    /// For a successful, verified edit (§4.9 step 5, H2b; P-25), one record
+    /// per file it changed, in apply order: which file, its digest before
+    /// (absent for a create or a patch's Add) and after (absent for a
+    /// delete). The run journals each (`EditApplied`), records the after
+    /// digest as the file's latest read (forgets it for a delete), and
+    /// keeps its workspace tree digest current with every record.
+    pub edits: Vec<EditRecord>,
     /// For a command `harness.exec.run` started (H2d): how it ended,
     /// whether everything it started is confirmed gone, what it wrote, and
     /// the workspace re-measured after it. `None` when no command started.
@@ -213,20 +215,25 @@ pub struct ReadRecord {
 
 /// A verified edit (§4.9 step 5): the file, and its whole content's
 /// SHA-256 before and after. `before` is `None` for a created file (the
-/// journal's convention for a create: no `before` key).
+/// journal's convention for a create: no `before` key). `after` is `None`
+/// when the edit deleted the file (P-25: no `after` key, no post-image);
+/// a live edit has exactly one of the image pair absent, a create only
+/// the before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditRecord {
     /// The workspace path (lexically checked).
     pub path: harness_policy::WorkspacePath,
     /// SHA-256 of the file before the edit; `None` when the edit created it.
     pub before: Option<Digest>,
-    /// SHA-256 of the file after the edit, as re-read and verified.
-    pub after: Digest,
+    /// SHA-256 of the file after the edit, as re-read and verified;
+    /// `None` when the edit deleted it (P-25).
+    pub after: Option<Digest>,
     /// The file's bytes before the edit, with their digest (P-22); `None`
     /// when the edit created it.
     pub before_image: Option<Image>,
-    /// The file's verified bytes after the edit, with their digest (P-22).
-    pub after_image: Image,
+    /// The file's verified bytes after the edit, with their digest (P-22);
+    /// `None` when the edit deleted it (P-25).
+    pub after_image: Option<Image>,
 }
 
 /// A provider-level failure (the provider could not even report a status).

@@ -101,14 +101,17 @@ macro_rules! say {
 mod approver;
 mod args;
 mod bundle;
+mod cmd_acp;
 mod cmd_apply;
 mod cmd_chat;
+mod cmd_compare;
 mod cmd_doctor;
 mod cmd_events;
 mod cmd_gc;
 mod cmd_manifest;
 mod cmd_profile;
 mod cmd_replay;
+mod cmd_review;
 mod cmd_run;
 mod cmd_schedule;
 mod cmd_sessions;

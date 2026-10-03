@@ -70,6 +70,28 @@ fn approval_of(r: &Record) -> Option<RecordedApproval> {
     })
 }
 
+/// A recorded session grant (P-23), in exactly the shape the loop writes:
+/// the capability, the list it joined, the matcher's canonical digest and
+/// the approver kind.
+fn rule_grant_of(r: &Record) -> Option<RecordedApproval> {
+    let b = &r.body;
+    if b.len() != 4
+        || !["capability", "list", "matcher", "approver"]
+            .iter()
+            .all(|k| b.contains_key(*k))
+    {
+        return None;
+    }
+    b.get("capability")?.as_str()?;
+    let matcher = digest_at(b, "matcher")?;
+    let kind = ApproverKind::parse(b.get("approver")?.as_str()?)?;
+    Some(match b.get("list")?.as_str()? {
+        "allow" => RecordedApproval::AllowSession { kind, matcher },
+        "deny" => RecordedApproval::DenySession { kind, matcher },
+        _ => return None,
+    })
+}
+
 fn status_of(b: &Map<String, Value>) -> Option<Option<ToolStatus>> {
     Some(match b.get("status")?.as_str()? {
         "ok" => Some(ToolStatus::Ok),
@@ -118,8 +140,9 @@ pub(crate) fn recorded(
     let mut last_turn_wall: Option<u64> = None;
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
     // `EditApplied` records waiting for their `ToolFinished` (H2b), by the
-    // intent they answer, with the record's own seq.
-    let mut edits: BTreeMap<u64, (u64, RecordedEdit)> = BTreeMap::new();
+    // intent they answer, with each record's own seq: several since P-25
+    // (a patch touches several files, a move two), in journal order.
+    let mut edits: BTreeMap<u64, Vec<(u64, RecordedEdit)>> = BTreeMap::new();
     let last_seq = v.records.last().map_or(0, |r| r.seq);
     for r in &v.records {
         let bad = || diverge(r.seq, r.step, "a record is not the shape the loop writes");
@@ -147,12 +170,14 @@ pub(crate) fn recorded(
                 intents.insert(r.seq, cap.to_owned());
             }
             EventKind::EditApplied => {
-                // The loop writes one for a verified edit, right before its
-                // result: an edit intent's, with the path as an untrusted
-                // payload, `before` only when the file existed, the after
-                // and tree digests, and the pre/after images' blob digests
-                // (P-22: `before_blob` only when there was a before; the
-                // after-blob is what a `/diff` shows).
+                // The loop writes one per verified file change, right
+                // before the result: an edit intent's, with the file's own
+                // path as an untrusted payload, `before` only when the file
+                // existed, the `after` and tree digests only when it still
+                // exists (P-25: a delete carries neither), and the pre/
+                // after images' blob digests (P-22: `before_blob` only when
+                // there was a before; the after-blob is what a `/diff`
+                // shows).
                 let seq = r
                     .body
                     .get("intent_seq")
@@ -174,6 +199,17 @@ pub(crate) fn recorded(
                 if !is_edit(cap) || !shape || !r.body.contains_key("path") {
                     return Err(bad());
                 }
+                // The path is an untrusted payload (re-hashed against its
+                // record), and it must be a workspace path for the tree to
+                // accept it (fail closed on anything else).
+                let path = payload_bytes(r.body.get("path").ok_or_else(bad)?, blobs, r.seq)
+                    .map_err(|_| bad())
+                    .and_then(|b| String::from_utf8(b).map_err(|_| bad()))
+                    .and_then(|p| {
+                        harness_policy::workspace_path(&p)
+                            .map(|_| p)
+                            .map_err(|_| bad())
+                    })?;
                 let before = match r.body.get("before") {
                     None => None,
                     Some(_) => Some(digest_at(&r.body, "before").ok_or_else(bad)?),
@@ -203,21 +239,32 @@ pub(crate) fn recorded(
                         Some(image(d).ok_or_else(bad)?)
                     }
                 };
-                let after = cited("after")?;
-                let after_blob = cited("after_blob")?;
-                if after != after_blob {
-                    return Err(bad());
-                }
+                // `after_blob` likewise, present exactly when `after` is
+                // (P-25: a delete carries neither).
+                let after = match r.body.get("after") {
+                    None => None,
+                    Some(_) => Some(digest_at(&r.body, "after").ok_or_else(bad)?),
+                };
+                let after_image = match r.body.get("after_blob") {
+                    None if after.is_some() => return Err(bad()),
+                    None => None,
+                    Some(_) => {
+                        let d = cited("after_blob")?;
+                        if after != Some(d) {
+                            return Err(bad());
+                        }
+                        Some(image(d).ok_or_else(bad)?)
+                    }
+                };
                 let e = RecordedEdit {
+                    path,
                     before,
                     after,
                     tree: cited("workspace_tree")?,
                     before_image,
-                    after_image: image(after_blob).ok_or_else(bad)?,
+                    after_image,
                 };
-                if edits.insert(seq, (r.seq, e)).is_some() {
-                    return Err(bad());
-                }
+                edits.entry(seq).or_default().push((r.seq, e));
             }
             EventKind::ToolFinished => {
                 let seq = r
@@ -226,19 +273,19 @@ pub(crate) fn recorded(
                     .and_then(Value::as_u64)
                     .ok_or_else(bad)?;
                 let cap = intents.get(&seq).ok_or_else(bad)?.clone();
-                let edit = edits.remove(&seq).map(|(_, e)| e);
+                let edit = edits.remove(&seq).unwrap_or_default();
                 // The sentinel's and the checklist's results are the loop's
                 // own, recomputed, never re-fed (H2e: the checklist).
                 if cap == SUBMIT_ID || cap == TODO_ID {
-                    if edit.is_some() {
+                    if !edit.is_empty() {
                         return Err(bad());
                     }
                     continue;
                 }
                 let status = status_of(&r.body).ok_or_else(bad)?;
-                // An ok edit has exactly its `EditApplied`, nothing else has
-                // one (H2b).
-                if edit.is_some() != (is_edit(&cap) && status == Some(ToolStatus::Ok)) {
+                // An ok edit has exactly its `EditApplied` records, nothing
+                // else has any (H2b; P-25: one or more per touched file).
+                if edit.is_empty() != !(is_edit(&cap) && status == Some(ToolStatus::Ok)) {
                     return Err(bad());
                 }
                 let (output, truncated, digest) = if status.is_some() {
@@ -292,12 +339,18 @@ pub(crate) fn recorded(
                     digest,
                     read_sha256: digest_at(&r.body, "read_sha256"),
                     environment,
-                    edit,
+                    edits: edit.into_iter().map(|(_, e)| e).collect(),
                     exec,
                 });
             }
             EventKind::ApprovalGranted | EventKind::ApprovalDenied | EventKind::ApprovalExpired => {
                 approvals.push_back(approval_of(r).ok_or_else(bad)?);
+            }
+            // A session grant (P-23) rides the approvals queue like any
+            // other answer: the replayed loop rebuilds the matcher from the
+            // call it is recorded against and must reach the same digest.
+            EventKind::RuleGranted => {
+                approvals.push_back(rule_grant_of(r).ok_or_else(bad)?);
             }
             // A wall-budget notice (H2e), in exactly the shape the loop
             // writes, at most one per step; the step notices are recomputed.
@@ -402,34 +455,49 @@ pub(crate) fn recorded(
             // A turn boundary is the loop's own: recomputed, never re-fed.
             EventKind::TurnEnded => {}
             // A record no slice owns yet is not a shape this loop writes
-            // (P-17 §6).
+            // (P-17 §6). The background-process kinds are owned from P-36h
+            // (canon, the record shapes), but nothing writes them until
+            // P-36j/P-36l, and their re-feed is P-36k: until then they are
+            // refused like the other reserved names.
             EventKind::ModeChanged
-            | EventKind::RuleGranted
             | EventKind::Restored
             | EventKind::InstructionsLoaded
             | EventKind::ForkedFrom
-            | EventKind::ChildRun => return Err(bad()),
+            | EventKind::ChildRun
+            | EventKind::BgStopped
+            | EventKind::OrphanCheck => return Err(bad()),
             _ => {}
         }
     }
     // An `EditApplied` with no result can only be the journal's last record:
     // a crash between the two. Re-fed as the edit it records (its result's
     // own fields were never written, so nothing after it is compared).
-    for (seq, (at, e)) in edits {
-        if at != last_seq {
-            return Err(diverge(at, 0, "a record is not the shape the loop writes"));
+    for (seq, group) in edits {
+        // Only the journal's very last record may dangle; but a whole edit
+        // group (P-25) was written together, so any but its last member
+        // dangling is a shape the loop does not write either.
+        let last = group.last().map_or(0, |(at, _)| *at);
+        if last != last_seq {
+            return Err(diverge(
+                last,
+                0,
+                "a record is not the shape the loop writes",
+            ));
         }
-        feed.push_back(RecordedResult {
-            capability: intents.get(&seq).cloned().unwrap_or_default(),
-            status: Some(ToolStatus::Ok),
-            output: Vec::new(),
-            truncated: false,
-            digest: harness_core::sha256(b""),
-            read_sha256: None,
-            environment: None,
-            edit: Some(e),
-            exec: None,
-        });
+        let cap = intents.get(&seq).cloned().unwrap_or_default();
+        for (_, e) in group {
+            feed.push_back(RecordedResult {
+                capability: cap.clone(),
+                status: Some(ToolStatus::Ok),
+                output: Vec::new(),
+                truncated: false,
+                digest: harness_core::sha256(b""),
+                read_sha256: None,
+                environment: None,
+                edits: vec![e],
+                exec: None,
+            });
+        }
     }
     Ok(Recorded {
         backend,

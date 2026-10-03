@@ -19,3 +19,13 @@ path = "src/main.rs"
 # `serde_json`, so it cannot pull a runtime, a process API or anything else
 # the purity gate has not reviewed into the test tree.
 serde_json.workspace = true
+
+[dev-dependencies]
+# P-37e: the client state machine's hostile-server suite lives here (this
+# package hosts the fixture `serve` the tests drive AND the in-memory
+# pipes the tests run it on). The client crate itself is purity-scanned
+# whole (scripts/ci/purity.sh §2), so it may not name the pipes, the
+# clock or a served session even in its tests; this package is not
+# scanned. The design note's original direction (harness-mcp
+# dev-depending on this lib) moves with P-37h's `testing` seam.
+harness-mcp = { path = "../harness-mcp" }

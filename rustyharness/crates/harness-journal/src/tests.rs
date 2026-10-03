@@ -1548,13 +1548,21 @@ fn source_web_escaped_in_journal() {
 
 /// The reader's closed set stays closed: a canonical, correctly re-chained
 /// record with an unknown kind is refused by name (P-10 added nine kinds,
-/// P-39c added two, and nothing else).
+/// P-36h two more, P-37g three more, P-39c two more, and nothing else).
 #[test]
 fn unknown_kind_still_refused() {
     let (r, b, _) = session_journal();
     let ls = lines(&b);
     let v = verify(&b, &r.blobs).unwrap();
-    for name in ["ModeChangedLater", "NoteSavedX", "NoteImportedX"] {
+    // Near-miss names, MCP-family and note-family ones included now that
+    // the kinds exist.
+    for name in [
+        "ModeChangedLater",
+        "McpConnectedLater",
+        "mcp_connected",
+        "NoteSavedX",
+        "NoteImportedX",
+    ] {
         let mut forged: serde_json::Map<String, Value> = serde_json::from_slice(&ls[2]).unwrap();
         forged.insert("kind".into(), Value::from(name));
         let (l2, _) = recompute_hash(
@@ -1573,6 +1581,104 @@ fn unknown_kind_still_refused() {
         );
         assert_eq!(EventKind::parse(name), None, "{name}");
     }
+}
+
+/// P-36h: the background-process kinds exist in the closed set, are
+/// fsynced (measurements the audit re-feeds), and their canonical bodies
+/// round-trip through the writer and the reader byte for byte.
+#[test]
+fn bg_stopped_and_orphan_check_kinds_round_trip_canonical() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let run = rid(7);
+    w.append(
+        0,
+        Event::new(EventKind::BgStopped)
+            .field("id", Trusted::U64(2))
+            .field("reason", Trusted::Text("run_end"))
+            .field(
+                "end",
+                Trusted::Obj(vec![
+                    ("end", Trusted::Text("exited")),
+                    ("code", Trusted::I64(0)),
+                ]),
+            )
+            .field(
+                "cleanup",
+                Trusted::Obj(vec![("confirmed", Trusted::U64(1))]),
+            )
+            .field("out_total", Trusted::U64(12))
+            .field("err_total", Trusted::U64(0))
+            .field("out_sha", Trusted::Digest(sha256(b"stdout bytes")))
+            .field("err_sha", Trusted::Digest(sha256(b""))),
+    )
+    .unwrap();
+    w.append(
+        0,
+        Event::new(EventKind::OrphanCheck)
+            .field("markers", Trusted::U64(1))
+            .field("clear", Trusted::U64(0))
+            .field(
+                "suspect",
+                Trusted::List(vec![Trusted::Obj(vec![
+                    ("run", Trusted::Id(Ident::from_trusted(&run).unwrap())),
+                    ("id", Trusted::U64(3)),
+                    ("lease", Trusted::Text("held")),
+                    ("ports_busy", Trusted::List(vec![Trusted::U64(5173)])),
+                ])]),
+            )
+            .field("action", Trusted::Text("refused")),
+    )
+    .unwrap();
+    // Durable: the header and both records are synced.
+    assert_eq!(r.syncs.get(), 3);
+    let v = verify(&bytes(&r), &r.blobs).unwrap();
+    let kinds: Vec<EventKind> = v.records.iter().map(|rec| rec.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::RunStarted,
+            EventKind::BgStopped,
+            EventKind::OrphanCheck
+        ]
+    );
+    // Exactly the canonical fields, on the wire as documented.
+    let stopped = &v.records[1].body;
+    assert_eq!(stopped.len(), 8, "exactly the canonical fields");
+    assert_eq!(stopped.get("id"), Some(&Value::from(2u64)));
+    assert_eq!(stopped.get("reason"), Some(&Value::from("run_end")));
+    assert_eq!(
+        stopped.get("end"),
+        Some(&serde_json::json!({"code": 0, "end": "exited"}))
+    );
+    assert_eq!(
+        stopped.get("cleanup"),
+        Some(&serde_json::json!({"confirmed": 1}))
+    );
+    assert_eq!(stopped.get("out_total"), Some(&Value::from(12u64)));
+    assert_eq!(stopped.get("err_total"), Some(&Value::from(0u64)));
+    assert_eq!(
+        stopped.get("out_sha"),
+        Some(&Value::from(sha256(b"stdout bytes").to_string()))
+    );
+    assert_eq!(
+        stopped.get("err_sha"),
+        Some(&Value::from(sha256(b"").to_string()))
+    );
+    let check = &v.records[2].body;
+    assert_eq!(check.len(), 4, "exactly the canonical fields");
+    assert_eq!(check.get("markers"), Some(&Value::from(1u64)));
+    assert_eq!(check.get("clear"), Some(&Value::from(0u64)));
+    assert_eq!(check.get("action"), Some(&Value::from("refused")));
+    let suspect = check.get("suspect").unwrap().as_array().unwrap();
+    assert_eq!(suspect.len(), 1);
+    assert_eq!(suspect[0].get("run"), Some(&Value::from(run.as_str())));
+    assert_eq!(suspect[0].get("id"), Some(&Value::from(3u64)));
+    assert_eq!(suspect[0].get("lease"), Some(&Value::from("held")));
+    assert_eq!(
+        suspect[0].get("ports_busy"),
+        Some(&Value::from(vec![Value::from(5173u64)]))
+    );
 }
 
 /// A user-source payload verifies: the reader recomputes the payload's
@@ -1735,6 +1841,282 @@ fn tap_has_nothing_after_poison() {
     // The failed record was never written, so nothing is tapped.
     assert!(w.drain_tap().is_empty());
     let _ = r;
+}
+
+// ---- P-37g: MCP kinds and the ToolFinished mcp_* fields ---------------------
+
+/// The connect-time baseline list (the §11 `tools` payload).
+const BASELINE_LIST: &[u8] = br#"[{"name":"echo","inputSchema":{"type":"object"}}]"#;
+
+/// The drifted list (the `McpDrift` `tools` payload).
+const DRIFTED_LIST: &[u8] =
+    br#"[{"name":"echo","description":"changed","inputSchema":{"type":"object"}}]"#;
+
+/// The raw `tools/call` request line whose digest `mcp_request` carries.
+const CALL_LINE: &[u8] =
+    br#"{"id":1,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{},"name":"echo"}}"#;
+
+/// A raw `tools/call` response line, over `INLINE_MAX` so the payload home
+/// is a blob store reference, as a big server response's would be.
+fn response_line() -> Vec<u8> {
+    let mut line = br#"{"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"#.to_vec();
+    line.push(b'"');
+    line.extend(std::iter::repeat_n(b'x', 5000));
+    line.extend(br#""}],"isError":false}}"#.iter().copied());
+    line
+}
+
+/// An MCP-shaped journal: header, `McpConnected` (step 0), a `ToolFinished`
+/// of an MCP capability with the `mcp_*` fields, `McpDrift`, `McpStopped`,
+/// `RunStopped`.
+fn mcp_journal() -> (Rig, Vec<u8>, Digest) {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let server = Source::Tool("fixture.echo".into());
+    let info = w
+        .untrusted(&Untrusted::new(
+            br#"{"serverInfo":{"name":"fake"}}"#.to_vec(),
+            server.clone(),
+        ))
+        .unwrap();
+    let tools = w
+        .untrusted(&Untrusted::new(BASELINE_LIST.to_vec(), server.clone()))
+        .unwrap();
+    w.append(
+        0,
+        Event::new(EventKind::McpConnected)
+            .field("provider", Trusted::Id(id("fixture")))
+            .field("protocol", Trusted::Text("2025-06-18"))
+            .field("server_info", Trusted::Untrusted(info))
+            .field("tools", Trusted::Untrusted(tools))
+            .field("tools_sha256", Trusted::Digest(sha256(BASELINE_LIST)))
+            .field(
+                "pins",
+                Trusted::Obj(vec![("fixture.echo", Trusted::Text("ok"))]),
+            )
+            .field("dropped", Trusted::U64(0)),
+    )
+    .unwrap();
+    let response = w
+        .untrusted(&Untrusted::new(response_line(), server.clone()))
+        .unwrap();
+    w.append(
+        1,
+        Event::new(EventKind::ToolFinished)
+            .field("capability", Trusted::Id(id("fixture.echo")))
+            .field("status", Trusted::Text("ok"))
+            .field("mcp_request_id", Trusted::U64(1))
+            .field("mcp_request", Trusted::Digest(sha256(CALL_LINE)))
+            .field("mcp_list", Trusted::Digest(sha256(BASELINE_LIST)))
+            .field("mcp_noise", Trusted::U64(3))
+            .field("mcp_response", Trusted::Untrusted(response)),
+    )
+    .unwrap();
+    let drifted = w
+        .untrusted(&Untrusted::new(DRIFTED_LIST.to_vec(), server.clone()))
+        .unwrap();
+    w.append(
+        2,
+        Event::new(EventKind::McpDrift)
+            .field("provider", Trusted::Id(id("fixture")))
+            .field("tools", Trusted::Untrusted(drifted))
+            .field("tools_sha256", Trusted::Digest(sha256(DRIFTED_LIST)))
+            .field(
+                "quarantined",
+                Trusted::Obj(vec![("fixture.echo", Trusted::Text("entry_changed"))]),
+            )
+            .field("added", Trusted::U64(1)),
+    )
+    .unwrap();
+    let stderr = w
+        .untrusted(&Untrusted::new(b"server log tail".to_vec(), server))
+        .unwrap();
+    w.append(
+        2,
+        Event::new(EventKind::McpStopped)
+            .field("provider", Trusted::Id(id("fixture")))
+            .field("reason", Trusted::Text("timeout"))
+            .field("cleanup", Trusted::Text("confirmed"))
+            .field("kills", Trusted::U64(1))
+            .field("stderr", Trusted::Untrusted(stderr))
+            .field("stderr_dropped", Trusted::U64(4096)),
+    )
+    .unwrap();
+    let rel = w.commit(2, &StopCause::Cancelled, unreadable(), None);
+    assert!(rel.chain_head.is_some(), "{rel:?}");
+    let head = rel.chain_head.unwrap();
+    let b = bytes(&r);
+    (r, b, head)
+}
+
+/// The three MCP kinds round trip through the canonical encoding and the
+/// verifying reader, each body with exactly its canonical fields, and every
+/// untrusted payload bound by its home (P-37 §11).
+#[test]
+fn mcp_kinds_round_trip_canonical() {
+    let (r, b, head) = mcp_journal();
+    let v = verify(&b, &r.blobs).unwrap();
+    let kinds: Vec<EventKind> = v.records.iter().map(|x| x.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::RunStarted,
+            EventKind::McpConnected,
+            EventKind::ToolFinished,
+            EventKind::McpDrift,
+            EventKind::McpStopped,
+            EventKind::RunStopped
+        ]
+    );
+    assert!(v.is_complete());
+    assert_eq!(v.head, head);
+
+    let connected = &v.records[1].body;
+    assert_eq!(connected.len(), 7, "exactly the canonical fields");
+    assert_eq!(connected.get("provider"), Some(&Value::from("fixture")));
+    assert_eq!(connected.get("protocol"), Some(&Value::from("2025-06-18")));
+    assert_eq!(
+        connected.get("tools_sha256"),
+        Some(&Value::from(sha256(BASELINE_LIST).to_string()))
+    );
+    assert_eq!(
+        connected.get("pins"),
+        Some(&serde_json::json!({"fixture.echo": "ok"}))
+    );
+    assert_eq!(connected.get("dropped"), Some(&Value::from(0u64)));
+    let tools = connected.get("tools").unwrap();
+    assert_eq!(tools.get("untrusted"), Some(&Value::Bool(true)));
+    assert_eq!(
+        tools.get("sha256"),
+        Some(&Value::from(sha256(BASELINE_LIST).to_string()))
+    );
+    assert_eq!(
+        tools.get("len"),
+        Some(&Value::from(BASELINE_LIST.len() as u64))
+    );
+
+    let drift = &v.records[3].body;
+    assert_eq!(drift.len(), 5, "exactly the canonical fields");
+    assert_eq!(
+        drift.get("tools_sha256"),
+        Some(&Value::from(sha256(DRIFTED_LIST).to_string()))
+    );
+    assert_eq!(
+        drift.get("quarantined"),
+        Some(&serde_json::json!({"fixture.echo": "entry_changed"}))
+    );
+    assert_eq!(drift.get("added"), Some(&Value::from(1u64)));
+
+    let stopped = &v.records[4].body;
+    assert_eq!(stopped.len(), 6, "exactly the canonical fields");
+    assert_eq!(stopped.get("provider"), Some(&Value::from("fixture")));
+    assert_eq!(stopped.get("reason"), Some(&Value::from("timeout")));
+    assert_eq!(stopped.get("cleanup"), Some(&Value::from("confirmed")));
+    assert_eq!(stopped.get("kills"), Some(&Value::from(1u64)));
+    assert_eq!(stopped.get("stderr_dropped"), Some(&Value::from(4096u64)));
+}
+
+/// The three MCP kinds are fsynced (inputs or provider-state changes resume
+/// keys on, P-37 §11), like the session kinds.
+#[test]
+fn mcp_kinds_are_fsynced() {
+    for k in [
+        EventKind::McpConnected,
+        EventKind::McpDrift,
+        EventKind::McpStopped,
+    ] {
+        assert!(k.needs_fsync(), "{}", k.as_str());
+    }
+    let (r, b, _) = mcp_journal();
+    verify(&b, &r.blobs).unwrap();
+    // header, McpConnected, ToolFinished (already fsynced), McpDrift,
+    // McpStopped, RunStopped: every record synced.
+    assert_eq!(r.syncs.get(), 6);
+}
+
+/// The `mcp_*` fields round trip on the `ToolFinished` record, the raw
+/// response is bound by its payload home, and a built-in capability's
+/// result carries no `mcp_*` field.
+#[test]
+fn tool_finished_mcp_fields_round_trip() {
+    let (r, b, _) = mcp_journal();
+    let v = verify(&b, &r.blobs).unwrap();
+    let fin = &v.records[2].body;
+    assert_eq!(fin.len(), 7, "the usual fields plus exactly the mcp ones");
+    assert_eq!(fin.get("mcp_request_id"), Some(&Value::from(1u64)));
+    assert_eq!(
+        fin.get("mcp_request"),
+        Some(&Value::from(sha256(CALL_LINE).to_string()))
+    );
+    assert_eq!(
+        fin.get("mcp_list"),
+        Some(&Value::from(sha256(BASELINE_LIST).to_string()))
+    );
+    assert_eq!(fin.get("mcp_noise"), Some(&Value::from(3u64)));
+    let response = fin.get("mcp_response").unwrap();
+    assert_eq!(
+        response.get("sha256"),
+        Some(&Value::from(sha256(&response_line()).to_string()))
+    );
+    assert_eq!(
+        response.get("len"),
+        Some(&Value::from(response_line().len() as u64))
+    );
+    assert!(response.get("blob").is_some(), "over INLINE_MAX, so a blob");
+
+    let (r2, b2, _) = good_journal();
+    let v2 = verify(&b2, &r2.blobs).unwrap();
+    assert!(!v2.records[2].body.keys().any(|k| k.starts_with("mcp_")));
+}
+
+/// The stored response bytes are evidence: an alteration in the blob store
+/// is caught, and so is an edit of the payload home with the record hash
+/// recomputed (only the payload check can catch that one).
+#[test]
+fn mcp_response_blob_tamper_detected() {
+    let (r, b, _) = mcp_journal();
+    let v = verify(&b, &r.blobs).unwrap();
+    // The journal has exactly one blob: the 5 000-byte response line.
+    let altered = MemBlobs::default();
+    for (k, val) in r.blobs.map.borrow().iter() {
+        let mut val = val.clone();
+        val[0] ^= 1;
+        altered.map.borrow_mut().insert(k.clone(), val);
+    }
+    assert_eq!(
+        verify(&b, &altered).unwrap_err(),
+        Broken {
+            record: 2,
+            why: BreakKind::UntrustedMismatch
+        }
+    );
+    // A len edit with the hash recomputed.
+    let ls = lines(&b);
+    let mut forged: serde_json::Map<String, Value> = serde_json::from_slice(&ls[2]).unwrap();
+    let body = forged.get_mut("body").unwrap().as_object_mut().unwrap();
+    let response = body
+        .get_mut("mcp_response")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    let len = response.get("len").unwrap().as_u64().unwrap();
+    response.insert("len".into(), Value::from(len + 1));
+    let (l2, _) = recompute_hash(
+        Value::Object(forged).to_string().as_bytes(),
+        &v.records[1].hash,
+    );
+    let mut ls2 = ls.clone();
+    ls2[2] = l2;
+    assert_eq!(
+        verify(&join(&ls2[..3]), &r.blobs).unwrap_err(),
+        Broken {
+            record: 2,
+            why: BreakKind::UntrustedMismatch
+        }
+    );
+    // The unaltered journal still verifies.
+    let again = verify(&b, &r.blobs).unwrap();
+    assert_eq!(again.head, v.head);
 }
 
 // ---- fuzz-style robustness (P-54) ----------------------------------------------

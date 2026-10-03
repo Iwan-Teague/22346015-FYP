@@ -56,12 +56,23 @@ pub(crate) fn is_submit_sentinel(c: &Capability) -> bool {
 }
 
 /// The built-in workspace edit tools (§4.8, §4.9; H2b; `harness.edit.multi`
-/// since H2e).
-pub const EDIT_IDS: [&str; 3] = [
+/// since H2e; the patch script and the delete/move file operations since
+/// P-25). The first three are the confirmation-`none` edit class; the last
+/// three are [`FILEOP_IDS`], which declare `user_confirm` and so always ask
+/// (§5.2's confirmation floor) — a user allow rule cannot reach them.
+pub const EDIT_IDS: [&str; 6] = [
     "harness.edit.replace",
     "harness.edit.write",
     "harness.edit.multi",
+    "harness.edit.patch",
+    "harness.edit.delete",
+    "harness.edit.move",
 ];
+
+/// The P-25 file operations, the `EDIT_IDS` members whose manifest
+/// confirmation is `user_confirm`: `harness.edit.delete` and
+/// `harness.edit.move`.
+pub const FILEOP_IDS: [&str; 2] = ["harness.edit.delete", "harness.edit.move"];
 
 /// The rule id of the built-in edits' default decision in this build (§5.2,
 /// H2b): an ask, since the workspace is edited in place.
@@ -71,8 +82,11 @@ pub const EDIT_DEFAULT_RULE: &str = "ask.edit.in-place";
 /// gives it (write / operational / own / none, content own, no declared
 /// confirmation). Anything else under those ids would not be the harness's
 /// edit tool, and its write class is then out of scope like any other.
+/// Only the confirmation-`none` edits pass; the file operations'
+/// `user_confirm` keeps them out of here and in [`is_builtin_fileop`].
 pub(crate) fn is_builtin_edit(c: &Capability) -> bool {
     EDIT_IDS.contains(&c.id().as_str())
+        && !FILEOP_IDS.contains(&c.id().as_str())
         && c.id().provider() == BUILTIN_NAMESPACE
         && c.effect() == Effect::Write
         && c.sensitivity() == Sensitivity::Operational
@@ -80,6 +94,22 @@ pub(crate) fn is_builtin_edit(c: &Capability) -> bool {
         && c.egress() == Egress::None
         && c.content() == Content::Own
         && c.confirmation() == Confirmation::None
+}
+
+/// Whether `c` is a built-in P-25 file operation with exactly the labels
+/// §4.8 gives the edits, except the declared confirmation: `user_confirm`,
+/// which policy's floor turns into an ask no matter what the user's rules
+/// say (§5.2). Anything else under those ids is out of scope like any
+/// provider's.
+pub(crate) fn is_builtin_fileop(c: &Capability) -> bool {
+    FILEOP_IDS.contains(&c.id().as_str())
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Write
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::Own
+        && c.confirmation() == Confirmation::UserConfirm
 }
 
 /// The built-in checklist (H2e): the model's own list of steps, kept in the
@@ -131,10 +161,71 @@ pub const CHILD_ELIGIBLE: [&str; 5] = [READ_ID, SEARCH_ID, LIST_ID, GLOB_ID, OUT
 /// The built-in command runner (§4.8; H2d).
 pub const EXEC_ID: &str = "harness.exec.run";
 
+/// The built-in fetch tool (§2.3, P-39b): one URL from the session's
+/// allowlist, in the research manifest only.
+pub const WEB_FETCH_ID: &str = "harness.web.fetch";
+
+/// The built-in web search tool (§2.3, P-39b): the session's configured
+/// search endpoint, in the research manifest only.
+pub const WEB_SEARCH_ID: &str = "harness.web.search";
+
+/// The rule that allows a fetch whose URL is exactly on the session's
+/// allowlist (§2.3).
+pub const WEB_ALLOWLIST_RULE: &str = "allow.web.session-allowlist";
+
+/// The rule that allows a search against the session's configured endpoint
+/// (§2.3).
+pub const WEB_SEARCH_RULE: &str = "allow.web.search-endpoint";
+
+/// Whether `c` is one of the two built-in web tools with exactly the labels
+/// §2.3 gives them (read / operational / own / internet, content
+/// `third_party`, no declared confirmation). Anything else under those ids
+/// would not be the harness's web tool, and its egress class is then out of
+/// scope like any provider's.
+fn is_builtin_web(c: &Capability, id: &str) -> bool {
+    c.id().as_str() == id
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Read
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::Internet
+        && c.content() == Content::ThirdParty
+        && c.confirmation() == Confirmation::None
+}
+
+/// Whether `c` is the built-in fetch tool with exactly the §2.3 labels.
+pub(crate) fn is_builtin_web_fetch(c: &Capability) -> bool {
+    is_builtin_web(c, WEB_FETCH_ID)
+}
+
+/// Whether `c` is the built-in search tool with exactly the §2.3 labels.
+pub(crate) fn is_builtin_web_search(c: &Capability) -> bool {
+    is_builtin_web(c, WEB_SEARCH_ID)
+}
+
+/// Whether `id` is one of the two web tool ids (§2.3). Only a research
+/// session can hold one; a coding session granting one is refused (§2.2).
+pub(crate) fn is_web_id(id: &str) -> bool {
+    matches!(id, WEB_FETCH_ID | WEB_SEARCH_ID)
+}
+
+/// Whether `id` is one of the four capabilities the research manifest
+/// declares (§2.2): the web tools plus the checklist and the submit
+/// sentinel. A research session grants nothing else.
+pub(crate) fn is_research_id(id: &str) -> bool {
+    matches!(id, WEB_FETCH_ID | WEB_SEARCH_ID | TODO_ID | SUBMIT_ID)
+}
+
 /// The rule id of the command runner's default decision in this build
 /// (H2d): an ask, like the edits (the workspace is changed in place, with no
 /// snapshot to undo a command).
 pub const EXEC_DEFAULT_RULE: &str = "ask.exec.default";
+
+/// The rule id of an mcp-stdio capability's default decision in this build
+/// (P-37b, §6.3): the pinned tier's derived `user_confirm` floor. The
+/// capability asks by default; a user allow rule (consulted first) allows it
+/// unattended, and with no approver present the ask is a deny (§5.2).
+pub const MCP_DEFAULT_RULE: &str = "ask.mcp.pinned";
 
 /// Whether `c` is the built-in command runner with exactly the labels §4.8
 /// gives it (execute / operational / own / none), `content: third_party`
@@ -171,6 +262,9 @@ pub enum ToolKind {
     Edit,
     /// The command runner (§4.8, H2d).
     Exec,
+    /// A web airlock tool (§2.3, P-39b): needs no workspace; a session
+    /// holding one must be a research session.
+    Web,
 }
 
 impl ToolKind {
@@ -249,6 +343,21 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         labels: is_builtin_edit,
     },
     BuiltinTool {
+        id: "harness.edit.patch",
+        kind: ToolKind::Edit,
+        labels: is_builtin_edit,
+    },
+    BuiltinTool {
+        id: "harness.edit.delete",
+        kind: ToolKind::Edit,
+        labels: is_builtin_fileop,
+    },
+    BuiltinTool {
+        id: "harness.edit.move",
+        kind: ToolKind::Edit,
+        labels: is_builtin_fileop,
+    },
+    BuiltinTool {
         id: "harness.exec.run",
         kind: ToolKind::Exec,
         labels: is_builtin_exec,
@@ -267,6 +376,20 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         id: "harness.task.submit",
         kind: ToolKind::Submit,
         labels: is_submit_sentinel,
+    },
+    // The web airlock (P-39b, §2.3) lives only in the research manifest; the
+    // entries sit here so registration, and with it every planning check,
+    // consults one table. Appending them changes no coding-session decision
+    // (pinned by `tests::policy_default_table_unchanged`).
+    BuiltinTool {
+        id: WEB_FETCH_ID,
+        kind: ToolKind::Web,
+        labels: is_builtin_web_fetch,
+    },
+    BuiltinTool {
+        id: WEB_SEARCH_ID,
+        kind: ToolKind::Web,
+        labels: is_builtin_web_search,
     },
 ];
 

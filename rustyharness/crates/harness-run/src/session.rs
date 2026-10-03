@@ -411,6 +411,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
 
     // ---- The loop. ----
     let meter = new_meter(limits, Box::new(SystemClock::default()));
+    let edit_tools = pre.edit_tools.clone();
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: s.registry,
@@ -419,7 +420,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         facts: loop_facts(&facts, s.spec),
         profile: s.profile,
         backend: s.backend,
-        providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec_tools),
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools, pre.patch_tools, exec_tools),
         meter,
         detector: LoopDetector::new(),
         turns: Vec::new(),
@@ -435,7 +436,9 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
             attempt,
             s.approver,
             std::collections::VecDeque::new(),
-        ),
+        )
+        .may_grant(s.config.run.allow_session_grants)
+        .with_edits(Some(edit_tools)),
         env: s.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),

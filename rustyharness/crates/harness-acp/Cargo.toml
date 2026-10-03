@@ -1,0 +1,39 @@
+[package]
+name = "harness-acp"
+description = "rustyharness ACP server (P-35): the Agent Client Protocol v1 over stdio (newline-delimited JSON-RPC), bridging `initialize`, `session/new`, `session/prompt`, `session/cancel` and `session/request_permission` onto harness-run's session loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The display sanitizer (untrusted model/tool text never reaches a client
+# raw) and the sha256 the tool-call correlation digest needs.
+harness-core = { path = "../harness-core" }
+# The journal's blob unescape (`canon::unescape`) and the stop-cause wire
+# names the session report's cause maps from.
+harness-journal = { path = "../harness-journal" }
+# The admitted providers a session's `SessionRun` carries.
+harness-manifest = { path = "../harness-manifest" }
+# The model backend trait and profile the session runs under.
+harness-model = { path = "../harness-model" }
+# The approval request the ACP client answers, the user policy and the
+# filesystem-locality probe the session is planned with.
+harness-policy = { path = "../harness-policy" }
+# The session loop (`run_session`) and its seams: `UserInput`, `EventSink`,
+# `Approver`, `Confinement`.
+harness-run = { path = "../harness-run" }
+harness-sandbox = { path = "../harness-sandbox" }
+# The only crates.io dep (pure-crate-adjacent allowlist, P-35): the wire is
+# built and parsed as `serde_json::Value`s by hand — no derive, no new
+# third-party dependencies beyond what the workspace already pins.
+serde_json.workspace = true
+
+[dev-dependencies]
+# The fixture, scripted model and audit assertion the integration tests
+# share with the rest of the workspace.
+harness-testkit = { path = "../harness-testkit" }

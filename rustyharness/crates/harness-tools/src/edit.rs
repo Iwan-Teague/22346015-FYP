@@ -193,6 +193,13 @@ impl ReadLog {
         self.files.insert(path.to_owned(), sha256);
     }
 
+    /// Forget a path's recorded read (P-25): the file was deleted or
+    /// moved away by the run's own delete/move, so a later edit must be
+    /// anchored on a fresh read (the path does not exist as it was).
+    pub fn forget(&mut self, path: &str) {
+        self.files.remove(path);
+    }
+
     /// The digest recorded for `path`, if any.
     pub fn get(&self, path: &str) -> Option<Digest> {
         self.files.get(path).copied()
@@ -455,7 +462,7 @@ impl From<ResolveErr> for EditError {
 }
 
 /// The in-process edit engine over one workspace (§4.9).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EditEngine {
     root: PathBuf,
     protected: Protected,
@@ -732,7 +739,7 @@ pub const WRITE_MAX_NEW_DIRS: usize = 8;
 /// workspace root, shallowest first; when it fails, what it made is removed
 /// again. The path was checked lexically ([`WorkspacePath`]: no `..`, no
 /// absolute path, no empty component), so the walk stays below `root`.
-fn create_parents(root: &Path, wp: &WorkspacePath) -> Result<Vec<String>, EditError> {
+pub(crate) fn create_parents(root: &Path, wp: &WorkspacePath) -> Result<Vec<String>, EditError> {
     let comps: Vec<&str> = wp.components().collect();
     let parents = comps.len().saturating_sub(1);
     let mut made: Vec<String> = Vec::new();
@@ -778,7 +785,7 @@ fn create_parents(root: &Path, wp: &WorkspacePath) -> Result<Vec<String>, EditEr
 /// Remove directories [`create_parents`] made, deepest first. Best effort:
 /// `remove_dir` removes an empty directory only, so it never removes
 /// anything the edit did not make.
-fn remove_dirs(root: &Path, made: &[String]) {
+pub(crate) fn remove_dirs(root: &Path, made: &[String]) {
     for rel in made.iter().rev() {
         let _ = fs::remove_dir(root.join(rel));
     }
@@ -966,7 +973,7 @@ fn plan_write_overwrite(req: &WriteReq, text: &str, bytes: &[u8]) -> Result<Vec<
 /// the preview's read-only mirror of [`create_parents`] (H2f) — each
 /// existing component must be a real directory (a symlink is refused,
 /// as everywhere), and at most [`WRITE_MAX_NEW_DIRS`] may be missing.
-fn check_new_parents(root: &Path, wp: &WorkspacePath) -> Result<(), EditError> {
+pub(crate) fn check_new_parents(root: &Path, wp: &WorkspacePath) -> Result<(), EditError> {
     let comps: Vec<&str> = wp.components().collect();
     let parents = comps.len().saturating_sub(1);
     let mut missing = 0usize;
@@ -1073,7 +1080,7 @@ fn bad_args_text(out: &Out) -> String {
 
 /// How many lines `bytes` has, as `str::lines` counts them (a final line
 /// without a newline counts; a trailing newline adds none).
-fn line_count(bytes: &[u8]) -> usize {
+pub(crate) fn line_count(bytes: &[u8]) -> usize {
     let nl = bytes.iter().filter(|&&b| b == b'\n').count();
     match bytes.last() {
         None => 0,
@@ -1084,7 +1091,7 @@ fn line_count(bytes: &[u8]) -> usize {
 
 /// Refuse content over the edit cap before it is written: the re-read of
 /// the verification could not read it back.
-fn check_cap(content: &[u8]) -> Result<(), EditError> {
+pub(crate) fn check_cap(content: &[u8]) -> Result<(), EditError> {
     let len = u64::try_from(content.len()).unwrap_or(u64::MAX);
     if len > EDIT_MAX_BYTES {
         return Err(EditError::TooLarge {
@@ -1100,7 +1107,7 @@ fn check_cap(content: &[u8]) -> Result<(), EditError> {
 /// store could not keep them, so the edit is refused, fail closed. `len`
 /// is the file's metadata size, so an oversize file is refused without
 /// being read.
-fn check_pre_image(len: u64) -> Result<(), EditError> {
+pub(crate) fn check_pre_image(len: u64) -> Result<(), EditError> {
     if len > PRE_IMAGE_MAX_BYTES {
         return Err(EditError::PreImageTooLarge {
             len,
@@ -1157,7 +1164,7 @@ fn zero_matches(text: &str, old: &str) -> EditError {
 
 /// Byte offsets of the non-overlapping occurrences of `needle` in
 /// `text`.
-fn find_offsets(text: &str, needle: &str) -> Vec<usize> {
+pub(crate) fn find_offsets(text: &str, needle: &str) -> Vec<usize> {
     text.match_indices(needle).map(|(o, _)| o).collect()
 }
 
@@ -1171,7 +1178,7 @@ fn line_of(text: &str, off: usize) -> usize {
 }
 
 /// `s` with every `\r\n` reduced to `\n`.
-fn normalize_lf(s: &str) -> String {
+pub(crate) fn normalize_lf(s: &str) -> String {
     if s.contains("\r\n") {
         s.replace("\r\n", "\n")
     } else {
@@ -1181,7 +1188,7 @@ fn normalize_lf(s: &str) -> String {
 
 /// Whether CRLF is the file's dominant line ending: at least one CRLF
 /// and at least as many CRLFs as bare LFs.
-fn crlf_dominant(s: &str) -> bool {
+pub(crate) fn crlf_dominant(s: &str) -> bool {
     let b = s.as_bytes();
     let lf = b.iter().filter(|&&x| x == b'\n').count();
     let crlf = b.windows(2).filter(|w| w == b"\r\n").count();
@@ -1190,7 +1197,7 @@ fn crlf_dominant(s: &str) -> bool {
 }
 
 /// `s` with every bare LF turned into CRLF (existing CRLFs stay).
-fn lf_to_crlf(s: &str) -> String {
+pub(crate) fn lf_to_crlf(s: &str) -> String {
     // `'\r'`/`'\n'` are ASCII, so char-level insertion is sound UTF-8.
     let mut out = String::with_capacity(s.len() + s.len() / 8);
     let mut prev = '\0';
@@ -1313,11 +1320,18 @@ pub const MULTI: &str = "harness.edit.multi";
 /// digest as the file's latest read, and keeps its tree digest current. An
 /// [`EditError::Unverified`] result is the one error after which the file
 /// may have changed ([`code::UNVERIFIED`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EditTools {
     ns: ProviderName,
     engine: EditEngine,
 }
+
+/// Whether this build keeps the P-22 pre-image store, which records every
+/// edit's before-image (up to [`PRE_IMAGE_MAX_BYTES`]) so a later slice can
+/// restore it. The store is unconditional today; the constant exists so a
+/// caller that would trade undoability for a blanket allow (`--accept-edits`,
+/// P-23) can refuse the trade instead of making it silently.
+pub const PRE_IMAGE_STORE: bool = true;
 
 impl EditTools {
     /// The edit tools over the workspace at `root`, under the read tools'
@@ -1599,9 +1613,9 @@ fn record(a: &Applied) -> EditRecord {
     EditRecord {
         path: a.path.clone(),
         before: a.before,
-        after: a.after,
+        after: Some(a.after),
         before_image: a.before_image.clone(),
-        after_image: a.after_image.clone(),
+        after_image: Some(a.after_image.clone()),
     }
 }
 
@@ -1780,7 +1794,7 @@ impl ToolProvider for EditTools {
             _ => self.write(&c.args, ctx.reads),
         };
         let mut res = finish(cap, out);
-        res.edit = edit;
+        res.edits = edit.into_iter().collect();
         Ok(res)
     }
 }

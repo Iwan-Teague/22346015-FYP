@@ -20,7 +20,7 @@ use harness_journal::testing::{FaultFile, FaultPlan, MemBlobs};
 use harness_journal::{Clock, Event, EventKind, Header, Ident, JournalWriter};
 use harness_manifest::admission::{Registry, Tier};
 use harness_manifest::{builtin, SemVer, ValidationContext};
-use harness_policy::{Call, Session, SessionSpec, UserPolicy, WorkspaceDecl};
+use harness_policy::{Call, Session, SessionKind, SessionSpec, UserPolicy, WorkspaceDecl};
 use harness_tools::builtin::code;
 use harness_tools::{
     EditTools, InvokeCtx, ReadLog, ReadTools, RefusalKind, ToolProvider, ToolResult, ToolStatus,
@@ -79,6 +79,7 @@ impl Rig {
                 conformed: false,
                 exec_programs: Vec::new(),
                 read_window: None,
+                kind: SessionKind::Coding,
             },
             &reg,
             &UserPolicy::new(
@@ -151,7 +152,7 @@ fn text(r: &ToolResult) -> String {
 }
 
 fn is_error(r: &ToolResult, c: u16) -> bool {
-    r.status == ToolStatus::Error { code: c } && r.edit.is_none()
+    r.status == ToolStatus::Error { code: c } && r.edits.is_empty()
 }
 
 #[test]
@@ -167,10 +168,10 @@ fn a_replace_reports_lines_and_digests_and_carries_its_record() {
     assert_eq!(r.status, ToolStatus::Ok, "{}", text(&r));
     let before = sha256(b"one\nconst X: u8 = 1;\nthree\n");
     let after = sha256(b"one\nconst X: u8 = 2;\nthree\n");
-    let e = r.edit.as_ref().unwrap();
+    let e = r.edits.first().unwrap();
     assert_eq!(
         (e.path.as_str(), e.before, e.after),
-        ("a.rs", Some(before), after)
+        ("a.rs", Some(before), Some(after))
     );
     let t = text(&r);
     assert!(
@@ -194,7 +195,7 @@ fn a_write_creates_and_rewrites() {
         json!({"path": "n.md", "content": "a\nb\n"}),
     );
     assert_eq!(r.status, ToolStatus::Ok, "{}", text(&r));
-    assert_eq!(r.edit.as_ref().unwrap().before, None);
+    assert_eq!(r.edits.first().unwrap().before, None);
     assert!(
         text(&r).starts_with("created n.md: 2 lines; sha256 "),
         "{}",
@@ -406,13 +407,13 @@ fn h2e_multi_applies_every_edit_in_order_as_one_verified_edit() {
     assert_eq!(r.status, ToolStatus::Ok, "{}", text(&r));
     let want = "/// The most upload attempts before giving up.\npub const UPLOAD_ATTEMPTS: u32 = 3;\n\npub fn tries() -> u32 {\n    UPLOAD_ATTEMPTS\n}\n";
     assert_eq!(fs::read_to_string(ws.join("lim.rs")).unwrap(), want);
-    let e = r.edit.as_ref().unwrap();
+    let e = r.edits.first().unwrap();
     assert_eq!(
         (e.path.as_str(), e.before, e.after),
         (
             "lim.rs",
             Some(sha256(MULTI_SRC.as_bytes())),
-            sha256(want.as_bytes())
+            Some(sha256(want.as_bytes()))
         )
     );
     let t = text(&r);
@@ -714,9 +715,9 @@ fn h2f_a_write_creates_missing_directories_and_says_which() {
         fs::read_to_string(ws.join("src/a/b/new.rs")).unwrap(),
         "fn main() {}\n"
     );
-    let rec = r.edit.expect("one edit record");
+    let rec = r.edits.first().expect("one edit record");
     assert_eq!(rec.before, None);
-    assert_eq!(rec.after, sha256(b"fn main() {}\n"));
+    assert_eq!(rec.after, Some(sha256(b"fn main() {}\n")));
     // One directory made: singular; an existing directory is not "made".
     let r = rig.call(
         "harness.edit.write",

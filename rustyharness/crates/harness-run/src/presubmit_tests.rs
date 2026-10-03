@@ -136,7 +136,7 @@ impl ToolProvider for FakeExec {
             output: Untrusted::new(text.into_bytes(), Source::Tool(EXEC_ID.to_owned())),
             truncated: false,
             read: None,
-            edit: None,
+            edits: Vec::new(),
             exec: Some(ExecRecord {
                 end: ExecEnd::Exited(c.exit),
                 cleanup: c.cleanup,
@@ -171,7 +171,7 @@ impl ToolProvider for Others {
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
             read: None,
-            edit: None,
+            edits: Vec::new(),
             exec: None,
         })
     }
@@ -829,7 +829,7 @@ fn recorded_check_results_are_re_fed_and_never_run_again() {
                 digest: sha256(text.as_bytes()),
                 read_sha256: None,
                 environment: None,
-                edit: None,
+                edits: Vec::new(),
                 exec: Some((
                     ExecRecord {
                         end: ExecEnd::Exited(c.exit),
@@ -859,7 +859,7 @@ fn recorded_check_results_are_re_fed_and_never_run_again() {
             digest: sha256(read_text.as_bytes()),
             read_sha256: None,
             environment: None,
-            edit: None,
+            edits: Vec::new(),
             exec: None,
         },
     );
@@ -903,7 +903,7 @@ fn a_forged_check_result_changes_what_the_replay_writes() {
         digest: sha256(text.as_bytes()),
         read_sha256: None,
         environment: None,
-        edit: None,
+        edits: Vec::new(),
         exec: Some((
             ExecRecord {
                 end: ExecEnd::Exited(exit),
@@ -958,7 +958,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
                 output: Untrusted::new(text.as_bytes().to_vec(), Source::Tool(EXEC_ID.into())),
                 truncated: false,
                 read: None,
-                edit: None,
+                edits: Vec::new(),
                 exec: Some(ExecRecord {
                     end: ExecEnd::TimedOut,
                     cleanup: ExecCleanup::Confirmed { kills: 2 },

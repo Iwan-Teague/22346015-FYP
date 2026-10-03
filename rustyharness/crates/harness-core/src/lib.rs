@@ -6,6 +6,11 @@
 //! environment-sample vocabulary, and the pure HTML-to-text extractor
 //! (P-44).
 //!
+//! P-39d adds the pure `rh-fetch/1` frame codec ([`fetch_frame`]): how the
+//! confined web fetcher reports one hop back to the harness (design note
+//! `P-39-web-airlock` §5.2). The fetcher itself lives in the sibling
+//! `harness-fetch` crate.
+//!
 //! The gate-layer outcome type lives in the sibling `gate-outcome` crate
 //! (`GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`); this
 //! crate defines none and must never (the INV-28 grep gate refuses any
@@ -27,6 +32,7 @@
 pub mod diff;
 pub mod display;
 pub mod environment;
+pub mod fetch_frame;
 pub mod glob;
 pub mod html;
 pub mod objfile;

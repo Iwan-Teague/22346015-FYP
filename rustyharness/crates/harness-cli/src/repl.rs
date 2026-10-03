@@ -295,7 +295,17 @@ impl ChatInput<'_, '_> {
                     None => note!(self.cx, "no journal yet"),
                 }
             }
-            ("/diff", _) => note!(self.cx, "/diff needs P-40 (not in this build)"),
+            ("/diff", _) => {
+                let dir = st.attempt_dir.clone();
+                let ws = st.workspace.clone();
+                drop(st);
+                match dir {
+                    Some(d) => {
+                        crate::cmd_review::review_live(self.cx, &d, &ws);
+                    }
+                    None => note!(self.cx, "no journal yet"),
+                }
+            }
             _ => note!(self.cx, "unknown command; {HELP}"),
         }
         Slash::Continue

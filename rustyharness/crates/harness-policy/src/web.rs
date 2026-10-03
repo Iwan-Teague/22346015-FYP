@@ -407,6 +407,81 @@ impl Allowlist {
             port: url.port,
         })
     }
+
+    /// Which part of a refused URL failed the exact match (§2.3): the decide
+    /// branch names one rule. Deterministic, and every answer still refuses:
+    /// scheme when some entry names the same host and port under the other
+    /// scheme, port when some entry names the host at the URL's scheme, and
+    /// host when no entry names the host at all.
+    pub(crate) fn mismatch(&self, url: &WebUrl) -> UrlMismatch {
+        let same_host_port = self
+            .entries
+            .iter()
+            .any(|e| e.host == url.host && e.port == url.port && e.scheme != url.scheme);
+        if same_host_port {
+            return UrlMismatch::Scheme;
+        }
+        let same_host_scheme = self
+            .entries
+            .iter()
+            .any(|e| e.host == url.host && e.scheme == url.scheme);
+        if same_host_scheme {
+            UrlMismatch::Port
+        } else {
+            UrlMismatch::Host
+        }
+    }
+}
+
+/// Why a refused URL is not exactly on the allowlist (§2.3's three rule
+/// names). The security outcome is the same for all three; the rule only
+/// says which tuple member differed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UrlMismatch {
+    /// The scheme differs from the entry naming the same host and port.
+    Scheme,
+    /// The port differs from the entry naming the same host and scheme.
+    Port,
+    /// No entry names the host at all.
+    Host,
+}
+
+/// The widest a search query may be, in characters (§2.3).
+pub(crate) const MAX_QUERY_CHARS: usize = 256;
+
+/// Whether a search query passes §2.3's bounds: 1..=256 characters, and no
+/// control, zero-width or bidi code point. The schema bounds `maxLength`
+/// only; the lower bound and the invisibility rule are policy's (the same
+/// code point set the manifest refuses in summaries).
+pub(crate) fn query_clean(q: &str) -> bool {
+    q.chars().count() <= MAX_QUERY_CHARS
+        && !q.is_empty()
+        && !q.chars().any(|c| c.is_control() || is_invisible_or_bidi(c))
+}
+
+/// Zero-width and bidi-control code points (§2.3, §4.3): the manifest's
+/// summary set.
+fn is_invisible_or_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 
 /// Parse one allowlist entry (§4.1). Refuses, in order: wildcards, an

@@ -55,6 +55,27 @@ impl Matcher {
         })
     }
 
+    /// Build a matcher whose only condition is `argv_prefix`: the prefix
+    /// list a session grant records for one exec call (P-23). The same
+    /// shape rules as [`Matcher::parse`]'s `argv_prefix` key hold: the
+    /// list must be non-empty and hold no empty item — an empty item would
+    /// match every argv.
+    pub fn argv_prefix(items: Vec<String>) -> Result<Matcher, PolicyConfigError> {
+        if items.is_empty() {
+            return Err(bad_matcher("argv_prefix must not be empty"));
+        }
+        if items.iter().any(String::is_empty) {
+            return Err(bad_matcher(
+                "argv_prefix holds an empty item, which would match every argv",
+            ));
+        }
+        Ok(Matcher {
+            path_glob: None,
+            argv_prefix: Some(items),
+            argv_not_prefix: None,
+        })
+    }
+
     /// Parse the value of a rule's `"match"` key (must be an object, and
     /// not empty: a `match` that says nothing is an authoring mistake the
     /// §5.1 order cannot disambiguate). Unknown keys are refused.
@@ -153,9 +174,10 @@ impl Matcher {
     }
 
     /// The matcher's canonical JSON text (sorted keys): what the policy
-    /// digest appends to a rule's line and what makes two rules with the
-    /// same selector comparable.
-    pub(crate) fn canonical(&self) -> String {
+    /// digest appends to a rule's line, what makes two rules with the
+    /// same selector comparable, and what a session grant digests into
+    /// its `RuleGranted` journal event (P-23).
+    pub fn canonical(&self) -> String {
         let mut m = serde_json::Map::new();
         if let Some(pg) = &self.path_glob {
             m.insert("path_glob".into(), Value::from(pg.source.clone()));

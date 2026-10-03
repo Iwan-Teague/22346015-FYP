@@ -544,6 +544,18 @@ pub fn users_dropped_text(k: u64) -> HarnessText {
     ))
 }
 
+/// The notice after a verified restore to an earlier workspace state
+/// (P-26): the step the workspace went back to and how many files the
+/// undo touched, both from the journaled `Restored` record, so the
+/// replay recomputes the same text. The model is told its later edits
+/// were undone, so it does not assume they still stand.
+pub fn restored_notice_text(files: usize, to_step: u64) -> HarnessText {
+    HarnessText::rendered(format!(
+        "The workspace was restored to its state as of step {to_step}: {files} file edit(s) were undone \
+         by the user. Your edits after that step no longer stand; read a file before you rely on it."
+    ))
+}
+
 /// The harness message after an accepted `harness.task.submit` in a
 /// session (P-05 §2.5): the turn is over, the session goes on.
 pub const SUBMIT_ACCEPTED_TEXT: &str =
@@ -3114,6 +3126,13 @@ sha256 {} -> sha256 {}). A file you read earlier may have changed: read it again
                 sha256(b"o"),
                 sha256(b"n")
             )
+        );
+        // The restore notice (P-26) names the step the workspace went
+        // back to and how many edits were undone.
+        assert_eq!(
+            restored_notice_text(2, 7).as_str(),
+            "The workspace was restored to its state as of step 7: 2 file edit(s) were undone \
+by the user. Your edits after that step no longer stand; read a file before you rely on it."
         );
         // Session system message = rules + session sentence, then the
         // protocol spec, then its session sentence; the batch one is

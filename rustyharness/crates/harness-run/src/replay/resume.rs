@@ -367,6 +367,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -736,6 +737,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        restore: Default::default(),
         // The resumed session opens turns: the catch-up re-feeds the kept
         // turns' inputs, then the live source is asked (a boundary) or the
         // interrupted turn keeps running (mid-turn).

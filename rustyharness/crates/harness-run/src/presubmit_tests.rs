@@ -404,6 +404,7 @@ fn drive(s: Setup<'_>) -> Done {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -1027,6 +1028,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: PresubmitState::of(&spec.presubmit),
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);

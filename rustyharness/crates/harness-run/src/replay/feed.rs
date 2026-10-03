@@ -374,6 +374,41 @@ pub(crate) fn recorded(
             EventKind::UserTurn | EventKind::TurnEnded | EventKind::InputEnded if !session => {
                 return Err(bad())
             }
+            // P-26: a `Restored` is re-fed by its checkpoint — the step and
+            // the tree digest the record names; everything else (the files
+            // the undone edits named, the notice) is recomputed from the
+            // journal's own edit records and compared by the record's body.
+            EventKind::Restored => {
+                if !session {
+                    return Err(bad());
+                }
+                if r.body.len() != 3
+                    || !["to_step", "tree_digest", "files"]
+                        .iter()
+                        .all(|k| r.body.contains_key(*k))
+                {
+                    return Err(bad());
+                }
+                let to_step = r
+                    .body
+                    .get("to_step")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(bad)?;
+                let tree_digest = digest_at(&r.body, "tree_digest").ok_or_else(bad)?;
+                // The files payload is a JSON array of path strings: the
+                // shape the loop writes, checked here so a record that
+                // could never be recomputed is refused at the source.
+                let bytes = payload_bytes(r.body.get("files").ok_or_else(bad)?, blobs, r.seq)
+                    .map_err(|_| bad())?;
+                let files: Vec<Value> = serde_json::from_slice(&bytes).map_err(|_| bad())?;
+                if files.iter().any(|f| !f.is_string()) {
+                    return Err(bad());
+                }
+                inputs.push_back(RecordedInput::Restore {
+                    to_step,
+                    tree_digest,
+                });
+            }
             // P-17 §6: a `UserTurn` is re-fed in exactly its re-fed parts —
             // the text, the facts it was measured with, and its wall time —
             // in exactly the shape the loop writes (nine fields). Everything
@@ -460,7 +495,6 @@ pub(crate) fn recorded(
             // P-36j/P-36l, and their re-feed is P-36k: until then they are
             // refused like the other reserved names.
             EventKind::ModeChanged
-            | EventKind::Restored
             | EventKind::InstructionsLoaded
             | EventKind::ForkedFrom
             | EventKind::ChildRun

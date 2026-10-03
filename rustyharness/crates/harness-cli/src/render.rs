@@ -55,6 +55,7 @@ impl EventSink for SinkRenderer<'_, '_> {
             EventKind::ToolStarted => self.tool_started(ev),
             EventKind::ToolFinished => self.tool_finished(ev),
             EventKind::EditApplied => self.edit_applied(ev),
+            EventKind::Restored => self.restored(ev),
             EventKind::ApprovalRequested => {
                 let cap = text(ev.body.get("capability"));
                 let tier = text(ev.body.get("tier"));
@@ -194,6 +195,28 @@ impl<'c, 'a> SinkRenderer<'c, 'a> {
             .unwrap_or_default();
         let shown = sanitize_for_terminal_bounded(&path, DisplayMode::Line, 200);
         note!(self.cx, "[edit] {shown} applied");
+    }
+
+    /// A restore's one line: the checkpoint it went back to and how many
+    /// file edits it undid (the files themselves were shown as `[edit]`
+    /// lines when they were made).
+    fn restored(&self, ev: &UiEvent<'_>) {
+        let to_step = ev.body.get("to_step").and_then(Value::as_u64).unwrap_or(0);
+        let files = ev
+            .body
+            .get("files")
+            .cloned()
+            .map(|f| {
+                blob_text(ev.blobs, &f)
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+                    .map(|f| f.len())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        note!(
+            self.cx,
+            "[restore] back to step {to_step}: {files} file edit(s) undone"
+        );
     }
 
     fn user_turn(&self, ev: &UiEvent<'_>) {

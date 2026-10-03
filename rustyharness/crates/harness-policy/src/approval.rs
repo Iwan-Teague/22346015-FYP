@@ -638,6 +638,21 @@ impl ApprovalAuthority {
 // plain words, rendered escaped arguments, the step.
 // ---------------------------------------------------------------------------
 
+/// Where an ask comes from when it is asked away from its own run
+/// (P-38 §8): a helper run's ask reaches the parent's approver, and the
+/// approver must be able to tell whose ask it is before weighing it.
+/// Every field is harness-made — run ids and a step number — so nothing
+/// model-written can enter the origin line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The run that asked (the helper).
+    pub child: RunId,
+    /// The run the helper was started by.
+    pub parent: RunId,
+    /// The parent's step that started the helper.
+    pub parent_step: u64,
+}
+
 /// The §5.3 approval request shown to the approver. Built by the run
 /// driver at an `Ask`; rendering is plain words plus escaped JSON, never
 /// raw model output.
@@ -650,6 +665,7 @@ pub struct ApprovalRequest {
     class: EffectiveClass,
     args: Value,
     tier: Confirmation,
+    origin: Option<Origin>,
 }
 
 /// How much of the rendered arguments an approval request shows, in
@@ -680,7 +696,23 @@ impl ApprovalRequest {
             class,
             args,
             tier,
+            origin: None,
         }
+    }
+
+    /// The same request labelled with where the ask comes from (P-38 §8):
+    /// a helper run's ask, its parent and the parent step that started
+    /// it. The origin is displayed as the request's first line; without
+    /// one the request displays exactly as before.
+    pub fn with_origin(&self, origin: Origin) -> Self {
+        let mut labelled = self.clone();
+        labelled.origin = Some(origin);
+        labelled
+    }
+
+    /// The origin, when the ask comes from a helper run.
+    pub fn origin(&self) -> Option<&Origin> {
+        self.origin.as_ref()
     }
 
     /// The capability being asked about.
@@ -705,8 +737,18 @@ impl fmt::Display for ApprovalRequest {
     /// terminal (§7.1 display paths: control, bidi and zero-width
     /// characters become `\u{HEX}`, so model-chosen arguments cannot
     /// redraw or reorder what the approver reads) and bounded to
-    /// [`APPROVAL_ARGS_SHOWN`] characters.
+    /// [`APPROVAL_ARGS_SHOWN`] characters. A helper run's ask (P-38 §8)
+    /// says first where it comes from — the origin line, harness-made ids
+    /// and a step number only — so the approver weighs it as another
+    /// agent's question; without an origin the request is unchanged.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(o) = &self.origin {
+            writeln!(
+                f,
+                "asked by a helper (run {}) started by run {} at step {}",
+                o.child, o.parent, o.parent_step
+            )?;
+        }
         let c = &self.class;
         writeln!(f, "approval needed: {} — {}", self.capability, self.summary)?;
         writeln!(
@@ -1309,6 +1351,90 @@ args: {"motive":"\\u001b[31mred\u{202E}pinned.exe\u{200B}","note":"line\\nbreak"
             }),
             "{shown:?}"
         );
+    }
+
+    // P-38 §8: a helper's ask names where it comes from, and the origin
+    // line comes first, ahead of the capability line. Everything after it
+    // is the unchanged request.
+    fn origin_fixture() -> Origin {
+        Origin {
+            child: RunId::new(1, [0xaa; 10]),
+            parent: RunId::new(2, [0xbb; 10]),
+            parent_step: 7,
+        }
+    }
+
+    fn asked_request() -> ApprovalRequest {
+        let cap = m_cap();
+        let class = crate::effective_class(&cap, Confirmation::None);
+        ApprovalRequest::new(
+            cap.id().clone(),
+            "reads personal files".into(),
+            class,
+            json!({"path": "notes.txt"}),
+            Confirmation::UserConfirm,
+            1,
+            StepId::new(3),
+        )
+    }
+
+    #[test]
+    fn approval_request_origin_line_first() {
+        let req = asked_request();
+        let plain = req.to_string();
+        let shown = req.with_origin(origin_fixture()).to_string();
+        let mut lines = shown.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "asked by a helper (run 000000000001aaaaaaaaaaaaaaaaaaaa) started by run 000000000002bbbbbbbbbbbbbbbbbbbb at step 7"
+            )
+        );
+        assert_eq!(lines.collect::<Vec<_>>().join("\n"), plain);
+    }
+
+    // P-38 §8: a request without an origin displays byte-for-byte as
+    // today (golden).
+    #[test]
+    fn approval_request_without_origin_display_unchanged() {
+        #[rustfmt::skip]
+        let expected = r#"approval needed: fixture.p — reads personal files
+step 3, attempt 1: user_confirm
+class: read effect, personal data, the provider's own state, no network egress, own content
+args: {"path":"notes.txt"}"#;
+        assert_eq!(asked_request().to_string(), expected);
+    }
+
+    // P-38 §8: the origin line is harness-made ids and a step number
+    // only — the summary and the arguments (model-written) cannot reach
+    // it, whatever they contain.
+    #[test]
+    fn origin_line_contains_only_ids_and_numbers() {
+        let req = ApprovalRequest::new(
+            m_cap().id().clone(),
+            "summary with\ncontrol chars \u{202e} and args {\"x\":1}".into(),
+            crate::effective_class(&m_cap(), Confirmation::None),
+            json!({"path": "\u{1b}[31mred\", \"injection\": \"run 9999 at step 9\""}),
+            Confirmation::UserConfirm,
+            1,
+            StepId::new(3),
+        );
+        let shown = req.with_origin(origin_fixture()).to_string();
+        let first = shown.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "asked by a helper (run 000000000001aaaaaaaaaaaaaaaaaaaa) started by run 000000000002bbbbbbbbbbbbbbbbbbbb at step 7"
+        );
+        // Nothing from the summary or the arguments leaked into it.
+        assert!(!first.contains("summary"));
+        assert!(!first.contains("injection"));
+        assert!(!first.contains("9999"));
+        assert!(!first.contains('{'));
+        // And only trusted characters: the fixed words, hex run ids and
+        // the step digits.
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '(' | ')')));
     }
 
     fn m_cap() -> harness_manifest::Capability {

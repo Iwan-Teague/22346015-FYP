@@ -1,0 +1,40 @@
+[package]
+name = "rh-dev"
+description = "rustyharness dev-only tooling (outside the shipped workspace): the `linux` verb runs the Linux conformance suite in the UTM VM over ssh."
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/Iwan-Teague/rustyharness"
+
+# Deliberately its own (nested) workspace root, NOT a member of the repo's
+# root workspace: the root purity gate refuses any workspace package whose
+# source it does not read (INV-23 §5 only admits crates/<name>), and its
+# INV-23 §2f refuses the word `Command` in any crates/*/src file outside the
+# two pinned spawn modules — both by design, since this tool's whole job is
+# to drive ssh/rsync/utmctl by argv. Living under tools/ as a standalone
+# crate keeps the shipped workspace (and its Cargo.lock, H-F) untouched.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rh-dev"
+path = "src/main.rs"
+
+# No dependencies at all (std only): same posture as the root workspace,
+# which admits no third-party crate without review.
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+# The root workspace's panic-set ratchet, mirrored here so the dev tool is
+# held to the same standard its gates cannot reach.
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+panic = "warn"

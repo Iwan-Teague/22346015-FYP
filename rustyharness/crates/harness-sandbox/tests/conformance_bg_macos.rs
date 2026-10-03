@@ -279,45 +279,56 @@ fn bg_sigkill_harness_entrypoint() {
 /// control pipes, the stub stops the program and sweeps the whole domain
 /// — including the setsid grandchild — with no harness code running. The
 /// test re-execs this binary as the harness (see the entrypoint above).
+///
+/// The harness is spawned through `sh ... &` so that this process is
+/// never its parent and launchd reaps it. The stub's per-pass canary
+/// accepts only EPERM or ESRCH, and on macOS `kill(0, zombie)` still
+/// succeeds: if the harness died and stayed a zombie past the stub's
+/// first sweep pass (one 20 ms select tick after the pipes closed), the
+/// canary would report and the domain would get no sweep at all. A
+/// reaper on this test's own scheduling (a thread blocked in `wait`)
+/// loses that race on a loaded host; launchd reaps at kernel pace, so
+/// the stub always sees ESRCH.
 #[test]
 fn ft_bg_parent_sigkill_sweeps_the_domain() {
     let t = Tree::new("parent-death");
     let pidfile = t.ws.join("pid");
     let grandfile = t.ws.join("grand");
+    let harness_pidfile = t.ws.join("harness-pid");
     let exe = std::env::current_exe().unwrap();
-    let mut h = Command::new(exe)
-        .args(["bg_sigkill_harness_entrypoint", "--exact", "--nocapture"])
+    let sh = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("\"$0\" \"$1\" --exact --nocapture & echo $! >\"$2\"")
+        .arg(&exe)
+        .arg("bg_sigkill_harness_entrypoint")
+        .arg(&harness_pidfile)
         .env("RH_BG_HARNESS", "sigkill")
         .env("RH_BG_WS", &t.ws)
         .env("RH_BG_CHILD_PF", &pidfile)
         .env("RH_BG_GRAND_PF", &grandfile)
-        .spawn()
+        .status()
         .unwrap();
-    let harness_pid = h.id();
-    // Reap the harness the instant it dies: the stub's per-pass canary
-    // check accepts only EPERM or ESRCH, and on macOS `kill(0, zombie)`
-    // still succeeds — an unreaped harness would make the stub report a
-    // canary and skip the sweep the crash is supposed to get. A thread
-    // already blocked in `wait` reaps within microseconds of the SIGKILL;
-    // the stub's perl needs far longer to reach its first check.
-    let reaper = std::thread::spawn(move || h.wait());
+    assert!(sh.success(), "the sh wrapper must have started the harness");
+    wait_for(&harness_pidfile, "the harness's own pid marker");
+    let harness_pid: u32 = std::fs::read_to_string(&harness_pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     let guards = || -> (u32, u32) {
         wait_for(&pidfile, "the harness child's pid marker");
         wait_for(&grandfile, "the setsid grandchild's pid marker");
         (pid_in(&pidfile), pid_in(&grandfile))
     };
     let (pid, grand) = guards();
-    // Murder the harness with the call still open.
+    // Murder the harness with the call still open. It is not this
+    // process's child, so there is nothing to reap (see the comment on
+    // the spawn above).
     Command::new("/bin/kill")
         .arg("-KILL")
         .arg(harness_pid.to_string())
         .status()
         .unwrap();
-    let reaper_status = reaper
-        .join()
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|s| format!("{s:?}"));
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut timeline: Vec<String> = Vec::new();
     let mut tick = Instant::now();
@@ -361,7 +372,7 @@ fn ft_bg_parent_sigkill_sweeps_the_domain() {
             }
             panic!(
                 "the domain outlived its killed harness (pid {pid}, grand {grand}); \
-                 harness exit {reaper_status:?}; timeline:\n{}\nsurvivors:\n{mine}",
+                 timeline:\n{}\nsurvivors:\n{mine}",
                 timeline.join("\n")
             );
         }

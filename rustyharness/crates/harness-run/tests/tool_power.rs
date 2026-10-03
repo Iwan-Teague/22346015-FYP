@@ -101,6 +101,7 @@ fn spec(grants: &[&str]) -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -197,7 +198,7 @@ impl Setup {
         resume(Resume {
             state_root: state,
             run: &r.run,
-            workspace: ws,
+            workspace: Some(ws),
             spec: &spec(&self.grants),
             registry: &registry(),
             policy: &self.policy,

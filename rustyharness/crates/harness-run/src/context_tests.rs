@@ -151,6 +151,7 @@ fn drive(
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_policy::SessionKind::Coding,
     };
     let policy = UserPolicy::default();
     let (session, tools) = plan(&spec, &reg, &policy, profile, false, false).unwrap();
@@ -202,6 +203,7 @@ fn drive(
         reads: ReadLog::default(),
         tree: harness_core::sha256(b"tree"),
         workspace: None,
+        research: false,
         approvals: Approvals::new(&RunId::new(9, [2; 10]), 1, None, Default::default()),
         env: &env,
         pressure: Vec::new(),

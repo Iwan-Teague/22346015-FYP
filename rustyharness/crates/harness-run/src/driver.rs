@@ -58,7 +58,7 @@ use harness_manifest::admission::Registry;
 use harness_model::profile::Profile;
 use harness_model::{ModelBackend, TaskText};
 use harness_policy::locality::{self, LocalityProbe, LocalityRefused};
-use harness_policy::{SessionRefused, UserPolicy};
+use harness_policy::{SessionKind, SessionRefused, UserPolicy};
 use harness_sandbox::{Confinement, Refused};
 use harness_tools::builtin::RootRefused;
 use harness_tools::{ExecSetupError, ExecSpec};
@@ -67,9 +67,11 @@ pub(crate) use approvals::Approvals;
 pub use header::WorkspaceModeRecord;
 pub(crate) use header::{
     builtin_manifest_sha256, header, limits_fields, protected_task_digest, terse_table_sha256,
-    ExecHeader, HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
+    web_grant_digest, ExecHeader, HeaderInputs, SandboxRecord, HEADER_INPUT_KEYS,
 };
-pub(crate) use plan::{attempt_check, create_run, loop_facts, plan, prepare, todo_for, Prepared};
+pub(crate) use plan::{
+    attempt_check, create_run, loop_facts, no_workspace_facts, plan, prepare, todo_for, Prepared,
+};
 pub(crate) use step::{BudgetNotices, Loop, LoopInit, NonceSource};
 pub(crate) use stop::commit;
 pub(crate) use tools::{exec_tools, is_edit, is_exec, parse_exec, RecordedEdit, RecordedResult};
@@ -99,6 +101,10 @@ pub struct TaskSpec {
     /// Task-declared protected-path globs (P-29), on top of the build's
     /// defaults: edits under them are refused, exec sees them read-only.
     pub protected: Vec<String>,
+    /// The session's kind (P-39i): [`SessionKind::Coding`] (the default,
+    /// unchanged) or [`SessionKind::Research`] — a workspace-less session
+    /// driven by [`crate::run_research`].
+    pub kind: SessionKind,
 }
 
 /// Budgets and timeouts (§2.4).
@@ -257,6 +263,12 @@ pub enum RunRefused {
     /// The session's turn limits are out of range (P-05 §4); nothing ran.
     #[error("turn limits refused: {0}")]
     TurnLimits(&'static str),
+    /// A research session's spec is refused (P-39i, fail closed): web
+    /// capabilities this build does not wire, an exec section, pre-submit
+    /// commands, protected paths, a workspace, no confinement, a witness
+    /// short of the web airlock, or the wrong registry. Nothing ran.
+    #[error("research session refused: {0}")]
+    Research(&'static str),
 }
 
 impl RunRefused {
@@ -312,12 +324,19 @@ pub struct RunReport {
 /// Run a task (see the crate docs). `Err` means the run did not start.
 pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
     // ---- Before anything is written. ----
+    // A research session (P-39i) is not a batch run: it is driven by
+    // `run_research`, whose loop carries the conversation.
+    if let SessionKind::Research(_) = r.spec.kind {
+        return Err(RunRefused::Research(
+            "a research session is not a batch run; drive it with run_research",
+        ));
+    }
     let pre = prepare(
         r.spec,
         r.registry,
         r.policy,
         r.profile,
-        r.workspace,
+        Some(r.workspace),
         r.state_root,
         r.probe,
         r.config,
@@ -381,7 +400,8 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         feed: std::collections::VecDeque::new(),
         reads: ReadLog::default(),
         tree: facts.tree,
-        workspace: Some(pre.tree),
+        workspace: pre.tree,
+        research: false,
         approvals: Approvals::new(
             &run_id,
             attempt,
@@ -389,7 +409,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
             std::collections::VecDeque::new(),
         )
         .may_grant(r.config.allow_session_grants)
-        .with_edits(Some(edit_tools)),
+        .with_edits(edit_tools),
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),

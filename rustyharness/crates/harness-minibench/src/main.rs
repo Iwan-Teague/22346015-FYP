@@ -677,6 +677,7 @@ fn spec_of(t: &TaskFile) -> TaskSpec {
             max_rounds: p.max_rounds.unwrap_or(DEFAULT_ROUNDS),
         }),
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 

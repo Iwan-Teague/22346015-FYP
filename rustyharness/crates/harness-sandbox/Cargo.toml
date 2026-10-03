@@ -32,6 +32,13 @@ harness-core = { path = "../harness-core" }
 harness-policy = { path = "../harness-policy" }
 thiserror.workspace = true
 
+# The Linux delegation (slice S-La, design §6.7): the workspace's one named
+# `unsafe` crate, where the Landlock/seccomp primitives will live. Target-
+# gated, so every other OS builds pull none of it. Not a registry dep: a
+# path dep inside crates/, read whole by scripts/ci/purity.sh §2f/§5.
+[target.'cfg(target_os = "linux")'.dependencies]
+harness-sandbox-linux = { path = "../harness-sandbox-linux" }
+
 [dev-dependencies]
 # The fixture HTTP client for the egress pump tests (a workspace crate,
 # not a new registry dependency; P-39g runs this same protocol over the

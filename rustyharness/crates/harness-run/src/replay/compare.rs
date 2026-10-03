@@ -6,9 +6,9 @@ use std::borrow::Cow;
 use harness_core::MeterLimits;
 use harness_journal::{EventKind, Record};
 use harness_manifest::admission::{Registry, Resolved};
-use harness_model::context::{CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
+use harness_model::context::{CONTEXT_FORMAT, RESEARCH_CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol, ToolDocs};
-use harness_policy::{UserPolicy, SUBMIT_ID};
+use harness_policy::{SessionKind, UserPolicy, SUBMIT_ID};
 use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
 use serde_json::{Map, Value};
 
@@ -128,9 +128,14 @@ pub(crate) fn expected_inputs(
     }
     m.insert(
         "context_format".into(),
-        Value::from(match session {
-            Some(_) => SESSION_CONTEXT_FORMAT,
-            None => CONTEXT_FORMAT,
+        Value::from(match &spec.kind {
+            // A research session's contexts are the research ones (P-39i),
+            // whatever the turn limits say.
+            SessionKind::Research(_) => RESEARCH_CONTEXT_FORMAT,
+            SessionKind::Coding => match session {
+                Some(_) => SESSION_CONTEXT_FORMAT,
+                None => CONTEXT_FORMAT,
+            },
         }),
     );
     m.insert(
@@ -157,6 +162,16 @@ pub(crate) fn expected_inputs(
                 .map(|(k, v)| (k.to_owned(), Value::from(v)))
                 .collect(),
             ),
+        );
+    }
+    // P-39i: a research session's kind and web grant; no key without them,
+    // as the header writes it (the web grant as its canonical digest, the
+    // allowlist being run input), so a coding journal compares as before.
+    if let SessionKind::Research(g) = &spec.kind {
+        m.insert("session_kind".into(), Value::from("research"));
+        m.insert(
+            "web".into(),
+            Value::from(crate::driver::web_grant_digest(g).to_string()),
         );
     }
     m
@@ -200,6 +215,8 @@ fn header_mismatch(key: &str) -> &'static str {
         }
         "mode" => "the run's mode (batch or session) differs from the recorded header",
         "turn_limits" => "the turn limits given differ from the recorded header",
+        "session_kind" => "the session kind differs from the recorded header",
+        "web" => "the web grant (allowlist, search, confirmation) differs from the recorded header",
         "context_format" => {
             "another harness build wrote this journal (its context format differs: since H1h the \
              native protocol shows past actions as tool calls, since H1i each observation keeps \

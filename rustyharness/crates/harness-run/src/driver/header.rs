@@ -8,9 +8,9 @@ use harness_core::{sha256, MeterLimits, Source, Untrusted};
 use harness_journal::{Header, Ident, StartError, Trusted};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::builtin;
-use harness_model::context::{CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
+use harness_model::context::{CONTEXT_FORMAT, RESEARCH_CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol};
-use harness_policy::{UserPolicy, SUBMIT_ID};
+use harness_policy::{SessionKind, UserPolicy, WebConfirmation, SUBMIT_ID};
 use harness_sandbox::Conformed;
 use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
@@ -242,8 +242,9 @@ impl ExecHeader {
 /// task's exec allowlist: absent without an exec grant, so a journal
 /// without one reads as before. `mode` and `turn_limits` (P-05 §1.4) are
 /// the session's: absent in a batch run's header, so such a journal reads
-/// as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 17] = [
+/// as before. `session_kind` and `web` (P-39i) are a research session's:
+/// absent for a coding session, so coding journals read exactly as before.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 19] = [
     "task",
     "grants",
     "workspace_public",
@@ -261,6 +262,8 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 17] = [
     "presubmit",
     "mode",
     "turn_limits",
+    "session_kind",
+    "web",
 ];
 
 /// The header's `limits` object, field by field: the one encoding the
@@ -293,6 +296,24 @@ pub(crate) fn builtin_manifest_sha256() -> Digest {
 /// `builtin_manifest` digest.
 pub(crate) fn terse_table_sha256() -> Digest {
     sha256(builtin::terse_table_text().as_bytes())
+}
+
+/// The `web` header input of a research session (P-39i, INV-42): the
+/// SHA-256 of the grant's canonical JSON — the allowlist exactly as the
+/// task gave it, the search flag, the confirmation. A digest, because the
+/// allowlist is run input: a journal names the authority it started with,
+/// and an audit or a resume recomputes the same digest or refuses.
+pub(crate) fn web_grant_digest(g: &harness_policy::WebGrant) -> Digest {
+    let v = serde_json::json!({
+        "allowlist": g.allowlist,
+        "confirmed": match g.confirmed {
+            Some(WebConfirmation::Tty) => "tty",
+            Some(WebConfirmation::Flag) => "flag",
+            None => "none",
+        },
+        "search": g.search,
+    });
+    sha256(v.to_string().as_bytes())
 }
 
 pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> {
@@ -385,12 +406,16 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
         )
         // What this build's contexts and requests are (H1h): a replay
         // recomputes them, so it needs the same format. A session run's
-        // contexts differ (the users' share, P-05 §2.3), so it has its own.
+        // contexts differ (the users' share, P-05 §2.3), so it has its own;
+        // a research session's differ again (P-39i, rh-research/1).
         .field(
             "context_format",
-            Trusted::Text(match h.session {
-                Some(_) => SESSION_CONTEXT_FORMAT,
-                None => CONTEXT_FORMAT,
+            Trusted::Text(match &spec.kind {
+                SessionKind::Research(_) => RESEARCH_CONTEXT_FORMAT,
+                SessionKind::Coding => match h.session {
+                    Some(_) => SESSION_CONTEXT_FORMAT,
+                    None => CONTEXT_FORMAT,
+                },
             }),
         )
         // The sandbox commands run under (H2d): the witness's backend, row
@@ -454,6 +479,15 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
                 ("format_errors", Trusted::U64(u64::from(t.format_errors))),
             ]),
         );
+    }
+    // P-39i: a research session's kind and web grant, header inputs an
+    // audit or a resume compares (INV-42: the session's own authority,
+    // journaled before any use). No key for a coding session, so coding
+    // journals read exactly as before.
+    if let SessionKind::Research(g) = &spec.kind {
+        hd = hd
+            .field("session_kind", Trusted::Text("research"))
+            .field("web", Trusted::Digest(web_grant_digest(g)));
     }
     if let Some((attempt, head, carried_ms, skipped)) = &h.resumed_from {
         let mut from = vec![

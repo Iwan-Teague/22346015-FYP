@@ -485,6 +485,7 @@ fn compare_each_arm_audits_clean() {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     };
     let policy = harness_policy::UserPolicy::default();
     let limits = harness_run::RunConfig::defaults(1_000_000).limits;

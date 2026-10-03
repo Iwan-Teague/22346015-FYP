@@ -804,11 +804,24 @@ sort -u "$tmpdir/ws-registry-raw" >"$tmpdir/ws-registry" || fail "sort failed (I
 #     search run away; the harness also bounds the compiled size and the
 #     lazy DFA's cache. `perf-literal` is off, so aho-corasick is not in
 #     the build (memchr already was, through serde_json).
+#   landlock, rustix, enumflags2 (design §6.7, slices S-Lb/S-Lc — admitted
+#     here ahead of first use, by review): the Linux confinement primitives
+#     behind harness-sandbox-linux, the ONE named unsafe crate (§5b).
+#     `landlock` 0.4 (the Rust Landlock ABI wrapper, MIT OR Apache-2.0) is
+#     a thin safe layer over the kernel's landlock syscalls; `rustix` is
+#     admitted for the direct syscall surface (pinned to its libc backend;
+#     L-Q2 open question: its build.rs is a feature probe only, no codegen —
+#     re-review at admission); `enumflags2` types the Landlock
+#     access-flag sets. All three are target-gated with
+#     harness-sandbox-linux, so no other platform's build pulls them. None
+#     has a process API; the unsafe sits in harness-sandbox-linux under the
+#     §5b ratchet, one `// SAFETY:` comment per site.
 printf '%s\n' \
     serde serde_core serde_derive proc-macro2 quote syn unicode-ident \
     serde_json itoa ryu memchr zmij thiserror thiserror-impl \
     sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
-    cpufeatures libc regex regex-automata regex-syntax >"$tmpdir/allowed-registry-raw"
+    cpufeatures libc regex regex-automata regex-syntax \
+    landlock rustix enumflags2 >"$tmpdir/allowed-registry-raw"
 sort -u "$tmpdir/allowed-registry-raw" >"$tmpdir/allowed-registry" || fail "sort failed (INV-23)"
 comm -23 "$tmpdir/ws-registry" "$tmpdir/allowed-registry" >"$tmpdir/ws-unlisted" || fail "comm failed (INV-23)"
 if [ -s "$tmpdir/ws-unlisted" ]; then
@@ -854,6 +867,11 @@ grep -qxF "$ws_root/crates/harness-cli/src/main.rs" "$tmpdir/meta-roots" ||
     fail "INV-23: no target has its root at crates/harness-cli/src/main.rs (read nothing?)"
 : >"$tmpdir/hits"
 while IFS= read -r f; do
+    # The ONE named unsafe exception (see below) is checked after this loop,
+    # not here: its root must open with #![allow(unsafe_code)], not forbid.
+    case $f in
+        */crates/harness-sandbox-linux/src/lib.rs) continue ;;
+    esac
     strip_comments "$f" "$tmpdir/root-stripped"
     normalise "$tmpdir/root-stripped" "$tmpdir/root-code"
     awk '{ sub(/^ +/, ""); if (index($0, "#![forbid(unsafe_code)]") != 1) exit 1 }' "$tmpdir/root-code" ||
@@ -863,6 +881,56 @@ if [ -s "$tmpdir/hits" ]; then
     fail "INV-23: every crate root forbids unsafe code, first thing (no foreign code, no assembly):
 $(cat "$tmpdir/hits")"
 fi
+
+# --- 5b. the ONE named unsafe exception: harness-sandbox-linux --------------
+# Design §6.7 (L-D1/L-D2, slice S-La): the Linux confinement primitives
+# (Landlock, seccomp, the tree kill) need FFI, so `unsafe` needs a home.
+# Giving it a home is safer than a workspace-wide allowance: exactly ONE
+# crate may open with `#![allow(unsafe_code)]`, and three checks hold it —
+#   - the exception shape: that crate's root opens with
+#     `#![allow(unsafe_code)]` FIRST (checked by content, as above);
+#   - the ratchet: the count of `unsafe` tokens in its code (comments and
+#     string contents stripped) never rises without a review of this gate —
+#     each site needs a `// SAFETY:` comment and a new ratchet number. S-La
+#     lands the decision logic with NO FFI site, so the ratchet starts at 0;
+#   - the blast radius: only harness-sandbox (target-gated to
+#     `target_os = "linux"`) may depend on it, so no other platform's build
+#     compiles any of it, and no behaviour of it reaches harness-run (INV-6:
+#     the crate decides "are the primitives present?", it never contains,
+#     never executes).
+# Its dependency tree, when the primitives land (S-Lb/S-Lc), is reviewed by
+# name in the registry list below (landlock, rustix on its libc backend,
+# enumflags2), like every other crates.io crate.
+linux_root="$ws_root/crates/harness-sandbox-linux/src/lib.rs"
+grep -qxF "$linux_root" "$tmpdir/meta-roots" ||
+    fail "INV-23: harness-sandbox-linux has no lib root (renamed? read nothing?)"
+strip_comments "$linux_root" "$tmpdir/linux-stripped"
+normalise "$tmpdir/linux-stripped" "$tmpdir/linux-code"
+awk '{ sub(/^ +/, ""); if (index($0, "#![allow(unsafe_code)]") != 1) exit 1 }' "$tmpdir/linux-code" ||
+    fail "INV-23: crates/harness-sandbox-linux/src/lib.rs must open with #![allow(unsafe_code)] (the one named unsafe exception; see design §6.7)"
+
+# The unsafe-site ratchet.
+linux_unsafe_ratchet=0
+rust_files "$tmpdir/linux-files" crates/harness-sandbox-linux/src
+: >"$tmpdir/linux-tokens"
+while IFS= read -r f; do
+    strip_comments "$f" "$tmpdir/linux-f-stripped"
+    cat "$tmpdir/linux-f-stripped" >>"$tmpdir/linux-tokens" ||
+        fail "cat failed on $f (unsafe ratchet)"
+done <"$tmpdir/linux-files"
+# Tokens, not a boundary regex: grep -o consumes the boundary character, so
+# adjacent matches undercount; tr splits on every non-identifier byte.
+LC_ALL=C tr -cs 'A-Za-z0-9_' '\n' <"$tmpdir/linux-tokens" >"$tmpdir/linux-words" ||
+    fail "tr failed (unsafe ratchet)"
+rc=0
+grep -cx unsafe "$tmpdir/linux-words" >"$tmpdir/linux-unsafe-count" || rc=$?
+case $rc in
+    0 | 1) ;;
+    *) fail "grep error (rc=$rc) counting the unsafe sites (ratchet)" ;;
+esac
+read -r linux_unsafe_count <"$tmpdir/linux-unsafe-count" || fail "could not read the unsafe count"
+[ "$linux_unsafe_count" -le "$linux_unsafe_ratchet" ] ||
+    fail "harness-sandbox-linux has $linux_unsafe_count unsafe sites (ratchet $linux_unsafe_ratchet): the count rises only with this gate — review each site (a // SAFETY: comment is required), then update linux_unsafe_ratchet in scripts/ci/purity.sh"
 
 # Cargo configuration in the repository.
 find . \( -path ./target -o -path ./.git \) -prune -o -name .cargo -print >"$tmpdir/cargo-config" ||

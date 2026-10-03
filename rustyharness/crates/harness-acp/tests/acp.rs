@@ -20,7 +20,7 @@ use harness_core::environment::{EnvProbe, EnvSample, Unmeasured};
 use harness_model::profile::Profile;
 use harness_model::scripted::ScriptedBackend;
 use harness_model::{Completion, TaskText};
-use harness_policy::UserPolicy;
+use harness_policy::{SessionKind, UserPolicy};
 use harness_run::session::SessionConfig;
 use harness_run::TaskSpec;
 use harness_testkit::{read_spec, registry, Fixture, Local};
@@ -238,6 +238,7 @@ fn edit_fixture(label: &str) -> Fixture {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: SessionKind::Coding,
     };
     let fx = Fixture::with_spec(label, spec).unwrap();
     fx.write("a.txt", "the answer is in here\n").unwrap();

@@ -221,6 +221,7 @@ fn spec(task: &str, grants: &[&str]) -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 

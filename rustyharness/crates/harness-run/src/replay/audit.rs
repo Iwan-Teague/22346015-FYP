@@ -18,7 +18,7 @@ use harness_manifest::admission::Registry;
 use harness_model::context::Renderings;
 use harness_model::profile::Profile;
 use harness_model::ModelBackend;
-use harness_policy::UserPolicy;
+use harness_policy::{SessionKind, UserPolicy};
 use serde_json::Value;
 
 use crate::approve::RecordedApproval;
@@ -420,6 +420,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         reads: ReadLog::default(),
         tree: facts.tree,
         workspace: None,
+        research: matches!(a.spec.kind, SessionKind::Research(_)),
         // Nobody is asked in an audit: the recorded answers are re-fed and
         // re-minted with their recorded nonces (a reused one refuses).
         approvals: Approvals::new(a.run, attempt, None, rec.approvals).may_grant(granted),

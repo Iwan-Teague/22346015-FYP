@@ -48,8 +48,7 @@
 //! Errors are `ToolStatus::Error { code }` with a harness-authored message
 //! as the output (see [`code`]); none is a provider failure.
 
-use std::fs::{self, File, Metadata};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -59,6 +58,7 @@ use harness_manifest::ProviderName;
 use harness_policy::{workspace_path, Authorized, Call, WorkspacePath};
 use serde_json::Value;
 
+use crate::file_ops::{FileOps, InProcess, Meta, Next, Step};
 use crate::glob::Glob;
 use crate::provider::{
     InvokeCtx, ReadRecord, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus,
@@ -217,6 +217,8 @@ pub struct ReadTools {
     /// by default — a library embedder decides (OD-2); the run's driver
     /// fills it from the policy.
     denied: Vec<Glob>,
+    /// Every filesystem access of these tools goes through here (P-36e).
+    pub(crate) ops: Box<dyn FileOps>,
 }
 
 /// Why the workspace root was refused.
@@ -239,7 +241,8 @@ impl ReadTools {
     /// of the workspace may be symlinks (`/tmp` on macOS), its contents may
     /// not.
     pub fn new(root: &Path) -> Result<Self, RootRefused> {
-        let root = canonical_root(root)?;
+        let mut ops: Box<dyn FileOps> = Box::new(InProcess);
+        let root = canonical_root(ops.as_mut(), root)?;
         let ns = ProviderName::new(harness_manifest::BUILTIN_NAMESPACE)
             .map_err(|_| RootRefused::Io(io::Error::other("builtin namespace")))?;
         Ok(Self {
@@ -248,7 +251,16 @@ impl ReadTools {
             window_lines: READ_MAX_LINES,
             window_bytes: READ_WINDOW_BYTES,
             denied: Vec::new(),
+            ops,
         })
+    }
+
+    /// The same tools over another [`FileOps`] implementation (P-36e): the
+    /// root check runs against it too. Results are the implementation's.
+    #[must_use]
+    pub fn with_file_ops(mut self, ops: Box<dyn FileOps>) -> Self {
+        self.ops = ops;
+        self
     }
 
     /// The same tools with another read window (H2e: the profile's
@@ -283,11 +295,6 @@ impl ReadTools {
     /// The policy-denied globs (P-12): what search and glob skip per path.
     pub(crate) fn denied(&self) -> &[Glob] {
         &self.denied
-    }
-
-    /// Whether a workspace-relative path is denied on these tools.
-    pub(crate) fn denied_hit(&self, rel: &str) -> bool {
-        self.denied.iter().any(|g| g.matches(rel))
     }
 
     /// The canonical workspace root.
@@ -436,20 +443,20 @@ pub(crate) fn arg_u64(
 /// symlink (ancestors of the workspace may be symlinks — `/tmp` on
 /// macOS — its contents may not). Shared by the read tools (§4.8) and
 /// the edit engine (§4.9).
-pub(crate) fn canonical_root(root: &Path) -> Result<PathBuf, RootRefused> {
+pub(crate) fn canonical_root(ops: &mut dyn FileOps, root: &Path) -> Result<PathBuf, RootRefused> {
     // The root as its components: a trailing separator or `.` makes the
     // OS resolve a final symlink (`symlink_metadata("link/")` follows
     // the link), and `components()` drops both (H1 phase-exit review
     // F-9 item 10).
     let root: PathBuf = root.components().collect();
-    let m = fs::symlink_metadata(&root)?;
-    if m.file_type().is_symlink() {
+    let m = ops.lstat(&root)?;
+    if m.kind.is_symlink() {
         return Err(RootRefused::Symlink);
     }
-    if !m.is_dir() {
+    if !m.kind.is_dir() {
         return Err(RootRefused::NotADir);
     }
-    fs::canonicalize(root).map_err(RootRefused::from)
+    ops.canonicalize(&root).map_err(RootRefused::from)
 }
 
 /// Why a workspace path could not be resolved by [`resolve`].
@@ -482,16 +489,17 @@ impl From<io::Error> for ResolveErr {
 /// [`ResolveErr::NotFound`]. The metadata returned is the final
 /// component's own (not followed through).
 pub(crate) fn resolve(
+    ops: &mut dyn FileOps,
     root: &Path,
     p: &WorkspacePath,
-) -> Result<(PathBuf, Option<Metadata>), ResolveErr> {
+) -> Result<(PathBuf, Option<Meta>), ResolveErr> {
     let mut cur = root.to_path_buf();
-    let mut meta = fs::symlink_metadata(&cur)?;
+    let mut meta = ops.lstat(&cur)?;
     let comps: Vec<&str> = p.components().collect();
     let last = comps.len();
     for (i, c) in comps.into_iter().enumerate() {
         cur.push(c);
-        let m = match fs::symlink_metadata(&cur) {
+        let m = match ops.lstat(&cur) {
             Ok(m) => m,
             // Only the final component may be missing (create case).
             Err(e) if i + 1 == last && e.kind() == io::ErrorKind::NotFound => {
@@ -499,7 +507,7 @@ pub(crate) fn resolve(
             }
             Err(e) => return Err(e.into()),
         };
-        if m.file_type().is_symlink() {
+        if m.kind.is_symlink() {
             return Err(ResolveErr::Symlink);
         }
         meta = m;
@@ -510,8 +518,8 @@ pub(crate) fn resolve(
 impl ReadTools {
     /// Resolve a workspace path component by component, refusing a symlink
     /// at any component. Returns the path and its (not followed) metadata.
-    pub(crate) fn resolve(&self, p: &WorkspacePath) -> Result<(PathBuf, Metadata), Out> {
-        match resolve(&self.root, p) {
+    pub(crate) fn resolve(&mut self, p: &WorkspacePath) -> Result<(PathBuf, Meta), Out> {
+        match resolve(self.ops.as_mut(), &self.root, p) {
             Ok((path, Some(meta))) => Ok((path, meta)),
             // A pattern in a path is the likely mistake (H2e: a local model gave
             // `path: "src/**"` to two searches and a glob, and got only "no
@@ -533,13 +541,13 @@ impl ReadTools {
         }
     }
 
-    fn read(&self, args: &Value) -> Out {
+    fn read(&mut self, args: &Value) -> Out {
         match self.try_read(args) {
             Ok(o) | Err(o) => o,
         }
     }
 
-    fn try_read(&self, args: &Value) -> Result<Out, Out> {
+    fn try_read(&mut self, args: &Value) -> Result<Out, Out> {
         let wp = arg_path(args, "path", None)?;
         let start = arg_u64(args, "start", 1, 1, u64::MAX)?;
         // The schema's hard maximum is the widest window any profile may
@@ -547,15 +555,15 @@ impl ReadTools {
         let want = arg_u64(args, "lines", self.window_lines, 1, READ_WINDOW_MAX_LINES)?
             .min(self.window_lines);
         let (path, meta) = self.resolve(&wp)?;
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(err(code::NOT_A_FILE, "not a regular file"));
         }
-        if meta.len() > READ_MAX_BYTES {
+        if meta.len > READ_MAX_BYTES {
             return Err(err(code::TOO_LARGE, "the file is larger than the read cap"));
         }
-        let mut bytes = Vec::new();
-        File::open(&path)
-            .and_then(|f| f.take(READ_MAX_BYTES + 1).read_to_end(&mut bytes))
+        let bytes = self
+            .ops
+            .read(&path, READ_MAX_BYTES + 1, None)
             .map_err(io_out)?;
         if u64::try_from(bytes.len()).map_or(true, |n| n > READ_MAX_BYTES) {
             return Err(err(code::TOO_LARGE, "the file is larger than the read cap"));
@@ -633,22 +641,31 @@ impl ReadTools {
         Ok(o)
     }
 
-    fn list(&self, args: &Value, deadline: Instant) -> Out {
+    fn list(&mut self, args: &Value, deadline: Instant) -> Out {
         match self.try_list(args, deadline) {
             Ok(o) | Err(o) => o,
         }
     }
 
-    fn try_list(&self, args: &Value, deadline: Instant) -> Result<Out, Out> {
+    fn try_list(&mut self, args: &Value, deadline: Instant) -> Result<Out, Out> {
         let wp = arg_path(args, "path", None)?;
         let depth = arg_u64(args, "depth", 1, 1, LIST_MAX_DEPTH)?;
         let (start, meta) = self.resolve(&wp)?;
-        if !meta.is_dir() {
+        if !meta.kind.is_dir() {
             return Err(err(code::NOT_A_DIR, "not a directory"));
         }
         let depth = usize::try_from(depth).unwrap_or(1);
-        let mut walk =
-            Walk::new(start, wp.as_str().to_owned(), meta, depth, WALK_MAX_ENTRIES).until(deadline);
+        let denied_globs = self.denied.clone();
+        let denied_hit = move |rel: &str| denied_globs.iter().any(|g| g.matches(rel));
+        let mut walk = Walk::new(
+            self.ops.as_mut(),
+            start,
+            wp.as_str().to_owned(),
+            meta,
+            depth,
+            WALK_MAX_ENTRIES,
+        )
+        .until(deadline);
         let mut s = String::new();
         let mut shown = 0usize;
         let mut more = false;
@@ -657,7 +674,7 @@ impl ReadTools {
         // are denied with it); the entry itself is still walked, and the
         // file check below skips it from the listing.
         while let Some(e) = walk.next_entry_if(&mut |e| {
-            if e.depth > 0 && self.denied_hit(&e.rel) {
+            if e.depth > 0 && denied_hit(&e.rel) {
                 denied += 1;
                 false
             } else {
@@ -670,7 +687,7 @@ impl ReadTools {
             if e.depth == 0 {
                 continue; // the directory itself
             }
-            if !e.meta.is_dir() && self.denied_hit(&e.rel) {
+            if !e.meta.kind.is_dir() && denied_hit(&e.rel) {
                 denied += 1;
                 continue;
             }
@@ -681,14 +698,14 @@ impl ReadTools {
             shown += 1;
             let line = if e.symlink {
                 format!("l {} (symlink, not followed)\n", e.rel)
-            } else if e.meta.is_dir() {
+            } else if e.meta.kind.is_dir() {
                 // No trailing '/': the listing is the model's vocabulary for
                 // the next call's path argument, and the workspace-path rule
                 // refuses a trailing slash (EmptyComponent). Never show the
                 // model a string the policy would refuse.
                 format!("d {}\n", e.rel)
-            } else if e.meta.is_file() {
-                format!("f {} {} bytes\n", e.rel, e.meta.len())
+            } else if e.meta.kind.is_file() {
+                format!("f {} {} bytes\n", e.rel, e.meta.len)
             } else {
                 format!("o {}\n", e.rel)
             };
@@ -712,11 +729,8 @@ impl ReadTools {
 
 /// Read at most `max` bytes of `path`; `None` if it is longer (or cannot be
 /// read).
-pub(crate) fn read_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
-        .ok()?;
+pub(crate) fn read_bounded(ops: &mut dyn FileOps, path: &Path, max: u64) -> Option<Vec<u8>> {
+    let bytes = ops.read(path, max + 1, None).ok()?;
     (u64::try_from(bytes.len()).ok()? <= max).then_some(bytes)
 }
 
@@ -751,7 +765,7 @@ fn io_out(e: io::Error) -> Out {
 pub(crate) struct Entry {
     pub(crate) path: PathBuf,
     pub(crate) rel: String,
-    pub(crate) meta: Metadata,
+    pub(crate) meta: Meta,
     pub(crate) depth: usize,
     pub(crate) symlink: bool,
 }
@@ -760,8 +774,10 @@ pub(crate) struct Entry {
 /// follows or descends into a symlink. The entry limit and the deadline are
 /// checked while a directory is being listed, not only between entries, so
 /// a huge directory is never enumerated in full (H1e-2a review F-2). A
-/// directory cut short by the limit makes the walk `stopped`.
-pub(crate) struct Walk {
+/// directory cut short by the limit makes the walk `stopped`. The listing
+/// itself goes through [`FileOps`] (P-36e).
+pub(crate) struct Walk<'a> {
+    ops: &'a mut dyn FileOps,
     stack: Vec<Entry>,
     max_depth: usize,
     limit: usize,
@@ -773,15 +789,17 @@ pub(crate) struct Walk {
     pub(crate) stopped: bool,
 }
 
-impl Walk {
+impl<'a> Walk<'a> {
     pub(crate) fn new(
+        ops: &'a mut dyn FileOps,
         start: PathBuf,
         rel: String,
-        meta: Metadata,
+        meta: Meta,
         max_depth: usize,
         limit: usize,
     ) -> Self {
         Self {
+            ops,
             stack: vec![Entry {
                 path: start,
                 rel,
@@ -806,6 +824,13 @@ impl Walk {
         self
     }
 
+    /// The seam the walk lists directories through, for per-entry reads
+    /// made while the walk is in progress (a searched file's bytes, a
+    /// file's outline, a tree entry's digest).
+    pub(crate) fn ops(&mut self) -> &mut dyn FileOps {
+        self.ops
+    }
+
     fn next_entry(&mut self) -> Option<Entry> {
         self.next_entry_if(&mut |_| true)
     }
@@ -824,52 +849,70 @@ impl Walk {
             self.stack.clear();
             return None;
         }
-        if e.meta.is_dir() && !e.symlink && e.depth < self.max_depth && enter(&e) {
-            let Ok(rd) = fs::read_dir(&e.path) else {
+        if e.meta.kind.is_dir() && !e.symlink && e.depth < self.max_depth && enter(&e) {
+            // The listing closure touches the walk's counters and stack
+            // while `ops` is doing the listing; the fields are disjoint.
+            let deadline = self.deadline;
+            let limit = self.limit;
+            let visited = self.visited;
+            let mut kids: Vec<Entry> = Vec::new();
+            let mut timed_out = false;
+            let mut stopped = false;
+            let mut unreadable = 0usize;
+            let mut symlinks = 0usize;
+            let listed = self.ops.list(&e.path, &mut |step| {
+                if deadline.is_some_and(|t| Instant::now() >= t) {
+                    timed_out = true;
+                    return Next::Stop;
+                }
+                if visited + self.stack.len() + kids.len() >= limit {
+                    stopped = true;
+                    return Next::Stop;
+                }
+                match step {
+                    Step::Unreadable => {
+                        unreadable += 1;
+                    }
+                    Step::Entry(listed) => {
+                        // A non-UTF-8 name is shown lossily, and the tree
+                        // digest hashes that lossy form too, so two names
+                        // that differ only in their invalid bytes hash
+                        // alike (a named residual, design row H1g); `path`
+                        // keeps the real name.
+                        let symlink = listed.meta.kind.is_symlink();
+                        if symlink {
+                            symlinks += 1;
+                        }
+                        let rel = if e.rel.is_empty() {
+                            listed.name
+                        } else {
+                            format!("{}/{}", e.rel, listed.name)
+                        };
+                        kids.push(Entry {
+                            path: listed.path,
+                            rel,
+                            meta: listed.meta,
+                            depth: e.depth + 1,
+                            symlink,
+                        });
+                    }
+                }
+                Next::Continue
+            });
+            if listed.is_err() {
                 self.unreadable += 1;
                 return Some(e);
-            };
-            let mut kids: Vec<Entry> = Vec::new();
-            for d in rd {
-                if self.deadline.is_some_and(|t| Instant::now() >= t) {
-                    self.timed_out = true;
-                    self.stack.clear();
-                    return None;
-                }
-                if self.visited + self.stack.len() + kids.len() >= self.limit {
-                    self.stopped = true;
-                    break;
-                }
-                let Ok(d) = d else {
-                    self.unreadable += 1;
-                    continue;
-                };
-                // A non-UTF-8 name is shown lossily, and the tree digest
-                // hashes that lossy form too, so two names that differ
-                // only in their invalid bytes hash alike (a named
-                // residual, design row H1g); `path` keeps the real name.
-                let name = d.file_name().to_string_lossy().into_owned();
-                let path = d.path();
-                let Ok(meta) = fs::symlink_metadata(&path) else {
-                    self.unreadable += 1;
-                    continue;
-                };
-                let symlink = meta.file_type().is_symlink();
-                if symlink {
-                    self.symlinks += 1;
-                }
-                let rel = if e.rel.is_empty() {
-                    name.to_owned()
-                } else {
-                    format!("{}/{name}", e.rel)
-                };
-                kids.push(Entry {
-                    path,
-                    rel,
-                    meta,
-                    depth: e.depth + 1,
-                    symlink,
-                });
+            }
+            // Counted as encountered, even when the listing stops early.
+            self.unreadable += unreadable;
+            self.symlinks += symlinks;
+            if timed_out {
+                self.timed_out = true;
+                self.stack.clear();
+                return None;
+            }
+            if stopped {
+                self.stopped = true;
             }
             // Reverse name order on the stack = name order when popped.
             kids.sort_by(|a, b| b.rel.cmp(&a.rel));
@@ -882,8 +925,6 @@ impl Walk {
 /// Files larger than this contribute their size, not their content, to
 /// the workspace tree digest (H1e-2a confirming review NF-1).
 pub const FACTS_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-/// Chunk size of the streaming file hash.
-const FACTS_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The harness facts of a workspace (§2.3 block 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -909,7 +950,16 @@ pub struct WorkspaceFacts {
 /// between chunks, so a read blocked in the kernel (a network or FUSE mount
 /// inside the workspace) is not interrupted (design §11).
 pub fn workspace_facts(root: &Path, deadline: Instant) -> io::Result<WorkspaceFacts> {
-    facts_with(root, deadline, FACTS_FILE_MAX_BYTES)
+    facts_with(&mut InProcess, root, deadline, FACTS_FILE_MAX_BYTES)
+}
+
+/// [`workspace_facts`] over another [`FileOps`] implementation (P-36e).
+pub fn workspace_facts_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    deadline: Instant,
+) -> io::Result<WorkspaceFacts> {
+    facts_with(ops, root, deadline, FACTS_FILE_MAX_BYTES)
 }
 
 /// [`workspace_facts`], keeping the listing the digest was computed over
@@ -918,11 +968,25 @@ pub fn workspace_facts(root: &Path, deadline: Instant) -> io::Result<WorkspaceFa
 /// after its own edits without walking the workspace again
 /// ([`WorkspaceTree::record_edit`]).
 pub fn workspace_tree(root: &Path, deadline: Instant) -> io::Result<WorkspaceTree> {
-    tree_with(root, deadline, FACTS_FILE_MAX_BYTES)
+    tree_with(&mut InProcess, root, deadline, FACTS_FILE_MAX_BYTES)
 }
 
-fn facts_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<WorkspaceFacts> {
-    tree_with(root, deadline, file_cap).map(|t| t.facts())
+/// [`workspace_tree`] over another [`FileOps`] implementation (P-36e).
+pub fn workspace_tree_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    deadline: Instant,
+) -> io::Result<WorkspaceTree> {
+    tree_with(ops, root, deadline, FACTS_FILE_MAX_BYTES)
+}
+
+fn facts_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    deadline: Instant,
+    file_cap: u64,
+) -> io::Result<WorkspaceFacts> {
+    tree_with(ops, root, deadline, file_cap).map(|t| t.facts())
 }
 
 /// One entry of a [`WorkspaceTree`]: what the facts walk digests for it.
@@ -1089,9 +1153,14 @@ impl WorkspaceTree {
     }
 }
 
-fn tree_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<WorkspaceTree> {
-    let m = fs::symlink_metadata(root)?;
-    if m.file_type().is_symlink() || !m.is_dir() {
+fn tree_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    deadline: Instant,
+    file_cap: u64,
+) -> io::Result<WorkspaceTree> {
+    let m = ops.lstat(root)?;
+    if m.kind.is_symlink() || !m.kind.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the workspace root is not a real directory",
@@ -1104,6 +1173,7 @@ fn tree_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<Worksp
         )
     };
     let mut walk = Walk::new(
+        ops,
         root.to_path_buf(),
         String::new(),
         m,
@@ -1123,15 +1193,15 @@ fn tree_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<Worksp
         }
         let (kind, content) = if e.symlink {
             (b'l', String::new())
-        } else if e.meta.is_dir() {
+        } else if e.meta.kind.is_dir() {
             (b'd', String::new())
-        } else if e.meta.is_file() {
+        } else if e.meta.kind.is_file() {
             files += 1;
-            match hash_capped(&e.path, file_cap, deadline)? {
+            match hash_capped(walk.ops(), &e.path, file_cap, deadline)? {
                 Some(d) => (b'f', d.to_string()),
                 None => {
                     oversize += 1;
-                    (b'F', format!("len:{}", e.meta.len()))
+                    (b'F', format!("len:{}", e.meta.len))
                 }
             }
         } else {
@@ -1160,34 +1230,25 @@ fn tree_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<Worksp
 /// SHA-256 of a file read in chunks, at most `cap + 1` bytes: `None` when
 /// the file is longer than `cap` (by its metadata, or because it grew
 /// while being read). The deadline is checked between chunks.
-fn hash_capped(path: &Path, cap: u64, deadline: Instant) -> io::Result<Option<Digest>> {
-    if fs::symlink_metadata(path)?.len() > cap {
+fn hash_capped(
+    ops: &mut dyn FileOps,
+    path: &Path,
+    cap: u64,
+    deadline: Instant,
+) -> io::Result<Option<Digest>> {
+    if ops.lstat(path)?.len > cap {
         return Ok(None);
     }
-    let mut f = File::open(path)?.take(cap + 1);
-    let mut h = Sha256Stream::new();
-    let mut buf = vec![0u8; FACTS_CHUNK_BYTES];
-    let mut total: u64 = 0;
-    loop {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the facts walk passed its deadline",
-            ));
-        }
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        total += n as u64;
-        h.update(buf.get(..n).unwrap_or(&[]));
-    }
-    Ok((total <= cap).then(|| h.finish()))
+    let bytes = ops.read(path, cap + 1, Some(deadline))?;
+    let total = bytes.len() as u64;
+    Ok((total <= cap).then(|| sha256(&bytes)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::fs::File;
     use std::time::Duration;
 
     fn dir(name: &str, files: usize) -> PathBuf {
@@ -1200,20 +1261,16 @@ mod tests {
         d
     }
 
-    fn walk(d: &Path, limit: usize) -> Walk {
-        Walk::new(
-            d.to_path_buf(),
-            String::new(),
-            fs::symlink_metadata(d).unwrap(),
-            4,
-            limit,
-        )
+    fn walk<'a>(ops: &'a mut dyn FileOps, d: &Path, limit: usize) -> Walk<'a> {
+        let meta = ops.lstat(d).unwrap();
+        Walk::new(ops, d.to_path_buf(), String::new(), meta, 4, limit)
     }
 
     #[test]
     fn a_large_directory_is_not_listed_past_the_entry_limit() {
         let d = dir("limit", 200);
-        let mut w = walk(&d, 10);
+        let mut ops = InProcess;
+        let mut w = walk(&mut ops, &d, 10);
         assert!(w.next_entry().is_some(), "the root");
         assert!(w.stack.len() < 10, "listed {} entries", w.stack.len());
         assert!(w.stopped);
@@ -1223,7 +1280,8 @@ mod tests {
     #[test]
     fn a_passed_deadline_stops_the_listing() {
         let d = dir("deadline", 20);
-        let mut w = walk(&d, 1000).until(Instant::now());
+        let mut ops = InProcess;
+        let mut w = walk(&mut ops, &d, 1000).until(Instant::now());
         assert!(w.next_entry().is_none());
         assert!(w.timed_out && w.stack.is_empty());
         let _ = fs::remove_dir_all(&d);
@@ -1245,9 +1303,15 @@ mod tests {
         // Under a small cap a file just over it is size-only too, and one
         // at the cap is hashed.
         fs::write(d.join("f000"), vec![b'a'; 1025]).unwrap();
-        assert_eq!(facts_with(&d, far, 1024).unwrap().oversize, 2);
+        assert_eq!(
+            facts_with(&mut InProcess, &d, far, 1024).unwrap().oversize,
+            2
+        );
         fs::write(d.join("f000"), vec![b'a'; 1024]).unwrap();
-        assert_eq!(facts_with(&d, far, 1024).unwrap().oversize, 1);
+        assert_eq!(
+            facts_with(&mut InProcess, &d, far, 1024).unwrap().oversize,
+            1
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1327,8 +1391,8 @@ mod tests {
         let d = dir("bounded", 0);
         let f = d.join("f");
         fs::write(&f, vec![b'a'; 11]).unwrap();
-        assert!(read_bounded(&f, 10).is_none());
-        assert_eq!(read_bounded(&f, 11).unwrap().len(), 11);
+        assert!(read_bounded(&mut InProcess, &f, 10).is_none());
+        assert_eq!(read_bounded(&mut InProcess, &f, 11).unwrap().len(), 11);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -1343,7 +1407,7 @@ mod tests {
             "[core]\n\trepositoryformatversion = 0\n",
         )
         .unwrap();
-        let t = ReadTools::new(&d).unwrap();
+        let mut t = ReadTools::new(&d).unwrap();
         let out = t.read(&serde_json::json!({ "path": ".git/config" }));
         match out.status {
             ToolStatus::Ok => {

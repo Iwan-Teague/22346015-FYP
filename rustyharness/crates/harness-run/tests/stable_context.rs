@@ -114,6 +114,7 @@ fn spec() -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -499,7 +500,7 @@ fn a_resume_catches_up_with_the_recorded_nonces() {
         let res = resume(Resume {
             state_root: &state,
             run: &r.run,
-            workspace: &ws,
+            workspace: Some(&ws),
             spec: &spec(),
             registry: &registry(),
             policy: &UserPolicy::default(),

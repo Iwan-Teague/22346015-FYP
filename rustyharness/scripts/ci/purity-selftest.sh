@@ -593,6 +593,36 @@ printf '/// ```compile_fail\n/// let x: u8 = "a";\n/// ```\npub fn zz() {}\n' >>
     fail "could not plant a doctest"
 expect_refusal "compile_fail without an error code" "compile_fail doctests without an expected error code"
 
+# --- S-La: the ONE named unsafe exception (purity.sh §5b) --------------------
+# The exception crate must open with the allowance, by content.
+fresh
+awk '{ if ($0 ~ /^#!\[allow\(unsafe_code\)\]/) next; print }' \
+    "$copy/crates/harness-sandbox-linux/src/lib.rs" >"$copy/zz-mut" ||
+    fail "awk failed (unsafe allowance removed)"
+mv "$copy/zz-mut" "$copy/crates/harness-sandbox-linux/src/lib.rs" ||
+    fail "mv failed (unsafe allowance removed)"
+expect_refusal "the named unsafe crate without its allowance" \
+    "must open with #![allow(unsafe_code)]"
+
+# unsafe_site_count_matches_ratchet: the ratchet is 0, so ONE planted
+# `unsafe` site must refuse, naming the ratchet.
+fresh
+printf '\nunsafe fn zz() {}\n' >>"$copy/crates/harness-sandbox-linux/src/lib.rs" ||
+    fail "could not plant an unsafe site"
+expect_refusal "unsafe_site_count_matches_ratchet: one planted site" \
+    "unsafe sites (ratchet"
+
+# purity_allows_the_named_linux_unsafe_crate_only: no OTHER crate root may
+# lower `forbid` to `allow` — the exception is named, not patterned.
+fresh
+awk '{ sub(/#!\[forbid\(unsafe_code\)\]/, "#![allow(unsafe_code)]"); print }' \
+    "$copy/crates/harness-run/src/lib.rs" >"$copy/zz-mut" ||
+    fail "awk failed (forbid lowered in harness-run)"
+mv "$copy/zz-mut" "$copy/crates/harness-run/src/lib.rs" ||
+    fail "mv failed (forbid lowered in harness-run)"
+expect_refusal "purity_allows_the_named_linux_unsafe_crate_only" \
+    "does not open with #![forbid(unsafe_code)]"
+
 # --- tool failures must fail closed -------------------------------------------
 mkdir "$tmpdir/shim" || fail "mkdir shim failed"
 cat >"$tmpdir/shim/cargo" <<EOF

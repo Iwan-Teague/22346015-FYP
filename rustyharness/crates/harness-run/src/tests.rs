@@ -162,6 +162,7 @@ fn drive_full(
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_policy::SessionKind::Coding,
     };
     let policy = UserPolicy::default();
     let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
@@ -210,6 +211,7 @@ fn drive_full(
         reads: ReadLog::default(),
         tree: harness_core::sha256(b"tree"),
         workspace: None,
+        research: false,
         approvals: Approvals::new(&RunId::new(9, [1; 10]), 1, None, Default::default()),
         env,
         pressure: Vec::new(),
@@ -876,6 +878,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_policy::SessionKind::Coding,
     };
     let policy = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
     let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
@@ -935,6 +938,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         reads: ReadLog::default(),
         tree: harness_core::sha256(b"tree"),
         workspace: None,
+        research: false,
         approvals: Approvals::new(&RunId::new(9, [1; 10]), 1, None, Default::default()),
         env: &env,
         pressure: Vec::new(),

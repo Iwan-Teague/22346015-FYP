@@ -68,6 +68,9 @@ pub use approve::{ApprovalAnswer, Approver, ApproverKind};
 pub use driver::{
     run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec, WorkspaceModeRecord,
 };
+/// Re-exported: a `TaskSpec`'s `kind` field names it (P-39i), so an
+/// embedder builds specs without a direct `harness-policy` dependency.
+pub use harness_policy::SessionKind;
 pub use harness_tools::{plain_name, ExecLimits, ExecProgram, ExecSpec, MAX_PROGRAMS};
 pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
 pub use replay::{
@@ -76,8 +79,8 @@ pub use replay::{
 };
 pub use restore::{external_differ, marks_from_records, plan, RestoreCommand, RestoreMark};
 pub use session::{
-    run_session, EventSink, InputEnd, SessionConfig, SessionReport, SessionRun, TurnLimits,
-    UiEvent, UserInput, UserInputEvent, UserMessage, UserMessageRefused,
+    run_research, run_session, EventSink, InputEnd, ResearchRun, SessionConfig, SessionReport,
+    SessionRun, TurnLimits, UiEvent, UserInput, UserInputEvent, UserMessage, UserMessageRefused,
 };
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 //! The interactive session loop (P-05, this slice P-13): [`run_session`],
-//! the twin of [`crate::driver::run`] that serves one user at a time.
+//! the twin of [`crate::driver::run`] that serves one user at a time — and,
+//! since P-39i, [`run_research`], the same loop for a research session
+//! (no workspace, the research context, §2.2-§2.4).
 //!
 //! A session is one run whose journal holds any number of **user turns**.
 //! Between turns the loop asks its [`UserInput`] for the next message (the
@@ -35,7 +37,7 @@ use harness_model::profile::Profile;
 use harness_model::wire::contains_nonce;
 use harness_model::ModelBackend;
 use harness_policy::locality::{self, LocalityProbe};
-use harness_policy::UserPolicy;
+use harness_policy::{SessionKind, UserPolicy};
 use harness_sandbox::Confinement;
 use harness_tools::builtin::workspace_tree;
 use harness_tools::builtin::WorkspaceFacts;
@@ -47,9 +49,9 @@ use crate::approve::Approver;
 use crate::driver::step::{journal, Flow, TurnEnd, UserState};
 use crate::driver::stop::End;
 use crate::driver::{
-    attempt_check, commit, create_run, exec_tools, header, loop_facts, new_meter, prepare,
-    Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, Prepared,
-    RunConfig, RunRefused, RunReport, TaskSpec,
+    attempt_check, commit, create_run, exec_tools, header, loop_facts, new_meter,
+    no_workspace_facts, prepare, Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop,
+    LoopInit, NonceSource, Prepared, RunConfig, RunRefused, RunReport, TaskSpec,
 };
 use crate::presubmit::PresubmitState;
 
@@ -365,6 +367,13 @@ pub struct SessionReport {
 /// Run an interactive session (see the module docs). `Err` means the
 /// session did not start.
 pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
+    // A research session (P-39i) is not a coding session: it is driven by
+    // `run_research`, whose loop carries no workspace.
+    if let SessionKind::Research(_) = s.spec.kind {
+        return Err(RunRefused::Research(
+            "a research session runs under run_research, not run_session",
+        ));
+    }
     check_turn_limits(s.config)?;
     let limits = session_limits(s.config);
 
@@ -374,7 +383,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         s.registry,
         s.policy,
         s.profile,
-        s.workspace,
+        Some(s.workspace),
         s.state_root,
         s.probe,
         &s.config.run,
@@ -444,7 +453,8 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         feed: std::collections::VecDeque::new(),
         reads: ReadLog::default(),
         tree: facts.tree,
-        workspace: Some(pre.tree),
+        workspace: pre.tree,
+        research: false,
         approvals: Approvals::new(
             &run_id,
             attempt,
@@ -452,7 +462,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
             std::collections::VecDeque::new(),
         )
         .may_grant(s.config.run.allow_session_grants)
-        .with_edits(Some(edit_tools)),
+        .with_edits(edit_tools),
         env: s.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
@@ -468,6 +478,184 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
             users: Vec::new(),
             deliverable: None,
             root: Some(s.workspace.to_path_buf()),
+            blobs,
+            sink: s.sink,
+        }),
+    });
+    let end = lp.drive_session(&mut w, SessionInputs::Live(s.input), s.config.input_timeout);
+    let turns = lp.user.as_ref().map_or(0, |u| u.turn.saturating_sub(1));
+    let released = commit(w, &end, None);
+    Ok(SessionReport {
+        run: RunReport {
+            run: run_id,
+            attempt,
+            run_dir,
+            cause: end.cause,
+            outcome: released.outcome,
+            chain_head: released.chain_head,
+            steps: end.step,
+            journal_error: released.error,
+            possibly_environmental: lp.pressure,
+            presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
+        },
+        turns,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// run_research (P-39i).
+// ---------------------------------------------------------------------------
+
+/// Everything [`run_research`] needs (P-39i): a [`SessionRun`] without a
+/// workspace — a research session has none (§2.4), and its turn starts
+/// re-measure nothing (P-05 D4 is a coding session's check).
+pub struct ResearchRun<'a> {
+    /// The per-user state root (§2.8). Must exist.
+    pub state_root: &'a Path,
+    /// The task: kind [`SessionKind::Research`] (refused otherwise), grants
+    /// the task tools only (the web capabilities are wired by P-39j).
+    pub spec: &'a TaskSpec,
+    /// Admitted providers (the research registry: §2.2).
+    pub registry: &'a Registry,
+    /// User policy.
+    pub policy: &'a UserPolicy,
+    /// The model profile.
+    pub profile: &'a Profile,
+    /// The model backend.
+    pub backend: &'a dyn ModelBackend,
+    /// The filesystem-locality probe.
+    pub probe: &'a dyn LocalityProbe,
+    /// The environment probe (§7.1).
+    pub env: &'a dyn EnvProbe,
+    /// Budgets, timeouts and the turn limits.
+    pub config: &'a SessionConfig,
+    /// Who answers an `Ask` (§5.3); `None` turns every ask into a deny.
+    pub approver: Option<&'a dyn Approver>,
+    /// Where the session's confinement is witnessed (INV-42): the web
+    /// airlock's cases must be covered, or the session does not start.
+    pub confinement: Option<&'a dyn Confinement>,
+    /// Where the session's messages come from.
+    pub input: &'a dyn UserInput,
+    /// Where journaled records are shown as they are written; `None`
+    /// buffers nothing and shows nothing.
+    pub sink: Option<&'a dyn EventSink>,
+}
+
+/// Run a research session (P-39i, §2.2-§2.4): the session loop with no
+/// workspace — the same turn budget, input handling and journal records as
+/// [`run_session`], but no tree walk at a turn's start (the facts stay the
+/// no-workspace facts), the research context (`rh-research/1`), and the
+/// header's `session_kind`/`web` keys. `Err` means the session did not
+/// start.
+pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
+    if let SessionKind::Coding = s.spec.kind {
+        return Err(RunRefused::Research(
+            "run_research runs a research session; this task is a coding one",
+        ));
+    }
+    check_turn_limits(s.config)?;
+    let limits = session_limits(s.config);
+
+    // ---- Before anything is written (the session's order; prepare's
+    // research branch takes no workspace and demands the airlock's
+    // witness, INV-42). ----
+    let pre = prepare(
+        s.spec,
+        s.registry,
+        s.policy,
+        s.profile,
+        None,
+        s.state_root,
+        s.probe,
+        &s.config.run,
+        s.approver.is_some(),
+        s.confinement,
+    )?;
+    let facts = pre.facts;
+
+    // ---- runs/<run-id>, the first attempt, the durable header. ----
+    let (run_id, run_dir) = create_run(&pre.state_root)?;
+    if let Some(str) = run_dir.to_str() {
+        locality::check(s.probe, str)?;
+    }
+    // No exec grant is possible (prepare refused the exec section), so no
+    // exec header and no exec tools.
+    let header = header(&HeaderInputs {
+        spec: s.spec,
+        registry: s.registry,
+        policy: s.policy,
+        profile: s.profile,
+        identity: &s.backend.identity(),
+        facts,
+        limits: &limits,
+        resumed_from: None,
+        environment: s.env.sample(),
+        environment_recorded: false,
+        approver_present: s.approver.is_some(),
+        session: Some(s.config.turn),
+        exec: None,
+        workspace_mode: s.config.run.workspace_mode.as_ref(),
+    })?;
+    let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
+        &run_dir,
+        run_id.clone(),
+        header,
+        &attempt_check(s.probe),
+    )?;
+
+    // The UI drain (P-05 §1.3), as in a coding session.
+    if s.sink.is_some() {
+        w.enable_tap();
+    }
+    let blobs = layout::attempt_dir(&run_dir, attempt).join(layout::BLOBS_DIR);
+
+    // ---- The loop: the session loop, workspace-less (P-39i). The facts
+    // are the research facts; the tree is the digest of nothing and no
+    // provider serves tools (the task tools are the loop's own). ----
+    let meter = new_meter(limits, Box::new(SystemClock::default()));
+    let mut lp = Loop::new(LoopInit {
+        session: pre.session,
+        registry: s.registry,
+        tools: pre.tools,
+        task: &s.spec.task,
+        facts: loop_facts(&facts, s.spec),
+        profile: s.profile,
+        backend: s.backend,
+        providers: Prepared::providers(None, None, None, None),
+        meter,
+        detector: LoopDetector::new(),
+        turns: Vec::new(),
+        config: &s.config.run,
+        step: 0,
+        nonces: NonceSource::default(),
+        feed: std::collections::VecDeque::new(),
+        reads: ReadLog::default(),
+        tree: facts.tree,
+        workspace: None,
+        research: true,
+        approvals: Approvals::new(
+            &run_id,
+            attempt,
+            s.approver,
+            std::collections::VecDeque::new(),
+        ),
+        env: s.env,
+        pressure: Vec::new(),
+        reads_seen: Default::default(),
+        todo: crate::driver::todo_for(&s.spec.grants),
+        notices: BudgetNotices::live(s.config.run.limits.wall),
+        presubmit: PresubmitState::of(&s.spec.presubmit),
+        restore: Default::default(),
+        user: Some(UserState {
+            limits: s.config.turn,
+            turn: 1,
+            allowance: 0,
+            used: 0,
+            users: Vec::new(),
+            deliverable: None,
+            // No workspace: a turn's start re-measures nothing (P-05 D4 is
+            // skipped), so `external_change` is always false.
+            root: None,
             blobs,
             sink: s.sink,
         }),
@@ -771,7 +959,10 @@ impl<'a> Loop<'a> {
 
     /// Measure the workspace, then open the turn (P-05 §2.3, §5, §9). The
     /// measurement happens BEFORE anything is journaled for the message,
-    /// so the record's facts are the turn's starting facts (INV-39).
+    /// so the record's facts are the turn's starting facts (INV-39). A
+    /// research session (P-39i) has no workspace: the turn starts on the
+    /// no-workspace facts and the re-measure (P-05 D4) is skipped, so
+    /// `external_change` is always false.
     fn begin_user_turn<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
@@ -781,18 +972,22 @@ impl<'a> Loop<'a> {
         // 1. The workspace now (P-05 §5): a live run measures; a failure
         // stops the session with nothing journaled for this message.
         // (An audit re-feeds the recorded measurement, P-17.)
-        let Some(root) = self.user.as_ref().and_then(|u| u.root.clone()) else {
-            return Err(StopCause::PolicyAbort);
+        let (measured, listing) = match self.user.as_ref().and_then(|u| u.root.clone()) {
+            Some(root) => {
+                let deadline = Instant::now() + self.config.facts_timeout;
+                let listing =
+                    workspace_tree(&root, deadline).map_err(|_| StopCause::PolicyAbort)?;
+                (listing.facts(), Some(listing))
+            }
+            None if self.research => (no_workspace_facts(), None),
+            None => return Err(StopCause::PolicyAbort),
         };
-        let deadline = Instant::now() + self.config.facts_timeout;
-        let listing = workspace_tree(&root, deadline).map_err(|_| StopCause::PolicyAbort)?;
-        let measured = listing.facts();
         let wall_used_ms = u64::try_from(self.meter.elapsed().as_millis()).unwrap_or(u64::MAX);
         let started = self.open_user_turn(w, text, measured, wall_used_ms, remaining)?;
         // The loop's state moves to the measured listing (P-05 §5); a
         // replayed turn has no listing of its own (the replay never
-        // touches the workspace).
-        self.workspace = Some(listing);
+        // touches the workspace), and a research turn has none to move to.
+        self.workspace = listing;
         Ok(started)
     }
 

@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use harness_core::RunId;
+use harness_core::{sha256, RunId};
 use harness_journal::layout;
 use harness_manifest::admission::{Registry, Resolved};
 use harness_model::context::{self, Fact, FactValue};
@@ -16,7 +16,7 @@ use harness_model::ToolSpec;
 use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::{
     Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionSpec, UserPolicy,
-    WorkspaceDecl, EXEC_ID, SUBMIT_ID, TODO_ID,
+    WorkspaceDecl, EXEC_ID, SUBMIT_ID, TODO_ID, WEB_FETCH_ID, WEB_SEARCH_ID,
 };
 use harness_sandbox::{Confinement, Conformed};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
@@ -32,19 +32,26 @@ use crate::presubmit::PresubmitRefused;
 pub(crate) struct Prepared {
     pub(crate) session: Session,
     pub(crate) tools: Vec<ToolSpec>,
-    pub(crate) read_tools: ReadTools,
-    pub(crate) edit_tools: EditTools,
-    pub(crate) patch_tools: PatchTools,
+    /// None for a research session (P-39i): no workspace, no file tools.
+    pub(crate) read_tools: Option<ReadTools>,
+    pub(crate) edit_tools: Option<EditTools>,
+    pub(crate) patch_tools: Option<PatchTools>,
     pub(crate) state_root: PathBuf,
+    /// The facts of the workspace (a coding run's measured walk) or, for a
+    /// research session, [`no_workspace_facts`] — present either way, so a
+    /// header and the turn records keep their fact fields.
     pub(crate) facts: WorkspaceFacts,
     /// The listing the facts were measured over, kept so the tree digest
-    /// follows the run's own edits (H2b).
-    pub(crate) tree: WorkspaceTree,
+    /// follows the run's own edits (H2b). None for a research session: no
+    /// workspace, so the loop's tree stays the digest of nothing.
+    pub(crate) tree: Option<WorkspaceTree>,
     /// For an exec grant (H2d): the pinned setup and the witness obtained
-    /// before anything was written.
+    /// before anything was written. None for a research session (P-39i: it
+    /// grants no exec).
     pub(crate) exec: Option<(Pinned, Conformed)>,
     /// The merged protected-path deny sources (P-29): the build's
-    /// [`DEFAULT_DENY`] plus the task's declared list, compiled.
+    /// [`DEFAULT_DENY`] plus the task's declared list, compiled. Empty for
+    /// a research session (P-39i: no workspace, no protected paths).
     pub(crate) protected: Protected,
 }
 
@@ -52,15 +59,25 @@ impl Prepared {
     /// The built-in providers: the read tools, the edit tools, the P-25
     /// patch/delete/move provider and, with an exec grant, the command
     /// runner, which share the `harness` namespace and split it by verb
-    /// (H2b, H2d, P-25).
+    /// (H2b, H2d, P-25). A research session (P-39i) carries none of them
+    /// (no workspace, no exec), so its providers are empty: the task tools
+    /// it grants are the loop's own, not provider-served.
     pub(crate) fn providers<'p>(
-        read: ReadTools,
-        edit: EditTools,
-        patch: PatchTools,
+        read: Option<ReadTools>,
+        edit: Option<EditTools>,
+        patch: Option<PatchTools>,
         exec: Option<ExecTools<'p>>,
     ) -> Vec<Box<dyn ToolProvider + 'p>> {
-        let mut v: Vec<Box<dyn ToolProvider + 'p>> =
-            vec![Box::new(read), Box::new(edit), Box::new(patch)];
+        let mut v: Vec<Box<dyn ToolProvider + 'p>> = Vec::new();
+        if let Some(r) = read {
+            v.push(Box::new(r));
+        }
+        if let Some(e) = edit {
+            v.push(Box::new(e));
+        }
+        if let Some(p) = patch {
+            v.push(Box::new(p));
+        }
         if let Some(x) = exec {
             v.push(Box::new(x));
         }
@@ -68,93 +85,211 @@ impl Prepared {
     }
 }
 
-/// The pre-start checks shared by `run` and `resume` (§2.1): plan the
-/// session, open the workspace, canonicalise `state_root`, refuse an
-/// overlap, check locality, measure the workspace facts.
+/// The pre-start checks shared by `run`, `run_research` and `resume` (§2.1,
+/// P-39i): plan the session; for a coding run, open the workspace,
+/// canonicalise `state_root`, refuse an overlap, check locality, measure the
+/// workspace facts; for a research session, refuse a workspace and require
+/// the web airlock's witness (§2.4, INV-42).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare(
     spec: &TaskSpec,
     registry: &Registry,
     policy: &UserPolicy,
     profile: &Profile,
-    workspace: &Path,
+    workspace: Option<&Path>,
     state_root: &Path,
     probe: &dyn LocalityProbe,
     config: &RunConfig,
     approver_present: bool,
     confinement: Option<&dyn Confinement>,
 ) -> Result<Prepared, RunRefused> {
-    // The exec grant and its setup agree, and the setup pins (H2d), before
-    // the session is planned with the witness it will need.
-    let pinned = exec_setup(spec)?;
-    let (session, tools) = plan(
-        spec,
-        registry,
-        policy,
-        profile,
-        approver_present,
-        pinned.is_some(),
-    )?;
-    // The read window is the profile's (H2e): what a read returns, and what
-    // the context shows of one observation.
-    let window = profile.read_window();
-    let read_tools = ReadTools::new(workspace)?
-        .with_window(
-            window.lines,
-            usize::try_from(window.bytes).unwrap_or(usize::MAX),
-        )
-        // P-12: the policy's own deny globs for the surfacing read
-        // tools (empty unless the policy names such rules), so search,
-        // glob and list skip denied paths and say how many. A library
-        // embedder passes an empty default policy and gets no skips
-        // (OD-2); the CLI overlays its default deny list.
-        .with_denied(policy.denied_globs());
-    let edit_tools = EditTools::new(workspace)?.with_protected(
-        Protected::new(&spec.protected)
-            .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
-    );
-    let patch_tools = PatchTools::new(workspace)?.with_protected(
-        Protected::new(&spec.protected)
-            .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
-    );
-    let ws = read_tools.root().to_path_buf();
-    let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
-    if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
-        return Err(RunRefused::Overlap);
-    }
-    let state_str = state_root.to_str().ok_or_else(|| {
-        RunRefused::StateRoot(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "state_root is not valid UTF-8",
-        ))
-    })?;
-    locality::check(probe, state_str)?;
-    let tree =
-        workspace_tree(&ws, Instant::now() + config.facts_timeout).map_err(RunRefused::Facts)?;
-    // INV-6: the witness, last, before anything is written; no confinement,
-    // or a refusal, refuses the run (there is no unconfined fallback).
-    let exec = match pinned {
-        None => None,
-        Some(p) => {
-            let c = confinement.ok_or(RunRefused::ExecGrant(
-                "harness.exec.run is granted but the run was given no confinement",
+    match &spec.kind {
+        SessionKind::Research(_) => {
+            if workspace.is_some() {
+                return Err(RunRefused::Research(
+                    "a research session takes no workspace",
+                ));
+            }
+            // P-39i research checks (fail closed): web ids (P-39j wires
+            // them), exec, pre-submit, protected paths, a workspace.
+            check_research_spec(spec)?;
+            let (session, tools) = plan(spec, registry, policy, profile, approver_present, true)?;
+            let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
+            let state_str = state_root.to_str().ok_or_else(|| {
+                RunRefused::StateRoot(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "state_root is not valid UTF-8",
+                ))
+            })?;
+            locality::check(probe, state_str)?;
+            // INV-42: the witness, last, before anything is written; no
+            // confinement or a refusal refuses the session (no unconfined
+            // fallback). §5.3/INV-46: a session that may fetch demands the
+            // witness cover the web airlock's cases — the proxy profile is
+            // part of the fetch path, not of plain execution. This slice
+            // grants no web capability (`check_research_spec` refused
+            // them), so the demand is armed but unreachable; it goes live
+            // the moment P-39j makes web ids grantable.
+            let c = confinement.ok_or(RunRefused::Research(
+                "a research session runs behind the web airlock and was given no confinement",
             ))?;
-            Some((p, c.require().map_err(RunRefused::Confinement)?))
+            let witness = c.require().map_err(RunRefused::Confinement)?;
+            if spec
+                .grants
+                .iter()
+                .any(|g| g == WEB_FETCH_ID || g == WEB_SEARCH_ID)
+            {
+                witness
+                    .covers(harness_sandbox::conformance::AIRLOCK_CASES)
+                    .map_err(|_missing| {
+                        RunRefused::Research(
+                            "the sandbox witness does not cover the web airlock's cases",
+                        )
+                    })?;
+            }
+            Ok(Prepared {
+                session,
+                tools,
+                read_tools: None,
+                edit_tools: None,
+                patch_tools: None,
+                state_root,
+                facts: no_workspace_facts(),
+                tree: None,
+                exec: None,
+                protected: Protected::new(&[])
+                    .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+            })
         }
-    };
-    Ok(Prepared {
-        session,
-        tools,
-        read_tools,
-        edit_tools,
-        patch_tools,
-        state_root,
-        facts: tree.facts(),
-        tree,
-        exec,
-        protected: Protected::new(&spec.protected)
-            .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
-    })
+        SessionKind::Coding => {
+            let Some(workspace) = workspace else {
+                return Err(RunRefused::Facts(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a coding run needs a workspace",
+                )));
+            };
+            // The exec grant and its setup agree, and the setup pins (H2d),
+            // before the session is planned with the witness it will need.
+            let pinned = exec_setup(spec)?;
+            let (session, tools) = plan(
+                spec,
+                registry,
+                policy,
+                profile,
+                approver_present,
+                pinned.is_some(),
+            )?;
+            // The read window is the profile's (H2e): what a read returns,
+            // and what the context shows of one observation.
+            let window = profile.read_window();
+            let read_tools = ReadTools::new(workspace)?
+                .with_window(
+                    window.lines,
+                    usize::try_from(window.bytes).unwrap_or(usize::MAX),
+                )
+                // P-12: the policy's own deny globs for the surfacing read
+                // tools (empty unless the policy names such rules), so search,
+                // glob and list skip denied paths and say how many. A library
+                // embedder passes an empty default policy and gets no skips
+                // (OD-2); the CLI overlays its default deny list.
+                .with_denied(policy.denied_globs());
+            let edit_tools = EditTools::new(workspace)?.with_protected(
+                Protected::new(&spec.protected)
+                    .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+            );
+            let patch_tools = PatchTools::new(workspace)?.with_protected(
+                Protected::new(&spec.protected)
+                    .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+            );
+            let ws = read_tools.root().to_path_buf();
+            let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
+            if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
+                return Err(RunRefused::Overlap);
+            }
+            let state_str = state_root.to_str().ok_or_else(|| {
+                RunRefused::StateRoot(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "state_root is not valid UTF-8",
+                ))
+            })?;
+            locality::check(probe, state_str)?;
+            let tree = workspace_tree(workspace, Instant::now() + config.facts_timeout)
+                .map_err(RunRefused::Facts)?;
+            // INV-6: the witness, last, before anything is written; no
+            // confinement, or a refusal, refuses the run (there is no
+            // unconfined fallback).
+            let exec = match pinned {
+                None => None,
+                Some(p) => {
+                    let c = confinement.ok_or(RunRefused::ExecGrant(
+                        "harness.exec.run is granted but the run was given no confinement",
+                    ))?;
+                    Some((p, c.require().map_err(RunRefused::Confinement)?))
+                }
+            };
+            Ok(Prepared {
+                session,
+                tools,
+                read_tools: Some(read_tools),
+                edit_tools: Some(edit_tools),
+                patch_tools: Some(patch_tools),
+                state_root,
+                facts: tree.facts(),
+                tree: Some(tree),
+                exec,
+                protected: Protected::new(&spec.protected)
+                    .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+            })
+        }
+    }
+}
+
+/// The research-session spec checks (P-39i, fail closed), shared by
+/// `prepare` and `plan` so a live run, a resume and an audit replay refuse
+/// alike: this build wires no web capabilities into its driver (P-39j
+/// does), and a research session has no workspace, so it takes no exec
+/// section, no pre-submit commands and no protected paths.
+pub(crate) fn check_research_spec(spec: &TaskSpec) -> Result<(), RunRefused> {
+    if let SessionKind::Coding = spec.kind {
+        return Ok(());
+    }
+    if spec
+        .grants
+        .iter()
+        .any(|g| g == WEB_FETCH_ID || g == WEB_SEARCH_ID)
+    {
+        return Err(RunRefused::Research(
+            "this build wires no web capabilities into its driver; a research session grants only the task tools",
+        ));
+    }
+    if spec.exec.is_some() {
+        return Err(RunRefused::Research(
+            "a research session takes no exec section",
+        ));
+    }
+    if spec.presubmit.is_some() {
+        return Err(RunRefused::Research(
+            "a research session runs no pre-submit commands",
+        ));
+    }
+    if !spec.protected.is_empty() {
+        return Err(RunRefused::Research(
+            "a research session has no workspace, so it has no protected paths",
+        ));
+    }
+    Ok(())
+}
+
+/// The facts of a session with no workspace (P-39i): an empty walk's
+/// values, so the header and the turn records keep their fact fields (an
+/// audit re-feeds them unchanged) and the loop's tree digest is the digest
+/// of nothing.
+pub(crate) fn no_workspace_facts() -> WorkspaceFacts {
+    WorkspaceFacts {
+        tree: sha256(b""),
+        files: 0,
+        oversize: 0,
+    }
 }
 
 /// The capabilities the ask floor covers (P-29): every edit cap, the only
@@ -226,9 +361,18 @@ pub(crate) fn attempt_check(
 }
 
 /// Context block 4 of a run: the measured facts, then those of the task's
-/// pre-submit checks (H3a), when it has any.
+/// pre-submit checks (H3a), when it has any. A research session (P-39i)
+/// renders the research facts (its kind, allowlist and web configuration)
+/// instead — it grants no pre-submit commands.
 pub(crate) fn loop_facts(f: &WorkspaceFacts, spec: &TaskSpec) -> Vec<Fact> {
-    let mut facts = facts_block(f);
+    let mut facts = match &spec.kind {
+        SessionKind::Research(g) => {
+            let mut hosts = g.allowlist.clone();
+            hosts.sort();
+            context::research_facts(&hosts, g.search)
+        }
+        SessionKind::Coding => facts_block(f),
+    };
     if let Some(p) = &spec.presubmit {
         facts.extend(context::presubmit_facts(
             p.commands.len() as u64,
@@ -263,7 +407,8 @@ pub(crate) fn facts_block(f: &WorkspaceFacts) -> Vec<Fact> {
 /// `approver_present`: whether anyone answers an ask (§5.2: with nobody,
 /// every ask is a deny). `conformed`: whether the run holds (or, in an
 /// audit, held) a `Conformed` witness (H2d: an exec grant plans only with
-/// one, INV-6).
+/// one, INV-6; P-39i: a research session plans only with one covering the
+/// web airlock — `prepare` has checked the witness, so it passes `true`).
 pub(crate) fn plan(
     spec: &TaskSpec,
     registry: &Registry,
@@ -272,28 +417,47 @@ pub(crate) fn plan(
     approver_present: bool,
     conformed: bool,
 ) -> Result<(Session, Vec<ToolSpec>), RunRefused> {
+    // P-39i: the research-spec checks, so the audit path (which plans
+    // without `prepare`'s witness work) refuses the same specs a live run
+    // refuses.
+    check_research_spec(spec)?;
+    if let SessionKind::Research(_) = spec.kind {
+        // The kind must agree with the registry (§2.2): a research session
+        // runs over the research registry, whose web capabilities are
+        // admitted (their driver wiring is P-39j).
+        if !matches!(registry.resolve(WEB_FETCH_ID), Resolved::One { .. }) {
+            return Err(RunRefused::Research(
+                "a research session needs the research registry (its web capabilities admitted)",
+            ));
+        }
+    }
     let mut grants = spec.grants.clone();
     if !grants.iter().any(|g| g == SUBMIT_ID) {
         grants.push(SUBMIT_ID.to_owned());
     }
+    let research = matches!(spec.kind, SessionKind::Research(_));
     // The P-29 ask floor (Cargo.lock, .github/**): decided with here, so a
     // live run, a resume and an audit replay all ask about the same edits.
-    let policy = protected_policy(policy)?;
+    // A research session (P-39i) has no edit tools, so it takes no floor.
+    let policy = if research {
+        policy.clone()
+    } else {
+        protected_policy(policy)?
+    };
     let session = Session::plan(
         &SessionSpec {
             grants: grants.clone(),
-            workspace: Some(WorkspaceDecl {
+            workspace: (!research).then_some(WorkspaceDecl {
                 declared_public: spec.workspace_public,
             }),
             approver_present,
             personal_data_granted: false,
             conformed,
             exec_programs: spec.exec.as_ref().map(ExecSpec::names).unwrap_or_default(),
-            // The run's read window bounds a read's lines (H2e).
-            read_window: Some(profile.read_window().lines),
-            // P-39b: the driver plans coding sessions; the web airlock has
-            // no driver path yet.
-            kind: SessionKind::Coding,
+            // The run's read window bounds a read's lines (H2e); a research
+            // session (P-39i) has no read tools, so no window.
+            read_window: (!research).then(|| profile.read_window().lines),
+            kind: spec.kind.clone(),
         },
         registry,
         &policy,

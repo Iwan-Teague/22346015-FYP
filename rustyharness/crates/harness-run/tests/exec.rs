@@ -105,6 +105,7 @@ fn spec_with(grants: &[&str], exec: Option<ExecSpec>) -> TaskSpec {
         exec,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -698,7 +699,7 @@ mod live {
         let res = harness_run::resume(Resume {
             state_root: &state,
             run: &r.run,
-            workspace: &ws,
+            workspace: Some(&ws),
             spec: &spec(),
             registry: &registry(),
             policy: &allow_all(),
@@ -947,7 +948,7 @@ mod live {
         let e = harness_run::resume(Resume {
             state_root: &state,
             run: &r.run,
-            workspace: &ws,
+            workspace: Some(&ws),
             spec: &s,
             registry: &registry(),
             policy: &allow_all(),

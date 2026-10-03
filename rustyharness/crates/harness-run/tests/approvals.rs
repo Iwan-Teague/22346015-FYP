@@ -109,6 +109,7 @@ fn spec() -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -520,7 +521,7 @@ fn resume_with(
     resume(Resume {
         state_root: state,
         run,
-        workspace: ws,
+        workspace: Some(ws),
         spec: &spec(),
         registry: &registry(),
         policy: &UserPolicy::default(),

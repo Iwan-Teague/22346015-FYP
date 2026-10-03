@@ -316,6 +316,9 @@ pub(crate) fn inputs(
             exec,
             presubmit,
             protected: task.protected,
+            // P-39i: the CLI's verbs run coding sessions; the research
+            // session's verbs arrive with the web slice (P-39j/§11).
+            kind: harness_run::SessionKind::Coding,
         },
         policy,
         profile,

@@ -51,6 +51,7 @@ fn spec(task: &str) -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -493,7 +494,7 @@ fn resume_under(
     resume(Resume {
         state_root: fx.state_root(),
         run,
-        workspace: fx.workspace(),
+        workspace: Some(fx.workspace()),
         spec: &fx.spec,
         registry: &harness_testkit::registry().unwrap(),
         policy: &UserPolicy::default(),
@@ -1332,7 +1333,7 @@ fn w4_a_failed_attempt_start_never_blocks_a_later_resume_or_audit() {
     let e = resume(Resume {
         state_root: fx.state_root(),
         run: &r.run,
-        workspace: fx.workspace(),
+        workspace: Some(fx.workspace()),
         spec: &fx.spec,
         registry: &harness_testkit::registry().unwrap(),
         policy: &UserPolicy::default(),

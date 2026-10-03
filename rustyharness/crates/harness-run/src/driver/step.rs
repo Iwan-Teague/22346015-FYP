@@ -102,6 +102,11 @@ pub(crate) struct Loop<'a> {
     /// The interactive session's state (P-05); `None` in a batch run, an
     /// audit and a resume's catch-up, which take every batch path unchanged.
     pub(crate) user: Option<UserState<'a>>,
+    /// A research session drives its turns with the research context (P-39i)
+    /// instead of the coding one (fail closed: a batch loop never renders
+    /// research text). Never `true` with `user: None` — a research session
+    /// is always a driven session.
+    pub(crate) research: bool,
 }
 
 /// The interactive session's state on the loop (P-05): the current turn's
@@ -163,6 +168,7 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) presubmit: Option<PresubmitState>,
     pub(crate) restore: crate::restore::RestoreLog,
     pub(crate) user: Option<UserState<'a>>,
+    pub(crate) research: bool,
 }
 
 impl<'a> Loop<'a> {
@@ -195,6 +201,7 @@ impl<'a> Loop<'a> {
             presubmit,
             restore,
             user,
+            research,
         } = init;
         Loop {
             session,
@@ -224,6 +231,7 @@ impl<'a> Loop<'a> {
             presubmit,
             restore,
             user,
+            research,
         }
     }
 }
@@ -505,10 +513,11 @@ impl<'a> Loop<'a> {
         // 2. Build the context (§2.3), once the observation it shows for the
         // first time has its delimiting (H1i). A session build keeps every
         // user's turn in the window and reserves the users' share of the
-        // budget for them (P-05 §2.3).
+        // budget for them (P-05 §2.3); a research session's build (P-39i)
+        // takes the research rules and facts instead of the coding ones.
         let first = self.first_render()?;
-        let built = match &self.user {
-            Some(u) => context::build_session(
+        let built = match (&self.user, self.research) {
+            (Some(u), true) => context::build_research(
                 self.profile,
                 &self.tools,
                 self.task,
@@ -517,7 +526,21 @@ impl<'a> Loop<'a> {
                 &u.users,
                 &self.nonces.assigned,
             ),
-            None => context::build(
+            (Some(u), false) => context::build_session(
+                self.profile,
+                &self.tools,
+                self.task,
+                &self.facts,
+                &self.turns,
+                &u.users,
+                &self.nonces.assigned,
+            ),
+            // Fail closed: a batch loop never renders research text. A
+            // research spec is refused by `run` and `resume` (and a batch
+            // audit at the recorded header's mode key), so this arm is
+            // unreachable; refuse rather than guess.
+            (None, true) => return Err(StopCause::PolicyAbort),
+            (None, false) => context::build(
                 self.profile,
                 &self.tools,
                 self.task,

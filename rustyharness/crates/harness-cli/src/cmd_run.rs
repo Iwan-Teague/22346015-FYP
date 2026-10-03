@@ -219,7 +219,7 @@ fn try_run(
         Some(id) => harness_run::resume(Resume {
             state_root: std::path::Path::new(state_root.as_ref()),
             run: &id,
-            workspace: std::path::Path::new(workspace.as_ref()),
+            workspace: Some(std::path::Path::new(workspace.as_ref())),
             spec: &inp.spec,
             registry: &inp.registry,
             policy: &inp.policy,

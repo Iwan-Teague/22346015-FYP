@@ -124,9 +124,15 @@ impl<'a> Loop<'a> {
                     // (P-16's preview, reached through P-23): the same
                     // plan the apply path would run, as sanitised text.
                     let mut summary = capability.summary().to_owned();
-                    if let (true, Some(edits)) =
-                        (is_edit(capability.id().as_str()), &self.approvals.edits)
-                    {
+                    // The preview is planned on a throwaway clone of the
+                    // tools (`EditEngine`'s `Clone` rides `FileOps`'s
+                    // `clone_box`): the loop holds them behind a shared
+                    // borrow, and a preview writes nothing, so the copy
+                    // reads exactly what the apply path would.
+                    if let (true, Some(mut edits)) = (
+                        is_edit(capability.id().as_str()),
+                        self.approvals.edits.clone(),
+                    ) {
                         if let Ok(diff) = edits.preview(&call, &self.reads) {
                             summary.push_str("\n\nproposed diff:\n");
                             summary.push_str(&diff);

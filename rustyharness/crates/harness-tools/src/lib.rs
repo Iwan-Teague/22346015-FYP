@@ -29,6 +29,7 @@
 pub mod builtin;
 pub mod edit;
 pub mod exec;
+pub mod file_ops;
 pub mod outline;
 pub mod patch;
 pub mod protected;
@@ -48,6 +49,7 @@ pub use edit::{
 pub use exec::{
     plain_name, ExecLimits, ExecProgram, ExecSetupError, ExecSpec, ExecTools, Pinned, MAX_PROGRAMS,
 };
+pub use file_ops::{FileOps, InProcess};
 pub use harness_core::glob;
 pub use outline::OUTLINE_MAX_ENTRIES;
 pub use patch::{PatchError, PatchTools, DELETE, MOVE, PATCH};

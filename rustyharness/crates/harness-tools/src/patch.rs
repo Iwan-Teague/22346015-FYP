@@ -43,7 +43,6 @@
 //! The result is harness text about what changed (paths, line counts,
 //! digests), never file content: hence `content: own` in the manifest.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -59,10 +58,11 @@ use crate::builtin::{
     RootRefused,
 };
 use crate::edit::{
-    atomic_write, check_cap, check_new_parents, check_pre_image, create_parents, crlf_dominant,
-    find_offsets, lf_to_crlf, line_count, normalize_lf, read_capped, remove_dirs, EditError,
-    ReadLog, StaleRead, EDIT_MAX_BYTES, WRITE_MAX_NEW_DIRS,
+    check_cap, check_new_parents, check_pre_image, create_parents, crlf_dominant, find_offsets,
+    lf_to_crlf, line_count, normalize_lf, read_capped, remove_dirs, EditError, ReadLog, StaleRead,
+    EDIT_MAX_BYTES, WRITE_MAX_NEW_DIRS,
 };
+use crate::file_ops::{FileOps, InProcess};
 use crate::protected::Protected;
 use crate::provider::{
     EditRecord, Image, InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult,
@@ -404,17 +404,22 @@ impl Plan {
     /// each restored file must hash back to its before-digest. One
     /// failure anywhere is the `Unverified` failure the driver stops a
     /// run on.
-    fn rollback(&self, root: &Path, applied: usize) -> Result<(), PatchError> {
+    fn rollback(
+        &self,
+        ops: &mut dyn FileOps,
+        root: &Path,
+        applied: usize,
+    ) -> Result<(), PatchError> {
         for op in self.ops.iter().take(applied).rev() {
             match (&op.before_image, op.before) {
                 (Some(img), Some(before)) => {
-                    atomic_write(&op.path, &img.bytes, None).map_err(|e| {
+                    ops.write_atomic(&op.path, &img.bytes, None).map_err(|e| {
                         PatchError::Unverified(format!(
                             "the rollback of {} failed: {e}",
                             op.wp.as_str()
                         ))
                     })?;
-                    match reread_digest(root, &op.wp) {
+                    match reread_digest(ops, root, &op.wp) {
                         Ok(got) if got == before => {}
                         Ok(_) => {
                             return Err(PatchError::Unverified(format!(
@@ -433,7 +438,7 @@ impl Plan {
                 (None, None) => {
                     // A create: remove it again; a missing file is
                     // already gone, which is what the rollback wants.
-                    if let Err(e) = fs::remove_file(&op.path) {
+                    if let Err(e) = ops.remove_file(&op.path) {
                         if e.kind() != io::ErrorKind::NotFound {
                             return Err(PatchError::Unverified(format!(
                                 "the rollback (removing {}) failed: {e}",
@@ -458,22 +463,30 @@ impl Plan {
 }
 
 /// The digest of the file at `wp`, through the confined walk and cap.
-fn reread_digest(root: &Path, wp: &WorkspacePath) -> Result<Digest, EditError> {
-    let (path, meta) = resolve_path(root, wp)?;
+fn reread_digest(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    wp: &WorkspacePath,
+) -> Result<Digest, EditError> {
+    let (path, meta) = resolve_path(ops, root, wp)?;
     let Some(meta) = meta else {
         return Err(EditError::NotFound);
     };
-    if !meta.is_file() {
+    if !meta.kind.is_file() {
         return Err(EditError::NotAFile);
     }
-    let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+    let bytes = read_capped(ops, &path, meta.len, EDIT_MAX_BYTES)?;
     Ok(sha256(&bytes))
 }
 
 /// Whether a path is verified gone: the confined walk finds the final
 /// component missing (a walk error is not a verification).
-fn verified_gone(root: &Path, wp: &WorkspacePath) -> Result<bool, PatchError> {
-    match resolve_path(root, wp) {
+fn verified_gone(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    wp: &WorkspacePath,
+) -> Result<bool, PatchError> {
+    match resolve_path(ops, root, wp) {
         Ok((_, None)) => Ok(true),
         Ok((_, Some(_))) => Ok(false),
         Err(ResolveErr::NotFound) => Ok(true),
@@ -491,18 +504,30 @@ pub struct PatchTools {
     ns: ProviderName,
     root: PathBuf,
     protected: Protected,
+    /// Every filesystem access of these tools goes through here (P-36e).
+    ops: Box<dyn FileOps>,
 }
 
 impl PatchTools {
     /// The P-25 tools over the workspace at `root`, under the read
     /// tools' root rule (a real directory, never a symlink).
     pub fn new(root: &Path) -> Result<Self, RootRefused> {
+        let mut ops: Box<dyn FileOps> = Box::new(InProcess);
         Ok(Self {
             ns: ProviderName::new(harness_manifest::BUILTIN_NAMESPACE)
                 .map_err(|_| RootRefused::Io(io::Error::other("builtin namespace")))?,
-            root: canonical_root(root)?,
+            root: canonical_root(ops.as_mut(), root)?,
             protected: Protected::empty(),
+            ops,
         })
+    }
+
+    /// The same tools over another [`FileOps`] implementation (P-36e):
+    /// the root check runs against it too. Results are the implementation's.
+    #[must_use]
+    pub fn with_file_ops(mut self, ops: Box<dyn FileOps>) -> Self {
+        self.ops = ops;
+        self
     }
 
     /// The same tools with a protected-path deny list (P-29): ops on
@@ -531,19 +556,19 @@ impl PatchTools {
     /// Read the file at `wp` whole (the caps and the stale anchor
     /// included), returning its resolved path, bytes and digest.
     fn read_anchored(
-        &self,
+        &mut self,
         wp: &WorkspacePath,
         reads: &ReadLog,
     ) -> Result<(PathBuf, Vec<u8>, Digest), PatchError> {
-        let (path, meta) = resolve_path(&self.root, wp)?;
+        let (path, meta) = resolve_path(self.ops.as_mut(), &self.root, wp)?;
         let Some(meta) = meta else {
             return Err(PatchError::NotFound);
         };
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(EditError::NotAFile.into());
         }
-        check_pre_image(meta.len())?;
-        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        check_pre_image(meta.len)?;
+        let bytes = read_capped(self.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads
             .check(wp.as_str(), before)
@@ -554,7 +579,7 @@ impl PatchTools {
     /// The plan half of `harness.edit.patch`: parse the script, plan
     /// every section against the file as it was read, write nothing.
     /// Every refusal here leaves the workspace as it was.
-    fn plan_patch(&self, args: &Value, reads: &ReadLog) -> Result<Plan, PatchError> {
+    fn plan_patch(&mut self, args: &Value, reads: &ReadLog) -> Result<Plan, PatchError> {
         let text = match args.get("patch").and_then(Value::as_str) {
             Some(t) => t,
             None => return Err(ParseError::NoPatch.into()),
@@ -566,13 +591,13 @@ impl PatchTools {
             self.guard(&wp)?;
             match s {
                 Section::Add { content, .. } => {
-                    let (path, meta) = resolve_path(&self.root, &wp)?;
+                    let (path, meta) = resolve_path(self.ops.as_mut(), &self.root, &wp)?;
                     if meta.is_some() {
                         return Err(PatchError::AddExists(wp.as_str().to_owned()));
                     }
                     let bytes = content.into_bytes();
                     check_cap(&bytes)?;
-                    check_new_parents(&self.root, &wp)?;
+                    check_new_parents(self.ops.as_mut(), &self.root, &wp)?;
                     ops.push(Planned {
                         wp,
                         path,
@@ -618,7 +643,7 @@ impl PatchTools {
 
     /// `harness.edit.patch`: plan all sections, then apply them in
     /// order, all or none (a later failure rolls the earlier ones back).
-    fn patch(&self, args: &Value, reads: &ReadLog) -> (Out, Vec<EditRecord>) {
+    fn patch(&mut self, args: &Value, reads: &ReadLog) -> (Out, Vec<EditRecord>) {
         let mut plan = match self.plan_patch(args, reads) {
             Ok(p) => p,
             Err(e) => return (patch_err(&e), Vec::new()),
@@ -633,7 +658,7 @@ impl PatchTools {
                 }
                 Err(e) => {
                     // All or none: undo what this call already wrote.
-                    let rolled = plan.rollback(&self.root, applied);
+                    let rolled = plan.rollback(self.ops.as_mut(), &self.root, applied);
                     return match rolled {
                         Ok(()) => (patch_err(&e), Vec::new()),
                         Err(rb) => (patch_err(&rb), Vec::new()),
@@ -669,14 +694,16 @@ impl PatchTools {
     /// atomic, the re-read must hold exactly the planned bytes (or be
     /// gone), and the plan is filled in with the after-digest. The
     /// caller collects the record and the result line.
-    fn apply(&self, op: &mut Planned) -> Result<String, PatchError> {
+    fn apply(&mut self, op: &mut Planned) -> Result<String, PatchError> {
         let new_bytes = op.new_bytes.clone();
         match new_bytes {
             None => {
                 // Delete: remove, then verify it is gone through the
                 // same confined walk.
-                fs::remove_file(&op.path).map_err(|e| PatchError::Edit(EditError::Io(e)))?;
-                if !verified_gone(&self.root, &op.wp)? {
+                self.ops
+                    .remove_file(&op.path)
+                    .map_err(|e| PatchError::Edit(EditError::Io(e)))?;
+                if !verified_gone(self.ops.as_mut(), &self.root, &op.wp)? {
                     return Err(PatchError::Unverified(format!(
                         "{} still exists after the delete",
                         op.wp.as_str()
@@ -690,16 +717,16 @@ impl PatchTools {
                 ))
             }
             Some(new_bytes) => {
-                let made = create_parents(&self.root, &op.wp)?;
+                let made = create_parents(self.ops.as_mut(), &self.root, &op.wp)?;
                 let expected = sha256(&new_bytes);
-                if let Err(e) = atomic_write(&op.path, &new_bytes, None) {
-                    remove_dirs(&self.root, &made);
+                if let Err(e) = self.ops.write_atomic(&op.path, &new_bytes, None) {
+                    remove_dirs(self.ops.as_mut(), &self.root, &made);
                     return Err(PatchError::Edit(EditError::Io(e)));
                 }
-                match reread_digest(&self.root, &op.wp) {
+                match reread_digest(self.ops.as_mut(), &self.root, &op.wp) {
                     Ok(got) if got == expected => {}
                     Ok(_) | Err(_) => {
-                        remove_dirs(&self.root, &made);
+                        remove_dirs(self.ops.as_mut(), &self.root, &made);
                         return Err(PatchError::Unverified(format!(
                             "{} was written but holds different bytes than planned",
                             op.wp.as_str()
@@ -730,7 +757,7 @@ impl PatchTools {
 
     /// `harness.edit.delete`: one file, anchored and pre-imaged, then
     /// removed and verified gone.
-    fn delete(&self, args: &Value, reads: &ReadLog) -> (Out, Vec<EditRecord>) {
+    fn delete(&mut self, args: &Value, reads: &ReadLog) -> (Out, Vec<EditRecord>) {
         let wp = match arg_path(args) {
             Ok(w) => w,
             Err(out) => return (out, Vec::new()),
@@ -773,7 +800,7 @@ impl PatchTools {
     /// target refused when it exists, then the source's bytes written to
     /// the target (verified) and the source removed (verified gone): two
     /// records, target create then source delete.
-    fn move_file(&self, args: &Value, reads: &ReadLog) -> (Out, Vec<EditRecord>) {
+    fn move_file(&mut self, args: &Value, reads: &ReadLog) -> (Out, Vec<EditRecord>) {
         let wp = match arg_path(args) {
             Ok(w) => w,
             Err(out) => return (out, Vec::new()),
@@ -802,7 +829,7 @@ impl PatchTools {
             Ok(x) => x,
             Err(e) => return (patch_err(&e), Vec::new()),
         };
-        let (to_path, to_meta) = match resolve_path(&self.root, &to) {
+        let (to_path, to_meta) = match resolve_path(self.ops.as_mut(), &self.root, &to) {
             Ok(x) => x,
             Err(e) => return (patch_err(&PatchError::from(e)), Vec::new()),
         };
@@ -812,23 +839,23 @@ impl PatchTools {
                 Vec::new(),
             );
         }
-        if let Err(e) = check_new_parents(&self.root, &to) {
+        if let Err(e) = check_new_parents(self.ops.as_mut(), &self.root, &to) {
             return (patch_err(&PatchError::Edit(e)), Vec::new());
         }
         // The target write, verified like every apply.
-        let made = match create_parents(&self.root, &to) {
+        let made = match create_parents(self.ops.as_mut(), &self.root, &to) {
             Ok(m) => m,
             Err(e) => return (patch_err(&PatchError::Edit(e)), Vec::new()),
         };
         let expected = sha256(&bytes);
-        if let Err(e) = atomic_write(&to_path, &bytes, None) {
-            remove_dirs(&self.root, &made);
+        if let Err(e) = self.ops.write_atomic(&to_path, &bytes, None) {
+            remove_dirs(self.ops.as_mut(), &self.root, &made);
             return (patch_err(&PatchError::Edit(EditError::Io(e))), Vec::new());
         }
-        match reread_digest(&self.root, &to) {
+        match reread_digest(self.ops.as_mut(), &self.root, &to) {
             Ok(got) if got == expected => {}
             _ => {
-                remove_dirs(&self.root, &made);
+                remove_dirs(self.ops.as_mut(), &self.root, &made);
                 return (
                     patch_err(&PatchError::Unverified(format!(
                         "{} was written but holds different bytes than planned",
@@ -841,12 +868,12 @@ impl PatchTools {
         // The source removal, verified gone; if it fails, the copy the
         // target now holds is taken back out, so the workspace keeps
         // looking as it did.
-        if let Err(e) = fs::remove_file(&path) {
-            let _ = fs::remove_file(&to_path);
-            remove_dirs(&self.root, &made);
+        if let Err(e) = self.ops.remove_file(&path) {
+            let _ = self.ops.remove_file(&to_path);
+            remove_dirs(self.ops.as_mut(), &self.root, &made);
             return (patch_err(&PatchError::Edit(EditError::Io(e))), Vec::new());
         }
-        match verified_gone(&self.root, &wp) {
+        match verified_gone(self.ops.as_mut(), &self.root, &wp) {
             Ok(true) => {}
             Ok(false) => {
                 return (

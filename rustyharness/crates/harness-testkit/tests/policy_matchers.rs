@@ -28,6 +28,7 @@ fn edit_spec(task: &str) -> harness_run::TaskSpec {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     }

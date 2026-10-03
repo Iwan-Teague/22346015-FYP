@@ -49,10 +49,10 @@ const BG_IDS: [&str; 3] = [
     "harness.exec.stop",
 ];
 
-/// All three tables agree: eighteen coding capabilities, manifest order.
-/// The dispatch table serves the fifteen non-background ones (manifest
+/// All three tables agree: nineteen coding capabilities, manifest order.
+/// The dispatch table serves the sixteen non-background ones (manifest
 /// order minus the P-36g trio). The policy registration table is the union
-/// (P-39b): the same eighteen in order, then the two web ids the research
+/// (P-39b): the same nineteen in order, then the two web ids the research
 /// manifest declares, which no tool provider serves yet. A new built-in
 /// registers in all of them or the run cannot dispatch what it grants.
 #[test]
@@ -61,16 +61,16 @@ fn builtin_registry_tables_agree_in_order() {
     let manifest_ids: Vec<&str> = m.capabilities().iter().map(|c| c.id().as_str()).collect();
     let policy_ids: Vec<&str> = policy_builtin::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
     let tool_ids: Vec<&str> = registry::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
-    assert_eq!(manifest_ids.len(), 18);
+    assert_eq!(manifest_ids.len(), 19);
     let served: Vec<&str> = manifest_ids
         .iter()
         .copied()
         .filter(|id| !BG_IDS.contains(id))
         .collect();
     assert_eq!(tool_ids, served);
-    assert_eq!(&policy_ids[..18], manifest_ids.as_slice());
+    assert_eq!(&policy_ids[..19], manifest_ids.as_slice());
     assert_eq!(
-        &policy_ids[18..],
+        &policy_ids[19..],
         ["harness.web.fetch", "harness.web.search"]
     );
 
@@ -84,7 +84,11 @@ fn builtin_registry_tables_agree_in_order() {
                 assert!(p.serves(t.id), "{} does not serve itself", t.id);
             }
             ProviderCtor::Exec => assert_eq!(t.id, "harness.exec.run"),
-            ProviderCtor::RunLoop => assert!(t.id.starts_with("harness.task.")),
+            ProviderCtor::RunLoop => assert!(
+                t.id.starts_with("harness.task.") || t.id == "harness.plan.submit",
+                "{}",
+                t.id
+            ),
         }
     }
     assert!(matches!(
@@ -101,6 +105,10 @@ fn builtin_registry_tables_agree_in_order() {
     ));
     assert!(matches!(
         registry::entry("harness.task.submit").map(|t| &t.ctor),
+        Some(ProviderCtor::RunLoop)
+    ));
+    assert!(matches!(
+        registry::entry("harness.plan.submit").map(|t| &t.ctor),
         Some(ProviderCtor::RunLoop)
     ));
     // Unknown ids have no entry and build nothing.

@@ -114,6 +114,7 @@ fn task(grants: &[&str], exec: Option<ExecSpec>, presubmit: Option<PresubmitSpec
         lan_ports: Vec::new(),
         exec,
         presubmit,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     }

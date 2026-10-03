@@ -54,8 +54,8 @@ pub use harness_core::glob;
 pub use outline::OUTLINE_MAX_ENTRIES;
 pub use patch::{PatchError, PatchTools, DELETE, MOVE, PATCH};
 pub use provider::{
-    EditRecord, ExecCleanup, ExecEnd, ExecRecord, Image, InvokeCtx, ReadRecord, RefusalKind,
-    ToolError, ToolProvider, ToolResult, ToolStatus,
+    EditRecord, ExecCleanup, ExecEnd, ExecRecord, Image, InvokeCtx, McpRecord, ReadRecord,
+    RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus,
 };
 pub use restore::{recreate_file, restore_file, uncreate_file, RestoreError};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};

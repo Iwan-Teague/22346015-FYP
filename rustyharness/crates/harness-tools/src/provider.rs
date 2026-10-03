@@ -117,11 +117,36 @@ pub struct ToolResult {
     /// whether everything it started is confirmed gone, what it wrote, and
     /// the workspace re-measured after it. `None` when no command started.
     pub exec: Option<ExecRecord>,
+    /// For an MCP tool (§9 step 6, P-37h): the wire facts of the one
+    /// `tools/call` exchange, for the journal's `ToolFinished` mcp fields.
+    /// `None` for built-in tools.
+    pub mcp: Option<McpRecord>,
     /// For a web call (`harness.web.fetch`, P-39g): the per-hop records
     /// (§4.5, §11) the run pairs with its journaled `Egress` entries
     /// (INV-43; the pairing itself is P-39j), plus the final URL and the
     /// digest of the extracted text. `None` for every non-web tool.
     pub web: Option<crate::web::WebRecord>,
+}
+
+/// The wire facts of one MCP `tools/call` exchange (§9 step 6, P-37h).
+/// Everything here is either harness-computed or untrusted server text;
+/// the driver journals the pieces the loop needs (`ToolFinished` mcp
+/// fields, §11).
+#[derive(Debug)]
+pub struct McpRecord {
+    /// The JSON-RPC request id the client used for the call.
+    pub request_id: u64,
+    /// SHA-256 of the exact request frame bytes sent for the call.
+    pub request_sha256: Digest,
+    /// The raw response line as it arrived, when a response arrived
+    /// (absent for a timeout, cancellation, or crashed connection).
+    pub response_frame: Option<Untrusted<Vec<u8>>>,
+    /// SHA-256 of the pre-call relist's tool list (canonical JSON), so the
+    /// journal can show which listing the call ran against.
+    pub list_sha256: Digest,
+    /// Server-originated noise (notifications, requests) observed during the
+    /// call exchange.
+    pub noise: u64,
 }
 
 /// What a command did (H2d). The run journals it with the command's

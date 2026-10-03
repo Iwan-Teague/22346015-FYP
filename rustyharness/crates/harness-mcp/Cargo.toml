@@ -1,6 +1,6 @@
 [package]
 name = "harness-mcp"
-description = "rustyharness MCP stdio client: the pure wire codec (frames, classification, encoders) and the pure response renderer (P-37f) now; the client, provider and confined connector in later P-37 slices."
+description = "rustyharness MCP stdio client: the pure wire codec (frames, classification, encoders), the response renderer, the client state machine and the tool provider (P-37h); the confined connector is P-37l."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,13 +10,30 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test-only seams ([`testing`]). Nothing in the normal dependency graph
+# may enable this: the purity gate plants an enabling edge and expects
+# the refusal (P-37h).
+testing = []
+
 [dependencies]
 # The shared strict JSON reader (harness_core::strict_json, INV-22), and the
 # digest and provenance types the renderer's output carries.
 harness-core = { path = "../harness-core" }
 # The ToolStatus/tool-code vocabulary the renderer maps MCP outcomes onto
-# (P-37f; a design §2 edge: harness-mcp -> harness-tools).
+# (P-37f; a design §2 edge: harness-mcp -> harness-tools), and the
+# McpRecord the provider fills (P-37h).
 harness-tools = { path = "../harness-tools" }
+# The sandbox witness the connector seam demands before dialing (§6,
+# P-37h): no provider dials a foreign process without confinement.
+harness-sandbox = { path = "../harness-sandbox" }
+# The journaled-call type the provider accepts (F-01/INV-33: no provider
+# runs a call whose intent is not durably journaled).
+harness-journal = { path = "../harness-journal" }
+# The provider and capability names the admitted map is keyed by.
+harness-manifest = { path = "../harness-manifest" }
+# The authorized call the provider accepts (minted only on Allow).
+harness-policy = { path = "../harness-policy" }
 # Pure-crate-adjacent allowlist (scripts/ci/purity.sh §5): serde_json,
 # thiserror only from crates.io, both already reviewed there.
 serde_json.workspace = true

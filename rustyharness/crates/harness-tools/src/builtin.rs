@@ -378,6 +378,7 @@ pub(crate) fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
         read: None,
         edits: Vec::new(),
         exec: None,
+        mcp: None,
         web: None,
     }
 }
@@ -403,6 +404,7 @@ pub(crate) fn finish(cap: &str, out: Out) -> ToolResult {
         read: out.read,
         edits: Vec::new(),
         exec: None,
+        mcp: None,
         web: None,
     }
 }

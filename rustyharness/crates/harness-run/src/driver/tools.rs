@@ -153,6 +153,10 @@ impl RecordedResult {
             read,
             edits,
             exec,
+            // Replay recompute of an `McpRecord` from the journal's
+            // `ToolFinished` mcp fields arrives with the MCP driver slice
+            // (P-37i); no journal written so far carries them.
+            mcp: None,
             web: None,
         })
     }

@@ -27,6 +27,7 @@ pub const SAMPLE_MODE_STRINGS: &[&str] = &[
     "drift-schema",
     "rug-pull-after:1",
     "vanish-after:1",
+    "new-tool-after:1",
     "list-changed-spam",
     "malformed",
     "huge-frame",
@@ -51,6 +52,7 @@ pub const SAMPLE_MODE_STRINGS: &[&str] = &[
     "exit-midcall",
     "stderr-spam",
     "hang",
+    "hang-after-connect",
     "confinement-probe",
 ];
 
@@ -73,6 +75,9 @@ pub enum Mode {
     RugPullAfter(u64),
     /// After `<n>` `tools/call` requests, `echo` vanishes from the list.
     VanishAfter(u64),
+    /// After `<n>` `tools/call` requests, an unlisted tool `extra` joins
+    /// the list (P-37h: the relist counts it and never quarantines).
+    NewToolAfter(u64),
     /// Sends a `notifications/tools/list_changed` before every list
     /// answer and after every call result.
     ListChangedSpam,
@@ -129,6 +134,11 @@ pub enum Mode {
     StderrSpam,
     /// Answers `initialize`, then never answers anything again.
     Hang,
+    /// Answers the lifecycle through the FIRST `tools/list`, then never
+    /// answers again (P-37h: a connect that succeeds and a pre-call
+    /// relist that hangs — the provider's call-phase timeout, not the
+    /// handshake's).
+    HangAfterConnect,
     /// Offers one tool that probes its confinement (home and cwd writes,
     /// loopback and internet connects, a planted home canary) and reports
     /// each attempt as a text line.
@@ -150,6 +160,7 @@ impl Mode {
             "drift-schema" => no_param(s, param, Mode::DriftSchema),
             "rug-pull-after" => calls_param(s, param).map(Mode::RugPullAfter),
             "vanish-after" => calls_param(s, param).map(Mode::VanishAfter),
+            "new-tool-after" => calls_param(s, param).map(Mode::NewToolAfter),
             "list-changed-spam" => no_param(s, param, Mode::ListChangedSpam),
             "malformed" => no_param(s, param, Mode::Malformed),
             "huge-frame" => no_param(s, param, Mode::HugeFrame),
@@ -174,6 +185,7 @@ impl Mode {
             "exit-midcall" => no_param(s, param, Mode::ExitMidcall),
             "stderr-spam" => no_param(s, param, Mode::StderrSpam),
             "hang" => no_param(s, param, Mode::Hang),
+            "hang-after-connect" => no_param(s, param, Mode::HangAfterConnect),
             "confinement-probe" => no_param(s, param, Mode::ConfinementProbe),
             _ => Err(ModeError::Unknown(s.to_owned())),
         }

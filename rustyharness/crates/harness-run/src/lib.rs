@@ -57,6 +57,7 @@
 
 pub mod approve;
 pub mod driver;
+pub mod postedit;
 pub mod presubmit;
 pub mod replay;
 pub mod restore;
@@ -73,6 +74,7 @@ pub use driver::{
 /// embedder builds specs without a direct `harness-policy` dependency.
 pub use harness_policy::SessionKind;
 pub use harness_tools::{plain_name, ExecLimits, ExecProgram, ExecSpec, MAX_PROGRAMS};
+pub use postedit::{PostEditCheck, PostEditRefused, PostEditReport, PostEditResult, PostEditSpec};
 pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
 pub use replay::{
     audit, audit_session, resume, resume_session, Audit, AuditRefused, AuditReport, Divergence,

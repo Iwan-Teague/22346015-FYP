@@ -135,6 +135,50 @@ pub(crate) fn is_builtin_todo(c: &Capability) -> bool {
         && c.confirmation() == Confirmation::None
 }
 
+/// The built-in plan sentinel (P-28, §5.4): the planning mode's one way to
+/// hand work back — the model submits its plan (a summary, the files it
+/// names, its steps) and the turn ends so the user can read it. Like the
+/// checklist and the sentinel, it touches nothing outside the run: the
+/// paths it lists are text for the user, not arguments anything runs.
+pub const PLAN_SUBMIT_ID: &str = "harness.plan.submit";
+
+/// The rule that allows the plan sentinel (P-28), after every deny rule
+/// and the schema, like the checklist's.
+pub const PLAN_SUBMIT_RULE: &str = "allow.plan-submit";
+
+/// The rule that allows an edit call on a file the approved plan names
+/// (P-28, §5.4): the ask the edit would otherwise take was answered when
+/// the user approved the plan.
+pub const PLAN_ALLOW_RULE: &str = "plan.allow";
+
+/// Whether `c` is the built-in plan sentinel with exactly the labels the
+/// manifest gives it — the checklist's row (write / public / own / none,
+/// content own, no declared confirmation). Anything else under that id
+/// would not be the harness's plan sentinel, and its write class is then
+/// out of scope.
+pub(crate) fn is_builtin_plan_submit(c: &Capability) -> bool {
+    c.id().as_str() == PLAN_SUBMIT_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Write
+        && c.sensitivity() == Sensitivity::Public
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::Own
+        && c.confirmation() == Confirmation::None
+}
+
+/// Whether `id` is one of the tools a plan-mode session keeps active
+/// (P-28): the read-class fs tools, the checklist and the plan sentinel.
+/// The loop filters its declared tool list with this, so a plan-mode
+/// request names no edit or exec tool; `decide` refuses the rest by the
+/// ordinary not-granted path.
+pub fn is_plan_tool_id(id: &str) -> bool {
+    matches!(
+        id,
+        READ_ID | SEARCH_ID | GLOB_ID | LIST_ID | OUTLINE_ID | TODO_ID | PLAN_SUBMIT_ID
+    )
+}
+
 /// Whether `c` is the built-in delegate (P-38) with exactly the labels the
 /// manifest gives it: read / operational / own / none, `content:
 /// third_party` (the helper's report is other people's text by default,
@@ -330,6 +374,9 @@ pub enum ToolKind {
     Submit,
     /// The checklist (H2e).
     Todo,
+    /// The plan sentinel (P-28): records the submitted plan and ends the
+    /// turn; touches nothing in or outside the workspace.
+    PlanSubmit,
     /// The delegate capability (P-38): one call starts one read-only
     /// helper run.
     Delegate,
@@ -466,6 +513,16 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         id: "harness.task.delegate",
         kind: ToolKind::Delegate,
         labels: is_builtin_delegate,
+    },
+    // The plan sentinel (P-28, §5.4) sits with the other task tools, in
+    // manifest order (between the delegate and the submit sentinel): it
+    // records the submitted plan and ends the turn, so it needs no
+    // workspace, and it is not a research id (a research session has no
+    // plan to build).
+    BuiltinTool {
+        id: PLAN_SUBMIT_ID,
+        kind: ToolKind::PlanSubmit,
+        labels: is_builtin_plan_submit,
     },
     BuiltinTool {
         id: "harness.task.submit",

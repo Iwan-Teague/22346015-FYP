@@ -41,6 +41,7 @@ fn spec(grants: &[&str]) -> SessionSpec {
         lan_ports: Vec::new(),
         read_window: None,
         kind: SessionKind::Coding,
+        mode: SessionMode::Build,
     }
 }
 
@@ -341,6 +342,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             exec_stop: false,
             web_search: false,
             mcp: false,
+            plan_submit: false,
         },
     );
     Session {
@@ -356,6 +358,9 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
         session_allow: BTreeMap::new(),
         web: None,
         workspace: None,
+        plan_allow: BTreeMap::new(),
+        mode: SessionMode::Build,
+        plan_set: BTreeSet::new(),
     }
 }
 
@@ -1962,7 +1967,7 @@ fn policy_default_table_unchanged() {
 /// (P-39b), todo and the sentinel in both manifests.
 #[test]
 fn tool_count_policy_default_read_allow() {
-    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 20);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 21);
     let reg = builtin_registry();
     let research = research_registry();
     for t in crate::builtin::BUILTIN_TOOLS {
@@ -3232,6 +3237,7 @@ fn research_spec(grants: &[&str]) -> SessionSpec {
             search: true,
             confirmed: Some(WebConfirmation::Tty),
         }),
+        mode: SessionMode::Build,
     }
 }
 
@@ -3555,7 +3561,7 @@ fn egress_still_out_of_scope_in_coding_sessions() {
 /// and the default deny table is untouched.
 #[test]
 fn web_entries_append_after_the_coding_table() {
-    const WANT: [(&str, crate::builtin::ToolKind); 18] = [
+    const WANT: [(&str, crate::builtin::ToolKind); 19] = [
         ("harness.fs.read", crate::builtin::ToolKind::Fs),
         ("harness.fs.search", crate::builtin::ToolKind::Fs),
         ("harness.fs.glob", crate::builtin::ToolKind::Fs),
@@ -3573,21 +3579,22 @@ fn web_entries_append_after_the_coding_table() {
         ("harness.exec.stop", crate::builtin::ToolKind::ExecBg),
         ("harness.task.todo", crate::builtin::ToolKind::Todo),
         ("harness.task.delegate", crate::builtin::ToolKind::Delegate),
+        ("harness.plan.submit", crate::builtin::ToolKind::PlanSubmit),
         ("harness.task.submit", crate::builtin::ToolKind::Submit),
     ];
     for (t, want) in crate::builtin::BUILTIN_TOOLS.iter().zip(WANT) {
         assert_eq!(t.id, want.0);
         assert_eq!(t.kind, want.1);
     }
-    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 20);
-    assert_eq!(crate::builtin::BUILTIN_TOOLS[18].id, WEB_FETCH_ID);
-    assert_eq!(crate::builtin::BUILTIN_TOOLS[19].id, WEB_SEARCH_ID);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 21);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS[19].id, WEB_FETCH_ID);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS[20].id, WEB_SEARCH_ID);
     assert!(matches!(
-        crate::builtin::BUILTIN_TOOLS[18].kind,
+        crate::builtin::BUILTIN_TOOLS[19].kind,
         crate::builtin::ToolKind::Web
     ));
     assert!(matches!(
-        crate::builtin::BUILTIN_TOOLS[19].kind,
+        crate::builtin::BUILTIN_TOOLS[20].kind,
         crate::builtin::ToolKind::Web
     ));
     assert_eq!(DEFAULT_DENY_GLOBS.len(), 10);
@@ -4008,6 +4015,7 @@ fn quarantine_recomputes_trifecta_and_never_widens() {
             Active {
                 class: effective_class(c, Confirmation::None),
                 schema: c.input_schema().clone(),
+                plan_submit: false,
                 user_deny: Vec::new(),
                 user_ask: Vec::new(),
                 user_allow: Vec::new(),
@@ -4039,6 +4047,9 @@ fn quarantine_recomputes_trifecta_and_never_widens() {
         session_allow: BTreeMap::new(),
         web: None,
         workspace: None,
+        plan_allow: BTreeMap::new(),
+        mode: SessionMode::Build,
+        plan_set: BTreeSet::new(),
     };
     assert_eq!(
         s.quarantine(&CapId::new("fixture.e1").unwrap()),

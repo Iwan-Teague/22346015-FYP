@@ -89,6 +89,7 @@ impl ToolProvider for Spy {
             read: None,
             edits: Vec::new(),
             exec: None,
+            mcp: None,
             web: None,
         })
     }
@@ -168,6 +169,7 @@ fn drive_full(
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_policy::SessionKind::Coding,
     };
@@ -226,7 +228,9 @@ fn drive_full(
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        post_edit: None,
         restore: Default::default(),
+        workspace_root: None,
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -886,6 +890,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_policy::SessionKind::Coding,
     };
@@ -955,7 +960,9 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        post_edit: None,
         restore: Default::default(),
+        workspace_root: None,
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -1405,6 +1412,7 @@ fn refusal_spec(grants: &[&str]) -> TaskSpec {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_policy::SessionKind::Coding,
     }

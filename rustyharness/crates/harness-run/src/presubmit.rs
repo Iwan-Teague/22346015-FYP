@@ -251,8 +251,9 @@ impl PresubmitState {
     }
 }
 
-/// One command's end, as the round sees it.
-enum CheckRun {
+/// One command's end, as the round sees it (shared with the post-edit
+/// checks, which run the same kind of call the same way; P-27).
+pub(crate) enum CheckRun {
     Passed,
     Failed {
         body: Untrusted<String>,
@@ -378,7 +379,7 @@ impl<'a> Loop<'a> {
     /// run it (or take the recorded result of the same call), journal its
     /// result with the tree measured after it, keep the loop's tree current,
     /// and charge the wall time.
-    fn run_check<F: JournalFile, B: BlobSink, K: Clock>(
+    pub(crate) fn run_check<F: JournalFile, B: BlobSink, K: Clock>(
         &mut self,
         w: &mut JournalWriter<F, B, K>,
         step: u64,

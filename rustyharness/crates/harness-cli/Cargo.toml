@@ -26,6 +26,11 @@ harness-acp = { path = "../harness-acp" }
 harness-core = { path = "../harness-core" }
 harness-journal = { path = "../harness-journal" }
 harness-manifest = { path = "../harness-manifest" }
+# The MCP client/provider crate (design §6, P-37h): the CLI is the suite's
+# composition root, and the purity gate's forwarding-witness selftest plants
+# a `[features]` forward to harness-mcp/testing in THIS manifest, which
+# cargo resolves only if harness-mcp is a direct dependency here.
+harness-mcp = { path = "../harness-mcp" }
 harness-model = { path = "../harness-model" }
 harness-policy = { path = "../harness-policy" }
 harness-run = { path = "../harness-run" }

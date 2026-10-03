@@ -261,6 +261,36 @@ if grep -qF 'harness-sandbox feature "remap"' "$tmpdir/feat-normal"; then
     fail "a normal dependency edge enables harness-sandbox/remap"
 fi
 
+# --- the MCP provider's test-only testing seam (P-37h) -----------------------
+# harness-mcp's `testing` feature compiles the provider crate's pure
+# test-only helpers (src/testing.rs). The REAL in-memory connector lives in
+# the harness-mcp-fixture package (the purity scan covers every file of
+# harness-mcp, so the connector's threads and channels cannot). Same seam
+# rule as remap: the feature must exist, and NO normal dependency edge may
+# enable it. `cargo tree` shows only ACTIVE features, so the declaration is
+# checked in the manifest itself (fail-closed if renamed).
+grep -qE '^testing[ \t]*=' crates/harness-mcp/Cargo.toml ||
+    fail "harness-mcp does not declare its test-only testing feature (renamed?)"
+if grep -qF 'harness-mcp feature "testing"' "$tmpdir/feat-normal"; then
+    fail "a normal dependency edge enables harness-mcp/testing"
+fi
+# Same forwarding rule as fault-injection: no `[features]` table in the
+# workspace may forward to harness-mcp/testing, except the feature's own
+# definition in harness-mcp.
+: >"$tmpdir/fwd-mcp-testing"
+for toml in crates/*/Cargo.toml; do
+    awk -v f="$toml" '
+        /^[ \t]*\[/ { sec = $0 }
+        sec ~ /^[ \t]*\[features\]/ && /harness-mcp[ \t]*\// {
+            if (!(f ~ /harness-mcp\/Cargo.toml/ && $0 ~ /^[ \t]*testing[ \t]*=[ \t]*\[[ \t]*\][ \t]*$/))
+                print f ": " $0
+        }' "$toml" >>"$tmpdir/fwd-mcp-testing" || fail "awk failed on $toml"
+done
+if [ -s "$tmpdir/fwd-mcp-testing" ]; then
+    fail "a workspace feature forwards to harness-mcp/testing:
+$(cat "$tmpdir/fwd-mcp-testing")"
+fi
+
 # --- shared: file lists and normalisation -----------------------------------
 
 # rust_files OUT DIR...: every .rs file under DIR... (src, tests, benches,
@@ -900,7 +930,9 @@ fi
 #   - the ratchet: the count of `unsafe` tokens in its code (comments and
 #     string contents stripped) never rises without a review of this gate —
 #     each site needs a `// SAFETY:` comment and a new ratchet number. S-La
-#     lands the decision logic with NO FFI site, so the ratchet starts at 0;
+#     landed the decision logic with no FFI site; S-Lc raised it to 1 (the
+#     one seccomp filter apply; its probe test needs no unsafe — std's
+#     `TcpListener` observes the denied socket family through `io::Error`);
 #   - the blast radius: only harness-sandbox (target-gated to
 #     `target_os = "linux"`) may depend on it, so no other platform's build
 #     compiles any of it, and no behaviour of it reaches harness-run (INV-6:
@@ -917,8 +949,8 @@ normalise "$tmpdir/linux-stripped" "$tmpdir/linux-code"
 awk '{ sub(/^ +/, ""); if (index($0, "#![allow(unsafe_code)]") != 1) exit 1 }' "$tmpdir/linux-code" ||
     fail "INV-23: crates/harness-sandbox-linux/src/lib.rs must open with #![allow(unsafe_code)] (the one named unsafe exception; see design §6.7)"
 
-# The unsafe-site ratchet.
-linux_unsafe_ratchet=0
+# The unsafe-site ratchet (S-Lc: the one production seccomp filter apply).
+linux_unsafe_ratchet=1
 rust_files "$tmpdir/linux-files" crates/harness-sandbox-linux/src
 : >"$tmpdir/linux-tokens"
 while IFS= read -r f; do

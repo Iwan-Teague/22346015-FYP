@@ -251,6 +251,7 @@ fn an_unknown_grant_refuses_the_session() {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     };
@@ -323,6 +324,7 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     };

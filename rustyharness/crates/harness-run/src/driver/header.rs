@@ -345,7 +345,9 @@ impl PortsHeader {
 /// the session's: absent in a batch run's header, so such a journal reads
 /// as before. `session_kind` and `web` (P-39i) are a research session's:
 /// absent for a coding session, so coding journals read exactly as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 20] = [
+/// `post_edit` (P-27) is the task's post-edit checks: absent without one,
+/// so a journal without one reads as before.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 21] = [
     "task",
     "grants",
     "workspace_public",
@@ -362,6 +364,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 20] = [
     "exec",
     "ports",
     "presubmit",
+    "post_edit",
     "mode",
     "turn_limits",
     "session_kind",
@@ -574,6 +577,16 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
                 ("spec", Trusted::Digest(p.digest())),
                 ("commands", Trusted::U64(p.commands.len() as u64)),
                 ("max_rounds", Trusted::U64(u64::from(p.max_rounds))),
+            ]),
+        );
+    }
+    // The task's post-edit checks (P-27): the same, by the same rules.
+    if let Some(p) = &spec.post_edit {
+        hd = hd.field(
+            "post_edit",
+            Trusted::Obj(vec![
+                ("spec", Trusted::Digest(p.digest())),
+                ("checks", Trusted::U64(p.checks.len() as u64)),
             ]),
         );
     }

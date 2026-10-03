@@ -139,10 +139,13 @@ fn pid_in(path: &Path) -> u32 {
         .unwrap()
 }
 
-/// Poll until `path` exists (the confined program's sync marker).
+/// Poll until `path` exists and holds its pid (the confined program's sync
+/// marker). The program creates the file (`open >`) before it writes the
+/// pid, so bare existence races a reader into an empty file: wait for the
+/// content, which the program writes in one `close`-time flush.
 fn wait_for(path: &Path, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !path.exists() {
+    while !std::fs::read_to_string(path).is_ok_and(|s| !s.trim().is_empty()) {
         assert!(Instant::now() < deadline, "{what} never happened");
         std::thread::sleep(Duration::from_millis(10));
     }

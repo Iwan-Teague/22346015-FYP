@@ -95,9 +95,10 @@ pub mod path;
 pub mod web;
 
 pub use builtin::{
-    is_bg_id, BG_READ_RULE, BG_STOP_RULE, CHILD_ELIGIBLE, DELEGATE_ID, EDIT_DEFAULT_RULE, EDIT_IDS,
-    EXEC_DEFAULT_RULE, EXEC_ID, EXEC_READ_ID, EXEC_START_ID, EXEC_STOP_ID, GLOB_ID, LAN_BIND_RULE,
-    LIST_ID, MCP_DEFAULT_RULE, OUTLINE_ID, READ_ID, SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
+    is_bg_id, is_plan_tool_id, BG_READ_RULE, BG_STOP_RULE, CHILD_ELIGIBLE, DELEGATE_ID,
+    EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, EXEC_READ_ID, EXEC_START_ID,
+    EXEC_STOP_ID, GLOB_ID, LAN_BIND_RULE, LIST_ID, MCP_DEFAULT_RULE, OUTLINE_ID, PLAN_ALLOW_RULE,
+    PLAN_SUBMIT_ID, PLAN_SUBMIT_RULE, READ_ID, SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
     WEB_ALLOWLIST_RULE, WEB_FETCH_ID, WEB_SEARCH_ID, WEB_SEARCH_RULE,
 };
 pub use denies::{
@@ -802,6 +803,25 @@ pub struct SessionSpec {
     /// everything the default has always been; `Research` admits the web
     /// airlock and refuses everything the airlock excludes.
     pub kind: SessionKind,
+    /// The session's mode (P-28, §5.4): `Build` is the default and is
+    /// everything the default has always been; `Plan` is the read-only
+    /// planning mode a session starts in when the caller asks for one —
+    /// its active set is the read tools, the checklist and the plan
+    /// sentinel only, until the user approves a submitted plan.
+    pub mode: SessionMode,
+}
+
+/// Which mode a session runs in (P-28, §5.4). `Build` is the default, so
+/// every existing caller is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionMode {
+    /// The normal mode: the full active set, as planned.
+    #[default]
+    Build,
+    /// The planning mode (P-28): a read-only active set — the fs read
+    /// tools, the checklist and the plan sentinel — whatever the grants
+    /// say. [`Session::build`] leaves it after the user approves a plan.
+    Plan,
 }
 
 /// What kind of session the task spec asks for (§2.2, P-39b). The kind is
@@ -1009,6 +1029,10 @@ struct Active {
     /// The built-in checklist (`harness.task.todo`, H2e): allowed by its
     /// named rule after every deny rule and the schema.
     todo: bool,
+    /// The built-in plan sentinel (`harness.plan.submit`, P-28): the
+    /// planning mode's one write-shaped tool; it records the plan and ends
+    /// the turn, touching nothing.
+    plan_submit: bool,
     /// The built-in delegate (`harness.task.delegate`, P-38): a read-class
     /// call that starts one read-only helper run, granted only explicitly;
     /// its label must cover the child scope (checked at planning).
@@ -1071,6 +1095,18 @@ pub struct Session {
     /// policy the run header digests, gone when the session ends.
     session_deny: BTreeMap<CapId, Vec<UserCandidate>>,
     session_allow: BTreeMap<CapId, Vec<UserCandidate>>,
+    /// Plan-scoped allow grants (P-28): one per file named in the approved
+    /// plan, per edit capability, checked before the user's own allow
+    /// rules. Like the session rules (P-23), session-scoped by
+    /// construction: never part of the policy the run header digests.
+    plan_allow: BTreeMap<CapId, Vec<UserCandidate>>,
+    /// The session's mode (P-28, §5.4): the whole active set decides only
+    /// in `Build`; in `Plan` the plan set decides.
+    mode: SessionMode,
+    /// The active subset a `Plan`-mode session decides (P-28): the fs read
+    /// tools, the checklist and the plan sentinel. Computed at planning;
+    /// quarantine shrinks it like the active set.
+    plan_set: BTreeSet<CapId>,
     /// The web session state (§2.3); `None` in a coding session.
     web: Option<WebSession>,
     /// The task's workspace declaration, kept so [`Session::quarantine`] can
@@ -1207,9 +1243,38 @@ impl Session {
             return Err(SessionRefused::Restricted(id.to_string()));
         }
 
-        let labels: Vec<(&CapId, EffectiveClass)> =
-            classes.iter().map(|(id, cl, _, _)| (*id, *cl)).collect();
-        trifecta_with_lan(&labels, spec.workspace, !spec.lan_ports.is_empty())?;
+        // The plan set (P-28, §5.4): the active subset a `Plan`-mode
+        // session decides — the fs read tools, the checklist and the plan
+        // sentinel. Computed over the resolved classes, before the
+        // trifecta, which a planning session runs over exactly this set:
+        // the labels a plan mode can reach are the read tools' only, so a
+        // session may plan over a set whose full trifecta is lethal and be
+        // refused when it later builds (P-28 §5.4).
+        let plan_ids: &[&str] = &[
+            READ_ID,
+            SEARCH_ID,
+            GLOB_ID,
+            LIST_ID,
+            OUTLINE_ID,
+            TODO_ID,
+            PLAN_SUBMIT_ID,
+        ];
+        let plan_set: BTreeSet<CapId> = classes
+            .iter()
+            .map(|(id, _, _, _)| (*id).clone())
+            .filter(|id| plan_ids.contains(&id.as_str()))
+            .collect();
+        let plan_mode = spec.mode == SessionMode::Plan;
+        let labels: Vec<(&CapId, EffectiveClass)> = classes
+            .iter()
+            .filter(|(id, _, _, _)| !plan_mode || plan_set.contains(id))
+            .map(|(id, cl, _, _)| (*id, *cl))
+            .collect();
+        trifecta_with_lan(
+            &labels,
+            spec.workspace,
+            !plan_mode && !spec.lan_ports.is_empty(),
+        )?;
 
         // The session kind (§2.2 item 3, P-39b). Coding is the default and
         // changes nothing; Research builds the web state or refuses. The
@@ -1306,6 +1371,7 @@ impl Session {
                         && c.id().as_str().starts_with(builtin::FS_PREFIX),
                     submit: builtin::is_submit_sentinel(c),
                     todo: builtin::is_builtin_todo(c),
+                    plan_submit: builtin::is_builtin_plan_submit(c),
                     delegate: builtin::is_builtin_delegate(c),
                     edit: builtin::is_builtin_edit(c) || builtin::is_builtin_fileop(c),
                     exec: builtin::is_builtin_exec(c),
@@ -1349,6 +1415,9 @@ impl Session {
             read_window: spec.read_window,
             session_deny: BTreeMap::new(),
             session_allow: BTreeMap::new(),
+            plan_allow: BTreeMap::new(),
+            mode: spec.mode,
+            plan_set,
             web,
             workspace: spec.workspace,
         })
@@ -1370,6 +1439,67 @@ impl Session {
             matcher: Some(matcher),
         });
         index
+    }
+
+    /// Grant one plan-scoped allow rule (P-28, §5.4): when the user
+    /// approves a plan, every edit call on a file the plan names skips its
+    /// ask. One matcher on one capability, like [`Session::grant`], but
+    /// under the `plan.allow` rule — checked after the session rules and
+    /// before the user's own allow rules, and only for calls whose whole
+    /// path set (a move's `to` included) the plan named. Returns the
+    /// rule's index in its list.
+    pub fn grant_plan(&mut self, cap: &CapId, matcher: Matcher) -> usize {
+        let rules = self.plan_allow.entry(cap.clone()).or_default();
+        let index = rules.len();
+        rules.push(UserCandidate {
+            index,
+            matcher: Some(matcher),
+        });
+        index
+    }
+
+    /// The session's mode (P-28).
+    pub fn mode(&self) -> SessionMode {
+        self.mode
+    }
+
+    /// The active edit capabilities (P-28): the ids a `/build` approval
+    /// grants plan rules for, one per approved file. A capability that was
+    /// quarantined decides nothing, so it takes no plan rule.
+    pub fn edit_caps(&self) -> Vec<CapId> {
+        self.active
+            .keys()
+            .filter(|id| {
+                self.active
+                    .get(*id)
+                    .is_some_and(|a| a.edit && !self.quarantined.contains(*id))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Enter the planning mode (P-28): the active set the loop decides and
+    /// declares shrinks to the plan set. Cannot fail — planning only ever
+    /// removes capabilities, and the trifecta over a subset cannot name a
+    /// label the full set did not.
+    pub fn enter_plan(&mut self) {
+        self.mode = SessionMode::Plan;
+    }
+
+    /// Leave the planning mode after the user approved a plan (P-28, §5.4):
+    /// the full active set decides again, and the trifecta is recomputed
+    /// over it plus the workspace and the LAN ports (INV-9). `Err` leaves
+    /// the mode unchanged — a set that is lethal in full stays read-only.
+    pub fn build(&mut self) -> Result<(), SessionRefused> {
+        let active: Vec<(&CapId, EffectiveClass)> = self
+            .active
+            .iter()
+            .filter(|&(k, _)| !self.quarantined.contains(k))
+            .map(|(k, a)| (k, a.class))
+            .collect();
+        trifecta_with_lan(&active, self.workspace, !self.lan_ports.is_empty())?;
+        self.mode = SessionMode::Build;
+        Ok(())
     }
 
     /// Plan a helper run's session (P-38 §11): the parent's planning plus
@@ -1404,6 +1534,7 @@ impl Session {
     /// The capability is recorded as quarantined either way.
     pub fn quarantine(&mut self, id: &CapId) -> Result<(), SessionRefused> {
         self.quarantined.insert(id.clone());
+        self.plan_set.remove(id);
         let active: Vec<(&CapId, EffectiveClass)> = self
             .active
             .iter()
@@ -1439,6 +1570,13 @@ impl Session {
         if self.quarantined.contains(id) {
             return deny(DenyReason::Quarantined, "deny.quarantined");
         }
+        // The planning mode's active set (P-28, §5.4): in `Plan` a
+        // capability outside the plan set decides exactly as if it were
+        // never granted — the same denial an ungranted tool gets, so a
+        // replay recomputes the same record either way.
+        if self.mode == SessionMode::Plan && !self.plan_set.contains(id) {
+            return deny(DenyReason::NotGranted, "deny.not-granted");
+        }
         let cl = a.class;
         // A provider-declared write or execute class of an mcp-stdio
         // capability is decided here (P-37b: the pinned default below);
@@ -1446,6 +1584,7 @@ impl Session {
         if cl.effect != Effect::Read
             && !a.submit
             && !a.todo
+            && !a.plan_submit
             && !a.edit
             && !a.exec
             && !a.exec_start
@@ -1636,6 +1775,23 @@ impl Session {
                 };
             }
         }
+        // A plan-scoped allow (P-28, §5.4): the file the call touches is
+        // named in the plan the user approved, so the edit skips its ask.
+        // Fail closed on a move: the rule must name the target too, so a
+        // plan that names `src` cannot move a file to an unnamed `dst`.
+        if let Some(rules) = self.plan_allow.get(id) {
+            let to = call.args.get("to").and_then(Value::as_str);
+            let hit = rules.iter().any(|c| {
+                c.matcher.as_ref().is_some_and(|m| {
+                    m.matches(&call.args) && to.is_none_or(|t| m.matches(&json!({ "path": t })))
+                })
+            });
+            if hit {
+                return PolicyDecision::Allow {
+                    rule: RuleId::Builtin(PLAN_ALLOW_RULE),
+                };
+            }
+        }
         if let Some(index) = first_matching(&a.user_allow, &call.args) {
             return PolicyDecision::Allow {
                 rule: RuleId::User {
@@ -1682,6 +1838,17 @@ impl Session {
         if a.todo {
             return PolicyDecision::Allow {
                 rule: RuleId::Builtin(TODO_RULE),
+            };
+        }
+        // The plan sentinel (P-28): like the checklist, it changes only the
+        // run's own state — the plan it records, shown to the user — and
+        // the turn it ends. The loop records it, no provider runs it. It
+        // decides only in plan mode: in build mode it is not declared and
+        // not granted (the plan set is the plan mode's set), so a build
+        // session falls through to the default deny.
+        if a.plan_submit && self.mode == SessionMode::Plan {
+            return PolicyDecision::Allow {
+                rule: RuleId::Builtin(PLAN_SUBMIT_RULE),
             };
         }
         // The background stopper (P-36g, §9): a plain allow — the run

@@ -678,6 +678,7 @@ fn spec_of(t: &TaskFile) -> TaskSpec {
             commands: p.commands.clone(),
             max_rounds: p.max_rounds.unwrap_or(DEFAULT_ROUNDS),
         }),
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     }

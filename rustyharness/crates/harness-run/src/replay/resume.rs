@@ -27,6 +27,7 @@ use crate::driver::{
     Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader,
     Prepared, ReadLog, WorkspaceModeRecord,
 };
+use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
 use crate::session::{
     check_turn_limits, session_limits, EventSink, SessionConfig, SessionInputs, SessionReport,
@@ -239,13 +240,22 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         ));
     };
     // The last tree digest a kept record states: an edit's `EditApplied`,
-    // or a command's `ToolFinished` (H2d: measured after the command).
+    // or a command's `ToolFinished` (H2d: measured after the command), or
+    // a post-edit check's rollback (P-27, whose `Restored` names the tree
+    // it put back).
     let expected = kept
         .records
         .iter()
         .rev()
-        .filter(|x| matches!(x.kind, EventKind::EditApplied | EventKind::ToolFinished))
-        .find_map(|x| digest_at(&x.body, "workspace_tree"))
+        .filter(|x| {
+            matches!(
+                x.kind,
+                EventKind::EditApplied | EventKind::ToolFinished | EventKind::Restored
+            )
+        })
+        .find_map(|x| {
+            digest_at(&x.body, "workspace_tree").or_else(|| digest_at(&x.body, "tree_digest"))
+        })
         .unwrap_or(start.tree);
     // A research session (P-39i) has no workspace to check against, so the
     // tree check is skipped (`pre.tree` is `None`; its facts are the
@@ -387,6 +397,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        post_edit: PostEditState::of(&r.spec.post_edit),
+        workspace_root: r.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
         user: None,
     });
@@ -404,6 +416,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         journal_error: released.error,
         possibly_environmental: lp.pressure,
         presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
+        post_edit: lp.post_edit.as_ref().map(PostEditState::report),
     })
 }
 
@@ -593,10 +606,15 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             .filter(|x| {
                 matches!(
                     x.kind,
-                    EventKind::EditApplied | EventKind::ToolFinished | EventKind::UserTurn
+                    EventKind::EditApplied
+                        | EventKind::ToolFinished
+                        | EventKind::Restored
+                        | EventKind::UserTurn
                 )
             })
-            .find_map(|x| digest_at(&x.body, "workspace_tree"))
+            .find_map(|x| {
+                digest_at(&x.body, "workspace_tree").or_else(|| digest_at(&x.body, "tree_digest"))
+            })
             .unwrap_or(start.tree);
         // A research session (P-39i) has no workspace: the turn-start tree
         // check is skipped (there is nothing to re-measure, and the
@@ -767,6 +785,8 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        post_edit: PostEditState::of(&r.spec.post_edit),
+        workspace_root: r.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
         // The resumed session opens turns: the catch-up re-feeds the kept
         // turns' inputs, then the live source is asked (a boundary) or the
@@ -808,6 +828,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             journal_error: released.error,
             possibly_environmental: lp.pressure,
             presubmit: lp.presubmit.as_ref().map(PresubmitState::report),
+            post_edit: lp.post_edit.as_ref().map(PostEditState::report),
         },
         turns,
     })

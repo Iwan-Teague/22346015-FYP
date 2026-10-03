@@ -532,7 +532,7 @@ impl<'a> Loop<'a> {
 
     /// The `Restored` record and the model's notice: one place, so the
     /// live run and the recompute cannot drift.
-    fn journal_restored<
+    pub(crate) fn journal_restored<
         F: harness_journal::JournalFile,
         B: harness_journal::BlobSink,
         K: harness_journal::Clock,

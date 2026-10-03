@@ -222,6 +222,7 @@ fn spec(task: &str, grants: &[&str]) -> TaskSpec {
         lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
+        post_edit: None,
         protected: Vec::new(),
         kind: harness_run::SessionKind::Coding,
     }
@@ -573,7 +574,7 @@ fn batch_run_behaviour_unchanged() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn session_header_has_mode_turn_limits_context_format6() {
+fn session_header_has_mode_turn_limits_context_format7() {
     let fx = Fixture::new("session-header").unwrap();
     let r = go(&fx, vec![say("hi")], &["hello"]);
     let head = &records(&r)[0].body;
@@ -581,7 +582,8 @@ fn session_header_has_mode_turn_limits_context_format6() {
     let tl = head.get("turn_limits").unwrap();
     assert_eq!(tl.get("steps").unwrap(), 50);
     assert_eq!(tl.get("format_errors").unwrap(), 3);
-    assert_eq!(head.get("context_format").unwrap(), "rh-context/6");
+    // P-28: the session context format is rh-context/7.
+    assert_eq!(head.get("context_format").unwrap(), "rh-context/7");
     // The meter never latches format errors in a session.
     assert_eq!(
         head.get("limits").unwrap().get("format_errors").unwrap(),

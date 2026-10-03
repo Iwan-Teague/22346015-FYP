@@ -175,12 +175,13 @@ fn fixture_manifest_validates() {
 /// make old journals read as "another build". Pin the exact bytes.
 ///
 /// P-36g changed the bytes once: the three background tools joined the
-/// manifest, so journals from before that build are refused by name.
+/// manifest. P-28 changed them again: `harness.plan.submit` joined, so
+/// journals from before that build are refused by name.
 #[test]
 fn builtin_manifest_bytes_unchanged() {
     assert_eq!(
         harness_core::sha256(builtin::builtin_manifest_json().as_bytes()).to_string(),
-        "9284d521e12303570412f49ed32118dced2b18bec967ecf84dfa9b3eb1c8b115"
+        "32d5d78b3ef189520d2a4906d1b963613b484ed05b0b58a9c15613afb1b7800d"
     );
 }
 
@@ -402,6 +403,7 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "harness.exec.stop",
             "harness.task.todo",
             "harness.task.delegate",
+            "harness.plan.submit",
             "harness.task.submit"
         ]
     );

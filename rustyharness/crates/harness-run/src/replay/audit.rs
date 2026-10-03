@@ -28,6 +28,7 @@ use crate::driver::{
     HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader, ReadLog, SandboxRecord,
     WorkspaceModeRecord,
 };
+use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
 use crate::sample;
 use crate::session::{SessionInputs, TurnLimits};
@@ -469,6 +470,8 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&a.spec.presubmit),
+        post_edit: PostEditState::of(&a.spec.post_edit),
+        workspace_root: None,
         restore: Default::default(),
         // A session replay opens turns (P-17 §6): the re-fed texts build
         // the users' share of the context, and each turn's budgets are

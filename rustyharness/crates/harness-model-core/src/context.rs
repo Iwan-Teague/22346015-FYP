@@ -121,12 +121,13 @@ pub const CONTEXT_FORMAT: &str = "rh-context/5";
 
 /// The context format of a SESSION request (P-05 §2, P-10): adds the
 /// conversation block (user messages verbatim, bounded by their share of
-/// the window) and the session rules and protocol sentences. A batch
-/// context stays [`CONTEXT_FORMAT`] (`rh-context/5`): batch headers,
-/// journals, context digests and request bytes are unchanged, and old
-/// journals still audit. Bump both with any change to what this module or
-/// `wire::render_request` produces.
-pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/6";
+/// the window) and the session rules and protocol sentences. Since P-28 it
+/// also carries the plan-mode line and, after `/build`, the approved plan
+/// block. A batch context stays [`CONTEXT_FORMAT`] (`rh-context/5`): batch
+/// headers, journals, context digests and request bytes are unchanged, and
+/// old journals still audit. Bump both with any change to what this module
+/// or `wire::render_request` produces.
+pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/7";
 
 /// The context format of a RESEARCH session (P-39i, §2.2-§2.4): the
 /// session request shape (the conversation block, the users' share) with
@@ -586,6 +587,11 @@ pub const SUBMIT_ACCEPTED_FAILING_TEXT: &str =
     "Submission recorded while a pre-submit check still fails \
 (no more turned-back submissions are allowed). Your turn is over; the user will reply.";
 
+/// The harness message after an accepted `harness.plan.submit` in a
+/// session (P-28): the plan is recorded for the user to approve with
+/// `/build`, and until then the session stays read-only.
+pub const PLAN_SUBMITTED_TEXT: &str = "Plan recorded. It is shown to the user, who can approve it with /build; until then you can only read, plan and update the checklist.";
+
 /// The turn-end notice for `reason` (a `TurnEnded` reason name, P-05
 /// §2.5), shown to the model when the harness itself ended the turn;
 /// `None` for reasons with no notice (`answered`, `submitted`,
@@ -598,6 +604,7 @@ pub fn turn_end_text(reason: &str) -> Option<HarnessText> {
         "format_errors" => {
             "Too many replies in a row could not be used, so the turn is over; the user will reply."
         }
+        "plan_submitted" => PLAN_SUBMITTED_TEXT,
         r if r.starts_with("loop:") => {
             "The harness ended this turn because the calls stopped making progress; the user will reply."
         }
@@ -948,7 +955,38 @@ pub fn build(
         shown,
         0,
         Mode::Batch,
+        None,
     )
+}
+
+/// The session's plan-mode state as the context renders it (P-28): plain
+/// data, so `build_session` stays pure in its inputs and audit replay
+/// recomputes the request bytes. `plan_mode` is the narrowed mode (the
+/// mode line says the session is read-only); `approved_plan` is the plan
+/// text the user approved with `/build` (shown verbatim as a
+/// user-approved block — the model may treat it as the user's intent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModeView {
+    /// `/plan` is active: read-only until `/build`.
+    pub plan_mode: bool,
+    /// The `/build`-approved plan, if one was approved this session.
+    pub approved_plan: Option<String>,
+}
+
+impl SessionModeView {
+    /// Build mode with no approved plan: the default session state.
+    pub fn build() -> Self {
+        Self {
+            plan_mode: false,
+            approved_plan: None,
+        }
+    }
+}
+
+impl Default for SessionModeView {
+    fn default() -> Self {
+        Self::build()
+    }
 }
 
 /// Build a session turn's context (P-05 §2): the batch blocks and step
@@ -956,7 +994,8 @@ pub fn build(
 /// interleaved at its `before` position, shown verbatim, never compacted,
 /// bounded by its share of the window; an oldest prefix beyond the share is
 /// dropped and rendered as one counted notice ([`Built::users_dropped`]).
-/// Pure in `(profile, tools, task, facts, turns, users, shown)`, so audit
+/// `mode_view` is the plan-mode state (P-28). Pure in
+/// `(profile, tools, task, facts, turns, users, shown, mode_view)`, so audit
 /// replay recomputes it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_session(
@@ -967,6 +1006,7 @@ pub fn build_session(
     turns: &[Turn],
     users: &[UserEntry],
     shown: &Renderings,
+    mode_view: &SessionModeView,
 ) -> Result<Built, ContextError> {
     build_inner(
         profile,
@@ -978,6 +1018,7 @@ pub fn build_session(
         shown,
         user_share_bytes(profile),
         Mode::Session,
+        Some(mode_view),
     )
 }
 
@@ -1008,6 +1049,7 @@ pub fn build_research(
         shown,
         user_share_bytes(profile),
         Mode::Research,
+        None,
     )
 }
 
@@ -1066,6 +1108,7 @@ fn build_inner(
     shown: &Renderings,
     reserved: u64,
     mode: Mode,
+    mode_view: Option<&SessionModeView>,
 ) -> Result<Built, ContextError> {
     let max = profile.max_active_tools();
     if u32::try_from(tools.len()).map_or(true, |n| n > max) {
@@ -1079,7 +1122,13 @@ fn build_inner(
     let keep = usize::try_from(profile.recent_turns()).unwrap_or(usize::MAX);
     let mut messages = match mode {
         Mode::Batch => fixed_messages(profile, tools, task, facts),
-        Mode::Session => session_fixed_messages(profile, tools, task, facts),
+        Mode::Session => session_fixed_messages(
+            profile,
+            tools,
+            task,
+            facts,
+            mode_view.unwrap_or(&SessionModeView::build()),
+        ),
         Mode::Research => research_fixed_messages(profile, tools, task, facts),
     };
     let fixed = bytes_of(&messages);
@@ -1313,12 +1362,16 @@ fn fixed_messages(
 /// session sentences added — the rules gain [`SESSION_RULES`], and the
 /// protocol spec gains [`SESSION_PROTOCOL_TEXT`] or
 /// [`SESSION_PROTOCOL_NATIVE`]. Which sentence depends only on the
-/// profile's protocol, so it is fixed for a session.
+/// profile's protocol, so it is fixed for a session. Since P-28 the rules
+/// block ends with the mode line (plan mode narrows the session to
+/// read-only tools; the caller passes that narrowed list), and an approved
+/// plan renders as one extra user-approved block after the facts.
 fn session_fixed_messages(
     profile: &Profile,
     tools: &[ToolSpec],
     task: &TaskText,
     facts: &[Fact],
+    mode_view: &SessionModeView,
 ) -> Vec<Message> {
     let protocol = profile.protocol();
     let mut out = Vec::new();
@@ -1342,6 +1395,12 @@ fn session_fixed_messages(
         Protocol::Text => SESSION_PROTOCOL_TEXT,
         Protocol::Native => SESSION_PROTOCOL_NATIVE,
     });
+    system.push('\n');
+    system.push_str(if mode_view.plan_mode {
+        "Mode: plan. The session is read-only: read files, keep the checklist and submit a plan with harness.plan.submit; edits and commands are unavailable until the user approves the plan with /build."
+    } else {
+        "Mode: build."
+    });
     out.push(Message::System(HarnessText::rendered(system)));
     // Blocks 3 and 4, unchanged.
     out.push(Message::Task(task.clone()));
@@ -1355,6 +1414,14 @@ fn session_fixed_messages(
             };
             s.push_str(&format!("- {}: {v} (method: {})\n", f.name, f.method));
         }
+        out.push(Message::System(HarnessText::rendered(s)));
+    }
+    // The approved plan (P-28): the user read the plan and approved it with
+    // /build, so the block is the user's own intent, not model text.
+    if let Some(plan) = &mode_view.approved_plan {
+        let mut s =
+            String::from("Approved plan (the user reviewed and approved it with /build):\n");
+        s.push_str(plan);
         out.push(Message::System(HarnessText::rendered(s)));
     }
     out
@@ -2988,15 +3055,25 @@ mod tests {
         turns: &[Turn],
         users: &[UserEntry],
     ) -> Result<Built, ContextError> {
-        build_session(p, &tools(2), &task(), &[], turns, users, &shown_for(turns))
+        build_session(
+            p,
+            &tools(2),
+            &task(),
+            &[],
+            turns,
+            users,
+            &shown_for(turns),
+            &SessionModeView::build(),
+        )
     }
 
     /// The context format constants: batch stays rh-context/5 (old journals
-    /// still audit), sessions are rh-context/6.
+    /// still audit), sessions are rh-context/7 (P-28 added the mode line
+    /// and the approved-plan block).
     #[test]
     fn context_format_constants() {
         assert_eq!(CONTEXT_FORMAT, "rh-context/5");
-        assert_eq!(SESSION_CONTEXT_FORMAT, "rh-context/6");
+        assert_eq!(SESSION_CONTEXT_FORMAT, "rh-context/7");
     }
 
     /// Batch contexts are byte for byte what they were: these digests were
@@ -3325,11 +3402,80 @@ by the user. Your edits after that step no longer stand; read a file before you 
         assert!(!batch.contains(SESSION_RULES) && !batch.contains(SESSION_PROTOCOL_TEXT));
         assert!(session.starts_with(&format!("{rules} {SESSION_RULES}\n")));
         let after = &session[rules.len() + 1 + SESSION_RULES.len() + 1..];
-        assert_eq!(after, format!("{prot}\n{SESSION_PROTOCOL_TEXT}"));
+        // P-28: the rules block ends with the mode line; build mode is the
+        // default session state.
+        assert_eq!(
+            after,
+            format!("{prot}\n{SESSION_PROTOCOL_TEXT}\nMode: build.")
+        );
         let native_session = texts(&build_users(&native(), &turns, &[]).unwrap())[0]
             .1
             .clone();
-        assert!(native_session.ends_with(SESSION_PROTOCOL_NATIVE));
+        assert!(native_session.ends_with(&format!("{SESSION_PROTOCOL_NATIVE}\nMode: build.")));
+    }
+
+    /// The plan-mode line and the approved-plan block (P-28): plan mode
+    /// says the session is read-only, and the approved plan renders after
+    /// the facts as the user's own approved text.
+    #[test]
+    fn plan_mode_line_and_approved_plan_block() {
+        let turns: Vec<Turn> = Vec::new();
+        let view = SessionModeView {
+            plan_mode: true,
+            approved_plan: None,
+        };
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            &turns,
+            &[],
+            &shown_for(&turns),
+            &view,
+        )
+        .unwrap();
+        let first = texts(&built)[0].1.clone();
+        assert!(first.ends_with("Mode: plan. The session is read-only: read files, keep the checklist and submit a plan with harness.plan.submit; edits and commands are unavailable until the user approves the plan with /build."));
+        // Build mode, approved plan: the block lands after the facts.
+        let approved = SessionModeView {
+            plan_mode: false,
+            approved_plan: Some("1. do the thing".to_owned()),
+        };
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            &turns,
+            &[],
+            &shown_for(&turns),
+            &approved,
+        )
+        .unwrap();
+        let ts = texts(&built);
+        assert!(ts[0].1.ends_with("Mode: build."));
+        assert_eq!(
+            ts.last().unwrap().1,
+            "Approved plan (the user reviewed and approved it with /build):\n1. do the thing"
+        );
+        // No approved plan in build mode: no block.
+        let plain = texts(
+            &build_session(
+                &profile(),
+                &tools(2),
+                &task(),
+                &[],
+                &turns,
+                &[],
+                &shown_for(&turns),
+                &SessionModeView::build(),
+            )
+            .unwrap(),
+        );
+        assert!(!plain
+            .iter()
+            .any(|(_, t)| t.contains("Approved plan") || t.contains("Mode: plan")));
     }
 
     /// The session notices are the spec's exact texts.

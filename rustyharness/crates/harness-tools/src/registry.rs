@@ -5,8 +5,8 @@
 //! is the seam a new built-in registers at, so adding one is a table entry,
 //! not a new dispatch site. Entries with run-owned state name that state
 //! instead of a constructor: the command runner needs the run's witnesses
-//! (H2d), and the checklist, the delegate and the submit sentinel are
-//! run-loop state, not providers at all.
+//! (H2d), and the checklist, the delegate, the plan sentinel (P-28) and the
+//! submit sentinel are run-loop state, not providers at all.
 
 use std::path::Path;
 
@@ -29,7 +29,8 @@ pub enum ProviderCtor {
     /// run driver owns.
     Exec,
     /// Run-loop state, not a provider: the checklist (H2e), the delegate
-    /// (P-38) and the submit sentinel (§2.5) are driven by the run loop.
+    /// (P-38), the plan sentinel (P-28) and the submit sentinel (§2.5) are
+    /// driven by the run loop.
     RunLoop,
 }
 
@@ -111,6 +112,10 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
     },
     BuiltinTool {
         id: "harness.task.delegate",
+        ctor: ProviderCtor::RunLoop,
+    },
+    BuiltinTool {
+        id: "harness.plan.submit",
         ctor: ProviderCtor::RunLoop,
     },
     BuiltinTool {

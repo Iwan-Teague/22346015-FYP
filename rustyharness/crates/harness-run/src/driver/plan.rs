@@ -15,9 +15,9 @@ use harness_model::profile::Profile;
 use harness_model::{EndpointClass, ToolSpec};
 use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::{
-    is_bg_id, Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionSpec,
-    UserPolicy, WorkspaceDecl, EXEC_ID, EXEC_START_ID, SUBMIT_ID, TODO_ID, WEB_FETCH_ID,
-    WEB_SEARCH_ID,
+    is_bg_id, Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionMode,
+    SessionSpec, UserPolicy, WorkspaceDecl, EXEC_ID, EXEC_START_ID, PLAN_SUBMIT_ID, SUBMIT_ID,
+    TODO_ID, WEB_FETCH_ID, WEB_SEARCH_ID,
 };
 use harness_sandbox::{Confinement, Conformed, PortsWitness};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
@@ -27,6 +27,7 @@ use harness_tools::{
 };
 
 use super::{new_run_id, RunConfig, RunRefused, TaskSpec, PORTS_PER_TASK};
+use crate::postedit::PostEditRefused;
 use crate::presubmit::PresubmitRefused;
 
 /// What `prepare` established before anything was written.
@@ -549,6 +550,12 @@ pub(crate) fn plan(
         grants.push(SUBMIT_ID.to_owned());
     }
     let research = matches!(spec.kind, SessionKind::Research(_));
+    // P-28: the plan sentinel is granted like the submit sentinel, so the
+    // plan tool is always declared to a coding session's model (a research
+    // session has no plan tool: the research manifest does not admit it).
+    if !research && !grants.iter().any(|g| g == PLAN_SUBMIT_ID) {
+        grants.push(PLAN_SUBMIT_ID.to_owned());
+    }
     // The P-29 ask floor (Cargo.lock, .github/**): decided with here, so a
     // live run, a resume and an audit replay all ask about the same edits.
     // A research session (P-39i) has no edit tools, so it takes no floor.
@@ -573,6 +580,9 @@ pub(crate) fn plan(
             // session (P-39i) has no read tools, so no window.
             read_window: (!research).then(|| profile.read_window().lines),
             kind: spec.kind.clone(),
+            // P-28: every session starts in build mode; `/plan` narrows the
+            // active set mid-run and `/build` widens it back.
+            mode: SessionMode::Build,
         },
         registry,
         &policy,
@@ -591,6 +601,21 @@ pub(crate) fn plan(
             }
         }
     }
+    // Post-edit checks (P-27): the same rules. The deny probe leaves the
+    // `{path}` placeholder literal: a path-glob rule cannot match it, and a
+    // denial that only fires on the real path still fails closed at run
+    // time (the check is not run, and the edit is rolled back).
+    if let Some(p) = &spec.post_edit {
+        p.check(&spec.grants, spec.exec.as_ref())?;
+        for i in 0..p.checks.len() {
+            let denied = p
+                .call(i, "{path}")
+                .is_none_or(|c| matches!(session.decide(&c), PolicyDecision::Deny { .. }));
+            if denied {
+                return Err(PostEditRefused::Denied(i + 1).into());
+            }
+        }
+    }
     let mut tools = Vec::with_capacity(grants.len());
     for g in &grants {
         // Planning resolved every grant to exactly one capability.
@@ -606,10 +631,15 @@ pub(crate) fn plan(
             );
         }
     }
+    // The active-tool bound counts what the start (build) mode declares
+    // (P-28): the plan sentinel rides in the list for `/plan`'s narrowed
+    // declaration, but it is not declared in build mode, so it takes no
+    // slot of the profile's budget.
     let max = profile.max_active_tools();
-    if u32::try_from(tools.len()).map_or(true, |n| n > max) {
+    let declared = tools.iter().filter(|t| t.id != PLAN_SUBMIT_ID).count();
+    if u32::try_from(declared).map_or(true, |n| n > max) {
         return Err(RunRefused::TooManyTools {
-            active: tools.len(),
+            active: declared,
             max,
         });
     }

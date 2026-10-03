@@ -285,7 +285,12 @@ fn arg_kind(args: &Value) -> Result<Option<String>, Out> {
 
 /// Whether a walked directory is entered: not a `.git` below the start
 /// (counted), not a policy-denied path (counted when skipped, P-12).
-fn enter(e: &Entry, tools: &ReadTools, gits: &mut usize, denied: &mut usize) -> bool {
+fn enter(
+    e: &Entry,
+    denied_globs: &[crate::glob::Glob],
+    gits: &mut usize,
+    denied: &mut usize,
+) -> bool {
     if e.depth == 0 {
         return true;
     }
@@ -293,7 +298,7 @@ fn enter(e: &Entry, tools: &ReadTools, gits: &mut usize, denied: &mut usize) -> 
         *gits += 1;
         return false;
     }
-    if tools.denied_hit(&e.rel) {
+    if denied_globs.iter().any(|g| g.matches(&e.rel)) {
         *denied += 1;
         return false;
     }
@@ -313,13 +318,13 @@ struct FileOutline {
 }
 
 impl ReadTools {
-    pub(crate) fn outline(&self, args: &Value, deadline: Instant) -> Out {
+    pub(crate) fn outline(&mut self, args: &Value, deadline: Instant) -> Out {
         match self.try_outline(args, deadline) {
             Ok(o) | Err(o) => o,
         }
     }
 
-    fn try_outline(&self, args: &Value, deadline: Instant) -> Result<Out, Out> {
+    fn try_outline(&mut self, args: &Value, deadline: Instant) -> Result<Out, Out> {
         let Some(ex) = Extractor::new() else {
             return Err(err(code::IO, "the outline matchers did not compile"));
         };
@@ -333,14 +338,14 @@ impl ReadTools {
         let (mut skipped, mut denied, mut gits) = (0usize, 0usize, 0usize);
         // The walk's own counters, for the foot (a single file has none).
         let (mut symlinks, mut stopped) = (0usize, false);
-        if meta.is_file() {
+        if meta.kind.is_file() {
             let Some(lang) = lang_of(wp.as_str()) else {
                 return Err(err(
                     code::NO_OUTLINE,
                     "no outline for files of this kind: the outline knows Rust, Python, JavaScript, TypeScript, Go, C-family and Markdown files by extension",
                 ));
             };
-            let Some(raw) = read_bounded(&start, SEARCH_FILE_MAX_BYTES) else {
+            let Some(raw) = read_bounded(self.ops.as_mut(), &start, SEARCH_FILE_MAX_BYTES) else {
                 return Err(err(code::TOO_LARGE, "the file is larger than the read cap"));
             };
             let Ok(text) = String::from_utf8(raw) else {
@@ -350,10 +355,12 @@ impl ReadTools {
             if !syms.is_empty() {
                 files.push((wp.as_str().to_owned(), syms));
             }
-        } else if !meta.is_dir() {
+        } else if !meta.kind.is_dir() {
             return Err(err(code::NOT_A_DIR, "not a directory"));
         } else {
+            let denied_globs = self.denied().to_vec();
             let mut walk = Walk::new(
+                self.ops.as_mut(),
                 start,
                 wp.as_str().to_owned(),
                 meta,
@@ -361,22 +368,23 @@ impl ReadTools {
                 WALK_MAX_ENTRIES,
             )
             .until(deadline);
-            while let Some(e) = walk.next_entry_if(&mut |e| enter(e, self, &mut gits, &mut denied))
+            while let Some(e) =
+                walk.next_entry_if(&mut |e| enter(e, &denied_globs, &mut gits, &mut denied))
             {
                 if Instant::now() >= deadline {
                     return Err(timeout());
                 }
-                if e.depth == 0 || !e.meta.is_file() || e.symlink {
+                if e.depth == 0 || !e.meta.kind.is_file() || e.symlink {
                     continue;
                 }
-                if self.denied_hit(&e.rel) {
+                if denied_globs.iter().any(|g| g.matches(&e.rel)) {
                     denied += 1;
                     continue;
                 }
                 let Some(lang) = lang_of(&e.rel) else {
                     continue;
                 };
-                if let Some(syms) = self.outline_file(&ex, lang, &e.path) {
+                if let Some(syms) = outline_file(walk.ops(), &ex, lang, &e.path) {
                     if !syms.is_empty() {
                         files.push((e.rel, syms));
                     }
@@ -463,17 +471,17 @@ impl ReadTools {
         }
         Ok(ok(s))
     }
+}
 
-    /// One file's symbols; `None` when the file is over
-    /// [`SEARCH_FILE_MAX_BYTES`] or not UTF-8 (counted by the caller).
-    fn outline_file(
-        &self,
-        ex: &Extractor,
-        lang: Lang,
-        path: &std::path::Path,
-    ) -> Option<Vec<Symbol>> {
-        let raw = read_bounded(path, SEARCH_FILE_MAX_BYTES)?;
-        let text = String::from_utf8(raw).ok()?;
-        Some(ex.extract(lang, &text))
-    }
+/// One file's symbols; `None` when the file is over
+/// [`SEARCH_FILE_MAX_BYTES`] or not UTF-8 (counted by the caller).
+fn outline_file(
+    ops: &mut dyn crate::file_ops::FileOps,
+    ex: &Extractor,
+    lang: Lang,
+    path: &std::path::Path,
+) -> Option<Vec<Symbol>> {
+    let raw = read_bounded(ops, path, SEARCH_FILE_MAX_BYTES)?;
+    let text = String::from_utf8(raw).ok()?;
+    Some(ex.extract(lang, &text))
 }

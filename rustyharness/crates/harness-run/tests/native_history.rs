@@ -100,6 +100,7 @@ fn spec(task: &str) -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -547,7 +548,7 @@ fn a_native_run_resumes_and_its_catch_up_matches_every_recorded_request() {
     let res = resume(Resume {
         state_root: &state,
         run: &r.run,
-        workspace: &ws,
+        workspace: Some(&ws),
         spec: &spec(TASK),
         registry: &registry(),
         policy: &UserPolicy::default(),
@@ -732,7 +733,7 @@ fn a_journal_from_before_h1i_is_refused_by_name_by_audit_and_resume() {
             let e = resume(Resume {
                 state_root: &state,
                 run: &r.run,
-                workspace: &ws,
+                workspace: Some(&ws),
                 spec: &spec(TASK),
                 registry: &registry(),
                 policy: &UserPolicy::default(),

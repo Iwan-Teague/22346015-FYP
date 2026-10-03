@@ -231,8 +231,13 @@ dependencies = [
  "harness-core",
  "harness-fetch",
  "harness-policy",
+ "harness-sandbox-linux",
  "thiserror",
 ]
+
+[[package]]
+name = "harness-sandbox-linux"
+version = "0.0.1"
 
 [[package]]
 name = "harness-testkit"

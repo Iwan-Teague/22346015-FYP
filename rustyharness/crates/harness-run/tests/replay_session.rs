@@ -75,6 +75,7 @@ fn spec(task: &str) -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -206,7 +207,7 @@ fn resume_session_with(
     resume_session(ResumeSession {
         state_root: fx.state_root(),
         run,
-        workspace: fx.workspace(),
+        workspace: Some(fx.workspace()),
         spec: &fx.spec,
         registry: &registry().unwrap(),
         policy: &UserPolicy::default(),
@@ -649,7 +650,7 @@ fn batch_resume_refuses_session_journal() {
     let e = resume(Resume {
         state_root: fx.state_root(),
         run: &r.run.run,
-        workspace: fx.workspace(),
+        workspace: Some(fx.workspace()),
         spec: &fx.spec,
         registry: &registry().unwrap(),
         policy: &UserPolicy::default(),

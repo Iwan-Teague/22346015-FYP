@@ -452,13 +452,13 @@ fn foot(s: &mut String, walk: &Walk, skipped: usize, gits: usize, denied: usize)
 }
 
 impl ReadTools {
-    pub(crate) fn search(&self, args: &Value, deadline: Instant) -> Out {
+    pub(crate) fn search(&mut self, args: &Value, deadline: Instant) -> Out {
         match self.try_search(args, deadline) {
             Ok(o) | Err(o) => o,
         }
     }
 
-    fn try_search(&self, args: &Value, deadline: Instant) -> Result<Out, Out> {
+    fn try_search(&mut self, args: &Value, deadline: Instant) -> Result<Out, Out> {
         let pattern = match args.get("pattern") {
             Some(Value::String(p)) if !p.is_empty() => p.clone(),
             _ => {
@@ -491,8 +491,10 @@ impl ReadTools {
         let (start, meta) = self.resolve(&wp)?;
         // One pass of the search at a context; a pass cut by the size of
         // its display is run again with less context (H2f), below.
-        let pass = |context: usize| -> Result<(String, bool), Out> {
+        let mut pass = |context: usize| -> Result<(String, bool), Out> {
+            let denied_globs = self.denied().to_vec();
             let mut walk = Walk::new(
+                self.ops.as_mut(),
                 start.clone(),
                 wp.as_str().to_owned(),
                 meta.clone(),
@@ -512,17 +514,17 @@ impl ReadTools {
                     &wp,
                     exclude.as_ref(),
                     &mut gits,
-                    self.denied(),
+                    &denied_globs,
                     &mut denied,
                 )
             }) {
                 if Instant::now() >= deadline {
                     return Err(timeout());
                 }
-                if !entry.meta.is_file() {
+                if !entry.meta.kind.is_file() {
                     continue;
                 }
-                if self.denied_hit(&entry.rel) {
+                if denied_globs.iter().any(|g| g.matches(&entry.rel)) {
                     denied += 1;
                     continue;
                 }
@@ -533,13 +535,13 @@ impl ReadTools {
                     continue;
                 }
                 matched_files += 1;
-                if entry.meta.len() > SEARCH_FILE_MAX_BYTES {
+                if entry.meta.len > SEARCH_FILE_MAX_BYTES {
                     skipped += 1;
                     continue;
                 }
                 // Bounded even if the file grew after the size check above
                 // (H1e-2a review F-2).
-                let Some(raw) = read_bounded(&entry.path, SEARCH_FILE_MAX_BYTES) else {
+                let Some(raw) = read_bounded(walk.ops(), &entry.path, SEARCH_FILE_MAX_BYTES) else {
                     skipped += 1;
                     continue;
                 };
@@ -649,39 +651,47 @@ impl ReadTools {
         Ok(ok(s))
     }
 
-    pub(crate) fn glob(&self, args: &Value, deadline: Instant) -> Out {
+    pub(crate) fn glob(&mut self, args: &Value, deadline: Instant) -> Out {
         match self.try_glob(args, deadline) {
             Ok(o) | Err(o) => o,
         }
     }
 
-    fn try_glob(&self, args: &Value, deadline: Instant) -> Result<Out, Out> {
+    fn try_glob(&mut self, args: &Value, deadline: Instant) -> Result<Out, Out> {
         let glob = match arg_glob(args, "pattern")? {
             Some(g) => g,
             None => return Err(err(code::BAD_ARGS, "missing pattern")),
         };
         let wp = arg_path(args, "path", Some("."))?;
         let (start, meta) = self.resolve(&wp)?;
-        if !meta.is_dir() {
+        if !meta.kind.is_dir() {
             return Err(err(code::NOT_A_DIR, "not a directory"));
         }
         let depth = glob.max_depth().unwrap_or(WALK_MAX_DEPTH);
-        let mut walk =
-            Walk::new(start, wp.as_str().to_owned(), meta, depth, WALK_MAX_ENTRIES).until(deadline);
+        let denied_globs = self.denied().to_vec();
+        let mut walk = Walk::new(
+            self.ops.as_mut(),
+            start,
+            wp.as_str().to_owned(),
+            meta,
+            depth,
+            WALK_MAX_ENTRIES,
+        )
+        .until(deadline);
         let mut gits = 0usize;
         let mut denied = 0usize;
         let mut found: Vec<(String, u64)> = Vec::new();
         let mut more = false;
         while let Some(e) =
-            walk.next_entry_if(&mut |e| enter(e, &wp, None, &mut gits, self.denied(), &mut denied))
+            walk.next_entry_if(&mut |e| enter(e, &wp, None, &mut gits, &denied_globs, &mut denied))
         {
             if Instant::now() >= deadline {
                 return Err(timeout());
             }
-            if e.depth == 0 || !e.meta.is_file() {
+            if e.depth == 0 || !e.meta.kind.is_file() {
                 continue;
             }
-            if self.denied_hit(&e.rel) {
+            if denied_globs.iter().any(|g| g.matches(&e.rel)) {
                 denied += 1;
                 continue;
             }
@@ -692,7 +702,7 @@ impl ReadTools {
                 more = true;
                 break;
             }
-            found.push((e.rel, e.meta.len()));
+            found.push((e.rel, e.meta.len));
         }
         if walk.timed_out {
             return Err(timeout());

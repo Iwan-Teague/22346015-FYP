@@ -62,10 +62,8 @@
 //! (materialisation, H2, controls what the workspace contains).
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use harness_core::diff::{self, DEFAULT_CONTEXT, DEFAULT_MAX_LINES};
@@ -80,6 +78,7 @@ use crate::builtin::{
     canonical_root, code, err, finish, ok, refused, resolve as resolve_path, Out, ResolveErr,
     RootRefused,
 };
+use crate::file_ops::{FileOps, InProcess, Kind};
 use crate::protected::Protected;
 use crate::provider::{
     EditRecord, Image, InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult,
@@ -466,6 +465,8 @@ impl From<ResolveErr> for EditError {
 pub struct EditEngine {
     root: PathBuf,
     protected: Protected,
+    /// Every filesystem access of the engine goes through here (P-36e).
+    ops: Box<dyn FileOps>,
 }
 
 impl EditEngine {
@@ -475,10 +476,21 @@ impl EditEngine {
     /// start empty; the driver installs the run's list with
     /// [`EditEngine::with_protected`].
     pub fn new(root: &Path) -> Result<Self, RootRefused> {
+        let mut ops: Box<dyn FileOps> = Box::new(InProcess);
         Ok(Self {
-            root: canonical_root(root)?,
+            root: canonical_root(ops.as_mut(), root)?,
             protected: Protected::empty(),
+            ops,
         })
+    }
+
+    /// The same engine over another [`FileOps`] implementation (P-36e):
+    /// the root check runs against it too. Results are the
+    /// implementation's.
+    #[must_use]
+    pub fn with_file_ops(mut self, ops: Box<dyn FileOps>) -> Self {
+        self.ops = ops;
+        self
     }
 
     /// The same engine with a protected-path deny list (P-29): every
@@ -511,26 +523,26 @@ impl EditEngine {
     /// hashes to the recorded digest. On success the file holds the
     /// spliced content (atomic apply, line endings preserved) and the
     /// re-read digest equals the expected splice.
-    pub fn replace(&self, req: &ReplaceReq, reads: &ReadLog) -> Result<Applied, EditError> {
+    pub fn replace(&mut self, req: &ReplaceReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
         self.guard(&wp)?;
         check_replace_args(req)?;
-        let (path, meta) = resolve_path(&self.root, &wp)?;
+        let (path, meta) = resolve_path(self.ops.as_mut(), &self.root, &wp)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound);
         };
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(EditError::NotAFile);
         }
-        check_pre_image(meta.len())?;
-        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        check_pre_image(meta.len)?;
+        let bytes = read_capped(self.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
         let (spliced, lines) = plan_replace(req, text, &bytes)?;
         let expected = sha256(&spliced);
         let lines_after = line_count(&spliced);
-        atomic_write(&path, &spliced, Some(meta.permissions()))?;
+        self.ops.write_atomic(&path, &spliced, meta.mode)?;
         let mut applied = self.verify(
             &wp,
             Some(Image {
@@ -554,7 +566,7 @@ impl EditEngine {
     /// nothing is written. Then the result is written once, atomically, and
     /// verified, exactly as [`EditEngine::replace`] does; `lines` holds the
     /// line of each match, in the text each replacement was matched in.
-    pub fn multi(&self, req: &MultiReq, reads: &ReadLog) -> Result<Applied, EditError> {
+    pub fn multi(&mut self, req: &MultiReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
         self.guard(&wp)?;
         let total = req.edits.len();
@@ -565,22 +577,22 @@ impl EditEngine {
             });
         }
         check_multi_edits(req)?;
-        let (path, meta) = resolve_path(&self.root, &wp)?;
+        let (path, meta) = resolve_path(self.ops.as_mut(), &self.root, &wp)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound);
         };
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(EditError::NotAFile);
         }
-        check_pre_image(meta.len())?;
-        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        check_pre_image(meta.len)?;
+        let bytes = read_capped(self.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
         let (spliced, lines) = plan_multi(req, text, &bytes)?;
         let expected = sha256(&spliced);
         let lines_after = line_count(&spliced);
-        atomic_write(&path, &spliced, Some(meta.permissions()))?;
+        self.ops.write_atomic(&path, &spliced, meta.mode)?;
         let mut applied = self.verify(
             &wp,
             Some(Image {
@@ -600,22 +612,22 @@ impl EditEngine {
     /// most [`WRITE_MAX_NEW_DIRS`], no link followed); an existing file is
     /// overwritten, which requires a fresh read of at most
     /// [`WRITE_OVERWRITE_MAX_LINES`] lines.
-    pub fn write(&self, req: &WriteReq, reads: &ReadLog) -> Result<Applied, EditError> {
+    pub fn write(&mut self, req: &WriteReq, reads: &ReadLog) -> Result<Applied, EditError> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
         self.guard(&wp)?;
         let mut made: Vec<String> = Vec::new();
-        let (path, meta) = match resolve_path(&self.root, &wp) {
+        let (path, meta) = match resolve_path(self.ops.as_mut(), &self.root, &wp) {
             Ok(x) => x,
             // A directory on the way is missing (H2f): a new file makes
             // it. The size is checked first, so nothing is created for a
             // write that would be refused anyway.
             Err(ResolveErr::NotFound) => {
                 check_cap(req.content.as_bytes())?;
-                made = create_parents(&self.root, &wp)?;
-                match resolve_path(&self.root, &wp) {
+                made = create_parents(self.ops.as_mut(), &self.root, &wp)?;
+                match resolve_path(self.ops.as_mut(), &self.root, &wp) {
                     Ok(x) => x,
                     Err(e) => {
-                        remove_dirs(&self.root, &made);
+                        remove_dirs(self.ops.as_mut(), &self.root, &made);
                         return Err(e.into());
                     }
                 }
@@ -630,8 +642,8 @@ impl EditEngine {
                 let content = req.content.as_bytes();
                 check_cap(content)?;
                 let expected = sha256(content);
-                if let Err(e) = atomic_write(&path, content, None) {
-                    remove_dirs(&self.root, &made);
+                if let Err(e) = self.ops.write_atomic(&path, content, None) {
+                    remove_dirs(self.ops.as_mut(), &self.root, &made);
                     return Err(e.into());
                 }
                 let mut applied =
@@ -640,18 +652,18 @@ impl EditEngine {
                 Ok(applied)
             }
             Some(meta) => {
-                if !meta.is_file() {
+                if !meta.kind.is_file() {
                     return Err(EditError::NotAFile);
                 }
-                check_pre_image(meta.len())?;
-                let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+                check_pre_image(meta.len)?;
+                let bytes = read_capped(self.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
                 let before = sha256(&bytes);
                 reads.check(wp.as_str(), before).map_err(EditError::from)?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
                 let out_bytes = plan_write_overwrite(req, text, &bytes)?;
                 let expected = sha256(&out_bytes);
                 let lines_after = line_count(&out_bytes);
-                atomic_write(&path, &out_bytes, Some(meta.permissions()))?;
+                self.ops.write_atomic(&path, &out_bytes, meta.mode)?;
                 self.verify(
                     &wp,
                     Some(Image {
@@ -674,7 +686,7 @@ impl EditEngine {
     /// being followed. The images travel with the result (P-22): they
     /// were captured before anything was written.
     fn verify(
-        &self,
+        &mut self,
         wp: &WorkspacePath,
         before_image: Option<Image>,
         expected: Digest,
@@ -701,19 +713,24 @@ impl EditEngine {
     /// The re-read of [`EditEngine::verify`]: the digest found, when it is
     /// the expected one and differs from `before`.
     fn reread(
-        &self,
+        &mut self,
         wp: &WorkspacePath,
         before: Option<Digest>,
         expected: Digest,
     ) -> Result<Digest, EditError> {
-        let (path, meta) = resolve_path(&self.root, wp)?;
+        let (path, meta) = resolve_path(self.ops.as_mut(), &self.root, wp)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound);
         };
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(EditError::NotAFile);
         }
-        let after = sha256(&read_capped(&path, meta.len(), EDIT_MAX_BYTES)?);
+        let after = sha256(&read_capped(
+            self.ops.as_mut(),
+            &path,
+            meta.len,
+            EDIT_MAX_BYTES,
+        )?);
         if before == Some(after) {
             return Err(EditError::NoChange { sha256: after });
         }
@@ -739,44 +756,52 @@ pub const WRITE_MAX_NEW_DIRS: usize = 8;
 /// workspace root, shallowest first; when it fails, what it made is removed
 /// again. The path was checked lexically ([`WorkspacePath`]: no `..`, no
 /// absolute path, no empty component), so the walk stays below `root`.
-pub(crate) fn create_parents(root: &Path, wp: &WorkspacePath) -> Result<Vec<String>, EditError> {
+pub(crate) fn create_parents(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    wp: &WorkspacePath,
+) -> Result<Vec<String>, EditError> {
     let comps: Vec<&str> = wp.components().collect();
     let parents = comps.len().saturating_sub(1);
     let mut made: Vec<String> = Vec::new();
     let mut cur = root.to_path_buf();
-    let fail = |made: &[String], e: EditError| {
-        remove_dirs(root, made);
-        Err(e)
-    };
+    macro_rules! fail {
+        ($e:expr) => {{
+            remove_dirs(ops, root, &made);
+            return Err($e);
+        }};
+    }
     for (i, c) in comps.iter().take(parents).enumerate() {
         cur.push(c);
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => return fail(&made, EditError::Symlink),
-            Ok(m) if m.is_dir() => continue,
-            Ok(_) => return fail(&made, EditError::NotADirectory),
+        match ops.lstat(&cur) {
+            Ok(m) => match m.kind {
+                Kind::Symlink => fail!(EditError::Symlink),
+                Kind::Dir => continue,
+                _ => fail!(EditError::NotADirectory),
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return fail(&made, EditError::Io(e)),
+            Err(e) => fail!(EditError::Io(e)),
         }
         if made.len() >= WRITE_MAX_NEW_DIRS {
-            return fail(&made, EditError::TooManyDirs);
+            fail!(EditError::TooManyDirs);
         }
-        match fs::create_dir(&cur) {
-            Ok(()) => made.push(
-                comps
-                    .iter()
-                    .take(i + 1)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            ),
-            Err(e) => return fail(&made, EditError::Io(e)),
+        if let Err(e) = ops.create_dir(&cur) {
+            fail!(EditError::Io(e));
         }
+        made.push(
+            comps
+                .iter()
+                .take(i + 1)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
         // What is there now must be the directory just made.
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-            Ok(m) if m.file_type().is_symlink() => return fail(&made, EditError::Symlink),
-            Ok(_) => return fail(&made, EditError::NotADirectory),
-            Err(e) => return fail(&made, EditError::Io(e)),
+        match ops.lstat(&cur) {
+            Ok(m) if m.kind.is_dir() && !m.kind.is_symlink() => {}
+            Ok(m) if m.kind.is_symlink() => fail!(EditError::Symlink),
+            Ok(_) => fail!(EditError::NotADirectory),
+            Err(e) => fail!(EditError::Io(e)),
         }
     }
     Ok(made)
@@ -785,9 +810,9 @@ pub(crate) fn create_parents(root: &Path, wp: &WorkspacePath) -> Result<Vec<Stri
 /// Remove directories [`create_parents`] made, deepest first. Best effort:
 /// `remove_dir` removes an empty directory only, so it never removes
 /// anything the edit did not make.
-pub(crate) fn remove_dirs(root: &Path, made: &[String]) {
+pub(crate) fn remove_dirs(ops: &mut dyn FileOps, root: &Path, made: &[String]) {
     for rel in made.iter().rev() {
-        let _ = fs::remove_dir(root.join(rel));
+        let _ = ops.remove_dir(&root.join(rel));
     }
 }
 
@@ -973,16 +998,20 @@ fn plan_write_overwrite(req: &WriteReq, text: &str, bytes: &[u8]) -> Result<Vec<
 /// the preview's read-only mirror of [`create_parents`] (H2f) — each
 /// existing component must be a real directory (a symlink is refused,
 /// as everywhere), and at most [`WRITE_MAX_NEW_DIRS`] may be missing.
-pub(crate) fn check_new_parents(root: &Path, wp: &WorkspacePath) -> Result<(), EditError> {
+pub(crate) fn check_new_parents(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    wp: &WorkspacePath,
+) -> Result<(), EditError> {
     let comps: Vec<&str> = wp.components().collect();
     let parents = comps.len().saturating_sub(1);
     let mut missing = 0usize;
     let mut cur = root.to_path_buf();
     for c in comps.iter().take(parents) {
         cur.push(c);
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => return Err(EditError::Symlink),
-            Ok(m) if m.is_dir() => {}
+        match ops.lstat(&cur) {
+            Ok(m) if m.kind.is_symlink() => return Err(EditError::Symlink),
+            Ok(m) if m.kind.is_dir() => {}
             Ok(_) => return Err(EditError::NotADirectory),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 missing += 1;
@@ -1121,14 +1150,16 @@ pub(crate) fn check_pre_image(len: u64) -> Result<(), EditError> {
 /// oversize file is refused without opening it; the bounded read also
 /// refuses a file that grew between the two). Crate-visible for the
 /// restore primitive's read-back.
-pub(crate) fn read_capped(path: &Path, len: u64, cap: u64) -> Result<Vec<u8>, EditError> {
+pub(crate) fn read_capped(
+    ops: &mut dyn FileOps,
+    path: &Path,
+    len: u64,
+    cap: u64,
+) -> Result<Vec<u8>, EditError> {
     if len > cap {
         return Err(EditError::TooLarge { len, cap });
     }
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(cap + 1).read_to_end(&mut bytes))
-        .map_err(EditError::from)?;
+    let bytes = ops.read(path, cap + 1, None).map_err(EditError::from)?;
     if u64::try_from(bytes.len()).map_or(true, |n| n > cap) {
         return Err(EditError::TooLarge {
             len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -1229,74 +1260,9 @@ fn splice(original: &[u8], offsets: &[usize], old_len: usize, new: &[u8]) -> Vec
     out
 }
 
-/// Monotonic temp-file suffix, so concurrent edits never collide.
-static TEMP_N: AtomicU64 = AtomicU64::new(0);
-
-/// How many temp names [`atomic_write`] tries before giving up. A name
-/// that already exists is never opened (it may be a planted symlink), so
-/// a workspace that squats on every tried name makes the edit fail
-/// closed, never write through.
-const TEMP_TRIES: usize = 16;
-
-/// Create a fresh temp file next to `target`, exclusively
-/// (`O_CREAT | O_EXCL`): an existing name, a symlink included, is never
-/// opened or followed. The name is predictable, and once H2 runs model
-/// code the workspace may hold anything at it; this engine runs outside
-/// the sandbox, so following a planted link would write outside the
-/// workspace as the harness user.
-fn create_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
-    for _ in 0..TEMP_TRIES {
-        let tmp = dir.join(format!(
-            ".rh-edit-{}-{}.tmp",
-            std::process::id(),
-            TEMP_N.fetch_add(1, Ordering::Relaxed)
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(f) => return Ok((tmp, f)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "every temp-file name tried already exists",
-    ))
-}
-
-/// Write `bytes` to `target` atomically: a temp file created exclusively
-/// in the SAME directory (same filesystem, so the rename is atomic),
-/// given `perms` through its open handle when supplied, fsynced, then
-/// renamed over the target. On any failure the temp file is removed and
-/// the target is untouched. The directory is not fsynced — the tested
-/// property is the rename's atomicity, not power-loss durability.
-/// Crate-visible for the restore primitive (P-22), which applies the
-/// same way.
-pub(crate) fn atomic_write(
-    target: &Path,
-    bytes: &[u8],
-    perms: Option<fs::Permissions>,
-) -> io::Result<()> {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let (tmp, mut f) = create_temp(dir)?;
-    let done = (|| -> io::Result<()> {
-        f.write_all(bytes)?;
-        if let Some(p) = perms {
-            f.set_permissions(p)?;
-        }
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, target)
-    })();
-    if done.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    done
-}
-
+// The atomic write and its exclusive temp file live in
+// `crate::file_ops::FileOps::write_atomic` (P-36e); `InProcess`
+// holds this code verbatim.
 // ---------------------------------------------------------------------------
 // The edit tools as a provider (§4.8, H2b).
 // ---------------------------------------------------------------------------
@@ -1361,7 +1327,7 @@ impl EditTools {
         self.engine.root()
     }
 
-    fn replace(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
+    fn replace(&mut self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
         let req = match parse_replace_args(args) {
             Ok(req) => req,
             Err(out) => return (out, None),
@@ -1387,7 +1353,7 @@ impl EditTools {
         }
     }
 
-    fn multi(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
+    fn multi(&mut self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
         let req = match parse_multi_args(args) {
             Ok(req) => req,
             Err(out) => return (out, None),
@@ -1413,7 +1379,7 @@ impl EditTools {
         }
     }
 
-    fn write(&self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
+    fn write(&mut self, args: &Value, reads: &ReadLog) -> (Out, Option<EditRecord>) {
         let req = match parse_write_args(args) {
             Ok(req) => req,
             Err(out) => return (out, None),
@@ -1463,7 +1429,7 @@ impl EditTools {
     ///
     /// Deterministic: no clock (a preview is not a provider invoke), no
     /// randomness — the same call, file and read log give the same text.
-    pub fn preview(&self, call: &Call, reads: &ReadLog) -> Result<String, PreviewRefused> {
+    pub fn preview(&mut self, call: &Call, reads: &ReadLog) -> Result<String, PreviewRefused> {
         match call.capability.as_str() {
             REPLACE => {
                 let req = parse_replace_args(&call.args)
@@ -1484,19 +1450,24 @@ impl EditTools {
         }
     }
 
-    fn preview_replace(&self, req: &ReplaceReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
+    fn preview_replace(
+        &mut self,
+        req: &ReplaceReq,
+        reads: &ReadLog,
+    ) -> Result<String, PreviewRefused> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
         self.engine.guard(&wp)?;
         check_replace_args(req)?;
-        let (path, meta) = resolve_path(&self.engine.root, &wp).map_err(EditError::from)?;
+        let (path, meta) = resolve_path(self.engine.ops.as_mut(), &self.engine.root, &wp)
+            .map_err(EditError::from)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound.into());
         };
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(EditError::NotAFile.into());
         }
-        check_pre_image(meta.len())?;
-        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        check_pre_image(meta.len)?;
+        let bytes = read_capped(self.engine.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
@@ -1505,7 +1476,7 @@ impl EditTools {
         Ok(render_diff(wp.as_str(), false, text, &new_text))
     }
 
-    fn preview_multi(&self, req: &MultiReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
+    fn preview_multi(&mut self, req: &MultiReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
         self.engine.guard(&wp)?;
         let total = req.edits.len();
@@ -1517,15 +1488,16 @@ impl EditTools {
             .into());
         }
         check_multi_edits(req)?;
-        let (path, meta) = resolve_path(&self.engine.root, &wp).map_err(EditError::from)?;
+        let (path, meta) = resolve_path(self.engine.ops.as_mut(), &self.engine.root, &wp)
+            .map_err(EditError::from)?;
         let Some(meta) = meta else {
             return Err(EditError::NotFound.into());
         };
-        if !meta.is_file() {
+        if !meta.kind.is_file() {
             return Err(EditError::NotAFile.into());
         }
-        check_pre_image(meta.len())?;
-        let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+        check_pre_image(meta.len)?;
+        let bytes = read_capped(self.engine.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
         let before = sha256(&bytes);
         reads.check(wp.as_str(), before).map_err(EditError::from)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
@@ -1534,16 +1506,16 @@ impl EditTools {
         Ok(render_diff(wp.as_str(), false, text, &new_text))
     }
 
-    fn preview_write(&self, req: &WriteReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
+    fn preview_write(&mut self, req: &WriteReq, reads: &ReadLog) -> Result<String, PreviewRefused> {
         let wp = workspace_path(&req.path).map_err(EditError::PathRefused)?;
         self.engine.guard(&wp)?;
-        let (path, meta) = match resolve_path(&self.engine.root, &wp) {
+        let (path, meta) = match resolve_path(self.engine.ops.as_mut(), &self.engine.root, &wp) {
             Ok(x) => x,
             // A directory on the way is missing (H2f): apply would make
             // it; the preview only checks that it could, making nothing.
             Err(ResolveErr::NotFound) => {
                 check_cap(req.content.as_bytes())?;
-                check_new_parents(&self.engine.root, &wp)?;
+                check_new_parents(self.engine.ops.as_mut(), &self.engine.root, &wp)?;
                 return Ok(render_diff(wp.as_str(), true, "", &req.content));
             }
             Err(e) => return Err(EditError::from(e).into()),
@@ -1555,15 +1527,15 @@ impl EditTools {
             // that it could, making nothing.
             None => {
                 check_cap(req.content.as_bytes())?;
-                check_new_parents(&self.engine.root, &wp)?;
+                check_new_parents(self.engine.ops.as_mut(), &self.engine.root, &wp)?;
                 Ok(render_diff(wp.as_str(), true, "", &req.content))
             }
             Some(meta) => {
-                if !meta.is_file() {
+                if !meta.kind.is_file() {
                     return Err(EditError::NotAFile.into());
                 }
-                check_pre_image(meta.len())?;
-                let bytes = read_capped(&path, meta.len(), EDIT_MAX_BYTES)?;
+                check_pre_image(meta.len)?;
+                let bytes = read_capped(self.engine.ops.as_mut(), &path, meta.len, EDIT_MAX_BYTES)?;
                 let before = sha256(&bytes);
                 reads.check(wp.as_str(), before).map_err(EditError::from)?;
                 let text = std::str::from_utf8(&bytes).map_err(|_| EditError::NotUtf8)?;
@@ -1969,7 +1941,7 @@ mod tests {
     #[test]
     fn preview_replace_matches_applied_result() {
         let ws = scratch("replace-matches-apply");
-        let tools = EditTools::new(&ws).expect("tools");
+        let mut tools = EditTools::new(&ws).expect("tools");
         let file = ws.join("notes.txt");
         std::fs::write(&file, "alpha\nbeta\ngamma\n").expect("seed");
         let mut reads = ReadLog::default();
@@ -2005,7 +1977,7 @@ mod tests {
     #[test]
     fn preview_does_not_modify_file() {
         let ws = scratch("no-modify");
-        let tools = EditTools::new(&ws).expect("tools");
+        let mut tools = EditTools::new(&ws).expect("tools");
         let file = ws.join("notes.txt");
         std::fs::write(&file, "keep\nthis\n").expect("seed");
         let before = std::fs::read(&file).expect("read");
@@ -2031,8 +2003,8 @@ mod tests {
     #[test]
     fn preview_refuses_stale_read_like_apply() {
         let ws = scratch("stale");
-        let tools = EditTools::new(&ws).expect("tools");
-        let engine = EditEngine::new(&ws).expect("engine");
+        let mut tools = EditTools::new(&ws).expect("tools");
+        let mut engine = EditEngine::new(&ws).expect("engine");
         std::fs::write(ws.join("notes.txt"), "one\ntwo\n").expect("seed");
         let req = ReplaceReq {
             path: "notes.txt".into(),
@@ -2072,7 +2044,7 @@ mod tests {
     #[test]
     fn preview_write_create_heads_dev_null_and_refuses_like_apply() {
         let ws = scratch("write-create");
-        let tools = EditTools::new(&ws).expect("tools");
+        let mut tools = EditTools::new(&ws).expect("tools");
         let call = Call {
             capability: WRITE.to_owned(),
             args: serde_json::json!({ "path": "new/dir/file.txt", "content": "h1\nh2\n" }),
@@ -2125,7 +2097,7 @@ mod tests {
     #[test]
     fn preview_refuses_a_non_edit_call() {
         let ws = scratch("not-edit");
-        let tools = EditTools::new(&ws).expect("tools");
+        let mut tools = EditTools::new(&ws).expect("tools");
         let call = Call {
             capability: "harness.fs.read".to_owned(),
             args: serde_json::json!({}),
@@ -2147,10 +2119,10 @@ mod tests {
     fn edit_into_dot_git_refused() {
         let ws = scratch("protected-git");
         let protected = crate::protected::Protected::new(&[]).expect("defaults compile");
-        let tools = EditTools::new(&ws)
+        let mut tools = EditTools::new(&ws)
             .expect("tools")
             .with_protected(protected.clone());
-        let engine = EditEngine::new(&ws)
+        let mut engine = EditEngine::new(&ws)
             .expect("engine")
             .with_protected(protected);
         std::fs::create_dir_all(ws.join(".git")).expect("git dir");
@@ -2261,7 +2233,7 @@ mod tests {
     fn applied_carries_pre_and_post_images() {
         let ws = scratch("p22-images");
         std::fs::write(ws.join("f.txt"), b"alpha\nbeta\n").expect("seed");
-        let engine = EditEngine::new(&ws).expect("engine");
+        let mut engine = EditEngine::new(&ws).expect("engine");
         let mut reads = ReadLog::default();
         reads.record("f.txt", sha256(b"alpha\nbeta\n"));
         let applied = engine
@@ -2316,7 +2288,7 @@ mod tests {
         let mut edge = vec![b'a'; PRE_IMAGE_MAX_BYTES as usize];
         edge[PRE_IMAGE_MAX_BYTES as usize - 1] = b'b';
         std::fs::write(ws.join("edge.txt"), &edge).expect("seed");
-        let engine = EditEngine::new(&ws).expect("engine");
+        let mut engine = EditEngine::new(&ws).expect("engine");
         let mut reads = ReadLog::default();
         reads.record("big.txt", sha256(&vec![b'a'; over as usize]));
         reads.record("edge.txt", sha256(&edge));
@@ -2365,7 +2337,7 @@ mod tests {
         );
 
         // The preview refuses exactly like apply.
-        let tools = EditTools::new(&ws).expect("tools");
+        let mut tools = EditTools::new(&ws).expect("tools");
         assert!(matches!(
             tools.preview(
                 &Call {

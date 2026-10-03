@@ -48,7 +48,7 @@ fn read_of(root: &Path, rel: &str) -> ReadLog {
 
 #[test]
 fn a_unique_match_applies_with_before_and_after_hashes() {
-    let (d, e) = engine("unique");
+    let (d, mut e) = engine("unique");
     file(&d.join("a.txt"), "alpha\nbeta\ngamma\n");
     let original = fs::read(d.join("a.txt")).unwrap();
     let mut reads = read_of(&d, "a.txt");
@@ -82,7 +82,7 @@ fn rep(path: &str, old: &str, new: &str) -> ReplaceReq {
 
 #[test]
 fn no_match_names_nearest_lines_and_hints_at_crlf() {
-    let (d, e) = engine("nomatch");
+    let (d, mut e) = engine("nomatch");
     file(&d.join("c.txt"), "one\r\ntwo\r\nthree\r\n");
     let reads = read_of(&d, "c.txt");
     // LF `old` never byte-matches a CRLF file…
@@ -100,7 +100,7 @@ fn no_match_names_nearest_lines_and_hints_at_crlf() {
         .unwrap();
     assert_eq!(fs::read(d.join("c.txt")).unwrap(), b"one\r\nX\r\n");
     // Something nowhere close: no nearest lines, no hint, no change.
-    let (d, e) = engine("nomatch-far");
+    let (d, mut e) = engine("nomatch-far");
     file(&d.join("f.txt"), "a\nb\nc\n");
     let reads = read_of(&d, "f.txt");
     match e.replace(&rep("f.txt", "zzz", "X"), &reads) {
@@ -117,7 +117,7 @@ fn no_match_names_nearest_lines_and_hints_at_crlf() {
 
 #[test]
 fn multiple_matches_name_every_line_and_change_nothing() {
-    let (d, e) = engine("multi");
+    let (d, mut e) = engine("multi");
     file(&d.join("m.txt"), "keep\ndup\nkeep\ndup\nkeep\n");
     let original = fs::read(d.join("m.txt")).unwrap();
     let reads = read_of(&d, "m.txt");
@@ -149,7 +149,7 @@ fn multiple_matches_name_every_line_and_change_nothing() {
         b"keep\nX\nkeep\nX\nkeep\n"
     );
     // Expected 3, found 2: still refused, with the lines named.
-    let (d, e) = engine("count");
+    let (d, mut e) = engine("count");
     file(&d.join("c.txt"), "dup\ndup\n");
     let reads = read_of(&d, "c.txt");
     match e.replace(
@@ -172,7 +172,7 @@ fn multiple_matches_name_every_line_and_change_nothing() {
 
 #[test]
 fn bad_arguments_are_refused_before_the_file_is_touched() {
-    let (d, e) = engine("badargs");
+    let (d, mut e) = engine("badargs");
     file(&d.join("a.txt"), "abc\n");
     let reads = read_of(&d, "a.txt");
     // `old` == `new` is a no-op, refused as such.
@@ -203,7 +203,7 @@ fn bad_arguments_are_refused_before_the_file_is_touched() {
 
 #[test]
 fn edits_require_a_fresh_read() {
-    let (d, e) = engine("stale");
+    let (d, mut e) = engine("stale");
     file(&d.join("a.txt"), "one\ntwo\n");
     // Never read: refused outright, replace and overwrite both.
     let empty = ReadLog::default();
@@ -242,7 +242,7 @@ fn wr(path: &str, content: &str) -> WriteReq {
 
 #[test]
 fn crlf_files_stay_crlf() {
-    let (d, e) = engine("crlf");
+    let (d, mut e) = engine("crlf");
     file(&d.join("c.txt"), "a\r\nb\r\nc\r\n");
     let reads = read_of(&d, "c.txt");
     // LF `new` takes the file's line endings.
@@ -261,7 +261,7 @@ fn crlf_files_stay_crlf() {
 
 #[test]
 fn a_write_body_equal_after_conversion_is_a_noop() {
-    let (d, e) = engine("noop");
+    let (d, mut e) = engine("noop");
     file(&d.join("c.txt"), "a\r\nb\r\n");
     let reads = read_of(&d, "c.txt");
     match e.write(&wr("c.txt", "a\r\nb\r\n"), &reads) {
@@ -284,7 +284,7 @@ fn a_write_body_equal_after_conversion_is_a_noop() {
 
 #[test]
 fn write_creates_only_where_nothing_exists() {
-    let (d, e) = engine("create");
+    let (d, mut e) = engine("create");
     let empty = ReadLog::default();
     let applied = e.write(&wr("new.txt", "fresh\n"), &empty).unwrap();
     assert_eq!(fs::read(d.join("new.txt")).unwrap(), b"fresh\n");
@@ -305,7 +305,7 @@ fn write_creates_only_where_nothing_exists() {
 
 #[test]
 fn overwrites_are_capped_at_400_lines() {
-    let (d, e) = engine("lines");
+    let (d, mut e) = engine("lines");
     file(
         &d.join("big.txt"),
         "l\n".repeat(WRITE_OVERWRITE_MAX_LINES + 1),
@@ -327,7 +327,7 @@ fn overwrites_are_capped_at_400_lines() {
 
 #[test]
 fn oversize_and_non_utf8_files_are_refused() {
-    let (d, e) = engine("bounds");
+    let (d, mut e) = engine("bounds");
     // Over the pre-image cap (P-22) by one: refused without a read —
     // the tighter bound now, since the pre-image store cannot keep
     // more than 2 MiB of prior bytes.
@@ -367,7 +367,7 @@ fn oversize_and_non_utf8_files_are_refused() {
 
 #[test]
 fn paths_outside_the_workspace_are_refused_lexically() {
-    let (d, e) = engine("outside");
+    let (d, mut e) = engine("outside");
     file(&d.join("a.txt"), "abc\n");
     let reads = read_of(&d, "a.txt");
     for path in ["/etc/passwd", "../escape", "a/../../escape", "C:\\x"] {
@@ -408,7 +408,7 @@ mod unix {
     fn symlinks_are_refused_at_any_component() {
         let outside = ws("unix-outside");
         file(&outside.join("secret.txt"), "secret\n");
-        let (d, e) = engine("symlink");
+        let (d, mut e) = engine("symlink");
         fs::create_dir(d.join("src")).unwrap();
         std::os::unix::fs::symlink(&outside, d.join("linkdir")).unwrap();
         std::os::unix::fs::symlink(outside.join("secret.txt"), d.join("src/linkfile")).unwrap();
@@ -456,7 +456,7 @@ mod unix {
     fn a_planted_temp_name_symlink_is_never_followed() {
         let outside = ws("unix-temp-victim");
         file(&outside.join("victim.txt"), "victim\n");
-        let (d, e) = engine("temp-symlink");
+        let (d, mut e) = engine("temp-symlink");
         file(&d.join("a.txt"), "old\n");
         // The counter is shared by every test in this binary, so plant a
         // wide range of names.
@@ -489,7 +489,7 @@ mod unix {
 
     #[test]
     fn edits_preserve_permissions_and_fail_atomically() {
-        let (d, e) = engine("atomic");
+        let (d, mut e) = engine("atomic");
         file(&d.join("a.txt"), "keep\nme\n");
         fs::set_permissions(d.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
         let reads = read_of(&d, "a.txt");
@@ -521,7 +521,7 @@ mod unix {
 // H2f: a write over the size cap is refused before any directory is made.
 #[test]
 fn a_write_over_the_cap_makes_no_directory() {
-    let (d, e) = engine("cap-dirs");
+    let (d, mut e) = engine("cap-dirs");
     let big = "y".repeat(4 * 1024 * 1024 + 1);
     match e.write(&wr("big/dir/x.txt", &big), &ReadLog::default()) {
         Err(EditError::TooLarge { .. }) => {}

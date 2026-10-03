@@ -113,6 +113,7 @@ fn task(grants: &[&str], exec: Option<ExecSpec>, presubmit: Option<PresubmitSpec
         exec,
         presubmit,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -499,7 +500,7 @@ mod live {
         resume(Resume {
             state_root: state,
             run: &r.run,
-            workspace: ws,
+            workspace: Some(ws),
             spec,
             registry: &registry(),
             policy: &allow_all(),

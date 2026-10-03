@@ -196,6 +196,7 @@ fn spec(task: &str, grants: &[&str]) -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -723,7 +724,7 @@ fn scenario_10_resume_after_kill_between_intent_and_result() {
         resume_session(ResumeSession {
             state_root: fx.state_root(),
             run: &r.run.run,
-            workspace: fx.workspace(),
+            workspace: Some(fx.workspace()),
             spec: &fx.spec,
             registry: &registry().unwrap(),
             policy: &policy,
@@ -970,6 +971,7 @@ mod live {
             }),
             presubmit: None,
             protected: Vec::new(),
+            kind: harness_run::SessionKind::Coding,
         };
         let policy = allow_tools(&["harness.edit.replace", EXEC]);
         let r = drive(
@@ -1039,6 +1041,7 @@ mod live {
                 max_rounds: 2,
             }),
             protected: Vec::new(),
+            kind: harness_run::SessionKind::Coding,
         };
         let policy = allow_tools(&["harness.edit.write", EXEC]);
         let r = drive(

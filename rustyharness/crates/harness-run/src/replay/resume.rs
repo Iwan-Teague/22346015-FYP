@@ -17,7 +17,7 @@ use harness_model::profile::Profile;
 use harness_model::replay::ReplayBackend;
 use harness_model::{Completion, ModelBackend, ModelError, ModelIdentity, ModelRequest};
 use harness_policy::locality::LocalityProbe;
-use harness_policy::UserPolicy;
+use harness_policy::{SessionKind, UserPolicy};
 use serde_json::Value;
 
 use crate::approve::{Approver, RecordedApproval};
@@ -72,8 +72,10 @@ pub struct Resume<'a> {
     pub run: &'a RunId,
     /// The workspace. It must be exactly as the interrupted attempt's last
     /// durable record left it (the tree digest after its last recorded
-    /// edit, or at its start), or the resume is refused.
-    pub workspace: &'a Path,
+    /// edit, or at its start), or the resume is refused. A research session
+    /// (P-39i) has no workspace: `None` (and `Some` is refused by
+    /// `prepare`).
+    pub workspace: Option<&'a Path>,
     /// The task spec (must match the recorded header).
     pub spec: &'a TaskSpec,
     /// Admitted providers.
@@ -141,6 +143,13 @@ fn resumable_attempt(run_dir: &Path, run: &RunId) -> Result<(u32, Verified, Vec<
 
 /// Resume an interrupted run in a new attempt (see the module docs).
 pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
+    // A research session (P-39i) is a session: it resumes with
+    // `resume_session`, whose loop carries the conversation.
+    if let SessionKind::Research(_) = r.spec.kind {
+        return Err(not_resumable(
+            "a research session is not resumed as a batch run; resume it with resume_session",
+        ));
+    }
     let pre = prepare(
         r.spec,
         r.registry,
@@ -232,7 +241,10 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         .filter(|x| matches!(x.kind, EventKind::EditApplied | EventKind::ToolFinished))
         .find_map(|x| digest_at(&x.body, "workspace_tree"))
         .unwrap_or(start.tree);
-    if pre.facts.tree != expected {
+    // A research session (P-39i) has no workspace to check against, so the
+    // tree check is skipped (`pre.tree` is `None`; its facts are the
+    // no-workspace facts, which the header recorded unchanged).
+    if pre.tree.is_some() && pre.facts.tree != expected {
         return Err(not_resumable(
             "the workspace differs from the interrupted attempt's last durable record (an edit \
              applied without its result, or a change made outside the run); this build keeps no \
@@ -350,10 +362,11 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         // The catch-up re-feeds each recorded edit's tree digest; the
         // listing measured now already holds every one of them.
         tree: start.tree,
-        workspace: Some(pre.tree),
+        workspace: pre.tree,
+        research: false,
         approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals)
             .may_grant(r.config.allow_session_grants || granted)
-            .with_edits(Some(edit_tools)),
+            .with_edits(edit_tools),
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
@@ -398,8 +411,10 @@ pub struct ResumeSession<'a> {
     /// The workspace. Mid-turn it must be exactly as the kept records
     /// left it (the tree digest after the turn's last recorded edit,
     /// command or turn start); at a turn boundary it may have changed —
-    /// the next turn measures it and says so.
-    pub workspace: &'a Path,
+    /// the next turn measures it and says so. A research session (P-39i)
+    /// has no workspace: `None`, and no tree check is made at a turn
+    /// start.
+    pub workspace: Option<&'a Path>,
     /// The task spec (must match the recorded header).
     pub spec: &'a TaskSpec,
     /// Admitted providers.
@@ -573,7 +588,10 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             })
             .find_map(|x| digest_at(&x.body, "workspace_tree"))
             .unwrap_or(start.tree);
-        if pre.facts.tree != expected {
+        // A research session (P-39i) has no workspace: the turn-start tree
+        // check is skipped (there is nothing to re-measure, and the
+        // records' facts are the no-workspace facts throughout).
+        if pre.tree.is_some() && pre.facts.tree != expected {
             return Err(not_resumable(
                 "the workspace differs from the session's records since its last turn started \
                  (a change made mid-turn outside the run); this build keeps no snapshot to \
@@ -719,10 +737,11 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         // The catch-up re-feeds each recorded edit's tree digest; the
         // listing measured now already holds every one of them.
         tree: start.tree,
-        workspace: Some(pre.tree),
+        workspace: pre.tree,
+        research: matches!(r.spec.kind, SessionKind::Research(_)),
         approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals)
             .may_grant(r.config.run.allow_session_grants || granted)
-            .with_edits(Some(edit_tools)),
+            .with_edits(edit_tools),
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
@@ -748,7 +767,9 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             used: 0,
             users: Vec::new(),
             deliverable: None,
-            root: Some(r.workspace.to_path_buf()),
+            // A research session (P-39i) has no workspace: a turn's start
+            // re-measures nothing, so `external_change` is always false.
+            root: r.workspace.map(std::path::Path::to_path_buf),
             blobs: layout::attempt_dir(&run_dir, attempt).join(layout::BLOBS_DIR),
             sink: r.sink,
         }),

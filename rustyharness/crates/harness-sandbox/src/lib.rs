@@ -20,7 +20,9 @@
 //!   deny-default profile ([`profile`]) and a domain stub that sweeps every
 //!   process of the sandbox instance when a call ends
 //!   (`confine_spawn`). Linux: [`linux::Linux`] reads the host's
-//!   confinement facts and refuses (the mechanism is owner decision D29).
+//!   confinement facts and refuses, delegating the "are the primitives
+//!   present?" decision to `harness-sandbox-linux` on `target_os = "linux"`
+//!   (design §6.7, slice S-La; the mechanism itself is owner decision D29).
 //!   Windows: [`windows::Windows`], the S-W1 stub — it measures nothing
 //!   (Win32 needs `unsafe`, forbidden workspace-wide) and refuses, so
 //!   read/edit sessions are all Windows gets until its conformance suite

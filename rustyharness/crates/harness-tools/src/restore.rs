@@ -30,7 +30,8 @@ use harness_core::{sha256, Digest};
 use harness_policy::workspace_path;
 
 use crate::builtin::{resolve, ResolveErr};
-use crate::edit::{atomic_write, read_capped, EditError, EDIT_MAX_BYTES};
+use crate::edit::{read_capped, EditError, EDIT_MAX_BYTES};
+use crate::file_ops::{FileOps, InProcess};
 use crate::provider::Image;
 
 /// Why a restore was refused. Nothing here can mean the file was touched:
@@ -115,8 +116,8 @@ impl From<ResolveErr> for RestoreError {
 /// their meaning, and anything else means the file changed as it was read
 /// (the path walked is re-checked by [`resolve`], so a symlink or a
 /// missing file surfaces there first).
-fn read_whole(path: &Path, len: u64) -> Result<Vec<u8>, RestoreError> {
-    read_capped(path, len, EDIT_MAX_BYTES).map_err(|e| match e {
+fn read_whole(ops: &mut dyn FileOps, path: &Path, len: u64) -> Result<Vec<u8>, RestoreError> {
+    read_capped(ops, path, len, EDIT_MAX_BYTES).map_err(|e| match e {
         EditError::TooLarge { len, cap } => RestoreError::TooLarge { len, cap },
         EditError::Io(e) => RestoreError::Io(e),
         other => RestoreError::Io(io::Error::other(format!(
@@ -144,6 +145,17 @@ pub fn restore_file(
     image: &Image,
     expect_current: Digest,
 ) -> Result<(), RestoreError> {
+    restore_file_with(&mut InProcess, root, rel, image, expect_current)
+}
+
+/// [`restore_file`] over another [`FileOps`] implementation (P-36e).
+pub fn restore_file_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    rel: &str,
+    image: &Image,
+    expect_current: Digest,
+) -> Result<(), RestoreError> {
     let wp = workspace_path(rel).map_err(RestoreError::PathRefused)?;
     let found = sha256(&image.bytes);
     if found != image.sha256 {
@@ -152,14 +164,14 @@ pub fn restore_file(
             found,
         });
     }
-    let (path, meta) = resolve(root, &wp)?;
+    let (path, meta) = resolve(ops, root, &wp)?;
     let Some(meta) = meta else {
         return Err(RestoreError::NotFound);
     };
-    if !meta.is_file() {
+    if !meta.kind.is_file() {
         return Err(RestoreError::NotAFile);
     }
-    let current = read_whole(&path, meta.len())?;
+    let current = read_whole(ops, &path, meta.len)?;
     let found = sha256(&current);
     if found != expect_current {
         return Err(RestoreError::ChangedSince {
@@ -167,19 +179,19 @@ pub fn restore_file(
             found,
         });
     }
-    let perms = meta.permissions();
-    atomic_write(&path, &image.bytes, Some(perms))?;
+    let perms = meta.mode;
+    ops.write_atomic(&path, &image.bytes, perms)?;
     // The re-read takes the same walk and cap as every access: a target
     // that became a symlink or grew past the cap after the rename fails
     // the restore instead of being followed.
-    let (path, meta) = resolve(root, &wp)?;
+    let (path, meta) = resolve(ops, root, &wp)?;
     let Some(meta) = meta else {
         return Err(RestoreError::NotFound);
     };
-    if !meta.is_file() {
+    if !meta.kind.is_file() {
         return Err(RestoreError::NotAFile);
     }
-    let after = read_whole(&path, meta.len())?;
+    let after = read_whole(ops, &path, meta.len)?;
     let found = sha256(&after);
     if found != image.sha256 {
         return Err(RestoreError::Verify {
@@ -206,6 +218,16 @@ pub fn restore_file(
 ///
 /// The caller owns the journaling and the tree-digest bookkeeping.
 pub fn recreate_file(root: &Path, rel: &str, image: &Image) -> Result<(), RestoreError> {
+    recreate_file_with(&mut InProcess, root, rel, image)
+}
+
+/// [`recreate_file`] over another [`FileOps`] implementation (P-36e).
+pub fn recreate_file_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    rel: &str,
+    image: &Image,
+) -> Result<(), RestoreError> {
     let wp = workspace_path(rel).map_err(RestoreError::PathRefused)?;
     let found = sha256(&image.bytes);
     if found != image.sha256 {
@@ -214,19 +236,19 @@ pub fn recreate_file(root: &Path, rel: &str, image: &Image) -> Result<(), Restor
             found,
         });
     }
-    let (path, meta) = resolve(root, &wp)?;
+    let (path, meta) = resolve(ops, root, &wp)?;
     if meta.is_some() {
         return Err(RestoreError::Exists);
     }
-    atomic_write(&path, &image.bytes, None)?;
-    let (path, meta) = resolve(root, &wp)?;
+    ops.write_atomic(&path, &image.bytes, None)?;
+    let (path, meta) = resolve(ops, root, &wp)?;
     let Some(meta) = meta else {
         return Err(RestoreError::NotFound);
     };
-    if !meta.is_file() {
+    if !meta.kind.is_file() {
         return Err(RestoreError::NotAFile);
     }
-    let after = read_whole(&path, meta.len())?;
+    let after = read_whole(ops, &path, meta.len)?;
     let found = sha256(&after);
     if found != image.sha256 {
         return Err(RestoreError::Verify {
@@ -243,15 +265,25 @@ pub fn recreate_file(root: &Path, rel: &str, image: &Image) -> Result<(), Restor
 /// (the digest the create produced), and is then removed and verified
 /// gone. Any other content refuses the un-create with the file untouched.
 pub fn uncreate_file(root: &Path, rel: &str, after: Digest) -> Result<(), RestoreError> {
+    uncreate_file_with(&mut InProcess, root, rel, after)
+}
+
+/// [`uncreate_file`] over another [`FileOps`] implementation (P-36e).
+pub fn uncreate_file_with(
+    ops: &mut dyn FileOps,
+    root: &Path,
+    rel: &str,
+    after: Digest,
+) -> Result<(), RestoreError> {
     let wp = workspace_path(rel).map_err(RestoreError::PathRefused)?;
-    let (path, meta) = resolve(root, &wp)?;
+    let (path, meta) = resolve(ops, root, &wp)?;
     let Some(meta) = meta else {
         return Err(RestoreError::NotFound);
     };
-    if !meta.is_file() {
+    if !meta.kind.is_file() {
         return Err(RestoreError::NotAFile);
     }
-    let bytes = read_whole(&path, meta.len())?;
+    let bytes = read_whole(ops, &path, meta.len)?;
     let found = sha256(&bytes);
     if found != after {
         return Err(RestoreError::ChangedSince {
@@ -259,11 +291,11 @@ pub fn uncreate_file(root: &Path, rel: &str, after: Digest) -> Result<(), Restor
             found,
         });
     }
-    std::fs::remove_file(&path)?;
+    ops.remove_file(&path)?;
     // Verified gone: the path must now resolve to "only the final
     // component missing". Anything still there is a change the harness
     // did not make.
-    if resolve(root, &wp)?.1.is_some() {
+    if resolve(ops, root, &wp)?.1.is_some() {
         return Err(RestoreError::Io(io::Error::other(
             "the file still exists after the removal",
         )));

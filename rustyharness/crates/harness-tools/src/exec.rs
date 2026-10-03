@@ -64,6 +64,7 @@ use serde_json::{json, Value};
 use crate::builtin::{
     canonical_root, code, err, refused, resolve, workspace_tree, Out, ResolveErr, RootRefused,
 };
+use crate::file_ops::InProcess;
 use crate::provider::{
     ExecCleanup, ExecEnd, ExecRecord, InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult,
     ToolStatus,
@@ -550,7 +551,7 @@ impl<'a> ExecTools<'a> {
     ) -> Result<Self, ExecSetupError> {
         let ns = ProviderName::new(harness_manifest::BUILTIN_NAMESPACE)
             .map_err(|_| ExecSetupError::Scratch("builtin namespace".into()))?;
-        let root = canonical_root(root)?;
+        let root = canonical_root(&mut InProcess, root)?;
         let scratch = Scratch::prepare(scratch, &root)?;
         Ok(Self {
             ns,
@@ -623,8 +624,8 @@ impl<'a> ExecTools<'a> {
             return Ok(self.root.clone());
         };
         let p = workspace_path(s).map_err(|e| err(code::PATH_REFUSED, &e.to_string()))?;
-        match resolve(&self.root, &p) {
-            Ok((path, Some(m))) if m.is_dir() => Ok(path),
+        match resolve(&mut InProcess, &self.root, &p) {
+            Ok((path, Some(m))) if m.kind.is_dir() => Ok(path),
             Ok((_, Some(_))) => Err(err(code::NOT_A_DIR, "cwd is not a directory")),
             Ok((_, None)) | Err(ResolveErr::NotFound) => {
                 Err(err(code::NOT_FOUND, "cwd: no such directory"))

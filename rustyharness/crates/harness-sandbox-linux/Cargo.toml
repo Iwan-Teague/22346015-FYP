@@ -1,0 +1,23 @@
+[package]
+name = "harness-sandbox-linux"
+description = "rustyharness Linux confinement primitives: the fail-closed \"are the primitives present?\" decision of design §6.7 (slice S-La; the only crate allowed unsafe code, ratcheted by scripts/ci/purity.sh §5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# NOT [lints] workspace = true: the workspace lints table forbids
+# `unsafe_code`, and a `[lints]` flag overrides a source `#![allow]`
+# attribute, which would make this crate uncompilable. This is the ONE
+# named unsafe exception (design §6.7, L-D1/L-D2); scripts/ci/purity.sh
+# §5 checks the exception shape and ratchets the unsafe-site count.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+panic = "warn"

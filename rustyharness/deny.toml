@@ -18,6 +18,12 @@ confidence-threshold = 1.0
 #   regex, regex-automata, regex-syntax (H2e): the linear-time regex engine
 #   of `harness.fs.search`; MIT OR Apache-2.0 (allowed above), pure Rust,
 #   no build script, no FFI.
+#   landlock, rustix, enumflags2 (design §6.7, slices S-Lb/S-Lc — admitted
+#   here ahead of first use, by review): the Linux confinement primitives
+#   behind harness-sandbox-linux, the ONE named unsafe crate (ratcheted by
+#   scripts/ci/purity.sh §5b). Target-gated with it, so no other platform
+#   pulls them; `rustix` is pinned to its libc backend (no build codegen —
+#   L-Q2 open question, re-review at admission). No process APIs.
 multiple-versions = "warn"
 wildcards = "deny"
 # Intra-workspace path dependencies carry no version; they are not registry

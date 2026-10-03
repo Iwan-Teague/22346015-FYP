@@ -35,20 +35,24 @@ pub(crate) fn exec_tools<'p>(
     confinement: Option<&'p dyn Confinement>,
     config: &RunConfig,
 ) -> Result<Option<ExecTools<'p>>, RunRefused> {
-    let (Some((pinned, witness)), Some(c)) = (&pre.exec, confinement) else {
+    let (Some((pinned, witness)), Some(c), Some(read)) =
+        (&pre.exec, confinement, pre.read_tools.as_ref())
+    else {
+        // A research session (P-39i) has neither an exec grant nor read
+        // tools; a coding run has both whenever the grant is set.
         return Ok(None);
     };
     let sources: Vec<String> = pre.protected.patterns().map(str::to_owned).collect();
     Ok(Some(
         ExecTools::new(
-            pre.read_tools.root(),
+            read.root(),
             pinned.clone(),
             &run_dir.join(SCRATCH_DIR),
             c,
             witness.clone(),
             config.facts_timeout,
         )?
-        .with_protected_dirs(overlay_dirs(pre.read_tools.root(), &sources)),
+        .with_protected_dirs(overlay_dirs(read.root(), &sources)),
     ))
 }
 

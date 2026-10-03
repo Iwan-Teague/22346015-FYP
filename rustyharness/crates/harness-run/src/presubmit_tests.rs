@@ -277,6 +277,7 @@ fn spec_of(commands: &[&[&str]], max_rounds: u32) -> TaskSpec {
                 .collect(),
             max_rounds,
         }),
+        kind: harness_policy::SessionKind::Coding,
     }
 }
 
@@ -399,6 +400,7 @@ fn drive(s: Setup<'_>) -> Done {
         reads: ReadLog::default(),
         tree: sha256(b"tree"),
         workspace: None,
+        research: false,
         approvals: Approvals::new(&run_id, 1, s.approver, Default::default()),
         env: &env,
         pressure: Vec::new(),
@@ -1024,6 +1026,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         reads: ReadLog::default(),
         tree: sha256(b"tree"),
         workspace: None,
+        research: false,
         approvals: Approvals::new(&run_id, 1, None, Default::default()),
         env: &env,
         pressure: Vec::new(),

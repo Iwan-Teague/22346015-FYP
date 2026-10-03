@@ -12,7 +12,10 @@
 //! MEASURES what the host offers, read-only, and refuses with those facts
 //! (fail closed per host capability). Every probe input is a small file
 //! under `/proc` or `/sys`, read bounded; a missing file is recorded as
-//! absent, never guessed.
+//! absent, never guessed. Whether the measured primitives suffice is the
+//! fail-closed decision of `harness-sandbox-linux` (design §6.7, slice
+//! S-La), the workspace's one named `unsafe` crate, pulled in only on
+//! `target_os = "linux"`; this crate itself stays `#![forbid(unsafe_code)]`.
 
 use crate::{
     Backend, BackendKind, ConfinedChild, ConfinedSpec, Conformed, SpawnError, Unavailable,
@@ -126,24 +129,50 @@ pub fn host_facts() -> HostFacts {
     }
 }
 
+/// The refusal a Linux probe returns, given which confinement primitive is
+/// missing (the decision itself lives in `harness-sandbox-linux`).
+///
+/// With a named missing primitive the reason is
+/// [`UnavailableReason::PrimitiveMissing`]; with `None` — every primitive
+/// present — there is still no committed matrix row (design §3.3), so the
+/// honest reason is [`UnavailableReason::MatrixRowMissing`]. Either way the
+/// probe refuses: this function never returns [`UnavailableReason::NotBuilt`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_refusal(missing_primitive: Option<&'static str>) -> Unavailable {
+    let reason = match missing_primitive {
+        Some(p) => UnavailableReason::PrimitiveMissing(p),
+        None => UnavailableReason::MatrixRowMissing,
+    };
+    Unavailable {
+        backend: Some(BackendKind::Linux),
+        reason,
+    }
+}
+
 impl Backend for Linux {
     fn kind(&self) -> BackendKind {
         BackendKind::Linux
     }
 
     fn probe(&self) -> Result<Conformed, Unavailable> {
-        if cfg!(not(target_os = "linux")) {
-            return Err(Unavailable {
+        #[cfg(target_os = "linux")]
+        {
+            let facts = host_facts();
+            let primitives = harness_sandbox_linux::Primitives {
+                landlock_lsm: facts.landlock_lsm,
+                seccomp_kill: facts.seccomp_kill,
+            };
+            Err(linux_refusal(
+                harness_sandbox_linux::LinuxBackend::missing_primitive(&primitives),
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Unavailable {
                 backend: None,
                 reason: UnavailableReason::NoBackendForOs,
-            });
+            })
         }
-        Err(Unavailable {
-            backend: Some(BackendKind::Linux),
-            reason: UnavailableReason::NotBuilt {
-                facts: host_facts().summary(),
-            },
-        })
     }
 
     fn spawn(&self, _spec: &ConfinedSpec, ev: &Conformed) -> Result<ConfinedChild, SpawnError> {
@@ -190,5 +219,43 @@ mod tests {
     #[test]
     fn the_linux_backend_never_mints() {
         assert!(Linux.probe().is_err());
+    }
+
+    #[test]
+    fn probe_still_refuses_without_primitives() {
+        // The delegation shape: a missing primitive is NAMED (never NotBuilt)
+        // and the refusal points at the Linux backend.
+        let r = linux_refusal(Some("landlock"));
+        assert_eq!(r.backend, Some(BackendKind::Linux));
+        assert_eq!(r.reason, UnavailableReason::PrimitiveMissing("landlock"));
+        let r = linux_refusal(Some("seccomp-kill"));
+        assert_eq!(r.backend, Some(BackendKind::Linux));
+        assert_eq!(
+            r.reason,
+            UnavailableReason::PrimitiveMissing("seccomp-kill")
+        );
+    }
+
+    #[test]
+    fn every_primitive_present_still_refuses_without_a_matrix_row() {
+        // No Linux matrix row is committed (design §3.3), so even a full
+        // primitive set refuses — honestly, as MatrixRowMissing.
+        let r = linux_refusal(None);
+        assert_eq!(r.backend, Some(BackendKind::Linux));
+        assert_eq!(r.reason, UnavailableReason::MatrixRowMissing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_delegates_to_the_linux_crate() {
+        // On a Linux host the probe refuses via the new crate's decision:
+        // PrimitiveMissing (some fact unknown or absent) or, on a host with
+        // every primitive present, MatrixRowMissing. Never NotBuilt, never Ok.
+        let err = Linux.probe().unwrap_err();
+        assert_eq!(err.backend, Some(BackendKind::Linux));
+        assert!(matches!(
+            err.reason,
+            UnavailableReason::PrimitiveMissing(_) | UnavailableReason::MatrixRowMissing
+        ));
     }
 }

@@ -27,6 +27,7 @@ fn edit_spec(task: &str) -> harness_run::TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 

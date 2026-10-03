@@ -111,6 +111,7 @@ fn spec() -> TaskSpec {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     }
 }
 
@@ -583,7 +584,7 @@ fn resume_edits(
     harness_run::resume(harness_run::Resume {
         state_root: state,
         run,
-        workspace: ws,
+        workspace: Some(ws),
         spec: &spec(),
         registry: &registry(),
         policy: &allow_edits(),

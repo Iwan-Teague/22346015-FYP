@@ -250,6 +250,7 @@ fn an_unknown_grant_refuses_the_session() {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     };
     let err = drive(
         fx.state_root(),
@@ -319,6 +320,7 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         exec: None,
         presubmit: None,
         protected: Vec::new(),
+        kind: harness_run::SessionKind::Coding,
     };
     let r = drive(
         fx.state_root(),

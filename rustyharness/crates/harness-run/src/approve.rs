@@ -33,7 +33,7 @@
 use std::time::Instant;
 
 use harness_core::Nonce;
-use harness_policy::approval::ApprovalRequest;
+use harness_policy::approval::{ApprovalRequest, Origin};
 
 /// What kind of approver answered: the closed set of names the journal
 /// records (§5.3 "approver id").
@@ -97,6 +97,35 @@ pub trait Approver {
     fn ask(&self, req: &ApprovalRequest, deadline: Instant) -> ApprovalAnswer;
 }
 
+/// The parent run's approver, as a helper run sees it (P-38 §8): every
+/// ask is labelled with where it comes from — the helper run, its parent,
+/// the parent step that started it — and forwarded to the inner approver
+/// unchanged otherwise. Nothing is decided here: the kind is the inner
+/// kind (the journal records who really answered), the deadline and the
+/// answer pass through, and a no answer is still a deny.
+pub struct LabelledApprover<'a> {
+    inner: &'a dyn Approver,
+    origin: Origin,
+}
+
+impl<'a> LabelledApprover<'a> {
+    /// Wrap `inner`; every ask it is shown carries `origin`.
+    pub fn new(inner: &'a dyn Approver, origin: Origin) -> Self {
+        Self { inner, origin }
+    }
+}
+
+impl Approver for LabelledApprover<'_> {
+    fn kind(&self) -> ApproverKind {
+        self.inner.kind()
+    }
+
+    fn ask(&self, req: &ApprovalRequest, deadline: Instant) -> ApprovalAnswer {
+        self.inner
+            .ask(&req.with_origin(self.origin.clone()), deadline)
+    }
+}
+
 /// A recorded answer, re-fed in place of asking (audit, resume catch-up).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordedApproval {
@@ -143,6 +172,10 @@ pub(crate) fn nonce_bytes(s: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::RunId;
+    use harness_policy::approval::StepId;
+    use harness_policy::EffectiveClass;
+    use std::cell::RefCell;
 
     #[test]
     fn approver_kinds_round_trip_and_nothing_else_parses() {
@@ -170,5 +203,90 @@ mod tests {
         ] {
             assert_eq!(nonce_bytes(bad), None, "{bad:?}");
         }
+    }
+
+    // An inner approver that records what it was shown (P-38 §8 tests).
+    struct Recording {
+        kind: ApproverKind,
+        answer: ApprovalAnswer,
+        seen: RefCell<Vec<(String, Instant)>>,
+    }
+
+    impl Approver for Recording {
+        fn kind(&self) -> ApproverKind {
+            self.kind
+        }
+
+        fn ask(&self, req: &ApprovalRequest, deadline: Instant) -> ApprovalAnswer {
+            self.seen.borrow_mut().push((req.to_string(), deadline));
+            self.answer
+        }
+    }
+
+    fn request() -> ApprovalRequest {
+        let class = EffectiveClass {
+            effect: harness_manifest::Effect::Read,
+            sensitivity: harness_manifest::Sensitivity::Personal,
+            blast_radius: harness_manifest::BlastRadius::Own,
+            egress: harness_manifest::Egress::None,
+            content: harness_manifest::Content::Own,
+            confirmation: harness_manifest::Confirmation::UserConfirm,
+            requires_conformed: false,
+        };
+        ApprovalRequest::new(
+            harness_manifest::CapId::new("fixture.p").unwrap(),
+            "reads personal files".into(),
+            class,
+            serde_json::json!({"path": "notes.txt"}),
+            harness_manifest::Confirmation::UserConfirm,
+            1,
+            StepId::new(3),
+        )
+    }
+
+    fn origin() -> Origin {
+        Origin {
+            child: RunId::new(1, [0xaa; 10]),
+            parent: RunId::new(2, [0xbb; 10]),
+            parent_step: 7,
+        }
+    }
+
+    // P-38 §8: the wrapper reports the inner kind, forwards the deadline,
+    // and the answer the inner gave comes back unchanged; the inner sees
+    // the request WITH the origin line first.
+    #[test]
+    fn labelled_approver_forwards_kind_answer_and_deadline() {
+        let inner = Recording {
+            kind: ApproverKind::Embedded,
+            answer: ApprovalAnswer::Yes,
+            seen: RefCell::new(Vec::new()),
+        };
+        let labelled = LabelledApprover::new(&inner, origin());
+        assert_eq!(labelled.kind(), ApproverKind::Embedded);
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(labelled.ask(&request(), deadline), ApprovalAnswer::Yes);
+        let seen = inner.seen.borrow();
+        assert_eq!(seen.len(), 1);
+        let (shown, seen_deadline) = &seen[0];
+        assert_eq!(*seen_deadline, deadline);
+        assert!(
+            shown.starts_with("asked by a helper (run 000000000001aa"),
+            "{shown}"
+        );
+    }
+
+    // P-38 §8: no answer by the deadline is a deny, as for any ask — the
+    // wrapper never invents a yes.
+    #[test]
+    fn labelled_approver_no_answer_is_deny() {
+        let inner = Recording {
+            kind: ApproverKind::Terminal,
+            answer: ApprovalAnswer::NoAnswer,
+            seen: RefCell::new(Vec::new()),
+        };
+        let labelled = LabelledApprover::new(&inner, origin());
+        let deadline = Instant::now();
+        assert_eq!(labelled.ask(&request(), deadline), ApprovalAnswer::NoAnswer);
     }
 }

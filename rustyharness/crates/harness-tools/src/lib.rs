@@ -30,6 +30,7 @@ pub mod builtin;
 pub mod edit;
 pub mod exec;
 pub mod outline;
+pub mod patch;
 pub mod protected;
 pub mod provider;
 pub mod registry;
@@ -41,12 +42,14 @@ pub mod todo;
 pub use builtin::{workspace_tree, ReadTools, WorkspaceTree};
 pub use edit::{
     EditEngine, EditTools, MultiReq, ReadLog, Replacement, StaleRead, PRE_IMAGE_MAX_BYTES,
+    PRE_IMAGE_STORE,
 };
 pub use exec::{
     plain_name, ExecLimits, ExecProgram, ExecSetupError, ExecSpec, ExecTools, Pinned, MAX_PROGRAMS,
 };
 pub use harness_core::glob;
 pub use outline::OUTLINE_MAX_ENTRIES;
+pub use patch::{PatchError, PatchTools, DELETE, MOVE, PATCH};
 pub use provider::{
     EditRecord, ExecCleanup, ExecEnd, ExecRecord, Image, InvokeCtx, ReadRecord, RefusalKind,
     ToolError, ToolProvider, ToolResult, ToolStatus,

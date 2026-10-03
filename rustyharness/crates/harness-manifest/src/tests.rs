@@ -177,8 +177,80 @@ fn fixture_manifest_validates() {
 fn builtin_manifest_bytes_unchanged() {
     assert_eq!(
         harness_core::sha256(builtin::builtin_manifest_json().as_bytes()).to_string(),
-        "d8a0ea17341e2490dcc4b8cef984a8bdcaa95eedcb136ffa9603f294e5223a30"
+        "1f681b35eb67ecfa8cd0d6e39e2bf51260a3db5cb91d9b7ac35bea5e234bd407"
     );
+}
+
+/// P-39b: the research manifest is pinned like the coding one, so neither
+/// assembly can drift under the other (a byte of drift in either would make
+/// journals from a web run read as "another build").
+#[test]
+fn research_manifest_bytes_pinned() {
+    assert_eq!(
+        harness_core::sha256(builtin::research_manifest_json().as_bytes()).to_string(),
+        "d677f8551639647771c73f61eabad5876b5eebef0fab6bd680007a064c6de37c"
+    );
+}
+
+/// P-39b: the research manifest declares exactly the two web tools plus the
+/// checklist and the submit sentinel, with §2.3's labels and schemas.
+#[test]
+fn research_manifest_declares_exactly_the_web_tools_and_the_task_sentinels() {
+    let m = builtin::research_manifest(&ctx()).unwrap();
+    assert_eq!(m.provider().as_str(), BUILTIN_NAMESPACE);
+    assert_eq!(m.origin(), Origin::Compiled);
+    assert_eq!(m.transport(), &Transport::Builtin);
+    let ids: Vec<&str> = m.capabilities().iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "harness.web.fetch",
+            "harness.web.search",
+            "harness.task.todo",
+            "harness.task.submit"
+        ]
+    );
+    for id in ["harness.web.fetch", "harness.web.search"] {
+        let c = m
+            .capabilities()
+            .iter()
+            .find(|c| c.id.as_str() == id)
+            .unwrap();
+        assert_eq!(
+            (c.effect, c.sensitivity, c.blast_radius, c.egress),
+            (
+                Effect::Read,
+                Sensitivity::Operational,
+                BlastRadius::Own,
+                Egress::Internet
+            ),
+            "{}",
+            c.id
+        );
+        assert_eq!(
+            (c.content, c.confirmation),
+            (Content::ThirdParty, Confirmation::None)
+        );
+        assert!(c.secrets.is_empty() && c.mcp_name.is_none());
+    }
+    let fetch = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id.as_str() == "harness.web.fetch")
+        .unwrap();
+    let props = fetch.input_schema().as_json()["properties"].clone();
+    assert_eq!(props["url"]["maxLength"], 4096);
+    assert_eq!(props["lines"]["maximum"], 400);
+    assert_eq!(props["start"]["minimum"], 1);
+    let search = m
+        .capabilities()
+        .iter()
+        .find(|c| c.id.as_str() == "harness.web.search")
+        .unwrap();
+    let props = search.input_schema().as_json()["properties"].clone();
+    assert_eq!(props["query"]["maxLength"], 256);
+    assert_eq!(props["max_results"]["minimum"], 1);
+    assert_eq!(props["max_results"]["maximum"], 10);
 }
 
 /// P-53: the terse table has an entry for every built-in capability, and
@@ -232,6 +304,9 @@ fn builtin_manifest_declares_exactly_the_read_and_edit_tools_and_the_sentinel() 
             "harness.edit.replace",
             "harness.edit.write",
             "harness.edit.multi",
+            "harness.edit.patch",
+            "harness.edit.delete",
+            "harness.edit.move",
             "harness.exec.run",
             "harness.task.todo",
             "harness.task.delegate",

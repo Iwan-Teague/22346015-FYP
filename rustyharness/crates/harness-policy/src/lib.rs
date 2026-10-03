@@ -24,7 +24,15 @@
 //!   only with a workspace and a conformed sandbox witness (INV-6), its
 //!   `argv[0]` must name a program on the task's exec allowlist and its
 //!   `cwd` stay in the workspace (INV-13), and it asks by default (rule
-//!   [`EXEC_DEFAULT_RULE`]) unless a user allow rule allows it.
+//!   [`EXEC_DEFAULT_RULE`]) unless a user allow rule allows it. Since
+//!   P-37b an mcp-stdio capability (§5.4, §6.3) plans only with a
+//!   `Conformed` sandbox witness (INV-6: the capability IS a confined
+//!   server process), carries egress, content and sensitivity lifted to
+//!   the max over its whole manifest (one process serves every tool), and
+//!   a provider-declared `write`/`execute` class plans and asks by default
+//!   (rule [`MCP_DEFAULT_RULE`]) instead of being out of scope; egress is
+//!   still refused, and the pinned tier's derived floor never lowers a
+//!   `protected_action` floor.
 //! - [`Session::plan_child`] (P-38): the parent's planning plus the
 //!   child-scope refusal — only the built-in fs tools and the submit
 //!   sentinel plan into a helper run, and a delegate's label must cover
@@ -33,6 +41,8 @@
 //! - [`Session::decide`]: the §5.1 order — deny rules (first match wins,
 //!   cannot be overridden), then ask rules, then allow rules, then DENY by
 //!   default. Every decision carries the id of the rule that produced it.
+//!   An mcp-stdio capability asks by default ([`MCP_DEFAULT_RULE`]) after
+//!   every user rule unless an allow rule covered it.
 //! - [`Session::authorize`]: a mint of [`Authorized`]; only `Allow`
 //!   mints. An `Ask` alone never mints: with no approver present an `Ask`
 //!   is a `Deny` (§5.2), and with one it stays an `Ask` until the approver
@@ -67,12 +77,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use harness_manifest::admission::{Registry, Resolved};
+use harness_manifest::admission::{Registry, Resolved, Tier};
 use harness_manifest::{
     ArgsError, BlastRadius, CapId, Capability, Confirmation, Content, Effect, Egress, InputSchema,
-    ProviderName, Sensitivity, BUILTIN_NAMESPACE,
+    Manifest, ProviderName, Sensitivity, Transport, BUILTIN_NAMESPACE,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
+
+use web::{AllowlistRefused, UrlRefused};
 
 pub mod approval;
 pub mod builtin;
@@ -84,9 +96,12 @@ pub mod web;
 
 pub use builtin::{
     CHILD_ELIGIBLE, DELEGATE_ID, EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, GLOB_ID,
-    LIST_ID, OUTLINE_ID, READ_ID, SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
+    LIST_ID, MCP_DEFAULT_RULE, OUTLINE_ID, READ_ID, SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
+    WEB_ALLOWLIST_RULE, WEB_FETCH_ID, WEB_SEARCH_ID, WEB_SEARCH_RULE,
 };
-pub use denies::{default_denies, overlay_default_denies, DEFAULT_DENY_GLOBS};
+pub use denies::{
+    default_denies, overlay_accept_edits, overlay_default_denies, DEFAULT_DENY_GLOBS,
+};
 pub use matcher::Matcher;
 pub use path::{workspace_path, PathRefused, WorkspacePath};
 
@@ -109,7 +124,9 @@ pub struct EffectiveClass {
     pub content: Content,
     /// max(declared, derived floors, user policy).
     pub confirmation: Confirmation,
-    /// `execute` needs a `Conformed` sandbox token (derived floor, §4.2).
+    /// `execute` needs a `Conformed` sandbox token (derived floor, §4.2);
+    /// since P-37b an mcp-stdio capability does too, whatever its class
+    /// (INV-6: the capability is one confined server process).
     pub requires_conformed: bool,
 }
 
@@ -536,6 +553,16 @@ pub enum RuleId {
         /// Index in that list.
         index: usize,
     },
+    /// Entry `index` of a session grant list (P-23): a rule the approver
+    /// granted at a prompt with `a`/`d`, scoped to this session only and
+    /// never journaled as policy — the run header's policy digest does not
+    /// change mid-run.
+    Session {
+        /// Which list (only Deny and Allow occur).
+        list: RuleList,
+        /// Index in that list.
+        index: usize,
+    },
 }
 
 impl fmt::Display for RuleId {
@@ -543,6 +570,13 @@ impl fmt::Display for RuleId {
         match self {
             RuleId::Builtin(n) => f.write_str(n),
             RuleId::User { list, index } => write!(f, "user.{list:?}[{index}]"),
+            RuleId::Session { list, index } => {
+                let name = match list {
+                    RuleList::Deny => "deny",
+                    _ => "allow",
+                };
+                write!(f, "session.{name}.{index}")
+            }
         }
     }
 }
@@ -566,12 +600,16 @@ pub enum DenyReason {
     PersonalNotGranted,
     /// A user deny rule.
     UserDenied,
+    /// A pattern the approver denied for the session (P-23).
+    SessionDenied,
     /// Arguments outside the capability's input schema.
     Args(ArgsError),
     /// A built-in file tool's path argument leaves the workspace.
     Path(PathRefused),
     /// A command-runner call refused before it runs (H2d, INV-13).
     Exec(ExecRefused),
+    /// A web-airlock call refused before anything connects (§2.3, P-39b).
+    Web(WebCallRefused),
     /// An ask with nobody to answer it (§5.2: every Ask becomes Deny).
     NoApprover,
     /// No allow rule matched (the §5.1 default).
@@ -597,6 +635,27 @@ pub enum ExecRefused {
 /// The most `argv` items one `harness.exec.run` call may pass (the 64 KiB
 /// action cap binds on their total size first).
 pub const EXEC_MAX_ARGS: usize = 256;
+
+/// Why a web call is refused before anything connects (§2.3, P-39b). The
+/// web branch never asks (per-fetch prompts are never offered): its only
+/// decisions are `Allow` by the session rules or one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebCallRefused {
+    /// The `url` argument is not a URL the airlock accepts (§2.3: grammar,
+    /// scheme, host, non-global literal).
+    Url(UrlRefused),
+    /// No allowlist entry names the host (§2.3).
+    HostNotAllowlisted,
+    /// The scheme differs from the entry naming the same host and port.
+    Scheme,
+    /// The port differs from the entry naming the same host and scheme.
+    Port,
+    /// The search query fails §2.3's bounds (1..=256 characters, no
+    /// control, zero-width or bidi code point).
+    Query,
+    /// The session has no web search endpoint configured (§2.3).
+    NoSearchEndpoint,
+}
 
 /// What may happen to one call (§5.1). Not a verdict (§1.4, INV-28).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,6 +792,80 @@ pub struct SessionSpec {
     /// `lines` above it is denied like any argument outside the schema the
     /// model was shown. `None`: the manifest's maximum alone.
     pub read_window: Option<u64>,
+    /// The session kind (P-39b, §2.2). `Coding` is the default and is
+    /// everything the default has always been; `Research` admits the web
+    /// airlock and refuses everything the airlock excludes.
+    pub kind: SessionKind,
+}
+
+/// What kind of session the task spec asks for (§2.2, P-39b). The kind is
+/// part of the plan: it decides which registry agrees with the session and
+/// which refusals apply, before anything runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionKind {
+    /// The coding session: the workspace tools, no egress (the default, so
+    /// existing callers are unchanged).
+    #[default]
+    Coding,
+    /// The research session (§2.2 item 3): no workspace, no personal data,
+    /// only the research manifest's capabilities, and egress only through
+    /// the two web tools under a session-start confirmation.
+    Research(WebGrant),
+}
+
+/// A research session's web grant (§2.2, §2.3): the allowlist the user
+/// confirmed at session start, whether a search endpoint is configured, and
+/// how the confirmation was given.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebGrant {
+    /// The allowlist entries (`host`, `host:port` or `http://host[:port]`),
+    /// parsed at planning; a malformed entry refuses the session.
+    pub allowlist: Vec<String>,
+    /// Whether the session has a web search endpoint to call.
+    pub search: bool,
+    /// The session-start confirmation of the allowlist (§2.3); `None`
+    /// refuses the session (the egress floor is met at session granularity,
+    /// never per fetch).
+    pub confirmed: Option<WebConfirmation>,
+}
+
+/// How the session-start web confirmation was given (§2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebConfirmation {
+    /// The user answered the session-start prompt on the tty.
+    Tty,
+    /// The task spec carried a flag (an embedding UI's consent).
+    Flag,
+}
+
+/// Why a research session was refused at planning (§2.2 item 3, P-39b).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WebSessionRefused {
+    /// A web session is granted a workspace (§2.2: it has none; the trifecta
+    /// names one first when the workspace is private).
+    #[error("a web session is granted no workspace")]
+    WorkspaceGranted,
+    /// A web session is granted personal data (§2.2: what it fetches is
+    /// other people's text; the user's data never joins it).
+    #[error("a web session is granted no personal data")]
+    PersonalData,
+    /// No session-start confirmation (§2.3: the egress floor is met once,
+    /// for the allowlist, at session start).
+    #[error("the web session never confirmed its allowlist at session start")]
+    Unconfirmed,
+    /// The allowlist config is malformed (§4.1's entry grammar).
+    #[error("the web session's allowlist is refused: {0}")]
+    Allowlist(AllowlistRefused),
+    /// A research session granted something the research manifest never
+    /// declares (§2.2: builtin-tier only, and only four ids).
+    #[error(
+        "capability {0} is not a web tool or task sentinel; a web session grants nothing else"
+    )]
+    GrantOutsideResearch(String),
+    /// A coding session granted a web capability (§2.2: defence in depth;
+    /// the coding registry cannot admit one).
+    #[error("capability {0} is a web capability and this is a coding session")]
+    WebGrantInCoding(String),
 }
 
 /// Why a session was refused at planning. Nothing has run.
@@ -777,6 +910,9 @@ pub enum SessionRefused {
         /// What.
         what: &'static str,
     },
+    /// A research (web) session refused at planning (§2.2 item 3, P-39b).
+    #[error(transparent)]
+    Web(#[from] WebSessionRefused),
     /// A granted delegate whose child scope could read above the delegate's
     /// own sensitivity (P-38, D12): the session's trifecta label would not
     /// cover what a helper run reads (§9).
@@ -867,6 +1003,25 @@ struct Active {
     /// allowlist, and it is allowed only by a user allow rule or an
     /// approval, and only with a conformed sandbox.
     exec: bool,
+    /// The built-in fetch tool (§2.3, P-39b): decided by the web branch,
+    /// never by the ask rules.
+    web_fetch: bool,
+    /// The built-in search tool (§2.3, P-39b): decided by the web branch,
+    /// never by the ask rules.
+    web_search: bool,
+    /// An mcp-stdio capability (P-37b, §5.4, §6.3): its trifecta labels are
+    /// lifted over its whole manifest, and by default (after every deny,
+    /// ask and allow rule) it asks at `user_confirm` — the pinned tier's
+    /// floor — instead of falling to the default deny.
+    mcp: bool,
+}
+
+/// A web session's decided-at-plan state (§2.3): the parsed allowlist the
+/// user confirmed at session start, and whether a search endpoint exists.
+#[derive(Debug, Clone)]
+struct WebSession {
+    allowlist: web::Allowlist,
+    search: bool,
 }
 
 /// A planned session: the active set with each capability's effective
@@ -880,6 +1035,16 @@ pub struct Session {
     conformed: bool,
     exec_programs: BTreeSet<String>,
     read_window: Option<u64>,
+    /// Rules granted at a prompt for the rest of the session (P-23), per
+    /// capability. Session-scoped by construction: never part of the
+    /// policy the run header digests, gone when the session ends.
+    session_deny: BTreeMap<CapId, Vec<UserCandidate>>,
+    session_allow: BTreeMap<CapId, Vec<UserCandidate>>,
+    /// The web session state (§2.3); `None` in a coding session.
+    web: Option<WebSession>,
+    /// The task's workspace declaration, kept so [`Session::quarantine`] can
+    /// re-run the trifecta over the survivors plus the workspace (§7.3).
+    workspace: Option<WorkspaceDecl>,
 }
 
 impl Session {
@@ -890,9 +1055,16 @@ impl Session {
     }
 }
 
-/// A grant's resolution (private mirror of `Resolved` without provenance).
+/// A grant's resolution (private mirror of `Resolved`): the capability plus
+/// the manifest and tier it resolved through, so planning can key the
+/// mcp-stdio rules on the transport and name the tier in refusals without
+/// reaching the registry.
 enum Lookup<'a> {
-    One(&'a Capability),
+    One {
+        capability: &'a Capability,
+        manifest: &'a Manifest,
+        tier: &'a Tier,
+    },
     NotFound,
     Ambiguous,
 }
@@ -900,15 +1072,23 @@ enum Lookup<'a> {
 impl Session {
     /// Plan a session: every grant must resolve to exactly one admitted
     /// capability, and the set must pass the session-level refusals, in this
-    /// order: resolution → `restricted` → trifecta → workspace → classes this
-    /// slice does not decide.
+    /// order: resolution → `restricted` → trifecta → workspace → the
+    /// mcp-stdio and class rules of the per-capability loop.
     pub fn plan(
         spec: &SessionSpec,
         registry: &Registry,
         policy: &UserPolicy,
     ) -> Result<Self, SessionRefused> {
         Self::plan_with(spec, policy, &|g| match registry.resolve(g) {
-            Resolved::One { capability, .. } => Lookup::One(capability),
+            Resolved::One {
+                capability,
+                manifest,
+                tier,
+            } => Lookup::One {
+                capability,
+                manifest,
+                tier,
+            },
             Resolved::NotFound => Lookup::NotFound,
             Resolved::Ambiguous => Lookup::Ambiguous,
         })
@@ -924,20 +1104,33 @@ impl Session {
         lookup: &dyn Fn(&str) -> Lookup<'a>,
     ) -> Result<Self, SessionRefused> {
         let mut seen = BTreeSet::new();
-        let mut resolved: Vec<&Capability> = Vec::with_capacity(spec.grants.len());
+        let mut resolved: Vec<(&Capability, &Manifest, &Tier)> =
+            Vec::with_capacity(spec.grants.len());
         for g in &spec.grants {
             if !seen.insert(g.as_str()) {
                 return Err(SessionRefused::DuplicateGrant(g.clone()));
             }
             match lookup(g) {
-                Lookup::One(capability) => resolved.push(capability),
+                Lookup::One {
+                    capability,
+                    manifest,
+                    tier,
+                } => resolved.push((capability, manifest, tier)),
                 Lookup::NotFound => return Err(SessionRefused::UnknownCapability(g.clone())),
                 Lookup::Ambiguous => return Err(SessionRefused::Ambiguous(g.clone())),
             }
         }
 
+        // Per-process label lift (P-37b, §5.4): one mcp-stdio server process
+        // serves every tool of its manifest, so data handed to any of them
+        // can leave through any of them, and text fetched by any can surface
+        // in any. An mcp-stdio capability therefore carries egress, content
+        // and sensitivity = the max over ALL capabilities of its manifest,
+        // granted or not. Computed once per manifest.
+        let mut lifts: BTreeMap<&str, (Egress, Content, Sensitivity)> = BTreeMap::new();
         let mut classes = Vec::with_capacity(resolved.len());
-        for c in &resolved {
+        for (c, m, _tier) in &resolved {
+            let mcp = matches!(m.transport(), Transport::McpStdio { .. });
             let user_ask = UserPolicy::candidates(&policy.ask, c.id());
             // Only an UNCONDITIONAL ask rule (no matcher) raises the
             // capability's confirmation floor: a matcher ask asks about the
@@ -948,45 +1141,128 @@ impl Session {
             } else {
                 Confirmation::None
             };
-            classes.push((c.id(), effective_class(c, floor), user_ask));
+            let mut cl = effective_class(c, floor);
+            if mcp {
+                let lifted = lifts
+                    .entry(m.provider().as_str())
+                    .or_insert_with(|| {
+                        m.capabilities().iter().fold(
+                            (Egress::None, Content::Own, Sensitivity::Public),
+                            |(e, t, s), cap| {
+                                (
+                                    e.max(cap.egress()),
+                                    t.max(cap.content()),
+                                    s.max(cap.sensitivity()),
+                                )
+                            },
+                        )
+                    })
+                    .to_owned();
+                cl.egress = lifted.0;
+                cl.content = lifted.1;
+                cl.sensitivity = lifted.2;
+                // INV-6: the capability IS a confined server process; no
+                // `Conformed` witness, no session, whatever its class.
+                cl.requires_conformed = true;
+            }
+            classes.push((c.id(), cl, user_ask, mcp));
         }
 
         // INV-27 before anything else can be said about the set.
-        if let Some((id, _, _)) = classes
+        if let Some((id, _, _, _)) = classes
             .iter()
-            .find(|(_, cl, _)| cl.sensitivity == Sensitivity::Restricted)
+            .find(|(_, cl, _, _)| cl.sensitivity == Sensitivity::Restricted)
         {
             return Err(SessionRefused::Restricted(id.to_string()));
         }
 
         let labels: Vec<(&CapId, EffectiveClass)> =
-            classes.iter().map(|(id, cl, _)| (*id, *cl)).collect();
+            classes.iter().map(|(id, cl, _, _)| (*id, *cl)).collect();
         trifecta(&labels, spec.workspace)?;
 
-        for (c, (id, cl, _)) in resolved.iter().zip(&classes) {
+        // The session kind (§2.2 item 3, P-39b). Coding is the default and
+        // changes nothing; Research builds the web state or refuses. The
+        // kind checks run after the trifecta so a private workspace in a
+        // web session is named as the trifecta it is (P and U from the
+        // workspace, E from the web capability).
+        let web = match &spec.kind {
+            SessionKind::Coding => None,
+            SessionKind::Research(g) => {
+                if spec.workspace.is_some() {
+                    return Err(SessionRefused::Web(WebSessionRefused::WorkspaceGranted));
+                }
+                if spec.personal_data_granted {
+                    return Err(SessionRefused::Web(WebSessionRefused::PersonalData));
+                }
+                if g.confirmed.is_none() {
+                    return Err(SessionRefused::Web(WebSessionRefused::Unconfirmed));
+                }
+                let allowlist = web::Allowlist::load(&g.allowlist)
+                    .map_err(|e| SessionRefused::Web(WebSessionRefused::Allowlist(e)))?;
+                Some(WebSession {
+                    allowlist,
+                    search: g.search,
+                })
+            }
+        };
+
+        for ((c, _, _), (id, cl, user_ask, mcp)) in resolved.iter().zip(&classes) {
             let out = |what| SessionRefused::OutOfScope {
                 capability: id.to_string(),
                 what,
             };
+            // Kind agrees with the capability set (§2.2): a research session
+            // grants only the research manifest's four ids, and a web
+            // capability plans only into a research session (defence in
+            // depth: the registries already keep them apart).
+            match (&spec.kind, builtin::is_research_id(id.as_str())) {
+                (SessionKind::Research(_), false) => {
+                    return Err(SessionRefused::Web(
+                        WebSessionRefused::GrantOutsideResearch(id.to_string()),
+                    ));
+                }
+                (SessionKind::Coding, true) if builtin::is_web_id(id.as_str()) => {
+                    return Err(SessionRefused::Web(WebSessionRefused::WebGrantInCoding(
+                        id.to_string(),
+                    )));
+                }
+                _ => {}
+            }
+            // Per-fetch prompts are never offered (§2.2): an ask rule on a
+            // web capability refuses the session at planning.
+            if builtin::is_web_id(id.as_str()) && !user_ask.is_empty() {
+                return Err(out(
+                    "ask rules on web capabilities (per-fetch prompts are never offered)",
+                ));
+            }
             let reg = builtin::registration(id.as_str());
             if reg.is_some_and(|t| t.kind.needs_workspace()) && spec.workspace.is_none() {
                 return Err(SessionRefused::NoWorkspace(id.to_string()));
             }
-            if cl.effect != Effect::Read && !reg.is_some_and(|t| (t.labels)(c)) {
+            // A provider-declared write or execute class plans for
+            // mcp-stdio (P-37b: it asks by default, like the edits and the
+            // runner); an irreversible class, and every non-read class of
+            // any other transport, is still undecided here and refused.
+            let planned_non_read = *mcp && matches!(cl.effect, Effect::Write | Effect::Execute);
+            if cl.effect != Effect::Read && !planned_non_read && !reg.is_some_and(|t| (t.labels)(c))
+            {
                 return Err(out("a non-read effect class"));
             }
-            // INV-6: no execution without a conformed sandbox, refused at
-            // planning, before anything starts (§4.5).
+            // INV-6: no execution and no mcp-stdio process without a
+            // conformed sandbox, refused at planning, before anything starts
+            // (§4.5).
             if cl.requires_conformed && !spec.conformed {
                 return Err(SessionRefused::NoConfinement(id.to_string()));
             }
-            if cl.egress != Egress::None {
+            // Egress plans only in a research session, and only through the
+            // two web ids (§2.2 item 3): the allowlist is the control (H4).
+            if cl.egress != Egress::None && !builtin::is_web_id(id.as_str()) {
                 return Err(out("egress (the allowlist proxy is H4)"));
             }
         }
 
         let mut active = BTreeMap::new();
-        for (c, (_, class, user_ask)) in resolved.iter().zip(&classes) {
+        for ((c, _, _), (_, class, user_ask, mcp)) in resolved.iter().zip(&classes) {
             active.insert(
                 c.id().clone(),
                 Active {
@@ -1000,8 +1276,11 @@ impl Session {
                     submit: builtin::is_submit_sentinel(c),
                     todo: builtin::is_builtin_todo(c),
                     delegate: builtin::is_builtin_delegate(c),
-                    edit: builtin::is_builtin_edit(c),
+                    edit: builtin::is_builtin_edit(c) || builtin::is_builtin_fileop(c),
                     exec: builtin::is_builtin_exec(c),
+                    web_fetch: builtin::is_builtin_web_fetch(c),
+                    web_search: builtin::is_builtin_web_search(c),
+                    mcp: *mcp,
                 },
             );
         }
@@ -1015,7 +1294,8 @@ impl Session {
         // operational, so this never fires on a real manifest; `plan_with`
         // over a fixture exercises it.
         if let Some((delegated, d)) = active.iter().find(|(_, a)| a.delegate) {
-            for (g, (_, (_, child, _))) in spec.grants.iter().zip(resolved.iter().zip(&classes)) {
+            for (g, (_, (_, child, _, _))) in spec.grants.iter().zip(resolved.iter().zip(&classes))
+            {
                 if builtin::CHILD_ELIGIBLE.contains(&g.as_str())
                     && child.sensitivity > d.class.sensitivity
                 {
@@ -1032,7 +1312,29 @@ impl Session {
             conformed: spec.conformed,
             exec_programs: spec.exec_programs.iter().cloned().collect(),
             read_window: spec.read_window,
+            session_deny: BTreeMap::new(),
+            session_allow: BTreeMap::new(),
+            web,
+            workspace: spec.workspace,
         })
+    }
+
+    /// Grant a session-scoped rule (P-23): the approver's `a`/`d` answer at
+    /// a prompt becomes one minimal matcher on one capability, applied for
+    /// the rest of the session. Returns the rule's index in its list. Only
+    /// the deny and allow lists occur — a session ask would answer, once,
+    /// for calls not yet made, so there is none.
+    pub fn grant(&mut self, list: RuleList, cap: &CapId, matcher: Matcher) -> usize {
+        let rules = match list {
+            RuleList::Deny => self.session_deny.entry(cap.clone()).or_default(),
+            _ => self.session_allow.entry(cap.clone()).or_default(),
+        };
+        let index = rules.len();
+        rules.push(UserCandidate {
+            index,
+            matcher: Some(matcher),
+        });
+        index
     }
 
     /// Plan a helper run's session (P-38 §11): the parent's planning plus
@@ -1058,10 +1360,22 @@ impl Session {
         Ok(child)
     }
 
-    /// Quarantine a capability for the rest of the session (H4 wires this to
-    /// pin drift; removal can only shrink the trifecta labels).
-    pub fn quarantine(&mut self, id: &CapId) {
+    /// Quarantine a capability for the rest of the session (P-37 wires this
+    /// to pin drift and a dead server): it leaves the active set, and the
+    /// trifecta is recomputed over the survivors plus the workspace
+    /// (§5.4, §7.3, INV-9). Removal only shrinks labels, so after a clean
+    /// plan this cannot refuse; if it ever does, `Err` is the session
+    /// saying the remaining set is lethal and the caller must stop the run.
+    /// The capability is recorded as quarantined either way.
+    pub fn quarantine(&mut self, id: &CapId) -> Result<(), SessionRefused> {
         self.quarantined.insert(id.clone());
+        let active: Vec<(&CapId, EffectiveClass)> = self
+            .active
+            .iter()
+            .filter(|&(k, _)| !self.quarantined.contains(k))
+            .map(|(k, a)| (k, a.class))
+            .collect();
+        trifecta(&active, self.workspace)
     }
 
     /// The effective class of an active capability.
@@ -1091,7 +1405,16 @@ impl Session {
             return deny(DenyReason::Quarantined, "deny.quarantined");
         }
         let cl = a.class;
-        if cl.effect != Effect::Read && !a.submit && !a.todo && !a.edit && !a.exec {
+        // A provider-declared write or execute class of an mcp-stdio
+        // capability is decided here (P-37b: the pinned default below);
+        // every other non-read class stays out of scope.
+        if cl.effect != Effect::Read
+            && !a.submit
+            && !a.todo
+            && !a.edit
+            && !a.exec
+            && !(a.mcp && matches!(cl.effect, Effect::Write | Effect::Execute))
+        {
             return deny(
                 DenyReason::ClassOutOfScope(cl.effect),
                 "deny.class-out-of-scope",
@@ -1100,7 +1423,9 @@ impl Session {
         if cl.sensitivity == Sensitivity::Restricted {
             return deny(DenyReason::Restricted, "deny.restricted");
         }
-        if cl.egress != Egress::None {
+        // Egress is unavailable everywhere except the web branch (§2.3): a
+        // web call is decided below, against the session's allowlist.
+        if cl.egress != Egress::None && !a.web_fetch && !a.web_search {
             return deny(DenyReason::EgressUnavailable, "deny.egress-unavailable");
         }
         // INV-6: execute-class only with a conformed sandbox witness.
@@ -1119,8 +1444,45 @@ impl Session {
                 },
             };
         }
+        // P-25: a move's target path is denied like a `path`. The deny
+        // matcher is re-run on the shadow args `{"path": to}`, so a
+        // `path_glob` deny rule covers where a file would land, not just
+        // where it comes from.
+        if a.edit {
+            if let Some(to) = call.args.get("to").and_then(Value::as_str) {
+                if let Some(index) = first_matching(&a.user_deny, &json!({ "path": to })) {
+                    return PolicyDecision::Deny {
+                        reason: DenyReason::UserDenied,
+                        rule: RuleId::User {
+                            list: RuleList::Deny,
+                            index,
+                        },
+                    };
+                }
+            }
+        }
+        // A session-scoped deny grant (P-23) sits just under the user's
+        // own deny rules: it must block calls a later allow rule — user or
+        // session — would otherwise let through.
+        if let Some(rules) = self.session_deny.get(id) {
+            if let Some(index) = first_matching(rules, &call.args) {
+                return PolicyDecision::Deny {
+                    reason: DenyReason::SessionDenied,
+                    rule: RuleId::Session {
+                        list: RuleList::Deny,
+                        index,
+                    },
+                };
+            }
+        }
         if let Err(e) = a.schema.validate_args(&call.args) {
             return deny(DenyReason::Args(e), "deny.args-schema");
+        }
+        // The web branch (§2.3, P-39b): after every deny rule and the
+        // schema, before the ask rules — a web call is never asked about.
+        // It decides from the session-start allowlist alone.
+        if a.web_fetch || a.web_search {
+            return self.decide_web(a, &call.args);
         }
         // The run's read window (H2e): the manifest's maximum for `lines` is
         // the widest any profile may set; the window is the maximum the
@@ -1142,6 +1504,13 @@ impl Session {
         if a.fs_tool || a.edit {
             if let Some(p) = call.args.get("path") {
                 // The schema says string; anything else was refused above.
+                let checked = p.as_str().map_or(Err(PathRefused::Empty), workspace_path);
+                if let Err(e) = checked {
+                    return deny(DenyReason::Path(e), "deny.path-outside-workspace");
+                }
+            }
+            // P-25: a move's target is a workspace path too.
+            if let Some(p) = call.args.get("to") {
                 let checked = p.as_str().map_or(Err(PathRefused::Empty), workspace_path);
                 if let Err(e) = checked {
                     return deny(DenyReason::Path(e), "deny.path-outside-workspace");
@@ -1172,7 +1541,18 @@ impl Session {
         // The user rule is credited only when the tier it produced is
         // exactly `user_confirm` — its own tier or a matcher ask's tier —
         // never above it: there the floor asks, not the user.
-        let ask_hit = first_matching(&a.user_ask, &call.args);
+        let ask_hit = first_matching(&a.user_ask, &call.args).or_else(|| {
+            // P-25: an ask rule on the move's target path asks too, so
+            // a protected-path ask floor covers where a file lands.
+            if a.edit {
+                call.args
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .and_then(|to| first_matching(&a.user_ask, &json!({ "path": to })))
+            } else {
+                None
+            }
+        });
         if cl.confirmation >= Confirmation::UserConfirm || ask_hit.is_some() {
             let rule = match ask_hit {
                 Some(index) if cl.confirmation <= Confirmation::UserConfirm => RuleId::User {
@@ -1189,12 +1569,41 @@ impl Session {
         }
 
         // ---- 3. Allow rules. ----
+        // A session-scoped allow grant (P-23) is checked first: the person
+        // answered `a` at a prompt for exactly this pattern. It can never
+        // reach a protected_action call — that floor asks at stage 2,
+        // before any allow list is consulted.
+        if let Some(rules) = self.session_allow.get(id) {
+            if let Some(index) = first_matching(rules, &call.args) {
+                return PolicyDecision::Allow {
+                    rule: RuleId::Session {
+                        list: RuleList::Allow,
+                        index,
+                    },
+                };
+            }
+        }
         if let Some(index) = first_matching(&a.user_allow, &call.args) {
             return PolicyDecision::Allow {
                 rule: RuleId::User {
                     list: RuleList::Allow,
                     index,
                 },
+            };
+        }
+        // An mcp-stdio capability (P-37b, §6.3): the pinned tier's derived
+        // `user_confirm` floor. A user allow rule above may allow it to run
+        // unattended; otherwise it asks, and with no approver present the
+        // ask is a deny (§5.2). A declared or dimension-derived floor above
+        // `user_confirm` already asked at step 2, before every allow rule,
+        // so this default can never lower one.
+        if a.mcp {
+            if !self.approver_present {
+                return deny(DenyReason::NoApprover, "deny.no-approver");
+            }
+            return PolicyDecision::Ask {
+                tier: Confirmation::UserConfirm,
+                rule: RuleId::Builtin(MCP_DEFAULT_RULE),
             };
         }
         if cl.effect == Effect::Read && cl.sensitivity <= Sensitivity::Operational {
@@ -1276,6 +1685,73 @@ impl Session {
             return Err(ExecRefused::NotAllowlisted);
         }
         Ok(())
+    }
+
+    /// The web branch (§2.3, P-39b): fetch against the session's allowlist,
+    /// search against the session's endpoint. The user's deny rules and the
+    /// schema have already had their say; from here the decision is `Allow`
+    /// by one named session rule or a `Deny` — never an `Ask` (per-fetch
+    /// prompts are never offered; the egress floor was met once, at session
+    /// start). The schema has already made `url` and `query` strings.
+    fn decide_web(&self, a: &Active, args: &Value) -> PolicyDecision {
+        let deny = |reason, name| PolicyDecision::Deny {
+            reason,
+            rule: RuleId::Builtin(name),
+        };
+        // Planning admits a web capability only into a web session; without
+        // the state there is no allowlist to hold the call to. Fail closed.
+        let Some(web) = &self.web else {
+            return deny(DenyReason::EgressUnavailable, "deny.egress-unavailable");
+        };
+        if a.web_fetch {
+            let parsed = match args.get("url").and_then(Value::as_str).map(web::parse_url) {
+                Some(Ok(u)) => u,
+                Some(Err(e)) => {
+                    return deny(DenyReason::Web(WebCallRefused::Url(e)), "deny.web.url");
+                }
+                // A missing or non-string `url` was refused by the schema;
+                // if one still arrives, it is refused like an empty target.
+                None => {
+                    return deny(
+                        DenyReason::Web(WebCallRefused::Url(UrlRefused::EmptyLocation)),
+                        "deny.web.url",
+                    );
+                }
+            };
+            if web.allowlist.allows(&parsed) {
+                return PolicyDecision::Allow {
+                    rule: RuleId::Builtin(WEB_ALLOWLIST_RULE),
+                };
+            }
+            let (reason, name) = match web.allowlist.mismatch(&parsed) {
+                web::UrlMismatch::Scheme => (WebCallRefused::Scheme, "deny.web.scheme"),
+                web::UrlMismatch::Port => (WebCallRefused::Port, "deny.web.port"),
+                web::UrlMismatch::Host => (
+                    WebCallRefused::HostNotAllowlisted,
+                    "deny.web.host-not-allowlisted",
+                ),
+            };
+            return deny(DenyReason::Web(reason), name);
+        }
+        // The search branch: the query's bounds are policy's (§2.3) — the
+        // schema's `maxLength` alone would let an empty or invisibly
+        // corrupted query through.
+        if !args
+            .get("query")
+            .and_then(Value::as_str)
+            .is_some_and(web::query_clean)
+        {
+            return deny(DenyReason::Web(WebCallRefused::Query), "deny.web.query");
+        }
+        if !web.search {
+            return deny(
+                DenyReason::Web(WebCallRefused::NoSearchEndpoint),
+                "deny.web.no-search-endpoint",
+            );
+        }
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin(WEB_SEARCH_RULE),
+        }
     }
 
     /// Whether the session holds a conformed sandbox witness (§6.1).

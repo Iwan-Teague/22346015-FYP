@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::builtin::RootRefused;
 use crate::provider::ToolProvider;
-use crate::{EditTools, ReadTools};
+use crate::{EditTools, PatchTools, ReadTools};
 
 /// A provider a dispatch entry builds, boxed for the run's provider list.
 pub type BoxedProvider = Box<dyn ToolProvider>;
@@ -50,6 +50,10 @@ fn edit_tools(root: &Path) -> Result<BoxedProvider, RootRefused> {
     Ok(Box::new(EditTools::new(root)?))
 }
 
+fn patch_tools(root: &Path) -> Result<BoxedProvider, RootRefused> {
+    Ok(Box::new(PatchTools::new(root)?))
+}
+
 /// The built-in tools, in manifest order: one entry per capability, the
 /// single place a new built-in dispatches from (P-02).
 pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
@@ -84,6 +88,18 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
     BuiltinTool {
         id: "harness.edit.multi",
         ctor: ProviderCtor::Workspace(edit_tools),
+    },
+    BuiltinTool {
+        id: "harness.edit.patch",
+        ctor: ProviderCtor::Workspace(patch_tools),
+    },
+    BuiltinTool {
+        id: "harness.edit.delete",
+        ctor: ProviderCtor::Workspace(patch_tools),
+    },
+    BuiltinTool {
+        id: "harness.edit.move",
+        ctor: ProviderCtor::Workspace(patch_tools),
     },
     BuiltinTool {
         id: "harness.exec.run",

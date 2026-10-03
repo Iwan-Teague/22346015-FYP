@@ -155,6 +155,24 @@ printf '%s\n' harness-model-core >>"$tmpdir/allowed-modelcore-raw" || fail "prin
 sort -u "$tmpdir/allowed-modelcore-raw" >"$tmpdir/allowed-modelcore" || fail "sort failed"
 refuse_intruders "$tmpdir/modelcore" "$tmpdir/allowed-modelcore" "harness-model-core"
 
+# harness-fetch (P-39d, design note `P-39-web-airlock` §5): the confined
+# HTTP-only fetcher. It is deliberately NOT on the pure-content scan above —
+# it dials the loopback pump and reads web bytes by design (INV-46 puts web
+# parsing HERE and nowhere else) — so its dependency tree is allowlisted
+# instead: exactly the reviewed harness-core tree plus harness-fetch itself.
+# serde_json is already inside harness-core's list, so P-39d adds no new
+# registry crate; the TLS-linked `net` feature (P-39n) must extend THIS
+# block with a review note when it lands (INV-52).
+tree_names "$tmpdir/fetch" harness-fetch
+grep -qxF harness-core "$tmpdir/fetch" ||
+    fail "harness-fetch tree does not contain harness-core (read the wrong tree?)"
+grep -qxF serde_json "$tmpdir/fetch" ||
+    fail "harness-fetch tree does not contain serde_json (read the wrong tree?)"
+grep -vxF harness-fetch "$tmpdir/allowed-core-raw" >"$tmpdir/allowed-fetch-raw" || true
+printf '%s\n' harness-fetch >>"$tmpdir/allowed-fetch-raw" || fail "printf failed"
+sort -u "$tmpdir/allowed-fetch-raw" >"$tmpdir/allowed-fetch" || fail "sort failed"
+refuse_intruders "$tmpdir/fetch" "$tmpdir/allowed-fetch" "harness-fetch"
+
 # --- INV-24 / H1d review F-4: harness-model's dependency tree is allowlisted --
 # harness-model is the crate that talks to the network. Its normal tree may
 # contain only the reviewed crates below; anything else (a TLS stack, an HTTP
@@ -228,6 +246,19 @@ done
 if [ -s "$tmpdir/fwd-hits" ]; then
     fail "a workspace feature forwards to harness-journal/fault-injection:
 $(cat "$tmpdir/fwd-hits")"
+fi
+
+# --- the sandbox's test-only remap seam (P-39f) ------------------------------
+# harness-sandbox's `remap` feature compiles RemapConnector, which dials a
+# loopback fixture under a fixed global address. Same seam rule as
+# fault-injection: the feature must exist, and NO normal dependency edge may
+# enable it — only tests, via `#[cfg(any(test, feature = "remap"))]`.
+# `cargo tree` shows only ACTIVE features and nothing enables remap, so the
+# declaration is checked in the manifest itself (fail-closed if renamed).
+grep -qE '^remap[ \t]*=' crates/harness-sandbox/Cargo.toml ||
+    fail "harness-sandbox does not declare its test-only remap feature (renamed?)"
+if grep -qF 'harness-sandbox feature "remap"' "$tmpdir/feat-normal"; then
+    fail "a normal dependency edge enables harness-sandbox/remap"
 fi
 
 # --- shared: file lists and normalisation -----------------------------------
@@ -607,7 +638,11 @@ read -r capture_got _ <"$tmpdir/capture-sha" || fail "could not read the digest 
 # The confined spawn, pinned. Update only with a review of the change.
 # P-41: the frame's lim line carries a bounded, optional sweep deadline
 # (1-30 s, default the reviewed 3 s) and the sweep grace scales with it.
-confine_spawn_sha256=47e355ba9a54d280ca33de184f923546992b6ef9de5ccf8083598b4e29c431a3
+# P-36b: the live confined child (§4.2, §3.2): output in bounded rings read
+# while the call runs (try_status/read/totals/stop), the control pipe closed
+# by a deadline closer; the three admitted programs, the stub and the frame
+# format are unchanged, and live bounds fail closed before the spawn.
+confine_spawn_sha256=575bd6d51d7815754c1217216533343bb28e021cf54df270fde067c86f92eeee
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum <"$confine_file" >"$tmpdir/confine-sha" || fail "sha256sum failed on $confine_file"
 else

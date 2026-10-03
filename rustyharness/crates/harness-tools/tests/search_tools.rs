@@ -21,7 +21,7 @@ use harness_journal::testing::{FaultFile, FaultPlan, MemBlobs};
 use harness_journal::{Clock, Event, EventKind, Header, Ident, JournalWriter};
 use harness_manifest::admission::{Registry, Tier};
 use harness_manifest::{builtin, SemVer, ValidationContext};
-use harness_policy::{Call, Session, SessionSpec, UserPolicy, WorkspaceDecl};
+use harness_policy::{Call, Session, SessionKind, SessionSpec, UserPolicy, WorkspaceDecl};
 use harness_tools::builtin::code;
 use harness_tools::{InvokeCtx, ReadTools, ToolProvider, ToolResult, ToolStatus};
 use serde_json::{json, Value};
@@ -77,6 +77,7 @@ impl Rig {
                 conformed: false,
                 exec_programs: Vec::new(),
                 read_window: None,
+                kind: SessionKind::Coding,
             },
             &reg,
             &UserPolicy::default(),
@@ -771,6 +772,7 @@ fn denied_rig(ws: &Path) -> Rig {
             conformed: false,
             exec_programs: Vec::new(),
             read_window: None,
+            kind: SessionKind::Coding,
         },
         &reg,
         &policy,

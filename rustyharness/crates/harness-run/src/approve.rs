@@ -74,6 +74,15 @@ pub enum ApprovalAnswer {
     No,
     /// No answer before the deadline: a deny (§5.3).
     NoAnswer,
+    /// Yes for the call's PATTERN, for the rest of the session (P-23): the
+    /// harness distils the call into one minimal matcher (exec: the argv
+    /// prefix; edit: that file; read: that directory), journals it as
+    /// `RuleGranted` and applies it as a session policy rule. Honoured only
+    /// when the run allowed session grants; a `protected_action` ask is
+    /// never lowered.
+    AllowSession,
+    /// No for the call's pattern, for the rest of the session (P-23).
+    DenySession,
 }
 
 /// Who answers an `Ask` (§5.3): the CLI prompt, or an embedding UI. The
@@ -97,6 +106,18 @@ pub(crate) enum RecordedApproval {
     Denied { kind: ApproverKind },
     /// `ApprovalExpired`.
     Expired,
+    /// `RuleGranted` (P-23): who, and the digest of the matcher's
+    /// canonical JSON — the replayed loop rebuilds the matcher from the
+    /// call and must reach the same digest or the replay diverges.
+    AllowSession {
+        kind: ApproverKind,
+        matcher: gate_outcome::Digest,
+    },
+    /// `RuleGranted`, deny list (P-23).
+    DenySession {
+        kind: ApproverKind,
+        matcher: gate_outcome::Digest,
+    },
 }
 
 /// A 16-byte approval nonce as the journal writes it: 32 lowercase hex

@@ -96,7 +96,7 @@ pub(crate) fn render_profile(p: &Profile) -> serde_json::Value {
         "tool_choice_required_ok": p.tool_choice_required_ok(),
         "grammar": "none",
         "max_active_tools": p.max_active_tools(),
-        "edit_format": match p.edit_format() { EditFormat::Replace => "replace", EditFormat::Whole => "whole" },
+        "edit_format": match p.edit_format() { EditFormat::Replace => "replace", EditFormat::Whole => "whole", EditFormat::Patch => "patch" },
         "recent_turns": p.recent_turns(),
         "sampling": sampling,
     });

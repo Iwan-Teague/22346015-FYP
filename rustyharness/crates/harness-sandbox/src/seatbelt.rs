@@ -48,7 +48,7 @@ use crate::conformance;
 use crate::spec::{self, ConfinedSpec, Context, Enforceable, Limits, Network};
 use crate::{
     confine_spawn, Backend, BackendKind, ChildStatus, ConfinedChild, Conformed, DomainCleanup,
-    SpawnError, Unavailable, UnavailableReason,
+    LiveOpts, SpawnError, Unavailable, UnavailableReason,
 };
 
 /// The Seatbelt launcher.
@@ -78,6 +78,11 @@ pub struct Seatbelt {
     private_root: PathBuf,
     home: Option<PathBuf>,
     primitives: [PathBuf; 2],
+    /// Ports no profile may allow (the model port at least, §4.3): they
+    /// are refused as grants at validation and denied last at render
+    /// (INV-41). Empty until a caller says otherwise; the run layer passes
+    /// the endpoint's port (P-36g).
+    reserved_ports: Vec<u16>,
 }
 
 impl Default for Seatbelt {
@@ -97,12 +102,20 @@ impl Seatbelt {
             private_root: std::env::temp_dir(),
             home,
             primitives: [SANDBOX_EXEC.into(), crate::profile::STUB_INTERPRETER.into()],
+            reserved_ports: Vec::new(),
         }
     }
 
     /// Put the private per-call directories under `root` instead.
     pub fn with_private_root(mut self, root: PathBuf) -> Self {
         self.private_root = root;
+        self
+    }
+
+    /// Refuse every grant of these ports and deny them last in every
+    /// profile (§4.3): the model port at least (INV-41).
+    pub fn with_reserved_ports(mut self, ports: Vec<u16>) -> Self {
+        self.reserved_ports = ports;
         self
     }
 
@@ -135,9 +148,20 @@ impl Seatbelt {
     }
 
     /// Validate, render, write the profile and start. The one spawn path of
-    /// this backend: `spawn` and the live probe both come here. The stub
-    /// sweeps for at most `sweep` when the call ends (P-41).
-    fn start(&self, spec: &ConfinedSpec, sweep: Duration) -> Result<ConfinedChild, SpawnError> {
+    /// this backend: `spawn`, the live probe and the port probe all come
+    /// here. The stub sweeps for at most `sweep` when the call ends (P-41).
+    /// `ports_conformed` says whether `Network::Loopback` may validate at
+    /// all: every production spawn derives it from its witness's coverage
+    /// of `PORTS_CASES`; the port probe passes `true` because it IS the
+    /// measurement that justifies the coverage. `live` makes the call
+    /// readable while it runs and bounds its lifetime (§4.2).
+    fn start(
+        &self,
+        spec: &ConfinedSpec,
+        sweep: Duration,
+        ports_conformed: bool,
+        live: Option<&LiveOpts>,
+    ) -> Result<ConfinedChild, SpawnError> {
         let dir = self
             .private_dir("call")
             .map_err(|e| SpawnError::Io(e.to_string()))?;
@@ -145,12 +169,14 @@ impl Seatbelt {
             home: self.home.as_deref(),
             private_dir: &dir,
             enforce: ENFORCE,
+            reserved_ports: &self.reserved_ports,
+            ports_conformed,
             // The Seatbelt profile can express the loopback-only proxy
             // allow (§5.3; spelling measured on this host).
             proxy: true,
         };
-        let v = match spec::validate(spec, &cx) {
-            Ok(v) => v,
+        let approved = match spec::validate(spec, &cx) {
+            Ok(a) => a,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(e.into());
@@ -161,9 +187,14 @@ impl Seatbelt {
         // grant, None renders the deny-all form byte-identically.
         let proxy_port = match spec.network {
             Network::Proxy { port } => Some(port),
-            Network::None => None,
+            Network::None | Network::Loopback { .. } => None,
         };
-        let text = match crate::profile::render(&v, proxy_port) {
+        let text = match crate::profile::render(
+            &approved.spec,
+            &approved.ports,
+            &self.reserved_ports,
+            proxy_port,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 // A validated spec never yields an unsafe path; treat a guard
@@ -176,7 +207,13 @@ impl Seatbelt {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(SpawnError::Io(e.to_string()));
         }
-        match confine_spawn::spawn(&profile, &v, sweep, Some(dir.clone())) {
+        let started = match live {
+            Some(live) => {
+                confine_spawn::spawn_live(&profile, &approved.spec, sweep, Some(dir.clone()), live)
+            }
+            None => confine_spawn::spawn(&profile, &approved.spec, sweep, Some(dir.clone())),
+        };
+        match started {
             Ok(inner) => Ok(ConfinedChild { inner }),
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -232,7 +269,7 @@ impl Seatbelt {
                 limits: Limits::wall(Duration::from_secs(20)),
             };
             let exit = self
-                .start(&spec, sweep)
+                .start(&spec, sweep, false, None)
                 .map_err(|e| fail("spawn", e.to_string()))?
                 .wait();
             if exit.status != ChildStatus::Exited(0) {
@@ -286,7 +323,7 @@ impl Seatbelt {
             };
             mem.limits.memory = Some(MEM_PROBE_BUDGET);
             let em = self
-                .start(&mem, sweep)
+                .start(&mem, sweep, false, None)
                 .map_err(|e| fail("mem-spawn", e.to_string()))?
                 .wait();
             let mo = String::from_utf8_lossy(&em.stdout).into_owned();
@@ -310,7 +347,7 @@ impl Seatbelt {
             proc.limits.memory = None;
             proc.limits.processes = Some(PROC_PROBE_CAP);
             let ep = self
-                .start(&proc, sweep)
+                .start(&proc, sweep, false, None)
                 .map_err(|e| fail("proc-spawn", e.to_string()))?
                 .wait();
             if ep.status != ChildStatus::ProcessLimit {
@@ -331,6 +368,135 @@ impl Seatbelt {
         })();
         let _ = std::fs::remove_dir_all(&dir);
         result
+    }
+
+    /// The live port probe (§4.4): one confined perl script through the
+    /// same spawn path, under a real `Loopback` profile rendered from the
+    /// granted `bind` ports, that must observe — each as `<name> ok`:
+    /// - `bind-granted`: binding and listening on one granted port works;
+    /// - `bind-ungranted`: binding a free but ungranted port fails with
+    ///   `EPERM`, so only the profile can have refused it;
+    /// - `bind-wildcard`: binding `0.0.0.0:<granted>` fails without a LAN
+    ///   grant, so `localhost:<p>` does not admit the whole interface;
+    /// - `connect-reserved`: connecting to a harness-held listener standing
+    ///   in for the model port fails, and the listener sees no connection
+    ///   (checked from outside, INV-41);
+    /// - `connect-routable`: connecting to a routable address still fails.
+    ///
+    /// Run at planning when the task grants ports; a failure refuses the
+    /// run (its task asked for ports). Single attempt: a loaded host
+    /// refuses and planning can be re-run; no observation is ever retried
+    /// past a refusal. The existing H2 probe is not touched.
+    pub fn probe_ports(
+        &self,
+        ev: &Conformed,
+        bind: &[u16],
+        reserved: &[u16],
+    ) -> Result<PortsWitness, Unavailable> {
+        let fail = |probe: &'static str, observed: String| Unavailable {
+            backend: Some(BackendKind::Seatbelt),
+            reason: UnavailableReason::LiveProbeFailed { probe, observed },
+        };
+        if ev.backend() != self.kind() {
+            return Err(fail(
+                "ports-witness",
+                "the witness belongs to another backend".into(),
+            ));
+        }
+        // The script measures on the first granted port; the rest are in
+        // the profile and the digest all the same.
+        let granted = match bind.first() {
+            Some(&p) => p,
+            None => {
+                return Err(fail(
+                    "ports-grant",
+                    "the port probe needs at least one granted port".into(),
+                ))
+            }
+        };
+        let io = |e: std::io::Error| Unavailable {
+            backend: Some(BackendKind::Seatbelt),
+            reason: UnavailableReason::Io(e.to_string()),
+        };
+        let dir = self.private_dir("ports").map_err(io)?;
+        let result = (|| {
+            let ws = dir.join("ws");
+            std::fs::create_dir_all(&ws).map_err(io)?;
+            // A free port that is NOT granted: bound, recorded, released at
+            // once, so only the profile can refuse the child's bind there.
+            let ungranted = {
+                let l = TcpListener::bind("127.0.0.1:0").map_err(io)?;
+                l.local_addr().map_err(io)?.port()
+            };
+            // The stand-in model port: this listener stays bound for the
+            // whole probe, so "the listener saw nothing" is checkable from
+            // outside, and the profile renders its final deny for it.
+            let model_listener = TcpListener::bind("127.0.0.1:0").map_err(io)?;
+            model_listener.set_nonblocking(true).map_err(io)?;
+            let model = model_listener.local_addr().map_err(io)?.port();
+            let mut probe_sb = self.clone();
+            probe_sb.reserved_ports = {
+                let mut r = reserved.to_vec();
+                if !r.contains(&model) {
+                    r.push(model);
+                }
+                r
+            };
+            let spec = ConfinedSpec {
+                argv: vec![
+                    crate::profile::STUB_INTERPRETER.into(),
+                    "-e".into(),
+                    PORT_PROBE.into(),
+                    granted.to_string().into(),
+                    ungranted.to_string().into(),
+                    model.to_string().into(),
+                ],
+                cwd: ws.clone(),
+                env: vec![("RH_PROBE".into(), "1".into())],
+                read_only: vec![],
+                read_write: vec![ws],
+                protected: vec![],
+                network: Network::Loopback {
+                    bind: bind.to_vec(),
+                    connect: vec![],
+                    lan: vec![],
+                },
+                limits: Limits::wall(Duration::from_secs(20)),
+            };
+            let exit = probe_sb
+                .start(&spec, confine_spawn::SWEEP_DEADLINE, true, None)
+                .map_err(|e| fail("ports-spawn", e.to_string()))?
+                .wait();
+            if exit.status != ChildStatus::Exited(0) {
+                return Err(fail(
+                    "ports-run",
+                    format!(
+                        "{:?}: {}",
+                        exit.status,
+                        String::from_utf8_lossy(&exit.stderr)
+                    ),
+                ));
+            }
+            let observed = check_port_observations(&String::from_utf8_lossy(&exit.stdout))?;
+            match model_listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => {
+                    return Err(fail(
+                        "connect-reserved",
+                        format!("the model-port listener saw {other:?}"),
+                    ));
+                }
+            }
+            match exit.domain {
+                DomainCleanup::Confirmed { .. } => {}
+                d => return Err(fail("ports-sweep", format!("{d:?}"))),
+            }
+            Ok(observed)
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.map(|observed| PortsWitness {
+            digest: ports_digest(bind, reserved, &observed),
+        })
     }
 }
 
@@ -536,6 +702,94 @@ my $p=fork(); if (defined $p && $p==0) { POSIX::setsid(); if (fork()) { POSIX::_
 waitpid($p,0); r('escape', 1);
 "#;
 
+/// What the live port probe observed (§4.4): the digest over the fixed
+/// observations and the ports they probed. Journalled in the header's
+/// `ports` object (P-36h), so an audit re-feeds what planning measured on
+/// this host; no public constructor, like [`Conformed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortsWitness {
+    digest: harness_core::Digest,
+}
+
+impl PortsWitness {
+    /// SHA-256 over the profile version, the granted and reserved ports,
+    /// and what the probe observed.
+    pub fn digest(&self) -> &harness_core::Digest {
+        &self.digest
+    }
+}
+
+/// The probes the port script reports, each as `<name> ok` (ok: the
+/// observation matched what a conforming host must show).
+const PORT_PROBES: &[&str] = &[
+    "bind-granted",
+    "bind-ungranted",
+    "bind-wildcard",
+    "connect-reserved",
+    "connect-routable",
+];
+
+/// Verify the port probe's observations: every name must read `<name> ok`,
+/// in the fixed order the script prints them. A missing or negative
+/// observation is a host that does not express the port rules, and is the
+/// final answer (§4.4).
+fn check_port_observations(out: &str) -> Result<Vec<u8>, Unavailable> {
+    let mut observed = String::new();
+    for name in PORT_PROBES {
+        let want = format!("{name} ok\n");
+        if !out.contains(&want) {
+            return Err(Unavailable {
+                backend: Some(BackendKind::Seatbelt),
+                reason: UnavailableReason::LiveProbeFailed {
+                    probe: name,
+                    observed: out.to_string(),
+                },
+            });
+        }
+        observed.push_str(&want);
+    }
+    Ok(observed.into_bytes())
+}
+
+/// The port probe's digest: profile version, the granted and reserved
+/// ports probed, and the observations, so a witness for one grant cannot
+/// stand for another.
+fn ports_digest(bind: &[u16], reserved: &[u16], observed: &[u8]) -> harness_core::Digest {
+    let ports_line = format!("bind={bind:?} reserved={reserved:?}\n");
+    harness_core::sha256_parts(&[
+        crate::profile::PROFILE_VERSION.as_bytes(),
+        b"\n",
+        ports_line.as_bytes(),
+        observed,
+    ])
+}
+
+/// The live port probe script (arguments: one granted port, an ungranted
+/// free port, the model-port stand-in). `EPERM` (1) is required for the
+/// bind refusals: a refusal for any other reason (say `EADDRINUSE`) means
+/// the measurement is bad, and reports FAIL.
+const PORT_PROBE: &str = r#"use strict; use Socket;
+my ($granted,$ungranted,$model)=@ARGV; $|=1;
+sub r { print $_[0], ($_[1] ? ' ok' : ' FAIL'), "\n" }
+socket(my $g,PF_INET,SOCK_STREAM,0) or die;
+my $b = bind($g, sockaddr_in($granted, inet_aton('127.0.0.1')));
+r('bind-granted', $b && listen($g,1));
+close($g);
+socket(my $u,PF_INET,SOCK_STREAM,0) or die;
+my $bu = bind($u, sockaddr_in($ungranted, inet_aton('127.0.0.1')));
+r('bind-ungranted', !$bu && ($!+0)==1);
+close($u);
+socket(my $w,PF_INET,SOCK_STREAM,0) or die;
+my $bw = bind($w, sockaddr_in($granted, INADDR_ANY));
+r('bind-wildcard', !$bw && ($!+0)==1);
+close($w);
+socket(my $m,PF_INET,SOCK_STREAM,0) or die;
+r('connect-reserved', !connect($m, sockaddr_in($model, inet_aton('127.0.0.1'))));
+close($m);
+socket(my $o,PF_INET,SOCK_STREAM,0) or die;
+r('connect-routable', !connect($o, sockaddr_in(80, inet_aton('192.0.2.1'))));
+"#;
+
 impl Backend for Seatbelt {
     fn kind(&self) -> BackendKind {
         BackendKind::Seatbelt
@@ -569,7 +823,29 @@ impl Backend for Seatbelt {
         if ev.backend() != BackendKind::Seatbelt {
             return Err(SpawnError::WrongWitness);
         }
-        self.start(spec, confine_spawn::SWEEP_DEADLINE)
+        // Defence in depth (§4.3): `validate` refuses `Network::Loopback`
+        // unless its context says the port cases are covered; a spawn may
+        // only claim that from its own witness, never from configuration.
+        let ports_conformed = ev.covers(conformance::PORTS_CASES).is_ok();
+        self.start(spec, confine_spawn::SWEEP_DEADLINE, ports_conformed, None)
+    }
+
+    fn spawn_live(
+        &self,
+        spec: &ConfinedSpec,
+        ev: &Conformed,
+        live: &LiveOpts,
+    ) -> Result<ConfinedChild, SpawnError> {
+        if ev.backend() != BackendKind::Seatbelt {
+            return Err(SpawnError::WrongWitness);
+        }
+        let ports_conformed = ev.covers(conformance::PORTS_CASES).is_ok();
+        self.start(
+            spec,
+            confine_spawn::SWEEP_DEADLINE,
+            ports_conformed,
+            Some(live),
+        )
     }
 }
 
@@ -920,5 +1196,53 @@ mod retry_tests {
             ),
             clean
         );
+    }
+}
+
+#[cfg(test)]
+mod port_probe_tests {
+    use super::*;
+
+    #[test]
+    fn probe_ports_refuses_when_an_ungranted_bind_succeeds() {
+        // The injected observation (§4.4): a host whose sandbox let the
+        // ungranted bind through reports `bind-ungranted FAIL`; the
+        // checker must refuse, naming that probe, so no PortsWitness is
+        // minted from a host that does not express the port rules.
+        let mut good = String::new();
+        for name in PORT_PROBES {
+            good.push_str(name);
+            good.push_str(" ok\n");
+        }
+        assert!(check_port_observations(&good).is_ok());
+        let hostile = good.replace("bind-ungranted ok", "bind-ungranted FAIL");
+        let e = check_port_observations(&hostile).unwrap_err();
+        assert!(
+            matches!(
+                &e.reason,
+                UnavailableReason::LiveProbeFailed { probe, .. } if *probe == "bind-ungranted"
+            ),
+            "{e}"
+        );
+        // A wildcard bind let through is refused the same way.
+        let hostile = good.replace("bind-wildcard ok", "bind-wildcard FAIL");
+        assert!(check_port_observations(&hostile).is_err());
+        // A truncated report (a probe that never ran) refuses too.
+        assert!(check_port_observations("bind-granted ok\n").is_err());
+        assert!(check_port_observations("").is_err());
+    }
+
+    #[test]
+    fn ports_witness_digest_covers_the_ports_and_the_observations() {
+        let o: &[u8] = b"bind-granted ok\n";
+        let a = ports_digest(&[5173], &[11434], o);
+        // The same record recomputes the same digest; any other grant,
+        // reservation, or observation hashes differently.
+        assert_eq!(a, ports_digest(&[5173], &[11434], o));
+        assert_ne!(a, ports_digest(&[5174], &[11434], o));
+        assert_ne!(a, ports_digest(&[5173], &[], o));
+        assert_ne!(a, ports_digest(&[5173], &[11434], b"bind-granted FAIL\n"));
+        let w = PortsWitness { digest: a };
+        assert_eq!(w.digest(), &a);
     }
 }

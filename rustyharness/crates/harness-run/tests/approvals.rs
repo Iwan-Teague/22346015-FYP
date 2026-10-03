@@ -568,3 +568,141 @@ fn a_resume_re_feeds_recorded_approvals_and_asks_live_only_after() {
     let a = audited(&state, &r.run, Some(2));
     assert_eq!(a.divergence, None, "{a:?}");
 }
+
+// P-23: a session answer (`a`) is honoured only when the run opted in
+// (`--allow-session-grants`, Q-4). Without the flag the answer degrades to
+// a plain denial of this call: nothing is granted, nothing runs.
+#[test]
+fn session_grant_requires_flag() {
+    let (state, ws) = scratch("grant-flag");
+    let a = Scripted::new(&[ApprovalAnswer::AllowSession]);
+    let backend = Capture::new(vec![read(), tag(), submit()]);
+    let r = go(&state, &ws, &backend, Some(&a), &config());
+    assert_eq!(r.cause, StopCause::Submitted);
+    assert_eq!(tagged(&ws), 0);
+    let recs = records(&r, 1);
+    let step2 = kinds(&recs, 2);
+    assert!(step2.contains(&EventKind::ApprovalDenied), "{step2:?}");
+    assert!(!step2.contains(&EventKind::RuleGranted), "{step2:?}");
+    // The person did answer; the harness just would not act on it.
+    assert_eq!(a.asked(), 1);
+    let _ = &ws;
+    // The degraded answer replays exactly as it was recorded.
+    let rep = audited(&state, &r.run, None);
+    assert_eq!(rep.divergence, None, "{rep:?}");
+}
+
+// P-23: an `a` at the prompt grants the call's minimal pattern for the
+// session. The journal carries `RuleGranted` (the matcher's digest, the
+// approver kind); the very next matching call runs without asking again;
+// and an audit re-feeds the grant and recomputes everything it wrote.
+#[test]
+fn granted_rule_recorded_and_audited() {
+    let (state, ws) = scratch("grant");
+    let mut cfg = config();
+    cfg.allow_session_grants = true;
+    let a = Scripted::new(&[ApprovalAnswer::AllowSession]);
+    let backend = Capture::new(vec![read(), tag(), tag(), submit()]);
+    let r = go(&state, &ws, &backend, Some(&a), &cfg);
+    assert_eq!(r.cause, StopCause::Submitted);
+    // Both edits ran, but the person answered exactly one ask.
+    assert_eq!(tagged(&ws), 2);
+    assert_eq!(a.asked(), 1);
+    let recs = records(&r, 1);
+    let step2 = kinds(&recs, 2);
+    let at = step2
+        .iter()
+        .position(|k| *k == EventKind::PolicyDecided)
+        .unwrap();
+    assert_eq!(
+        &step2[at..],
+        &[
+            EventKind::PolicyDecided,
+            EventKind::ApprovalRequested,
+            EventKind::RuleGranted,
+            EventKind::PolicyDecided,
+            EventKind::ToolStarted,
+            EventKind::EditApplied,
+            EventKind::ToolFinished,
+        ][..]
+    );
+    // The first decision is the ask, the second the grant's re-decision.
+    let decided = of(&recs, EventKind::PolicyDecided);
+    assert_eq!(decided[1].body["decision"], "ask");
+    let allow = &decided[2].body;
+    assert_eq!(allow["decision"], "allow");
+    assert_eq!(
+        allow["rule"],
+        serde_json::json!({"index": 0, "list": "allow", "source": "session"})
+    );
+    // `RuleGranted` names the capability, the list, the matcher's digest
+    // and the approver kind — never the args themselves.
+    let grant = &of(&recs, EventKind::RuleGranted)[0].body;
+    assert_eq!(grant["capability"], "harness.edit.replace");
+    assert_eq!(grant["list"], "allow");
+    assert_eq!(grant["approver"], "embedded");
+    assert_eq!(grant["matcher"].as_str().unwrap().len(), 64);
+    // The second edit's decision is the session rule, with no ask at all.
+    let step3 = kinds(&recs, 3);
+    let at = step3
+        .iter()
+        .position(|k| *k == EventKind::PolicyDecided)
+        .unwrap();
+    assert_eq!(
+        &step3[at..],
+        &[
+            EventKind::PolicyDecided,
+            EventKind::ToolStarted,
+            EventKind::EditApplied,
+            EventKind::ToolFinished,
+        ][..]
+    );
+    let again = of(&recs, EventKind::PolicyDecided);
+    assert_eq!(
+        again[3].body["rule"],
+        serde_json::json!({"index": 0, "list": "allow", "source": "session"})
+    );
+    // The audit re-feeds the grant from the journal and matches byte for byte.
+    let rep = audited(&state, &r.run, None);
+    assert_eq!(rep.divergence, None, "{rep:?}");
+    assert!(rep.stop_recomputed);
+}
+
+// P-23 (and §5.3): no answer by the deadline is a deny. A scripted approver
+// with an empty script answers `NoAnswer` (what a closed stdin or a timeout
+// surfaces as), so the call is `ApprovalExpired` and nothing runs.
+#[test]
+fn eof_at_prompt_is_noanswer_deny() {
+    let (state, ws) = scratch("eof");
+    let nobody = Scripted::new(&[]);
+    let backend = Capture::new(vec![read(), tag(), submit()]);
+    let r = go(&state, &ws, &backend, Some(&nobody), &config());
+    assert_eq!(r.cause, StopCause::Submitted);
+    assert_eq!(tagged(&ws), 0);
+    let recs = records(&r, 1);
+    let step2 = kinds(&recs, 2);
+    assert!(step2.contains(&EventKind::ApprovalExpired), "{step2:?}");
+    assert!(!step2.contains(&EventKind::RuleGranted), "{step2:?}");
+    let rep = audited(&state, &r.run, None);
+    assert_eq!(rep.divergence, None, "{rep:?}");
+}
+
+// P-23: an edit prompt shows the diff the call would produce (P-16's
+// preview, reached through the approval path), after the summary.
+#[test]
+fn prompt_shows_diff_for_edit() {
+    let (state, ws) = scratch("diff");
+    let no = Scripted::new(&[ApprovalAnswer::No]);
+    let backend = Capture::new(vec![read(), tag(), submit()]);
+    let r = go(&state, &ws, &backend, Some(&no), &config());
+    assert_eq!(r.cause, StopCause::Submitted);
+    assert_eq!(no.asked(), 1);
+    let shown = &no.shown.borrow()[0];
+    assert!(shown.contains("proposed diff:"), "{shown}");
+    assert!(shown.contains("--- a/lib.rs"), "{shown}");
+    assert!(
+        shown.contains("+pub const RETRY_BASE_MS: u64 = 250; // tagged"),
+        "{shown}"
+    );
+    let _ = state;
+}

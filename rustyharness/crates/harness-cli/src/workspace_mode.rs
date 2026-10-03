@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use gate_outcome::{Finding, FindingCode, Severity};
 use harness_core::{sha256, Digest};
+use harness_run::scratch::copy_walk;
 use harness_run::WorkspaceModeRecord;
 
 use crate::report::exit;
@@ -27,15 +28,10 @@ use crate::Cx;
 
 /// The scratch copy's caps (P-52): a workspace over either is refused with
 /// a clear message, before anything is copied. Generous on purpose: the
-/// point is a stopped run, not a silent truncation.
-pub(crate) const SCRATCH_MAX_FILES: usize = 20_000;
-pub(crate) const SCRATCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Directory names the scratch copy never descends into (build output and
-/// dependency trees; the model cannot need them to read or edit source).
-const SKIPPED_DIRS: [&str; 2] = ["target", "node_modules"];
-/// The git internals directory, copied only with `--scratch-with-git`.
-const GIT_DIR: &str = ".git";
+/// point is a stopped run, not a silent truncation. The walk itself is
+/// cap-free (`harness_run::scratch`); the caps are the caller's policy,
+/// so the refusal can name the workspace before a byte is copied.
+pub(crate) use harness_run::scratch::{SCRATCH_MAX_BYTES, SCRATCH_MAX_FILES};
 
 /// The workspace-mode option's value. `worktree` is refused in
 /// [`parse_mode`] (INV-23), so it is not a variant here.
@@ -281,62 +277,6 @@ pub(crate) fn stamp() -> String {
 /// to the second plus the process id.
 fn scratch_name() -> String {
     stamp()
-}
-
-/// One file found by the copy walk.
-struct CopyFile {
-    rel: String,
-    digest: Digest,
-    bytes: u64,
-}
-
-/// Walk `root`, collecting every regular file's relative path (forward
-/// slashes), content digest and size, sorted by path. `target/` and
-/// `node_modules/` are never entered; `.git` only with `with_git`;
-/// symlinks are never followed (a symlink is skipped, never copied).
-fn copy_walk(root: &Path, with_git: bool) -> Result<Vec<CopyFile>, String> {
-    let mut files = Vec::new();
-    walk(root, root, with_git, &mut files)?;
-    files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(files)
-}
-
-fn walk(base: &Path, dir: &Path, with_git: bool, out: &mut Vec<CopyFile>) -> Result<(), String> {
-    let rd = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    for entry in rd {
-        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let ft = entry
-            .file_type()
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            if name == GIT_DIR && !with_git {
-                continue;
-            }
-            if SKIPPED_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            walk(base, &path, with_git, out)?;
-            continue;
-        }
-        let bytes =
-            std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let rel = path
-            .strip_prefix(base)
-            .map_err(|_| format!("{} is not under {}", path.display(), base.display()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        out.push(CopyFile {
-            rel,
-            digest: sha256(&bytes),
-            bytes: bytes.len() as u64,
-        });
-    }
-    Ok(())
 }
 
 /// Copy the manifest into `runs/<id>/` once the run is committed, like the

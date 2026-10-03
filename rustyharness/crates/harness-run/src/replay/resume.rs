@@ -20,7 +20,7 @@ use harness_policy::locality::LocalityProbe;
 use harness_policy::UserPolicy;
 use serde_json::Value;
 
-use crate::approve::Approver;
+use crate::approve::{Approver, RecordedApproval};
 use crate::driver::step::UserState;
 use crate::driver::{
     attempt_check, commit, exec_tools, header, loop_facts, new_meter_resumed, prepare, todo_for,
@@ -312,6 +312,17 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         live: r.backend,
         diverged: Cell::new(false),
     };
+    // A recorded `RuleGranted` re-applies exactly as it was granted (P-23),
+    // whether or not this resume opted in again; an opt-in also lets new
+    // `a`/`d` answers grant. The edit previews come from the re-planned
+    // tools.
+    let edit_tools = pre.edit_tools.clone();
+    let granted = rec.approvals.iter().any(|a| {
+        matches!(
+            a,
+            RecordedApproval::AllowSession { .. } | RecordedApproval::DenySession { .. }
+        )
+    });
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: r.registry,
@@ -320,7 +331,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         facts: loop_facts(&start, r.spec),
         profile: r.profile,
         backend: &chain,
-        providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec),
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools, pre.patch_tools, exec),
         meter: new_meter_resumed(
             r.config.limits.clone(),
             Box::new(SystemClock::default()),
@@ -340,7 +351,9 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         // listing measured now already holds every one of them.
         tree: start.tree,
         workspace: Some(pre.tree),
-        approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals),
+        approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals)
+            .may_grant(r.config.allow_session_grants || granted)
+            .with_edits(Some(edit_tools)),
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),
@@ -667,6 +680,17 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         live: r.backend,
         diverged: Cell::new(false),
     };
+    // A recorded `RuleGranted` re-applies exactly as it was granted (P-23),
+    // whether or not this resume opted in again; an opt-in also lets new
+    // `a`/`d` answers grant. The edit previews come from the re-planned
+    // tools.
+    let edit_tools = pre.edit_tools.clone();
+    let granted = rec.approvals.iter().any(|a| {
+        matches!(
+            a,
+            RecordedApproval::AllowSession { .. } | RecordedApproval::DenySession { .. }
+        )
+    });
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: r.registry,
@@ -675,7 +699,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         facts: loop_facts(&start, r.spec),
         profile: r.profile,
         backend: &chain,
-        providers: Prepared::providers(pre.read_tools, pre.edit_tools, exec),
+        providers: Prepared::providers(pre.read_tools, pre.edit_tools, pre.patch_tools, exec),
         meter: new_meter_resumed(
             limits.clone(),
             Box::new(SystemClock::default()),
@@ -695,7 +719,9 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         // listing measured now already holds every one of them.
         tree: start.tree,
         workspace: Some(pre.tree),
-        approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals),
+        approvals: Approvals::new(r.run, attempt, r.approver, rec.approvals)
+            .may_grant(r.config.run.allow_session_grants || granted)
+            .with_edits(Some(edit_tools)),
         env: r.env,
         pressure: Vec::new(),
         reads_seen: Default::default(),

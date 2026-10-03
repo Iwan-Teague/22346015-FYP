@@ -940,11 +940,11 @@ impl<'a> Loop<'a> {
             reads: &self.reads,
         };
         let mut fed_environment = None;
-        let mut fed_tree = None;
+        let mut fed_edit_trees: Vec<Digest> = Vec::new();
         let mut fed_exec_tree = None;
         let result = if let Some(rec) = self.feed.pop_front() {
             fed_environment = rec.environment;
-            fed_tree = rec.edit.as_ref().map(|e| e.tree);
+            fed_edit_trees = rec.edits.iter().map(|e| e.tree).collect();
             fed_exec_tree = rec.exec.as_ref().map(|(_, t)| *t);
             // Replaying (audit, or a resume catching up): the recorded
             // result of this very call stands in for running it again, an
@@ -978,7 +978,7 @@ impl<'a> Loop<'a> {
         // `ToolFinished` is durable, so every intent that ran has its result.
 
         // 9. Journal the result.
-        let mut edited = None;
+        let mut edited: Vec<String> = Vec::new();
         let mut unverified = false;
         let mut repeated = false;
         let mut exec_stop = None;
@@ -986,77 +986,104 @@ impl<'a> Loop<'a> {
         let feedback = match result {
             Ok(res) => {
                 let out = w.untrusted(&res.output).map_err(journal)?;
-                // A verified edit (§4.9 step 5): `EditApplied` before its
-                // `ToolFinished`, so a durable result implies a durable
-                // record of the edit. The tree digest after it comes from
-                // the live listing, or from the journal when re-fed (a
-                // resume's catch-up measured its listing after the edit).
-                if let (Some(e), ToolStatus::Ok) = (&res.edit, res.status) {
-                    let tree = match (fed_tree, self.workspace.as_mut()) {
-                        (Some(t), _) => t,
-                        (None, Some(ws)) => ws.record_edit(&e.path, e.after),
-                        // An audit re-feeds every edit with its tree digest
-                        // (`recorded` refuses one without it).
-                        (None, None) => return Err(StopCause::PolicyAbort),
-                    };
-                    let path = w
-                        .untrusted(&Untrusted::new(e.path.as_str().to_owned(), Source::Model))
-                        .map_err(journal)?;
-                    let mut ev = Event::new(EventKind::EditApplied)
-                        .field("intent_seq", Trusted::U64(intent_seq))
-                        .field("path", Trusted::Untrusted(path));
-                    // A create has no `before` (the journal's convention).
-                    if let Some(b) = e.before {
-                        ev = ev.field("before", Trusted::Digest(b));
-                    }
-                    // The pre-image store (P-22): the file's bytes before and
-                    // after are kept as content-addressed blobs, and the
-                    // record cites them by their digests (`before_blob` only
-                    // when there was a before; the after-blob is what a
-                    // `/diff` shows). An image whose bytes do not hash to the
-                    // digest the edit itself carries would make a record no
-                    // replay can recompute, so it is refused before the
-                    // record is written, with nothing journaled.
-                    let mut store = |img: &Image| {
-                        w.untrusted_stored(&Untrusted::new(
-                            img.bytes.clone(),
-                            Source::Workspace(e.path.as_str().to_owned()),
-                        ))
-                    };
-                    let before_blob = match &e.before_image {
-                        Some(img) => {
-                            let d = store(img).map_err(journal)?;
-                            if Some(d.sha256()) != e.before || d.sha256() != img.sha256 {
+                // A verified edit (§4.9 step 5): one `EditApplied` per
+                // touched file before the `ToolFinished`, so a durable
+                // result implies a durable record of every change (P-25: a
+                // patch touches several files, a move two). Each tree
+                // digest comes from the live listing (or from the journal
+                // when re-fed: a resume's catch-up measured its listing
+                // after the edit), and each file's own path is in its
+                // record, not the call's.
+                if res.status == ToolStatus::Ok && !res.edits.is_empty() {
+                    for (i, e) in res.edits.iter().enumerate() {
+                        let tree = match (fed_edit_trees.get(i), self.workspace.as_mut()) {
+                            (Some(&t), _) => t,
+                            (None, Some(ws)) => match e.after {
+                                Some(after) => ws.record_edit(&e.path, after),
+                                // A delete takes the file out of the tree.
+                                None => ws.record_delete(&e.path),
+                            },
+                            // An audit re-feeds every edit with its tree
+                            // digest (`recorded` refuses one without it).
+                            (None, None) => return Err(StopCause::PolicyAbort),
+                        };
+                        let path = w
+                            .untrusted(&Untrusted::new(e.path.as_str().to_owned(), Source::Model))
+                            .map_err(journal)?;
+                        let mut ev = Event::new(EventKind::EditApplied)
+                            .field("intent_seq", Trusted::U64(intent_seq))
+                            .field("path", Trusted::Untrusted(path));
+                        // A create has no `before` (the journal's convention).
+                        if let Some(b) = e.before {
+                            ev = ev.field("before", Trusted::Digest(b));
+                        }
+                        // The pre-image store (P-22): the file's bytes before
+                        // and after are kept as content-addressed blobs, and
+                        // the record cites them by their digests (`before_blob`
+                        // only when there was a before; the after-blob is what
+                        // a `/diff` shows; a delete cites neither after
+                        // field). An image whose bytes do not hash to the
+                        // digest the edit itself carries would make a record
+                        // no replay can recompute, so it is refused before
+                        // the record is written, with nothing journaled.
+                        let mut store = |img: &Image| {
+                            w.untrusted_stored(&Untrusted::new(
+                                img.bytes.clone(),
+                                Source::Workspace(e.path.as_str().to_owned()),
+                            ))
+                        };
+                        let before_blob = match &e.before_image {
+                            Some(img) => {
+                                let d = store(img).map_err(journal)?;
+                                if Some(d.sha256()) != e.before || d.sha256() != img.sha256 {
+                                    return Err(journal(JournalError::InvalidEvent(
+                                        "an edit image does not hash to the digest the edit carries",
+                                    )));
+                                }
+                                Some(d.sha256())
+                            }
+                            // A create keeps no pre-image: the field's absence is
+                            // the absent marker.
+                            None => None,
+                        };
+                        let after_blob = match (&e.after_image, e.after) {
+                            (Some(img), Some(after)) => {
+                                let d = store(img).map_err(journal)?;
+                                if Some(d.sha256()) != Some(after) || d.sha256() != img.sha256 {
+                                    return Err(journal(JournalError::InvalidEvent(
+                                        "an edit image does not hash to the digest the edit carries",
+                                    )));
+                                }
+                                Some(d.sha256())
+                            }
+                            // A delete keeps no after-image: both fields
+                            // absent is the absent marker.
+                            (None, None) => None,
+                            _ => {
                                 return Err(journal(JournalError::InvalidEvent(
                                     "an edit image does not hash to the digest the edit carries",
-                                )));
+                                )))
                             }
-                            Some(d.sha256())
+                        };
+                        if let Some(b) = before_blob {
+                            ev = ev.field("before_blob", Trusted::Digest(b));
                         }
-                        // A create keeps no pre-image: the field's absence is
-                        // the absent marker.
-                        None => None,
-                    };
-                    let after_img = store(&e.after_image).map_err(journal)?;
-                    if after_img.sha256() != e.after || after_img.sha256() != e.after_image.sha256 {
-                        return Err(journal(JournalError::InvalidEvent(
-                            "an edit image does not hash to the digest the edit carries",
-                        )));
+                        if let Some(a) = after_blob {
+                            ev = ev.field("after", Trusted::Digest(a));
+                            ev = ev.field("after_blob", Trusted::Digest(a));
+                        }
+                        ev = ev.field("workspace_tree", Trusted::Digest(tree));
+                        w.append(step, ev).map_err(journal)?;
+                        // A written file is the model's latest read of it, so
+                        // it may edit it again without re-reading; a deleted
+                        // one is forgotten: a further edit needs a fresh read.
+                        match e.after {
+                            Some(after) => self.reads.record(e.path.as_str(), after),
+                            None => self.reads.forget(e.path.as_str()),
+                        }
+                        self.tree = tree;
+                        edited.push(e.path.as_str().to_owned());
                     }
-                    if let Some(d) = before_blob {
-                        ev = ev.field("before_blob", Trusted::Digest(d));
-                    }
-                    ev = ev
-                        .field("after", Trusted::Digest(e.after))
-                        .field("after_blob", Trusted::Digest(after_img.sha256()))
-                        .field("workspace_tree", Trusted::Digest(tree));
-                    w.append(step, ev).map_err(journal)?;
-                    // The harness wrote these bytes: they are the file's
-                    // latest read, so the model may edit it again without
-                    // re-reading; any other change still makes it stale.
-                    self.reads.record(e.path.as_str(), e.after);
-                    self.tree = tree;
-                    edited = Some(e.path.as_str().to_owned());
                 }
                 let mut ev = Event::new(EventKind::ToolFinished)
                     .field("intent_seq", Trusted::U64(intent_seq))
@@ -1084,7 +1111,11 @@ impl<'a> Loop<'a> {
                     if let (None, Some(listing)) = (fed_exec_tree, &x.workspace) {
                         self.workspace = Some(listing.clone());
                     }
-                    ev = ev.field("exec", exec_fields(x));
+                    // No background process exists yet (the tools arrive
+                    // with P-36i), so no loopback port is reachable and
+                    // the record carries no `connect`; a live run passes
+                    // the ports its live ids hold (P-36 §6.2).
+                    ev = ev.field("exec", exec_fields(x, &[]));
                     if let Some(t) = tree {
                         ev = ev.field("workspace_tree", Trusted::Digest(t));
                         exec_changed = t != self.tree;
@@ -1179,10 +1210,14 @@ impl<'a> Loop<'a> {
             });
         }
         // §2.6: edit churn, and a changed tree is progress.
-        if let Some(file) = edited {
+        // §2.6: edit churn (per touched file), and a changed tree once.
+        let n_edited = edited.len();
+        for file in edited {
             if let LoopSignal::Stop(kind) = self.detector.observe(LoopEvent::EditApplied { file }) {
                 return self.loop_stop(w, step, kind);
             }
+        }
+        if n_edited > 0 {
             self.detector.observe(LoopEvent::WorkspaceChanged {
                 tree_digest: self.tree,
             });

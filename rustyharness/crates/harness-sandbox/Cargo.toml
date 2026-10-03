@@ -10,11 +10,30 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The direct egress door (§4.4, INV-52): without `net` the build has NO
+# direct socket dialling at all — `open_hop` refuses `mode: direct` and
+# `direct_egress_available()` reports it. The loopback pump and the
+# user-proxy / search-endpoint doors work in every build.
+net = []
+# Test-only seam (the harness-journal sealed-seam pattern): exposes
+# `RemapConnector`, which maps ONE fixed global address onto a loopback
+# fixture. Nothing in the workspace enables it; purity.sh refuses any
+# normal dependency edge that does.
+remap = []
+
 [dependencies]
 # The environment probe measures for the vocabulary and pressure rule in
 # harness-core (design §7.1: the probe here, the rule there).
 harness-core = { path = "../harness-core" }
 # The filesystem-locality probe measures for the pure decision in
-# harness-policy (design §2.8: the probe here, the allowlist there).
+# harness-policy (design §2.8: the probe here, the allowlist there); the
+# egress airlock re-uses the §4.2 address classification.
 harness-policy = { path = "../harness-policy" }
 thiserror.workspace = true
+
+[dev-dependencies]
+# The fixture HTTP client for the egress pump tests (a workspace crate,
+# not a new registry dependency; P-39g runs this same protocol over the
+# pump).
+harness-fetch = { path = "../harness-fetch" }

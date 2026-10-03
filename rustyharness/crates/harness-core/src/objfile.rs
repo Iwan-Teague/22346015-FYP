@@ -128,7 +128,7 @@ pub fn is_object(bytes: &[u8]) -> bool {
 pub fn parse(bytes: &[u8]) -> Result<ObjFile, ObjError> {
     match bytes {
         [0x7F, b'E', b'L', b'F', ..] => parse_elf(bytes),
-        _ => parse_macho(bytes),
+        _ => parse_macho(bytes, 0),
     }
 }
 
@@ -218,13 +218,21 @@ const HOST_CPU: u32 = 0x0100_000c;
 
 /// Parse a Mach-O: a thin image in either byte order, 32- or 64-bit, or
 /// the slice of a fat (universal) archive that matches this host's CPU.
-fn parse_macho(bytes: &[u8]) -> Result<ObjFile, ObjError> {
+/// `depth` is the fat nesting: the format has none (a fat archive's
+/// slice is thin), so a slice that is itself a fat archive — or a slice
+/// whose offset points back at its own header — is refused rather than
+/// walked round forever (P-55's fuzz loop found the unbounded
+/// recursion).
+fn parse_macho(bytes: &[u8], depth: usize) -> Result<ObjFile, ObjError> {
     let magic = u32_bounded(bytes, 0, true)?;
     if magic == FAT_MAGIC || magic == FAT_MAGIC.swap_bytes() {
+        if depth > 0 {
+            return Err(ObjError::Malformed("a fat slice is itself a fat archive"));
+        }
         // On disk a fat header is big-endian, so the little-endian read
         // sees the byte-swapped magic; the plain magic means the (rare)
         // little-endian layout, and both keep their fields that way too.
-        return fat_slice(bytes, magic == FAT_MAGIC);
+        return fat_slice(bytes, magic == FAT_MAGIC, depth);
     }
     let le = magic == MH_MAGIC || magic == MH_MAGIC_64;
     if !le && magic != MH_MAGIC.swap_bytes() && magic != MH_MAGIC_64.swap_bytes() {
@@ -295,7 +303,7 @@ fn parse_macho(bytes: &[u8]) -> Result<ObjFile, ObjError> {
 /// The fat archive's slice for [`HOST_CPU`]: a big-endian fat header and
 /// 20-byte architecture entries, each naming an offset and size into the
 /// same bytes. At most 16 slices are read; a real archive has a handful.
-fn fat_slice(bytes: &[u8], le: bool) -> Result<ObjFile, ObjError> {
+fn fat_slice(bytes: &[u8], le: bool, depth: usize) -> Result<ObjFile, ObjError> {
     let narch = u32_bounded(bytes, 4, le)? as usize;
     if narch > 16 {
         return Err(ObjError::Malformed("too many slices in a fat archive"));
@@ -309,7 +317,7 @@ fn fat_slice(bytes: &[u8], le: bool) -> Result<ObjFile, ObjError> {
             let slice = bytes
                 .get(off..off.saturating_add(size))
                 .ok_or(ObjError::Malformed("a fat slice leaves the file"))?;
-            return parse_macho(slice);
+            return parse_macho(slice, depth + 1);
         }
     }
     Err(ObjError::Unsupported(
@@ -754,5 +762,327 @@ mod tests {
         fat.extend_from_slice(&0u32.to_be_bytes()); // align
         let e = parse(&fat).unwrap_err();
         assert!(matches!(e, ObjError::Unsupported(_)), "{e}");
+    }
+
+    // ---- fuzz-style robustness (P-55) ---------------------------------------
+    //
+    // The parser's input is untrusted-ish bytes — a pinned program can be
+    // anything a build, a crash or an attacker left on the disk — so the
+    // documented contract is exercised the way P-54 does for the other
+    // parsers of untrusted bytes: mutated valid fixtures and plain garbage
+    // from the seeded `harness_testkit::mutator`, every case reproducible
+    // from the seed the loop names (seed base + case index, both carried in
+    // the assert messages). Either verdict is fine; the test is that there
+    // IS one, typed, and that an `Ok` stays inside the documented bounds.
+
+    use harness_testkit::mutator::{self, XorShift64};
+
+    /// A 32-bit big-endian Mach-O with the given rpaths and install names:
+    /// the other thin shape the parser reads (the sibling of
+    /// [`macho_bytes`], which is 64-bit little-endian).
+    fn macho_bytes_be(rpaths: &[&str], libs: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&MH_MAGIC.to_be_bytes());
+        v.extend_from_slice(&HOST_CPU.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes()); // cpusubtype
+        v.extend_from_slice(&6u32.to_be_bytes()); // MH_DYLIB
+        v.extend_from_slice(&((rpaths.len() + libs.len()) as u32).to_be_bytes()); // ncmds
+        v.extend_from_slice(&0u32.to_be_bytes()); // sizeofcmds, patched below
+        v.extend_from_slice(&0u32.to_be_bytes()); // flags
+        let mut cmds: Vec<u8> = Vec::new();
+        for r in rpaths {
+            let len = 12 + r.len() + 1;
+            let size = len.div_ceil(4) * 4;
+            cmds.extend_from_slice(&LC_RPATH.to_be_bytes());
+            cmds.extend_from_slice(&(size as u32).to_be_bytes());
+            cmds.extend_from_slice(&12u32.to_be_bytes()); // path.offset
+            cmds.extend_from_slice(r.as_bytes());
+            cmds.push(0);
+            cmds.resize(cmds.len() + (size - len), 0);
+        }
+        for l in libs {
+            let len = 24 + l.len() + 1;
+            let size = len.div_ceil(4) * 4;
+            cmds.extend_from_slice(&LC_LOAD_DYLIB.to_be_bytes());
+            cmds.extend_from_slice(&(size as u32).to_be_bytes());
+            cmds.extend_from_slice(&24u32.to_be_bytes()); // name.offset
+            cmds.extend_from_slice(&1u32.to_be_bytes()); // timestamp
+            cmds.extend_from_slice(&0u32.to_be_bytes()); // current_version
+            cmds.extend_from_slice(&0u32.to_be_bytes()); // compat_version
+            cmds.extend_from_slice(l.as_bytes());
+            cmds.push(0);
+            cmds.resize(cmds.len() + (size - len), 0);
+        }
+        v[20..24].copy_from_slice(&(cmds.len() as u32).to_be_bytes());
+        v.extend_from_slice(&cmds);
+        v
+    }
+
+    /// A fat (universal) archive whose single slice is `thin`, named for
+    /// this host's CPU: the on-disk header form is big-endian, the slice
+    /// sits right after the one 20-byte architecture entry.
+    fn fat_bytes(thin: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        v.extend_from_slice(&1u32.to_be_bytes()); // nfat_arch
+        v.extend_from_slice(&HOST_CPU.to_be_bytes()); // cputype
+        v.extend_from_slice(&0u32.to_be_bytes()); // cpusubtype
+        v.extend_from_slice(&28u32.to_be_bytes()); // offset: header + one entry
+        v.extend_from_slice(&(thin.len() as u32).to_be_bytes()); // size
+        v.extend_from_slice(&12u32.to_be_bytes()); // align (2^12)
+        v.extend_from_slice(thin);
+        v
+    }
+
+    /// The parser's documented output bounds, on whatever it returned: at
+    /// most one string per load command or dynamic entry, so never more
+    /// entries than the [`MAX_ENTRIES`] cap allows, and no string past the
+    /// [`MAX_STRING`] cap.
+    fn assert_within_bounds(o: &ObjFile) {
+        assert!(
+            o.libs.len() + o.rpaths.len() <= MAX_ENTRIES,
+            "{} libs + {} rpaths is past the entry cap",
+            o.libs.len(),
+            o.rpaths.len()
+        );
+        for s in o.libs.iter().chain(o.rpaths.iter()) {
+            assert!(s.len() <= MAX_STRING, "string past the cap: {s}");
+        }
+    }
+
+    /// Whatever the bytes, the verdict is typed and honest: an `Ok` only
+    /// for bytes whose magic names a format, within the documented
+    /// bounds; `UnknownFormat` only once a magic was read at all — the
+    /// only possible verdict when the leading four bytes name no format,
+    /// and through a fat archive the host slice's verdict (whose own
+    /// leading magic named nothing); anything else a typed [`ObjError`]
+    /// (which always renders).
+    fn assert_typed_verdict(bytes: &[u8], case: usize) {
+        match parse(bytes) {
+            Ok(o) => {
+                assert!(
+                    is_object(bytes),
+                    "case {case}: parsed what its magic does not name"
+                );
+                assert_within_bounds(&o);
+            }
+            Err(ObjError::UnknownFormat) => {
+                // The fat magics are the only ones whose parse can speak
+                // for bytes other than the leading four.
+                let fat = matches!(
+                    bytes.get(..4),
+                    Some([0xCA, 0xFE, 0xBA, 0xBE] | [0xBE, 0xBA, 0xFE, 0xCA])
+                );
+                assert!(
+                    bytes.len() >= 4 && (!is_object(bytes) || fat),
+                    "case {case}: called unknown what a magic names (len {})",
+                    bytes.len()
+                );
+            }
+            Err(e) => assert!(!e.to_string().is_empty(), "case {case}"),
+        }
+    }
+
+    /// One fuzz loop: `cases` mutations of each fixture in `corpora`
+    /// (seed base + running case index), each fed to the parser with its
+    /// verdict checked, then re-derived from the same seed and compared —
+    /// a failure is replayable from the printed case index alone.
+    fn fuzz_over_images(corpora: &[Vec<u8>], cases: usize) {
+        let mut case = 0usize;
+        for bytes in corpora {
+            for _ in 0..cases {
+                let mut rng = XorShift64::new(0x5100_0000_0001 + case as u64);
+                let m = mutator::mutate(bytes, &mut rng, 24);
+                assert_typed_verdict(&m, case);
+                let mut rng2 = XorShift64::new(0x5100_0000_0001 + case as u64);
+                assert_eq!(mutator::mutate(bytes, &mut rng2, 24), m, "case {case}");
+                case += 1;
+            }
+        }
+        // Plain garbage of the fixtures' order of size gets the same
+        // treatment, in its own seed range.
+        for g in 0..cases {
+            let mut rng = XorShift64::new(0x5F00_0000_0001 + g as u64);
+            let len = 1 + rng.below(160);
+            assert_typed_verdict(&mutator::garbage(&mut rng, len), g);
+        }
+    }
+
+    /// The Mach-O corpora: a valid thin 64-bit image, a 32-bit
+    /// big-endian one, and a fat archive whose slice is this host's.
+    fn macho_corpora() -> Vec<Vec<u8>> {
+        let thin = macho_bytes(
+            &["@loader_path/../lib", "@executable_path/../lib"],
+            &[
+                "/usr/lib/libSystem.B.dylib",
+                "@rpath/libgit2.1.9.dylib",
+                "@rpath/libgit2.1.9.dylib",
+            ],
+        );
+        let be = macho_bytes_be(&["@loader_path/../lib"], &["@rpath/libb.dylib"]);
+        let fat = fat_bytes(&thin);
+        for (label, bytes) in [("thin", &thin), ("be", &be), ("fat", &fat)] {
+            let o = parse(bytes).expect(label);
+            assert_eq!(o.format, Format::MachO);
+        }
+        vec![thin, be, fat]
+    }
+
+    /// The ELF corpus: one valid 64-bit little-endian image (the other
+    /// class and byte-order shapes share the parser's bounds, which the
+    /// mutations exercise).
+    fn elf_corpus() -> Vec<Vec<u8>> {
+        let elf = elf_bytes("$ORIGIN/../lib", &["libgit2.so.1.9", "libc.so.6"]);
+        assert_eq!(parse(&elf).unwrap().format, Format::Elf);
+        vec![elf]
+    }
+
+    #[test]
+    fn fuzz_macho_parser_never_panics() {
+        fuzz_over_images(&macho_corpora(), mutator::case_count(2_000));
+    }
+
+    /// The case the fuzz loop found (a mutated fat archive whose slice
+    /// offset pointed back at its own header): a fat archive whose host
+    /// slice is the fat archive itself is a typed refusal, not an
+    /// unbounded `parse_macho` -> `fat_slice` recursion.
+    #[test]
+    fn fat_archive_pointing_at_itself_is_typed_refusal() {
+        let mut fat = fat_bytes(&macho_bytes(&[], &[]));
+        // The one slice's offset (bytes 16..20, big-endian) now points at
+        // the fat header itself.
+        fat[16..20].copy_from_slice(&0u32.to_be_bytes());
+        let e = parse(&fat).unwrap_err();
+        assert!(matches!(e, ObjError::Malformed(_)), "{e}");
+    }
+
+    /// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+    /// drives the case count up.
+    #[test]
+    #[ignore]
+    fn fuzz_macho_long_cases() {
+        fuzz_over_images(&macho_corpora(), mutator::case_count(50_000));
+    }
+
+    #[test]
+    fn fuzz_elf_parser_never_panics() {
+        fuzz_over_images(&elf_corpus(), mutator::case_count(2_000));
+    }
+
+    /// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+    /// drives the case count up.
+    #[test]
+    #[ignore]
+    fn fuzz_elf_long_cases() {
+        fuzz_over_images(&elf_corpus(), mutator::case_count(50_000));
+    }
+
+    #[test]
+    fn fuzz_macho_truncation_at_every_byte_is_typed_error() {
+        // No bytes at all is a typed refusal, not a panic.
+        assert!(matches!(parse(&[]), Err(ObjError::TooShort)));
+        let thin = macho_bytes(
+            &["@loader_path/../lib"],
+            &["/usr/lib/libSystem.B.dylib", "@rpath/libgit2.1.9.dylib"],
+        );
+        let fat = fat_bytes(&thin);
+        for bytes in [&thin, &fat] {
+            let whole = parse(bytes).unwrap();
+            assert_eq!(whole.libs.len() + whole.rpaths.len(), 3);
+            // Every proper prefix answers with a typed verdict, and an
+            // `Ok` never reports more than the whole file does, nor
+            // anything the whole file does not carry in the same place:
+            // a cut can only drop whole load commands (each names its own
+            // size, so a straddling one is a typed refusal), so a
+            // prefix's entries are a prefix of the whole's.
+            for i in 0..bytes.len() {
+                match parse(&bytes[..i]) {
+                    Ok(o) => {
+                        assert_within_bounds(&o);
+                        assert!(
+                            o.libs.len() <= whole.libs.len()
+                                && o.rpaths.len() <= whole.rpaths.len()
+                                && whole.libs.starts_with(&o.libs[..])
+                                && whole.rpaths.starts_with(&o.rpaths[..]),
+                            "prefix {i} of {} invents entries",
+                            bytes.len()
+                        );
+                    }
+                    Err(e) => assert!(!e.to_string().is_empty(), "prefix {i}"),
+                }
+            }
+        }
+    }
+
+    /// The cyclic-dependency fixture: two images, `a` naming `b` and `b`
+    /// naming `a`, both through `@rpath` and the same search path — the
+    /// shape a dependency cycle takes on disk. The loader would bounce
+    /// between the two forever; the parser must not even notice.
+    fn cyclic_pair() -> (Vec<u8>, Vec<u8>) {
+        (
+            macho_bytes(&["@loader_path/../lib"], &["@rpath/libb.dylib"]),
+            macho_bytes(&["@loader_path/../lib"], &["@rpath/liba.dylib"]),
+        )
+    }
+
+    /// The bounds loop over the mutated cyclic fixture: whatever a case
+    /// leaves, an `Ok` keeps its entries inside the caps and every install
+    /// name expands to at most one candidate per rpath (one of its own
+    /// when there are no rpaths) — a cycle in the references cannot grow
+    /// the output.
+    fn fuzz_over_cyclic(cases: usize) {
+        let (a, b) = cyclic_pair();
+        for case in 0..cases {
+            let which = if case % 2 == 0 { &a } else { &b };
+            let mut rng = XorShift64::new(0x5300_0000_0001 + case as u64);
+            let m = mutator::mutate(which, &mut rng, 24);
+            if let Ok(o) = parse(&m) {
+                assert_within_bounds(&o);
+                for name in &o.libs {
+                    let got = candidates(name, "/opt/tool/bin", &o.rpaths, "/opt/tool/bin");
+                    assert!(
+                        got.len() <= o.rpaths.len().max(1),
+                        "case {case}: {name} expanded to {} candidates from {} rpaths",
+                        got.len(),
+                        o.rpaths.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_macho_bounds_hold_on_cyclic_dependency_fixture() {
+        // On the untouched pair the cycle is parsed as written: `a` names
+        // `b`, `b` names `a`, duplicates and all.
+        let (a, b) = cyclic_pair();
+        assert_eq!(parse(&a).unwrap().libs, vec!["@rpath/libb.dylib"]);
+        assert_eq!(parse(&b).unwrap().libs, vec!["@rpath/liba.dylib"]);
+        // Expansion stays bounded across the cycle: one name yields at
+        // most one candidate per rpath, and a search path that points
+        // back into the `@`-world (`@rpath/…` as an rpath) adds none at
+        // all.
+        let cyclic_rpaths = vec![
+            "@rpath/liba.dylib".to_owned(),
+            "@loader_path/../lib".to_owned(),
+        ];
+        assert_eq!(
+            candidates(
+                "@rpath/libb.dylib",
+                "/opt/tool/bin",
+                &cyclic_rpaths,
+                "/opt/tool/bin"
+            ),
+            vec!["/opt/tool/bin/../lib/libb.dylib"]
+        );
+        fuzz_over_cyclic(mutator::case_count(2_000));
+    }
+
+    /// The long form: `cargo test -- --ignored` with `RH_FUZZ_CASES` set
+    /// drives the case count up.
+    #[test]
+    #[ignore]
+    fn fuzz_macho_cyclic_long_cases() {
+        fuzz_over_cyclic(mutator::case_count(50_000));
     }
 }

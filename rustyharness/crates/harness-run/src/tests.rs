@@ -23,7 +23,7 @@ use crate::driver::approvals::Approvals;
 use crate::driver::plan::plan;
 use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
 use crate::driver::stop::{commit, End};
-use crate::driver::tools::{exec_fields, parse_exec};
+use crate::driver::tools::{bg_fields, exec_fields, parse_bg, parse_exec};
 use crate::driver::{new_meter, new_nonce, new_run_id, ReadLog};
 
 use crate::{RunConfig, TaskSpec};
@@ -82,7 +82,7 @@ impl ToolProvider for Spy {
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
             read: None,
-            edit: None,
+            edits: Vec::new(),
             exec: None,
         })
     }
@@ -1017,7 +1017,7 @@ fn h2d_a_command_record_reads_back_exactly_and_nothing_else_does() {
                 1,
                 Event::new(EventKind::ToolFinished)
                     .field("status", Trusted::Text("ok"))
-                    .field("exec", exec_fields(&x)),
+                    .field("exec", exec_fields(&x, &[])),
             )
             .unwrap();
             written.push(x);
@@ -1065,5 +1065,310 @@ fn h2d_a_command_record_reads_back_exactly_and_nothing_else_does() {
         ("kills on an unconfirmed cleanup", kills_unconfirmed),
     ] {
         assert!(parse_exec(&bad).is_none(), "{what}: {bad}");
+    }
+}
+
+// P-36h: the loopback ports a command may reach (`connect`, P-36 §6.2) are
+// in the exec record only when non-empty, so a journal from a build before
+// background processes encodes byte for byte the same body.
+
+#[test]
+fn exec_record_connect_absent_when_empty_digest_unchanged() {
+    use harness_journal::Trusted;
+    use harness_tools::{ExecCleanup, ExecEnd, ExecRecord};
+    // The body the loop wrote before background processes existed,
+    // hand-written field for field (the pre-P-36h `exec_fields`).
+    let old_body = |x: &ExecRecord| -> Trusted {
+        let mut f = vec![(
+            "end",
+            Trusted::Text(match x.end {
+                ExecEnd::Exited(_) => "exited",
+                ExecEnd::Signaled(_) => "signaled",
+                ExecEnd::TimedOut => "timed_out",
+                ExecEnd::ProcessLimit => "process_limit",
+                ExecEnd::ExecFailed => "exec_failed",
+                ExecEnd::Unknown => "unknown",
+            }),
+        )];
+        match x.end {
+            ExecEnd::Exited(c) => f.push(("code", Trusted::I64(i64::from(c)))),
+            ExecEnd::Signaled(n) => f.push(("signal", Trusted::I64(i64::from(n)))),
+            _ => {}
+        }
+        if let Some(g) = x.end.guard() {
+            f.push(("guard", Trusted::Text(g)));
+        }
+        match x.cleanup {
+            ExecCleanup::Confirmed { kills } => {
+                f.push(("cleanup", Trusted::Text("confirmed")));
+                f.push(("kills", Trusted::U64(u64::from(kills))));
+            }
+            ExecCleanup::Unconfirmed => f.push(("cleanup", Trusted::Text("unconfirmed"))),
+        }
+        f.extend([
+            ("stdout_bytes", Trusted::U64(x.stdout_bytes)),
+            ("stderr_bytes", Trusted::U64(x.stderr_bytes)),
+            ("stdout_cut", Trusted::Bool(x.stdout_cut)),
+            ("stderr_cut", Trusted::Bool(x.stderr_cut)),
+            ("elapsed_ms", Trusted::U64(x.elapsed_ms)),
+        ]);
+        Trusted::Obj(f)
+    };
+    let ends = [
+        ExecEnd::Exited(0),
+        ExecEnd::Signaled(9),
+        ExecEnd::TimedOut,
+        ExecEnd::ProcessLimit,
+        ExecEnd::ExecFailed,
+        ExecEnd::Unknown,
+    ];
+    let cleanups = [
+        ExecCleanup::Confirmed { kills: 0 },
+        ExecCleanup::Confirmed { kills: 2 },
+        ExecCleanup::Unconfirmed,
+    ];
+    for end in ends {
+        for cleanup in cleanups {
+            let x = ExecRecord {
+                end,
+                cleanup,
+                stdout_bytes: 12,
+                stderr_bytes: 0,
+                stdout_cut: false,
+                stderr_cut: true,
+                elapsed_ms: 345,
+                workspace: None,
+            };
+            // No ports: the body is exactly the old one, byte for byte
+            // (identical field list, order included), so the record hash
+            // of an old journal is unchanged.
+            assert_eq!(exec_fields(&x, &[]), old_body(&x));
+        }
+    }
+    // Ports held by live ids: `connect` sits after the cleanup fields and
+    // before the byte counts, and the record reads back whole.
+    let x = ExecRecord {
+        end: ExecEnd::Exited(0),
+        cleanup: ExecCleanup::Confirmed { kills: 1 },
+        stdout_bytes: 5,
+        stderr_bytes: 6,
+        stdout_cut: false,
+        stderr_cut: false,
+        elapsed_ms: 7,
+        workspace: None,
+    };
+    let connected = Trusted::Obj(vec![
+        ("end", Trusted::Text("exited")),
+        ("code", Trusted::I64(0)),
+        ("cleanup", Trusted::Text("confirmed")),
+        ("kills", Trusted::U64(1)),
+        (
+            "connect",
+            Trusted::List(vec![Trusted::U64(5173), Trusted::U64(8000)]),
+        ),
+        ("stdout_bytes", Trusted::U64(5)),
+        ("stderr_bytes", Trusted::U64(6)),
+        ("stdout_cut", Trusted::Bool(false)),
+        ("stderr_cut", Trusted::Bool(false)),
+        ("elapsed_ms", Trusted::U64(7)),
+    ]);
+    assert_eq!(exec_fields(&x, &[5173, 8000]), connected);
+    // The connected record round-trips through the real encoding ...
+    let file = FaultFile::new(FaultPlan::default());
+    let buf = file.buf.clone();
+    let blobs = MemBlobs::default();
+    let mut w = JournalWriter::start(
+        file,
+        blobs.clone(),
+        Tick(Cell::new(0)),
+        RunId::new(1, [0; 10]),
+        1,
+        Header::new(Ident::of("0.0.1").unwrap()),
+    )
+    .unwrap();
+    use harness_journal::Event;
+    w.append(
+        1,
+        Event::new(EventKind::ToolFinished)
+            .field("status", Trusted::Text("ok"))
+            .field("exec", exec_fields(&x, &[5173, 8000])),
+    )
+    .unwrap();
+    let v = verify(&buf.borrow().clone(), &blobs).unwrap();
+    let json = v.records[1].body["exec"].clone();
+    assert_eq!(parse_exec(&json), Some(x));
+    // ... and `connect: []` is a shape the loop never writes: refused.
+    let mut empty = json.clone();
+    empty
+        .as_object_mut()
+        .unwrap()
+        .insert("connect".into(), serde_json::json!([]));
+    assert!(parse_exec(&empty).is_none());
+}
+
+// P-36h: a background tool's `bg` record (P-36 §10.2) reads back exactly as
+// the tools write it, every op, through the real encoding; anything the
+// tools never write reads back as nothing, so an audit calls it a
+// divergence.
+
+#[test]
+fn tool_finished_bg_record_round_trip_every_op() {
+    use crate::driver::tools::{
+        BgListItem, BgRead, BgReadMode, BgReady, BgReadyKind, BgRecord, BgScope, BgStart,
+        BgStartState, BgState, BgStop, BgWindow,
+    };
+    use harness_journal::{Event, Trusted};
+    use harness_tools::{ExecCleanup, ExecEnd};
+    let window = |since: u64, total: u64, dropped: u64, bytes: &[u8]| BgWindow {
+        since,
+        from: since + dropped,
+        to: total,
+        dropped,
+        skipped: 0,
+        total,
+        sha: sha256(bytes),
+    };
+    let records = vec![
+        BgRecord::Start(BgStart {
+            id: 1,
+            state: BgStartState::Running,
+            ports: vec![5173, 8000],
+            lan: vec![8000],
+            scope: BgScope::Turn,
+            lifetime_s: 1800,
+            ready: Some(BgReady {
+                kind: BgReadyKind::Port,
+                met: true,
+                waited_ms: 12,
+            }),
+        }),
+        BgRecord::Start(BgStart {
+            id: 2,
+            state: BgStartState::ExecFailed,
+            ports: Vec::new(),
+            lan: Vec::new(),
+            scope: BgScope::Session,
+            lifetime_s: 60,
+            ready: None,
+        }),
+        BgRecord::Read(BgRead {
+            id: 1,
+            mode: BgReadMode::Next,
+            state: BgState::Running,
+            out: window(0, 4096, 0, b"out bytes"),
+            err: window(100, 2128, 1024, b"err bytes"),
+            ended: None,
+        }),
+        BgRecord::Read(BgRead {
+            id: 1,
+            mode: BgReadMode::Tail,
+            state: BgState::Exited,
+            out: window(4096, 8192, 0, b"later out"),
+            err: window(2128, 2128, 0, b""),
+            ended: Some((ExecEnd::Exited(0), ExecCleanup::Confirmed { kills: 2 })),
+        }),
+        BgRecord::List(vec![
+            BgListItem {
+                id: 1,
+                state: BgState::Exited,
+                ports: vec![5173],
+                pending_out: 0,
+                pending_err: 0,
+            },
+            BgListItem {
+                id: 2,
+                state: BgState::Running,
+                ports: Vec::new(),
+                pending_out: 40,
+                pending_err: 2,
+            },
+        ]),
+        BgRecord::Stop(BgStop {
+            id: 2,
+            end: ExecEnd::Signaled(15),
+            cleanup: ExecCleanup::Unconfirmed,
+            out: window(0, 512, 0, b"stop out"),
+            err: window(0, 0, 0, b""),
+            out_total: 512,
+            err_total: 0,
+            out_sha: sha256(b"every out byte"),
+            err_sha: sha256(b""),
+        }),
+    ];
+    let file = FaultFile::new(FaultPlan::default());
+    let buf = file.buf.clone();
+    let blobs = MemBlobs::default();
+    let mut w = JournalWriter::start(
+        file,
+        blobs.clone(),
+        Tick(Cell::new(0)),
+        RunId::new(1, [0; 10]),
+        1,
+        Header::new(Ident::of("0.0.1").unwrap()),
+    )
+    .unwrap();
+    for r in &records {
+        w.append(
+            1,
+            Event::new(EventKind::ToolFinished)
+                .field("status", Trusted::Text("ok"))
+                .field("bg", bg_fields(r)),
+        )
+        .unwrap();
+    }
+    let v = verify(&buf.borrow().clone(), &blobs).unwrap();
+    let read: Vec<BgRecord> = v
+        .records
+        .iter()
+        .filter(|r| r.kind == EventKind::ToolFinished)
+        .map(|r| parse_bg(&r.body["bg"]).expect("reads back"))
+        .collect();
+    assert_eq!(read, records);
+    // Shapes the tools never write.
+    let good = v
+        .records
+        .iter()
+        .find(|r| r.kind == EventKind::ToolFinished && r.body["bg"]["op"] == "stop")
+        .unwrap()
+        .body["bg"]
+        .clone();
+    let mut extra = good.clone();
+    extra["extra"] = serde_json::json!(1);
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("out_sha");
+    let mut bad_sha = good.clone();
+    bad_sha["out_sha"] = serde_json::json!("nothex");
+    let mut window_extra = good.clone();
+    window_extra["out"]["extra"] = serde_json::json!(0);
+    let mut unknown_op = good.clone();
+    unknown_op["op"] = serde_json::json!("peek");
+    let read_ended = v
+        .records
+        .iter()
+        .find(|r| {
+            r.kind == EventKind::ToolFinished
+                && r.body["bg"]["op"] == "read"
+                && r.body["bg"].get("end").is_some()
+        })
+        .unwrap()
+        .body["bg"]
+        .clone();
+    let mut no_cleanup = read_ended.clone();
+    no_cleanup.as_object_mut().unwrap().remove("cleanup");
+    let mut cleanup_without_end = read_ended.clone();
+    cleanup_without_end.as_object_mut().unwrap().remove("end");
+    let mut bad_state = read_ended.clone();
+    bad_state["state"] = serde_json::json!("zombie");
+    for (what, bad) in [
+        ("an extra key", extra),
+        ("a missing key", missing),
+        ("a digest that is not hex", bad_sha),
+        ("a window with an extra key", window_extra),
+        ("an op the tools do not have", unknown_op),
+        ("an ended read without its cleanup", no_cleanup),
+        ("a cleanup without an end", cleanup_without_end),
+        ("a state the loop never writes", bad_state),
+    ] {
+        assert!(parse_bg(&bad).is_none(), "{what}: {bad}");
     }
 }

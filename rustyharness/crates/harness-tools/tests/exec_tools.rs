@@ -24,7 +24,7 @@ use harness_journal::testing::{FaultFile, FaultPlan, MemBlobs};
 use harness_journal::{Clock, Event, EventKind, Header, Ident, JournalWriter};
 use harness_manifest::admission::{Registry, Tier};
 use harness_manifest::{builtin, SemVer, ValidationContext};
-use harness_policy::{Call, Session, SessionSpec, UserPolicy, WorkspaceDecl, EXEC_ID};
+use harness_policy::{Call, Session, SessionKind, SessionSpec, UserPolicy, WorkspaceDecl, EXEC_ID};
 use harness_sandbox::{
     ConfinedChild, ConfinedSpec, Confinement, Conformed, Refused, SpawnError, SystemConfinement,
 };
@@ -142,6 +142,7 @@ impl Rig {
                 conformed: true,
                 exec_programs: vec!["perl".into(), "sh".into()],
                 read_window: None,
+                kind: SessionKind::Coding,
             },
             &reg,
             &UserPolicy::new(&[], &[], &[EXEC_ID]).unwrap(),

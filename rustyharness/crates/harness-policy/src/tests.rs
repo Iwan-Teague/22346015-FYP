@@ -2,7 +2,7 @@
 
 use super::*;
 use harness_manifest::admission::Tier;
-use harness_manifest::{builtin, Manifest, SemVer, ValidationContext};
+use harness_manifest::{builtin, Manifest, SemVer, Sha256Pin, ValidationContext};
 use serde_json::json;
 
 const PIN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -33,9 +33,13 @@ fn spec(grants: &[&str]) -> SessionSpec {
         workspace: ws(),
         approver_present: false,
         personal_data_granted: false,
-        conformed: false,
+        // The default fixture host HOLDS a witness: since P-37b an
+        // mcp-stdio grant plans only with one (INV-6), and the refusal is
+        // asserted explicitly in the tests that are about it.
+        conformed: true,
         exec_programs: Vec::new(),
         read_window: None,
+        kind: SessionKind::Coding,
     }
 }
 
@@ -85,24 +89,71 @@ fn fixture(caps: Vec<Value>) -> Manifest {
     Manifest::parse(m.to_string().as_bytes(), &ctx()).unwrap()
 }
 
+/// One capability JSON for an IN-PROCESS fixture manifest (no `mcp_name`;
+/// the pins are still required for a non-builtin transport).
+fn cap_json_inproc(verb: &str, dims: [&str; 6]) -> Value {
+    let [effect, sensitivity, blast_radius, egress, content, confirmation] = dims;
+    json!({
+        "id": format!("fixture.{verb}"),
+        "summary": "fixture capability",
+        "effect": effect, "sensitivity": sensitivity, "blast_radius": blast_radius,
+        "egress": egress, "content": content, "confirmation": confirmation,
+        "input_schema": {"type": "object", "additionalProperties": false, "properties": {}},
+        "schema_sha256": PIN, "description_sha256": PIN
+    })
+}
+
+/// An in-process fixture manifest: the transport whose classes policy still
+/// refuses wholesale, so the pre-P-37b planning order stays exercised.
+fn fixture_inproc(caps: Vec<Value>) -> Manifest {
+    let m = json!({
+        "schema_version": 1, "provider": "fixture", "provider_version": "1",
+        "min_harness": "0.0.1",
+        "transport": {"kind": "in-process", "feature": "probe"},
+        "capabilities": caps
+    });
+    Manifest::parse(m.to_string().as_bytes(), &ctx()).unwrap()
+}
+
 const READ_OWN: [&str; 6] = ["read", "operational", "own", "none", "own", "none"];
 
+/// A registry that admits one parsed mcp-stdio manifest under the pinned
+/// tier (what `rustyharness provider add` records; the digest is this
+/// file's stand-in pin).
+fn pinned(m: Manifest) -> Registry {
+    Registry::admit(vec![(
+        m,
+        Tier::Pinned {
+            manifest_sha256: Sha256Pin::parse_hex(PIN).unwrap(),
+        },
+    )])
+    .unwrap()
+}
+
 /// Plan over parsed manifests the H1 admission gate would refuse (test-only
-/// private seam), so every dimension reaches the decision order.
+/// private seam), so every dimension reaches the decision order. The seam
+/// resolves through the PINNED tier: the only tier this build admits an
+/// mcp-stdio manifest under.
 fn plan_over(
     ms: &[Manifest],
     spec: &SessionSpec,
     policy: &UserPolicy,
 ) -> Result<Session, SessionRefused> {
+    let tier = Tier::Pinned {
+        manifest_sha256: Sha256Pin::parse_hex(PIN).unwrap(),
+    };
     Session::plan_with(spec, policy, &|g| {
-        let hits: Vec<&Capability> = ms
+        let mut hits = ms
             .iter()
-            .flat_map(|m| m.capabilities())
-            .filter(|c| c.id().as_str() == g)
-            .collect();
-        match hits.as_slice() {
-            [one] => Lookup::One(one),
-            [] => Lookup::NotFound,
+            .flat_map(|m| m.capabilities().iter().map(move |c| (m, c)))
+            .filter(|(_, c)| c.id().as_str() == g);
+        match (hits.next(), hits.next()) {
+            (Some((m, one)), None) => Lookup::One {
+                capability: one,
+                manifest: m,
+                tier: &tier,
+            },
+            (None, None) => Lookup::NotFound,
             _ => Lookup::Ambiguous,
         }
     })
@@ -203,6 +254,10 @@ fn ambiguous_lookup_is_refused_not_resolved() {
 
 #[test]
 fn classes_this_slice_does_not_decide_are_refused_at_planning() {
+    // In-process fixtures: an mcp-stdio write/execute now plans and asks
+    // (P-37b, `mcp_write_capability_plans_and_asks`), so the undecided
+    // classes are exercised on the transport policy still refuses
+    // wholesale. Irreversible stays refused for mcp-stdio too.
     for (verb, dims, what) in [
         (
             "w",
@@ -225,7 +280,7 @@ fn classes_this_slice_does_not_decide_are_refused_at_planning() {
             "egress (the allowlist proxy is H4)",
         ),
     ] {
-        let m = fixture(vec![cap_json(verb, dims)]);
+        let m = fixture_inproc(vec![cap_json_inproc(verb, dims)]);
         let mut sp = spec(&[&format!("fixture.{verb}")]);
         sp.workspace = None; // keep the trifecta out of the way
         assert_eq!(
@@ -237,6 +292,21 @@ fn classes_this_slice_does_not_decide_are_refused_at_planning() {
             "{verb}"
         );
     }
+    // An mcp-stdio capability still refuses for an UNDECIDED class: only
+    // write and execute plan (P-37b); irreversible does not.
+    let m = fixture(vec![cap_json(
+        "wipe",
+        ["irreversible", "public", "own", "none", "own", "none"],
+    )]);
+    let mut sp = spec(&["fixture.wipe"]);
+    sp.workspace = None;
+    assert_eq!(
+        plan_over(&[m], &sp, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::OutOfScope {
+            capability: "fixture.wipe".into(),
+            what: "a non-read effect class"
+        }
+    );
 }
 
 /// A session built directly (in-crate only), bypassing planning, to show the
@@ -264,6 +334,9 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             delegate: false,
             edit: false,
             exec: false,
+            web_fetch: false,
+            web_search: false,
+            mcp: false,
         },
     );
     Session {
@@ -274,6 +347,10 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
         conformed: false,
         exec_programs: BTreeSet::new(),
         read_window: None,
+        session_deny: BTreeMap::new(),
+        session_allow: BTreeMap::new(),
+        web: None,
+        workspace: None,
     }
 }
 
@@ -324,9 +401,12 @@ fn inv_27_restricted_capability_refuses_the_session() {
         let mut sp = spec(&["fixture.t", "fixture.r"]);
         sp.approver_present = approver;
         sp.personal_data_granted = personal;
+        // P-37b lift: `t` carries the whole manifest's max sensitivity, so
+        // the granted sibling is restricted too and names first (INV-27
+        // still refuses the session either way).
         assert_eq!(
             plan_over(std::slice::from_ref(&m), &sp, &UserPolicy::default()).unwrap_err(),
-            SessionRefused::Restricted("fixture.r".into())
+            SessionRefused::Restricted("fixture.t".into())
         );
     }
 }
@@ -345,38 +425,61 @@ fn inv_9_trifecta_is_refused_naming_one_source_per_label() {
     ]);
     let mut sp = spec(&["fixture.p", "fixture.u", "fixture.e"]);
     sp.workspace = None;
+    // P-37b lift: the labels are per process (§5.4), so all three
+    // capabilities of the manifest carry the max of each — the first grant
+    // names every label's source. The refusal itself is unchanged.
     assert_eq!(
         plan_over(std::slice::from_ref(&m), &sp, &UserPolicy::default()).unwrap_err(),
         SessionRefused::Trifecta {
             private: "fixture.p".into(),
-            untrusted: "fixture.u".into(),
-            egress: "fixture.e".into()
+            untrusted: "fixture.p".into(),
+            egress: "fixture.p".into()
         }
     );
-    // The workspace alone supplies P and U (private and third-party by default).
+    // The workspace alone supplies P and U (private and third-party by
+    // default) — but P-37b's lift gives the granted `fixture.e` the whole
+    // manifest's labels (personal, third_party, lan), so IT names every
+    // source before the workspace fallbacks are reached.
     let mut sp = spec(&["fixture.e"]);
     sp.workspace = ws();
     assert_eq!(
         plan_over(std::slice::from_ref(&m), &sp, &UserPolicy::default()).unwrap_err(),
         SessionRefused::Trifecta {
-            private: "workspace".into(),
-            untrusted: "workspace".into(),
+            private: "fixture.e".into(),
+            untrusted: "fixture.e".into(),
             egress: "fixture.e".into()
         }
     );
-    // Declaring the workspace public removes P: no trifecta (egress is then
-    // refused for this slice's own reason).
+    // Declaring the workspace public used to remove P; since P-37b the
+    // lift gives the process itself a personal label, so the trifecta
+    // refuses naming the granted capability for every label (§5.4: such a
+    // server is usable only in a workspace-less session — and the egress
+    // itself is still refused until the proxy, below).
     sp.workspace = Some(WorkspaceDecl {
         declared_public: true,
     });
-    assert!(matches!(
+    assert_eq!(
         plan_over(std::slice::from_ref(&m), &sp, &UserPolicy::default()).unwrap_err(),
-        SessionRefused::OutOfScope { .. }
-    ));
-    // Any two labels without the third: allowed by the trifecta rule.
+        SessionRefused::Trifecta {
+            private: "fixture.e".into(),
+            untrusted: "fixture.e".into(),
+            egress: "fixture.e".into()
+        }
+    );
+    // Any two labels without the third: allowed by the trifecta rule. Two
+    // SINGLE-capability manifests (since P-37b one manifest's capabilities
+    // share lifted labels, so a third label could not stay out of it).
+    let p_only = fixture(vec![cap_json(
+        "p",
+        ["read", "personal", "own", "none", "own", "none"],
+    )]);
+    let u_only = fixture(vec![cap_json(
+        "u",
+        ["read", "public", "own", "none", "third_party", "none"],
+    )]);
     let mut sp = spec(&["fixture.p", "fixture.u"]);
     sp.workspace = None;
-    assert!(plan_over(std::slice::from_ref(&m), &sp, &UserPolicy::default()).is_ok());
+    assert!(plan_over(&[p_only, u_only], &sp, &UserPolicy::default()).is_ok());
 }
 
 // ---- ask rules, approvers, personal data ---------------------------------------
@@ -594,7 +697,8 @@ fn inv_30_builtin_reads_cannot_name_a_path_outside_the_workspace() {
 #[test]
 fn quarantined_capabilities_are_denied() {
     let mut s = read_all();
-    s.quarantine(&CapId::new("harness.fs.read").unwrap());
+    s.quarantine(&CapId::new("harness.fs.read").unwrap())
+        .unwrap();
     assert!(is_deny(
         &s.decide(&call("harness.fs.read", json!({"path": "a"}))),
         &DenyReason::Quarantined
@@ -741,9 +845,10 @@ fn a_user_deny_still_beats_the_submit_rule() {
 
 #[test]
 fn a_write_capability_that_merely_looks_like_submit_stays_out_of_scope() {
-    // Same verb, other provider: not the sentinel, so its write class is
-    // refused at planning like every other write.
-    let m = fixture(vec![cap_json(
+    // Same verb, other provider, in-process transport: not the sentinel, so
+    // its write class is refused at planning like every other non-mcp write
+    // (an mcp-stdio write plans and asks since P-37b).
+    let m = fixture_inproc(vec![cap_json_inproc(
         "task.submit",
         ["write", "public", "own", "none", "own", "none"],
     )]);
@@ -1474,10 +1579,11 @@ fn h2d_decide_denies_a_command_without_the_witness() {
 }
 
 // Only the built-in runner, with exactly its labels, is the runner: an
-// external execute-class capability stays out of scope.
+// external execute-class capability stays out of scope (in-process: an
+// mcp-stdio execute plans and asks since P-37b).
 #[test]
 fn h2d_an_external_execute_capability_stays_out_of_scope() {
-    let m = fixture(vec![cap_json(
+    let m = fixture_inproc(vec![cap_json_inproc(
         "run",
         [
             "execute",
@@ -1555,7 +1661,7 @@ fn h2e_the_checklist_is_allowed_by_its_own_rule() {
 // Only the built-in checklist, with exactly its labels, is the checklist.
 #[test]
 fn h2e_a_capability_that_merely_looks_like_the_checklist_stays_out_of_scope() {
-    let m = fixture(vec![cap_json(
+    let m = fixture_inproc(vec![cap_json_inproc(
         "task.todo",
         ["write", "public", "own", "none", "own", "none"],
     )]);
@@ -1846,21 +1952,28 @@ fn policy_default_table_unchanged() {
 
 /// The outline tool (P-24) is a read-class built-in like `list`: planned
 /// alone under the default policy it decides allow through the default read
-/// rule, and the registration table and the compiled-in registry agree on
-/// the tool count (every table id resolves).
+/// rule, and the registration table and the compiled-in registries agree:
+/// every table id resolves, the web ids only in the research registry
+/// (P-39b), todo and the sentinel in both manifests.
 #[test]
 fn tool_count_policy_default_read_allow() {
-    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 12);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 17);
     let reg = builtin_registry();
+    let research = research_registry();
     for t in crate::builtin::BUILTIN_TOOLS {
-        assert!(
-            matches!(
-                reg.resolve(t.id),
-                harness_manifest::admission::Resolved::One { .. }
-            ),
-            "{}",
-            t.id
+        let in_coding = matches!(
+            reg.resolve(t.id),
+            harness_manifest::admission::Resolved::One { .. }
         );
+        let in_research = matches!(
+            research.resolve(t.id),
+            harness_manifest::admission::Resolved::One { .. }
+        );
+        if crate::builtin::is_web_id(t.id) {
+            assert!(!in_coding && in_research, "{}", t.id);
+        } else {
+            assert!(in_coding, "{}", t.id);
+        }
     }
     let s = Session::plan(&spec(&[OUTLINE_ID]), &reg, &UserPolicy::default()).unwrap();
     assert_eq!(
@@ -1994,17 +2107,25 @@ fn delegate_refused_when_child_scope_more_sensitive() {
         "recs",
         ["read", "personal", "own", "none", "own", "none"],
     )]);
+    let tier = Tier::Pinned {
+        manifest_sha256: Sha256Pin::parse_hex(PIN).unwrap(),
+    };
     let lookup = |g: &str| -> Lookup<'_> {
         let hit = (g == "harness.fs.read" || g == "fixture.personal.read")
-            .then(|| personal_m.capabilities().first().unwrap())
+            .then(|| (personal_m.capabilities().first().unwrap(), &personal_m))
             .or_else(|| {
                 builtin_m
                     .capabilities()
                     .iter()
                     .find(|c| c.id().as_str() == g)
+                    .map(|c| (c, &builtin_m))
             });
         match hit {
-            Some(c) => Lookup::One(c),
+            Some((c, m)) => Lookup::One {
+                capability: c,
+                manifest: m,
+                tier: &tier,
+            },
             None => Lookup::NotFound,
         }
     };
@@ -2611,7 +2732,7 @@ fn denied_globs_from_read_only_deny() {
 #[test]
 fn default_denies_cover_the_documented_globs() {
     let p = default_denies().unwrap();
-    assert_eq!(p.deny.len(), 8 * DEFAULT_DENY_GLOBS.len());
+    assert_eq!(p.deny.len(), 11 * DEFAULT_DENY_GLOBS.len());
     // Per capability: 10 globs each, capability-major order.
     for (cap, base) in [
         ("harness.fs.read", 0),
@@ -2622,6 +2743,9 @@ fn default_denies_cover_the_documented_globs() {
         ("harness.edit.replace", 50),
         ("harness.edit.write", 60),
         ("harness.edit.multi", 70),
+        ("harness.edit.patch", 80),
+        ("harness.edit.delete", 90),
+        ("harness.edit.move", 100),
     ] {
         let mut grants = vec![cap];
         if cap != "harness.fs.read" {
@@ -2716,4 +2840,1091 @@ fn fuzz_policy_parser_never_panics() {
 #[ignore]
 fn fuzz_policy_long_cases() {
     fuzz_policy_over_mutated_files(mutator::case_count(50_000));
+}
+
+// ---- P-23: session-scoped grants --------------------------------------------------
+
+/// A session allow grant applies to later calls matching its pattern — for
+/// the rest of the session, not once — and only to them.
+#[test]
+fn session_allow_applies_to_next_matching_call_only() {
+    let mut s = exec_session(true, &["cargo"], &UserPolicy::default());
+    let index = s.grant(
+        RuleList::Allow,
+        &CapId::new(EXEC_ID).unwrap(),
+        Matcher::argv_prefix(vec!["cargo".into(), "test".into()]).unwrap(),
+    );
+    assert_eq!(index, 0);
+    assert_eq!(
+        RuleId::Session {
+            list: RuleList::Allow,
+            index
+        }
+        .to_string(),
+        "session.allow.0"
+    );
+    // The matching call no longer asks — and not just the next one: the
+    // grant stands until the session ends.
+    for _ in 0..2 {
+        assert_eq!(
+            s.decide(&run(&["cargo", "test", "--offline"])),
+            PolicyDecision::Allow {
+                rule: RuleId::Session {
+                    list: RuleList::Allow,
+                    index: 0
+                }
+            }
+        );
+    }
+    // A non-matching call still asks under the built-in default.
+    assert_eq!(
+        s.decide(&run(&["cargo", "build"])),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+        }
+    );
+}
+
+/// The grant is matcher-bound: a different argv (even the same program) is
+/// not covered, and falls back to the ordinary decision order.
+#[test]
+fn session_allow_does_not_match_other_argv() {
+    let mut s = exec_session(true, &["cargo"], &UserPolicy::default());
+    s.grant(
+        RuleList::Allow,
+        &CapId::new(EXEC_ID).unwrap(),
+        Matcher::argv_prefix(vec!["cargo".into(), "test".into()]).unwrap(),
+    );
+    for argv in [vec!["cargo", "build"], vec!["cargo"]] {
+        assert!(
+            matches!(s.decide(&run(&argv)), PolicyDecision::Ask { .. }),
+            "{argv:?}"
+        );
+    }
+    // A different program is not covered either (and stays allowlisted-gated).
+    assert!(matches!(
+        s.decide(&run(&["cargo", "test"])),
+        PolicyDecision::Allow { .. }
+    ));
+    let mut other = exec_session(true, &["cargo", "rustc"], &UserPolicy::default());
+    other.grant(
+        RuleList::Allow,
+        &CapId::new(EXEC_ID).unwrap(),
+        Matcher::argv_prefix(vec!["cargo".into(), "test".into()]).unwrap(),
+    );
+    assert!(matches!(
+        other.decide(&run(&["rustc", "--version"])),
+        PolicyDecision::Ask { .. }
+    ));
+}
+
+/// A `protected_action` floor stands above any session grant: the class
+/// asks at the confirmation stage, before any allow list is consulted, so
+/// answering `a` at a prompt can never answer for a protected action.
+#[test]
+fn session_grant_never_covers_protected_action() {
+    let cap = json!({
+        "id": "fixture.protect",
+        "mcp_name": "protect",
+        "summary": "fixture protected capability",
+        "effect": "read", "sensitivity": "public", "blast_radius": "shared",
+        "egress": "none", "content": "own", "confirmation": "none",
+        "input_schema": {"type": "object", "additionalProperties": false,
+            "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        "schema_sha256": PIN, "description_sha256": PIN
+    });
+    let m = fixture(vec![cap]);
+    let mut sp = spec(&["fixture.protect"]);
+    sp.approver_present = true;
+    let mut s = plan_over(&[m], &sp, &UserPolicy::default()).unwrap();
+    s.grant(
+        RuleList::Allow,
+        &CapId::new("fixture.protect").unwrap(),
+        Matcher::path_glob("**").unwrap(),
+    );
+    let c = call("fixture.protect", json!({"path": "x"}));
+    assert_eq!(
+        s.decide(&c),
+        PolicyDecision::Ask {
+            tier: Confirmation::ProtectedAction,
+            rule: RuleId::Builtin("ask.confirmation-floor"),
+        }
+    );
+    assert!(s.authorize(c).is_err());
+}
+
+/// A session deny grant blocks a call a user allow matcher would let
+/// through, and its decision names the session rule; outside the denied
+/// pattern the allow still applies.
+#[test]
+fn denied_session_rule_blocks_later_allow_matcher() {
+    let policy = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
+    let mut s = edit_session(true, &policy);
+    assert!(matches!(
+        s.decide(&replace("src/lib.rs")),
+        PolicyDecision::Allow { .. }
+    ));
+    let index = s.grant(
+        RuleList::Deny,
+        &CapId::new("harness.edit.replace").unwrap(),
+        Matcher::path_glob("src/**").unwrap(),
+    );
+    assert_eq!(index, 0);
+    assert_eq!(
+        s.decide(&replace("src/lib.rs")),
+        PolicyDecision::Deny {
+            reason: DenyReason::SessionDenied,
+            rule: RuleId::Session {
+                list: RuleList::Deny,
+                index: 0
+            },
+        }
+    );
+    assert_eq!(
+        RuleId::Session {
+            list: RuleList::Deny,
+            index
+        }
+        .to_string(),
+        "session.deny.0"
+    );
+    assert!(matches!(
+        s.decide(&replace("docs/notes.md")),
+        PolicyDecision::Allow { .. }
+    ));
+}
+
+/// `--accept-edits` is refused when the pre-image store is missing;
+/// otherwise it appends one allow rule per edit capability, idempotently
+/// (replay re-applies the overlay to the already-overlaid policy).
+#[test]
+fn accept_edits_refused_without_pre_image_store() {
+    assert!(overlay_accept_edits(UserPolicy::default(), false).is_err());
+    let once = overlay_accept_edits(UserPolicy::default(), true).unwrap();
+    assert_eq!(once.allow.len(), EDIT_IDS.len());
+    for (index, id) in EDIT_IDS.iter().enumerate() {
+        assert!(
+            once.allow[index].selector.matches(&CapId::new(id).unwrap()),
+            "{id}"
+        );
+        assert!(once.allow[index]
+            .matcher
+            .as_ref()
+            .is_some_and(|m| m.matches(&json!({"path": "src/any.rs"}))));
+    }
+    let twice = overlay_accept_edits(once, true).unwrap();
+    assert_eq!(twice.allow.len(), EDIT_IDS.len());
+}
+
+// ---- P-39b: the web airlock (§2.2 item 3, §2.3) ---------------------------------
+
+/// A registry holding the research manifest (§2.2: a registry holds exactly
+/// one manifest).
+fn research_registry() -> Registry {
+    Registry::admit(vec![(
+        builtin::research_manifest(&ctx()).unwrap(),
+        Tier::Builtin,
+    )])
+    .unwrap()
+}
+
+/// A research session spec: the research manifest's grants, no workspace, no
+/// personal data, the session-start confirmation given (§2.2 item 3). One
+/// allowlist entry, `example.com` (https on 443), and a search endpoint.
+fn research_spec(grants: &[&str]) -> SessionSpec {
+    SessionSpec {
+        grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+        workspace: None,
+        approver_present: false,
+        personal_data_granted: false,
+        conformed: false,
+        exec_programs: Vec::new(),
+        read_window: None,
+        kind: SessionKind::Research(WebGrant {
+            allowlist: vec!["example.com".to_owned()],
+            search: true,
+            confirmed: Some(WebConfirmation::Tty),
+        }),
+    }
+}
+
+/// The registry refusal (§2.2): the coding manifest declares no web id, and
+/// a coding session granting one is refused by name before anything runs.
+#[test]
+fn coding_registry_has_no_web_capability() {
+    let reg = builtin_registry();
+    assert!(matches!(
+        reg.resolve(WEB_FETCH_ID),
+        harness_manifest::admission::Resolved::NotFound
+    ));
+    assert!(matches!(
+        reg.resolve(WEB_SEARCH_ID),
+        harness_manifest::admission::Resolved::NotFound
+    ));
+    assert_eq!(
+        Session::plan(&spec(&[WEB_FETCH_ID]), &reg, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::UnknownCapability(WEB_FETCH_ID.to_owned())
+    );
+}
+
+/// The trifecta refusal (§2.2): a workspace plus a web capability is the
+/// lethal triad, named from the labels themselves (P from the private
+/// workspace, U and E from the fetch). A public workspace is no trifecta,
+/// and a web session is still refused one (§2.2: it has no workspace).
+#[test]
+fn web_session_refused_with_workspace_grant() {
+    let mut sp = research_spec(&[WEB_FETCH_ID]);
+    sp.workspace = ws();
+    assert_eq!(
+        Session::plan(&sp, &research_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Trifecta {
+            private: "workspace".to_owned(),
+            untrusted: WEB_FETCH_ID.to_owned(),
+            egress: WEB_FETCH_ID.to_owned(),
+        }
+    );
+    let mut sp = research_spec(&[WEB_FETCH_ID]);
+    sp.workspace = Some(WorkspaceDecl {
+        declared_public: true,
+    });
+    assert_eq!(
+        Session::plan(&sp, &research_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Web(WebSessionRefused::WorkspaceGranted)
+    );
+}
+
+/// A research session grants only the four ids the research manifest
+/// declares (§2.2): no file tools, no edits, no command runner. Planned over
+/// both parsed manifests (the `plan_with` seam), since a real research
+/// registry could not resolve them at all.
+#[test]
+fn research_session_refuses_fs_edit_exec_grants() {
+    for g in ["harness.fs.read", "harness.edit.replace", EXEC_ID] {
+        let coding = builtin::manifest(&ctx()).unwrap();
+        let research = builtin::research_manifest(&ctx()).unwrap();
+        assert_eq!(
+            plan_over(
+                &[coding, research],
+                &research_spec(&[g]),
+                &UserPolicy::default()
+            )
+            .unwrap_err(),
+            SessionRefused::Web(WebSessionRefused::GrantOutsideResearch(g.to_owned())),
+            "{g}"
+        );
+    }
+}
+
+/// A personal capability in a web session is the trifecta (§2.2): P from
+/// the fixture cap, U and E from the fetch. The fixture is one the H1 gate
+/// would refuse, so the seam plans over it directly.
+#[test]
+fn research_session_with_personal_capability_refused_by_trifecta() {
+    let research = builtin::research_manifest(&ctx()).unwrap();
+    let personal = fixture(vec![cap_json(
+        "peek",
+        ["read", "personal", "own", "none", "own", "none"],
+    )]);
+    assert_eq!(
+        plan_over(
+            &[personal, research],
+            &research_spec(&["fixture.peek", WEB_FETCH_ID]),
+            &UserPolicy::default()
+        )
+        .unwrap_err(),
+        SessionRefused::Trifecta {
+            private: "fixture.peek".to_owned(),
+            untrusted: WEB_FETCH_ID.to_owned(),
+            egress: WEB_FETCH_ID.to_owned(),
+        }
+    );
+}
+
+/// The session-start confirmation (§2.3): without it the session is
+/// refused, whatever the grants. The egress floor is met once, for the
+/// allowlist, never per fetch.
+#[test]
+fn research_session_without_confirmation_refused() {
+    let mut sp = research_spec(&[WEB_FETCH_ID]);
+    sp.kind = SessionKind::Research(WebGrant {
+        allowlist: vec!["example.com".to_owned()],
+        search: true,
+        confirmed: None,
+    });
+    assert_eq!(
+        Session::plan(&sp, &research_registry(), &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Web(WebSessionRefused::Unconfirmed)
+    );
+}
+
+/// The web branch never asks (§2.3): over URL and query samples, with and
+/// without an approver, every decision is `Allow` or `Deny`. With no
+/// approver the allowlisted fetch and the search are still allowed: the
+/// confirmation happened at session start.
+#[test]
+fn web_decisions_never_ask() {
+    let reg = research_registry();
+    for approver in [false, true] {
+        let mut sp = research_spec(&[WEB_FETCH_ID, WEB_SEARCH_ID]);
+        sp.approver_present = approver;
+        let s = Session::plan(&sp, &reg, &UserPolicy::default()).unwrap();
+        for url in [
+            "https://example.com/docs",
+            "http://example.com:80/x",
+            "https://other.org/a",
+            "https://example.com:8443",
+            "notaurl",
+            "",
+            "https://192.0.2.1/",
+        ] {
+            let d = s.decide(&call(WEB_FETCH_ID, json!({ "url": url })));
+            assert!(!matches!(d, PolicyDecision::Ask { .. }), "{url}: {d:?}");
+        }
+        for q in ["rust async", "", "\u{202e}evil", &"x".repeat(257)] {
+            let d = s.decide(&call(WEB_SEARCH_ID, json!({ "query": q })));
+            assert!(!matches!(d, PolicyDecision::Ask { .. }), "{q}: {d:?}");
+        }
+        if !approver {
+            assert_eq!(
+                s.decide(&call(
+                    WEB_FETCH_ID,
+                    json!({ "url": "https://example.com/docs" })
+                )),
+                PolicyDecision::Allow {
+                    rule: RuleId::Builtin(WEB_ALLOWLIST_RULE)
+                }
+            );
+            assert_eq!(
+                s.decide(&call(WEB_SEARCH_ID, json!({ "query": "rust async" }))),
+                PolicyDecision::Allow {
+                    rule: RuleId::Builtin(WEB_SEARCH_RULE)
+                }
+            );
+        }
+    }
+}
+
+/// Per-fetch prompts are never offered (§2.2): an ask rule on a web
+/// capability refuses the session at planning.
+#[test]
+fn ask_rule_on_web_capability_refuses_session() {
+    let policy = policy_json(json!({
+        "deny": [],
+        "ask": [{"capability": WEB_FETCH_ID}],
+        "allow": []
+    }));
+    assert_eq!(
+        Session::plan(
+            &research_spec(&[WEB_FETCH_ID]),
+            &research_registry(),
+            &policy
+        )
+        .unwrap_err(),
+        SessionRefused::OutOfScope {
+            capability: WEB_FETCH_ID.to_owned(),
+            what: "ask rules on web capabilities (per-fetch prompts are never offered)",
+        }
+    );
+}
+
+/// The fetch branch names one rule per refusal (§2.3): the URL rule for a
+/// bad URL, scheme when the entry differs only in scheme, port when it
+/// differs only in port, and the host rule when no entry names the host.
+#[test]
+fn fetch_to_unlisted_host_denied_with_rule_id() {
+    let s = Session::plan(
+        &research_spec(&[WEB_FETCH_ID]),
+        &research_registry(),
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    let deny_web = |reason| PolicyDecision::Deny {
+        reason: DenyReason::Web(reason),
+        rule: RuleId::Builtin("deny.web.host-not-allowlisted"),
+    };
+    assert_eq!(
+        s.decide(&call(WEB_FETCH_ID, json!({ "url": "https://other.org/a" }))),
+        deny_web(WebCallRefused::HostNotAllowlisted)
+    );
+    let scheme_deny = |reason, name| PolicyDecision::Deny {
+        reason: DenyReason::Web(reason),
+        rule: RuleId::Builtin(name),
+    };
+    assert_eq!(
+        s.decide(&call(
+            WEB_FETCH_ID,
+            json!({ "url": "http://example.com:443" })
+        )),
+        scheme_deny(WebCallRefused::Scheme, "deny.web.scheme")
+    );
+    assert_eq!(
+        s.decide(&call(
+            WEB_FETCH_ID,
+            json!({ "url": "https://example.com:8443" })
+        )),
+        scheme_deny(WebCallRefused::Port, "deny.web.port")
+    );
+    assert_eq!(
+        s.decide(&call(WEB_FETCH_ID, json!({ "url": "ftp://example.com/" }))),
+        scheme_deny(WebCallRefused::Url(UrlRefused::Scheme), "deny.web.url")
+    );
+}
+
+/// The search query's bounds are policy's (§2.3): the schema's `maxLength`
+/// alone would let an empty or invisibly corrupted query through; and a
+/// session with no search endpoint is refused by name.
+#[test]
+fn search_query_bounds_enforced() {
+    let s = Session::plan(
+        &research_spec(&[WEB_SEARCH_ID]),
+        &research_registry(),
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    for q in ["", "\u{202e}evil", "a\u{0}"] {
+        assert_eq!(
+            s.decide(&call(WEB_SEARCH_ID, json!({ "query": q }))),
+            PolicyDecision::Deny {
+                reason: DenyReason::Web(WebCallRefused::Query),
+                rule: RuleId::Builtin("deny.web.query"),
+            },
+            "{q}"
+        );
+    }
+    // 257 characters never reach the branch: the schema's `maxLength`
+    // refuses them first, one layer earlier.
+    let too_long = "x".repeat(257);
+    assert!(is_deny(
+        &s.decide(&call(WEB_SEARCH_ID, json!({ "query": too_long }))),
+        &DenyReason::Args(ArgsError {
+            at: "/query".into(),
+            detail: "longer than maxLength 256".into(),
+        })
+    ));
+    // 256 characters is allowed.
+    let max = "x".repeat(256);
+    assert_eq!(
+        s.decide(&call(WEB_SEARCH_ID, json!({ "query": max }))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin(WEB_SEARCH_RULE)
+        }
+    );
+    // No search endpoint configured: refused by name.
+    let mut sp = research_spec(&[WEB_SEARCH_ID]);
+    sp.kind = SessionKind::Research(WebGrant {
+        allowlist: vec!["example.com".to_owned()],
+        search: false,
+        confirmed: Some(WebConfirmation::Flag),
+    });
+    let s = Session::plan(&sp, &research_registry(), &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call(WEB_SEARCH_ID, json!({ "query": "rust" }))),
+        PolicyDecision::Deny {
+            reason: DenyReason::Web(WebCallRefused::NoSearchEndpoint),
+            rule: RuleId::Builtin("deny.web.no-search-endpoint"),
+        }
+    );
+}
+
+/// Defence in depth (§2.2): egress is still out of scope in coding
+/// sessions, for any provider's internet capability, and a web id is
+/// refused by name even over the seam a registry cannot admit.
+#[test]
+fn egress_still_out_of_scope_in_coding_sessions() {
+    let m = fixture(vec![cap_json(
+        "ping",
+        [
+            "read",
+            "operational",
+            "own",
+            "internet",
+            "third_party",
+            "none",
+        ],
+    )]);
+    let mut sp = spec(&["fixture.ping"]);
+    sp.workspace = None; // keep the trifecta out of the way
+    assert_eq!(
+        plan_over(&[m], &sp, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::OutOfScope {
+            capability: "fixture.ping".to_owned(),
+            what: "egress (the allowlist proxy is H4)",
+        }
+    );
+    let research = builtin::research_manifest(&ctx()).unwrap();
+    let mut sp = spec(&[WEB_FETCH_ID]);
+    sp.workspace = None;
+    assert_eq!(
+        plan_over(&[research], &sp, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Web(WebSessionRefused::WebGrantInCoding(WEB_FETCH_ID.to_owned()))
+    );
+}
+
+/// The registration table (P-39b): the web entries append after the coding
+/// table, which keeps its ids and kinds (the delegate row sits between todo
+/// and submit, P-38; the default decisions themselves are pinned by
+/// `policy_default_table_unchanged`, which iterates the twelve coding ids),
+/// and the default deny table is untouched.
+#[test]
+fn web_entries_append_after_the_coding_table() {
+    const WANT: [(&str, crate::builtin::ToolKind); 15] = [
+        ("harness.fs.read", crate::builtin::ToolKind::Fs),
+        ("harness.fs.search", crate::builtin::ToolKind::Fs),
+        ("harness.fs.glob", crate::builtin::ToolKind::Fs),
+        ("harness.fs.list", crate::builtin::ToolKind::Fs),
+        ("harness.fs.outline", crate::builtin::ToolKind::Fs),
+        ("harness.edit.replace", crate::builtin::ToolKind::Edit),
+        ("harness.edit.write", crate::builtin::ToolKind::Edit),
+        ("harness.edit.multi", crate::builtin::ToolKind::Edit),
+        ("harness.edit.patch", crate::builtin::ToolKind::Edit),
+        ("harness.edit.delete", crate::builtin::ToolKind::Edit),
+        ("harness.edit.move", crate::builtin::ToolKind::Edit),
+        ("harness.exec.run", crate::builtin::ToolKind::Exec),
+        ("harness.task.todo", crate::builtin::ToolKind::Todo),
+        ("harness.task.delegate", crate::builtin::ToolKind::Delegate),
+        ("harness.task.submit", crate::builtin::ToolKind::Submit),
+    ];
+    for (t, want) in crate::builtin::BUILTIN_TOOLS.iter().zip(WANT) {
+        assert_eq!(t.id, want.0);
+        assert_eq!(t.kind, want.1);
+    }
+    assert_eq!(crate::builtin::BUILTIN_TOOLS.len(), 17);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS[15].id, WEB_FETCH_ID);
+    assert_eq!(crate::builtin::BUILTIN_TOOLS[16].id, WEB_SEARCH_ID);
+    assert!(matches!(
+        crate::builtin::BUILTIN_TOOLS[15].kind,
+        crate::builtin::ToolKind::Web
+    ));
+    assert!(matches!(
+        crate::builtin::BUILTIN_TOOLS[16].kind,
+        crate::builtin::ToolKind::Web
+    ));
+    assert_eq!(DEFAULT_DENY_GLOBS.len(), 10);
+}
+
+// ---- P-25: the delete/move file operations --------------------------------------
+
+/// The file operations declare `user_confirm`, so the confirmation floor
+/// asks no matter what the user's rules say: an allow rule (a section-3
+/// check) can never reach them, and with no approver they deny.
+#[test]
+fn delete_move_ask_always_not_allow_listed() {
+    let r = builtin_registry();
+    let grants = spec(&[
+        "harness.fs.read",
+        "harness.edit.delete",
+        "harness.edit.move",
+    ]);
+    let p = UserPolicy::new(&[], &[], &["harness.edit.delete", "harness.edit.move"]).unwrap();
+
+    // No approver: the ask floor is a deny, allow rules unreachable.
+    let s = Session::plan(&grants, &r, &p).unwrap();
+    for (cap, args) in [
+        ("harness.edit.delete", json!({"path": "a.txt"})),
+        ("harness.edit.move", json!({"path": "a.txt", "to": "b.txt"})),
+    ] {
+        assert!(
+            is_deny(&s.decide(&call(cap, args)), &DenyReason::NoApprover),
+            "{cap} allow-listed anyway"
+        );
+    }
+
+    // With an approver the ask is the floor's, never the user's rule.
+    let mut asker = grants;
+    asker.approver_present = true;
+    let s = Session::plan(&asker, &r, &p).unwrap();
+    assert_eq!(
+        s.decide(&call("harness.edit.delete", json!({"path": "a.txt"}))),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin("ask.confirmation-floor")
+        },
+    );
+    assert_eq!(
+        s.decide(&call(
+            "harness.edit.move",
+            json!({"path": "a.txt", "to": "b.txt"})
+        )),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin("ask.confirmation-floor")
+        },
+    );
+
+    // Deny rules still win (section 1) before the ask.
+    let p = UserPolicy::new(&["harness.edit.delete"], &[], &[]).unwrap();
+    let s = Session::plan(&asker, &r, &p).unwrap();
+    assert!(is_deny(
+        &s.decide(&call("harness.edit.delete", json!({"path": "a.txt"}))),
+        &DenyReason::UserDenied
+    ));
+}
+
+/// A move's `to` path is a workspace path like `path`: outside the
+/// workspace it denies, a `path_glob` deny rule on it denies, and a
+/// `path_glob` ask rule on it raises the ask floor.
+#[test]
+fn move_target_paths_are_checked_like_the_source() {
+    let r = builtin_registry();
+    let grants = spec(&["harness.fs.read", "harness.edit.move"]);
+    let args = json!({"path": "a.txt", "to": "../escape.txt"});
+
+    // Outside the workspace, allow rule or not.
+    let p = UserPolicy::new(&[], &[], &["harness.edit.move"]).unwrap();
+    let s = Session::plan(&grants, &r, &p).unwrap();
+    assert!(is_deny(
+        &s.decide(&call("harness.edit.move", args)),
+        &DenyReason::Path(PathRefused::Parent)
+    ));
+
+    // A deny glob on the target denies (the source is harmless).
+    let mut sp = grants.clone();
+    sp.approver_present = true;
+    let p = UserPolicy::from_json(&json!({
+        "deny": [{"capability": "harness.edit.move", "match": {"path_glob": "secret/**"}}]
+    }))
+    .unwrap();
+    let s = Session::plan(&sp, &r, &p).unwrap();
+    assert!(is_deny(
+        &s.decide(&call(
+            "harness.edit.move",
+            json!({"path": "a.txt", "to": "secret/b.txt"})
+        )),
+        &DenyReason::UserDenied
+    ));
+
+    // An ask glob on the target asks even though the source is allowed.
+    let p = UserPolicy::from_json(&json!({
+        "ask": [{"capability": "harness.edit.move", "match": {"path_glob": "secret/**"}}],
+        "allow": ["harness.edit.move"]
+    }))
+    .unwrap();
+    let s = Session::plan(&sp, &r, &p).unwrap();
+    assert_eq!(
+        s.decide(&call(
+            "harness.edit.move",
+            json!({"path": "a.txt", "to": "secret/b.txt"})
+        )),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::User {
+                list: RuleList::Ask,
+                index: 0
+            }
+        }
+    );
+}
+
+// ---- P-37b: policy planning for MCP capabilities (§5.4, §6.3, §9 step 1) ------
+
+#[test]
+fn mcp_capability_without_conformed_refused_at_planning() {
+    let m = fixture(vec![cap_json("read", READ_OWN)]);
+    let r = pinned(m);
+    let mut sp = spec(&["fixture.read"]);
+    // INV-6: the capability is a confined server process; no `Conformed`
+    // witness, no session, at planning, before anything starts.
+    sp.conformed = false;
+    assert_eq!(
+        Session::plan(&sp, &r, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::NoConfinement("fixture.read".into())
+    );
+    // With a witness the read plans; there is no unconfined fallback.
+    sp.conformed = true;
+    assert!(Session::plan(&sp, &r, &UserPolicy::default()).is_ok());
+}
+
+#[test]
+fn pinned_tier_read_capability_asks_by_default() {
+    let m = fixture(vec![cap_json("read", READ_OWN)]);
+    let r = pinned(m);
+    // §6.3: every pinned capability gets the derived floor `user_confirm`,
+    // so it asks unless a user rule covers it — even a plain read that a
+    // built-in tool would default-allow.
+    let mut sp = spec(&["fixture.read"]);
+    sp.approver_present = true;
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call("fixture.read", json!({}))),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(MCP_DEFAULT_RULE),
+        }
+    );
+    // With nobody to answer, the ask is a deny (§5.2).
+    sp.approver_present = false;
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    assert!(is_deny(
+        &s.decide(&call("fixture.read", json!({}))),
+        &DenyReason::NoApprover
+    ));
+}
+
+#[test]
+fn pinned_tier_allow_rule_allows_unattended() {
+    let m = fixture(vec![cap_json("read", READ_OWN)]);
+    let r = pinned(m);
+    for selector in ["fixture.read", "fixture.*"] {
+        let p = UserPolicy::new(&[], &[], &[selector]).unwrap();
+        let mut sp = spec(&["fixture.read"]);
+        sp.approver_present = false;
+        let s = Session::plan(&sp, &r, &p).unwrap();
+        // The allow rule is consulted before the pinned default ask, so
+        // the capability runs with no approver present.
+        assert_eq!(
+            s.decide(&call("fixture.read", json!({}))),
+            PolicyDecision::Allow {
+                rule: RuleId::User {
+                    list: RuleList::Allow,
+                    index: 0
+                }
+            },
+            "{selector}"
+        );
+        assert!(
+            s.authorize(call("fixture.read", json!({}))).is_ok(),
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn mcp_protected_action_never_allowed_by_rule() {
+    // A derived `protected_action` floor (blast radius shared here; an
+    // `irreversible` effect refuses at planning, above). Admission would
+    // refuse a pinned manifest that declares `shared`, so this plans over
+    // the seam — the decision order must still never lower the floor.
+    let m = fixture(vec![cap_json(
+        "w",
+        ["write", "operational", "shared", "none", "own", "none"],
+    )]);
+    let p = UserPolicy::new(&[], &[], &["fixture.*"]).unwrap();
+    let mut sp = spec(&["fixture.w"]);
+    sp.workspace = None;
+    sp.approver_present = true;
+    let s = plan_over(std::slice::from_ref(&m), &sp, &p).unwrap();
+    assert_eq!(
+        s.class("fixture.w").unwrap().confirmation,
+        Confirmation::ProtectedAction
+    );
+    // The floor asks at step 2, BEFORE any allow rule: the user allow
+    // above can never allow it.
+    assert_eq!(
+        s.decide(&call("fixture.w", json!({}))),
+        PolicyDecision::Ask {
+            tier: Confirmation::ProtectedAction,
+            rule: RuleId::Builtin("ask.confirmation-floor"),
+        }
+    );
+    assert!(s.authorize(call("fixture.w", json!({}))).is_err());
+}
+
+#[test]
+fn mcp_write_capability_plans_and_asks() {
+    let m = fixture(vec![cap_json(
+        "w",
+        ["write", "operational", "own", "none", "own", "none"],
+    )]);
+    let r = pinned(m);
+    // Planning succeeds where a non-mcp write is refused: the provider
+    // declared the class, and the pinned default decides it.
+    let mut sp = spec(&["fixture.w"]);
+    sp.approver_present = true;
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call("fixture.w", json!({}))),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(MCP_DEFAULT_RULE),
+        }
+    );
+    assert!(matches!(
+        s.authorize(call("fixture.w", json!({}))),
+        Err(PolicyDecision::Ask { .. })
+    ));
+    // No approver: the ask is a deny (§5.2).
+    sp.approver_present = false;
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    assert!(is_deny(
+        &s.decide(&call("fixture.w", json!({}))),
+        &DenyReason::NoApprover
+    ));
+}
+
+#[test]
+fn mcp_egress_capability_refused_until_proxy() {
+    let m = fixture(vec![cap_json(
+        "fetch",
+        ["read", "public", "own", "internet", "third_party", "none"],
+    )]);
+    let r = pinned(m);
+    let mut sp = spec(&["fixture.fetch"]);
+    sp.workspace = None; // keep the trifecta out of the way: this is egress
+    assert_eq!(
+        Session::plan(&sp, &r, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::OutOfScope {
+            capability: "fixture.fetch".into(),
+            what: "egress (the allowlist proxy is H4)",
+        }
+    );
+    // The lift is per process: even the granted sibling of an egress tool
+    // carries its egress label, so the session refuses all the same.
+    let m = fixture(vec![
+        cap_json("read", READ_OWN),
+        cap_json(
+            "fetch",
+            ["read", "public", "own", "lan", "third_party", "none"],
+        ),
+    ]);
+    let r = pinned(m);
+    let mut sp = spec(&["fixture.read"]);
+    sp.workspace = None;
+    assert!(matches!(
+        Session::plan(&sp, &r, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::OutOfScope {
+            what: "egress (the allowlist proxy is H4)",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn process_label_lift_marks_sibling_capability_third_party() {
+    // One manifest, two tools, only the own-content one granted: the
+    // labels are per PROCESS (§5.4), so the granted capability carries
+    // its sibling's third-party content.
+    let m = fixture(vec![
+        cap_json("read", READ_OWN),
+        cap_json(
+            "readweb",
+            ["read", "operational", "own", "none", "third_party", "none"],
+        ),
+    ]);
+    let r = pinned(m);
+    let sp = spec(&["fixture.read"]);
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.class("fixture.read").unwrap().content,
+        Content::ThirdParty
+    );
+    // The lifted labels feed the trifecta: with the workspace supplying P
+    // and the process supplying U and E through the GRANTED capability,
+    // the session refuses and names the granted capability as the source.
+    let m = fixture(vec![
+        cap_json("read", READ_OWN),
+        cap_json(
+            "readweb",
+            ["read", "operational", "own", "none", "third_party", "none"],
+        ),
+        cap_json(
+            "net",
+            ["read", "public", "own", "internet", "third_party", "none"],
+        ),
+    ]);
+    let r = pinned(m);
+    assert_eq!(
+        Session::plan(&sp, &r, &UserPolicy::default()).unwrap_err(),
+        SessionRefused::Trifecta {
+            private: "workspace".into(),
+            untrusted: "fixture.read".into(),
+            egress: "fixture.read".into(),
+        }
+    );
+    // Sensitivity lifts the same way (the seam: admission refuses a pinned
+    // manifest that declares personal data, the decision order still sees it).
+    let m = fixture(vec![
+        cap_json("read", READ_OWN),
+        cap_json(
+            "contacts",
+            ["read", "personal", "own", "none", "own", "none"],
+        ),
+    ]);
+    let s = plan_over(
+        std::slice::from_ref(&m),
+        &spec(&["fixture.read"]),
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        s.class("fixture.read").unwrap().sensitivity,
+        Sensitivity::Personal
+    );
+}
+
+#[test]
+fn quarantined_mcp_capability_denied_with_rule_id() {
+    let m = fixture(vec![cap_json("read", READ_OWN)]);
+    let r = pinned(m);
+    let mut s = Session::plan(&spec(&["fixture.read"]), &r, &UserPolicy::default()).unwrap();
+    s.quarantine(&CapId::new("fixture.read").unwrap()).unwrap();
+    assert_eq!(
+        s.decide(&call("fixture.read", json!({}))),
+        PolicyDecision::Deny {
+            reason: DenyReason::Quarantined,
+            rule: RuleId::Builtin("deny.quarantined"),
+        }
+    );
+}
+
+#[test]
+fn quarantine_recomputes_trifecta_and_never_widens() {
+    // A planned session whose trifecta inputs are the lifted labels plus
+    // the workspace: removing capabilities can only shrink them, so every
+    // quarantine recomputes to Ok, and the survivors' labels never widen.
+    let m = fixture(vec![
+        cap_json("read", READ_OWN),
+        cap_json(
+            "readweb",
+            ["read", "operational", "own", "none", "third_party", "none"],
+        ),
+    ]);
+    let r = pinned(m);
+    let mut s = Session::plan(
+        &spec(&["fixture.read", "fixture.readweb"]),
+        &r,
+        &UserPolicy::default(),
+    )
+    .unwrap();
+    let before = s.class("fixture.readweb").unwrap();
+    for id in ["fixture.read", "fixture.readweb"] {
+        assert!(
+            s.quarantine(&CapId::new(id).unwrap()).is_ok(),
+            "{id}: removal widened the trifecta"
+        );
+    }
+    assert_eq!(
+        s.class("fixture.readweb").unwrap(),
+        before,
+        "labels never widen"
+    );
+    // The recompute is real: over a set (unreachable by planning) that
+    // still holds P ∧ U ∧ E after a removal, it refuses and names the
+    // surviving egress source.
+    let mut active = BTreeMap::new();
+    for (verb, dims) in [
+        ("p", ["read", "personal", "own", "none", "own", "none"]),
+        (
+            "u",
+            ["read", "public", "own", "none", "third_party", "none"],
+        ),
+        ("e1", ["read", "public", "own", "lan", "own", "none"]),
+        ("e2", ["read", "public", "own", "internet", "own", "none"]),
+    ] {
+        let fm = fixture(vec![cap_json(verb, dims)]);
+        let c = &fm.capabilities()[0];
+        active.insert(
+            c.id().clone(),
+            Active {
+                class: effective_class(c, Confirmation::None),
+                schema: c.input_schema().clone(),
+                user_deny: Vec::new(),
+                user_ask: Vec::new(),
+                user_allow: Vec::new(),
+                fs_tool: false,
+                submit: false,
+                todo: false,
+                delegate: false,
+                edit: false,
+                exec: false,
+                web_fetch: false,
+                web_search: false,
+                mcp: false,
+            },
+        );
+    }
+    let mut s = Session {
+        active,
+        quarantined: BTreeSet::new(),
+        approver_present: true,
+        personal_granted: true,
+        conformed: true,
+        exec_programs: BTreeSet::new(),
+        read_window: None,
+        session_deny: BTreeMap::new(),
+        session_allow: BTreeMap::new(),
+        web: None,
+        workspace: None,
+    };
+    assert_eq!(
+        s.quarantine(&CapId::new("fixture.e1").unwrap()),
+        Err(SessionRefused::Trifecta {
+            private: "fixture.p".into(),
+            untrusted: "fixture.u".into(),
+            egress: "fixture.e2".into(),
+        })
+    );
+    // The refused recompute still quarantined the capability it named.
+    assert!(is_deny(
+        &s.decide(&call("fixture.e1", json!({}))),
+        &DenyReason::Quarantined
+    ));
+}
+
+#[test]
+fn builtin_decisions_unchanged() {
+    // P-37b touches the mcp-stdio rows only; the built-in tools decide
+    // exactly as before, rule ids included.
+    let r = builtin_registry();
+    let mut sp = spec(&[
+        "harness.fs.read",
+        "harness.edit.replace",
+        "harness.exec.run",
+        "harness.task.submit",
+        "harness.task.todo",
+    ]);
+    sp.approver_present = true;
+    sp.conformed = true;
+    sp.exec_programs = vec!["cargo".to_owned()];
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    assert_eq!(
+        s.decide(&call("harness.fs.read", json!({"path": "a"}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.default.read")
+        }
+    );
+    assert_eq!(
+        s.decide(&call(
+            "harness.edit.replace",
+            json!({"path": "a", "old": "x", "new": "y"})
+        )),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
+        }
+    );
+    assert_eq!(
+        s.decide(&call(
+            "harness.exec.run",
+            json!({"argv": ["cargo", "test"], "cwd": "."})
+        )),
+        PolicyDecision::Ask {
+            tier: Confirmation::UserConfirm,
+            rule: RuleId::Builtin(EXEC_DEFAULT_RULE),
+        }
+    );
+    assert_eq!(
+        s.decide(&call("harness.task.submit", json!({"note": "done"}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.task-submit")
+        }
+    );
+    assert_eq!(
+        s.decide(&call("harness.task.todo", json!({}))),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin(TODO_RULE)
+        }
+    );
+    // An ungranted capability denies as before, and so do bad arguments.
+    assert!(is_deny(
+        &s.decide(&call("fixture.read", json!({}))),
+        &DenyReason::NotGranted
+    ));
+    assert!(matches!(
+        s.decide(&call("harness.fs.read", json!({}))),
+        PolicyDecision::Deny {
+            reason: DenyReason::Args(_),
+            rule: RuleId::Builtin("deny.args-schema"),
+        }
+    ));
 }

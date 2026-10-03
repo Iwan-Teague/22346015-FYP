@@ -841,7 +841,7 @@ fn result_of(cap: &str, out: Out) -> ToolResult {
         output: Untrusted::new(out.text.into_bytes(), Source::Tool(cap.to_owned())),
         truncated: false,
         read: None,
-        edit: None,
+        edits: Vec::new(),
         exec: None,
     }
 }
@@ -932,7 +932,7 @@ impl ToolProvider for ExecTools<'_> {
             output: Untrusted::new(text.into_bytes(), Source::Tool(cap.to_owned())),
             truncated: cut,
             read: None,
-            edit: None,
+            edits: Vec::new(),
             exec: Some(ExecRecord {
                 end,
                 cleanup,

@@ -60,6 +60,7 @@ pub mod driver;
 pub mod presubmit;
 pub mod replay;
 mod sample;
+pub mod scratch;
 pub mod session;
 
 pub use approve::{ApprovalAnswer, Approver, ApproverKind};

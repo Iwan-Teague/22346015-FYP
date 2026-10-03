@@ -75,7 +75,7 @@ impl ToolProvider for Canned {
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
             read: None,
-            edit: None,
+            edits: Vec::new(),
             exec: None,
         })
     }

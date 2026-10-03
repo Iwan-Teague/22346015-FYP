@@ -24,16 +24,24 @@
 //!   file-write*` on FIFOs anywhere (the OD-5 draft's FT-27: a FIFO in a
 //!   granted root is otherwise a channel); `deny network*`: no connect, no
 //!   bind, no listen, no unix-socket connect (FT-1, FT-11, FT-15, D31).
+//! - Port grants (P-36a, §4.3) come AFTER that deny, because later rules
+//!   win (measured, E6): `network-bind`/`network-inbound` per granted
+//!   port (`localhost:<p>`, or `*:<p>` for the LAN members) and
+//!   `network-outbound` per connect port.
 //! - With a [`Network::Proxy`][crate::spec::Network::Proxy] grant, one
-//!   final allow after the deny (later rules override earlier ones, E6):
-//!   `network-outbound` to `localhost:<port>` and nothing else — the
-//!   harness's loopback pump port (§5.3; spelling measured on this host,
-//!   SBPL refuses a numeric host in `(remote ip ...)`). The fetcher dials
-//!   `127.0.0.1:<port>` (§5.2); every other loopback port, IPv6 loopback,
-//!   the resolver and bind stay denied (FT-13-proxy, FT-15-proxy, FT-19,
-//!   FT-20).
+//!   allow after the grants: `network-outbound` to `localhost:<port>` and
+//!   nothing else — the harness's loopback pump port (§5.3; spelling
+//!   measured on this host, SBPL refuses a numeric host in
+//!   `(remote ip ...)`). The fetcher dials `127.0.0.1:<port>` (§5.2);
+//!   every other loopback port, IPv6 loopback, the resolver and bind stay
+//!   denied (FT-13-proxy, FT-15-proxy, FT-19, FT-20).
+//! - Last of all, one final `deny network*` per reserved port (the model
+//!   port at least, INV-41), so even a renderer bug that let a reserved
+//!   port into a grant is overridden. With `Network::None` (and no
+//!   reserved ports) none of this renders: the profile is byte-identical
+//!   to the pre-ports one (golden test).
 
-use crate::spec::{policy_safe, Validated};
+use crate::spec::{policy_safe, Ports, Validated};
 
 /// A path that should have been `policy_safe` reached profile rendering. It
 /// cannot happen after [`crate::spec::validate`] (which refuses such paths),
@@ -81,15 +89,21 @@ fn ancestors(root: &str) -> Vec<String> {
     out
 }
 
-/// The profile text for `v`, plus the proxy overlay for `proxy_port` (the
-/// granted pump port of a [`Network::Proxy`][crate::spec::Network::Proxy]
-/// spec; `None` renders byte-identically to the deny-all form). The caller
-/// passes the port only of a spec that [`crate::spec::validate`] accepted.
-/// `Err` only if a path is not safe to quote, which validate already
-/// refuses, so in practice this is infallible; returning a `Result` keeps
-/// the guard real in release builds (LOW-5) instead of a skipped
-/// `debug_assert!`.
-pub fn render(v: &Validated, proxy_port: Option<u16>) -> Result<String, UnsafePath> {
+/// The profile text for the validated spec `v` with its approved port
+/// grants `ports`, the reserved ports `reserved` no rule may allow, and
+/// the proxy overlay for `proxy_port` (the granted pump port of a
+/// [`Network::Proxy`][crate::spec::Network::Proxy] spec; `None` adds
+/// nothing). The caller passes the port and grants only of a spec
+/// [`crate::spec::validate`] accepted. `Err` only if a path is not safe
+/// to quote, which validate already refuses, so in practice this is
+/// infallible; returning a `Result` keeps the guard real in release builds
+/// (LOW-5) instead of a skipped `debug_assert!`.
+pub fn render(
+    v: &Validated,
+    ports: &Ports,
+    reserved: &[u16],
+    proxy_port: Option<u16>,
+) -> Result<String, UnsafePath> {
     let mut p = String::new();
     p.push_str(&format!(
         "(version 1)\n; {PROFILE_VERSION}\n(deny default)\n"
@@ -148,9 +162,43 @@ pub fn render(v: &Validated, proxy_port: Option<u16>) -> Result<String, UnsafePa
     }
     p.push_str("(deny file-read* file-write* (vnode-type FIFO))\n");
     p.push_str("(deny network*)\n");
+    // The port grants (§4.3): AFTER the deny, because later rules win
+    // (measured, E6). Ports are plain decimal numbers, so nothing here can
+    // carry an unsafe path. The loopback-only form (`localhost:<p>`) is
+    // what the port probe measures first (P-36a): whether it covers ::1
+    // and refuses a wildcard bind is recorded on the host that mints the
+    // port cases, and a wildcard bind is allowed only for the lan members.
+    for port in &ports.bind {
+        if ports.lan.contains(port) {
+            continue;
+        }
+        p.push_str(&format!(
+            "(allow network-bind network-inbound (local tcp \"localhost:{port}\"))\n"
+        ));
+    }
+    for port in &ports.lan {
+        p.push_str(&format!(
+            "(allow network-bind network-inbound (local tcp \"*:{port}\"))\n"
+        ));
+    }
+    for port in &ports.connect {
+        p.push_str(&format!(
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
+        ));
+    }
+    // The proxy overlay (§5.3): the granted pump port, spelled `localhost`
+    // (SBPL refuses a numeric host in `(remote ip ...)`, measured on this
+    // host). Only loopback outbound opens; bind stays denied.
     if let Some(port) = proxy_port {
         p.push_str(&format!(
             "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+    }
+    // The reserved-port backstop (§4.3): LAST, so a renderer bug that let
+    // a reserved port into a grant is overridden by a later deny (INV-41).
+    for m in reserved {
+        p.push_str(&format!(
+            "(deny network* (remote tcp \"localhost:{m}\") (local tcp \"*:{m}\"))\n"
         ));
     }
     Ok(p)
@@ -174,9 +222,36 @@ mod tests {
         }
     }
 
+    fn render_none(f: &Validated) -> String {
+        render(f, &Ports::default(), &[], None).unwrap()
+    }
+
+    #[test]
+    fn network_none_profile_unchanged_byte_for_byte() {
+        // Golden: with no port grant and no reserved port, the profile is
+        // byte-identical to the pre-ports renderer, so every exec profile
+        // and the live probe digest are unchanged (§4.3).
+        let want = "(version 1)\n\
+                    ; rh-seatbelt/1\n\
+                    (deny default)\n\
+                    (allow process-fork)\n\
+                    (allow process-exec (literal \"/usr/bin/perl\") (subpath \"/bin\") (subpath \"/usr/bin\") (subpath \"/usr/sbin\") (subpath \"/usr/libexec\") (subpath \"/opt/tool\") (subpath \"/w/ws\"))\n\
+                    (allow signal (target same-sandbox))\n\
+                    (allow process-info* (target self))\n\
+                    (allow sysctl-read)\n\
+                    (allow file-read* (literal \"/\") (subpath \"/usr\") (subpath \"/System\") (subpath \"/bin\") (subpath \"/private/var/select\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\") (subpath \"/opt/tool\") (subpath \"/w/ws\"))\n\
+                    (allow file-read-metadata (literal \"/opt\") (literal \"/w\"))\n\
+                    (allow file-write-data (literal \"/dev/null\"))\n\
+                    (allow file-write* (subpath \"/w/ws\"))\n\
+                    (deny file-write* (subpath \"/w/ws/.git\"))\n\
+                    (deny file-read* file-write* (vnode-type FIFO))\n\
+                    (deny network*)\n";
+        assert_eq!(render_none(&v()), want);
+    }
+
     #[test]
     fn deny_default_with_overrides_last() {
-        let p = render(&v(), None).unwrap();
+        let p = render_none(&v());
         assert!(p.contains("(deny default)"));
         assert!(!p.contains("(allow default)"));
         assert!(!p.contains("mach-lookup"));
@@ -194,7 +269,7 @@ mod tests {
 
     #[test]
     fn read_only_roots_are_not_writable_and_ancestors_are_metadata_only() {
-        let p = render(&v(), None).unwrap();
+        let p = render_none(&v());
         assert!(!p.contains("(allow file-write* (subpath \"/opt/tool\")"));
         assert!(p.contains("(allow file-read-metadata (literal \"/opt\") (literal \"/w\"))"));
         assert_eq!(
@@ -212,7 +287,60 @@ mod tests {
         assert!(matches!(q("/a\"b"), Err(UnsafePath(_))));
         let mut bad = v();
         bad.read_write.push("/w/ws/a\"b".to_string());
-        assert!(matches!(render(&bad, None), Err(UnsafePath(_))));
+        assert!(matches!(
+            render(&bad, &Ports::default(), &[], None),
+            Err(UnsafePath(_))
+        ));
+    }
+
+    #[test]
+    fn render_puts_port_allows_after_network_deny_and_reserved_deny_last() {
+        // 5173 is loopback-only, 8000 is the LAN member (a `*` rule, and no
+        // `localhost` allow of its own), 5173 is also a connect target, and
+        // 11434 stands in for the model port: its deny is the last rule of
+        // the whole profile (§4.3, INV-41).
+        let ports = Ports {
+            bind: vec![5173, 8000],
+            connect: vec![5173],
+            lan: vec![8000],
+        };
+        let p = render(&v(), &ports, &[11434], None).unwrap();
+        let net = p.find("(deny network*)\n").unwrap();
+        let bind5173 = p
+            .find("(allow network-bind network-inbound (local tcp \"localhost:5173\"))\n")
+            .unwrap();
+        let bind8000 = p
+            .find("(allow network-bind network-inbound (local tcp \"*:8000\"))\n")
+            .unwrap();
+        let out5173 = p
+            .find("(allow network-outbound (remote tcp \"localhost:5173\"))\n")
+            .unwrap();
+        let deny11434 = p
+            .find("(deny network* (remote tcp \"localhost:11434\") (local tcp \"*:11434\"))\n")
+            .unwrap();
+        assert!(net < bind5173 && bind5173 < bind8000 && bind8000 < out5173 && out5173 < deny11434);
+        assert!(
+            p.ends_with(
+                "(deny network* (remote tcp \"localhost:11434\") (local tcp \"*:11434\"))\n"
+            ),
+            "the reserved deny is the profile's last rule"
+        );
+        // The lan member never gets a loopback allow of its own, and the
+        // reserved port is never allowed in any list.
+        assert!(!p.contains("(local tcp \"localhost:8000\")"));
+        assert!(!p.contains(":11434\"))\n(allow"));
+        // Multiple reserved ports each get their final deny.
+        let p = render(&v(), &ports, &[11434, 9999], None).unwrap();
+        assert!(
+            p.contains("(deny network* (remote tcp \"localhost:9999\") (local tcp \"*:9999\"))\n")
+        );
+        assert!(
+            p.find("(deny network* (remote tcp \"localhost:9999\")")
+                .unwrap()
+                > p.find("(deny network* (remote tcp \"localhost:11434\")")
+                    .unwrap(),
+            "reserved denies follow the grants"
+        );
     }
 
     #[test]
@@ -220,7 +348,7 @@ mod tests {
         // Golden suffix: the deny stays, and exactly one allow follows it —
         // the pump's port, spelled `localhost` (SBPL refuses a numeric host
         // in `(remote ip ...)`, measured on this host; §5.3).
-        let p = render(&v(), Some(8080)).unwrap();
+        let p = render(&v(), &Ports::default(), &[], Some(8080)).unwrap();
         assert!(
             p.ends_with(
                 "(deny network*)\n\
@@ -232,14 +360,14 @@ mod tests {
         assert!(!p.contains("(allow network-bind"));
         // Without a grant the profile renders byte-identically to the
         // deny-all form (the P-36 convention).
-        let p = render(&v(), None).unwrap();
+        let p = render_none(&v());
         assert!(p.ends_with("(deny network*)\n"));
         assert!(!p.contains("(allow network"));
     }
 
     #[test]
     fn proxy_profile_keeps_deny_network_before_the_allow() {
-        let p = render(&v(), Some(8123)).unwrap();
+        let p = render(&v(), &Ports::default(), &[], Some(8123)).unwrap();
         let deny = p.find("(deny network*)").unwrap();
         let allow = p
             .find("(allow network-outbound (remote ip \"localhost:8123\"))")

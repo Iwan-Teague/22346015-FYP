@@ -13,6 +13,7 @@ use crate::cmd_gc::gc;
 use crate::cmd_manifest::manifest_check;
 use crate::cmd_profile::{profile_check, profile_init};
 use crate::cmd_replay::replay;
+use crate::cmd_review::review;
 use crate::cmd_run::run_or_resume;
 use crate::cmd_sessions::sessions;
 use crate::report::{emit, exit, refused};
@@ -22,8 +23,13 @@ use crate::Cx;
 const DEFAULT_GATE: &str = "rustyharness.run";
 
 /// The options that are flags, not `--key value` pairs (P-11; P-12 added
-/// `no-default-denies`).
-pub(crate) const VALUELESS: &[&str] = &["shell", "no-default-denies"];
+/// `no-default-denies`; P-23 added the session-grant flags).
+pub(crate) const VALUELESS: &[&str] = &[
+    "shell",
+    "no-default-denies",
+    "allow-session-grants",
+    "accept-edits",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verb {
@@ -56,6 +62,7 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
         ["resume", rest @ ..] => gate_child(cx, rest, Verb::Resume),
         ["replay", rest @ ..] => gate_child(cx, rest, Verb::Replay),
         ["events", rest @ ..] => events(cx, rest),
+        ["review", rest @ ..] => review(cx, rest),
         ["apply", rest @ ..] => crate::cmd_apply::apply(cx, rest),
         ["profile", "check", rest @ ..] => profile_check(cx, rest),
         ["profile", "init", rest @ ..] => profile_init(cx, rest),
@@ -63,6 +70,8 @@ pub fn main_with(cx: &Cx<'_>, args: &[&str]) -> u8 {
         ["gc", rest @ ..] => gc(cx, rest),
         ["schedule", rest @ ..] => crate::cmd_schedule::schedule(cx, rest),
         ["chat", rest @ ..] => crate::cmd_chat::chat(cx, rest),
+        ["acp", rest @ ..] => crate::cmd_acp::acp(cx, rest),
+        ["compare", rest @ ..] => crate::cmd_compare::compare(cx, rest),
         _ => {
             note!(cx, "{USAGE}");
             exit::USAGE
@@ -85,6 +94,8 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "preset",
             "shell",
             "no-default-denies",
+            "allow-session-grants",
+            "accept-edits",
             "workspace-mode",
         ],
         Verb::Resume => &[
@@ -101,6 +112,8 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "preset",
             "shell",
             "no-default-denies",
+            "allow-session-grants",
+            "accept-edits",
         ],
         Verb::Replay => &[
             "run",
@@ -115,6 +128,7 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "preset",
             "shell",
             "no-default-denies",
+            "accept-edits",
         ],
     };
     // `scratch-with-git` (P-52) goes with `--workspace-mode scratch`, which

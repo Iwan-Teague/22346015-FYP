@@ -350,12 +350,21 @@ pub fn encode_initialized() -> Vec<u8> {
         .into_bytes()
 }
 
-/// A `tools/list` request (§3.3 step 4, §7.2). Cursor pagination rides in
-/// a later slice, with the client that drives the pages.
-pub fn encode_list(id: u64) -> Vec<u8> {
-    json!({"jsonrpc": "2.0", "id": id, "method": METHOD_TOOLS_LIST})
-        .to_string()
-        .into_bytes()
+/// A `tools/list` request (§3.3 step 4, §7.2). `cursor` carries the
+/// previous page's `nextCursor` (P-37e drives the walk); the first page
+/// passes `None`.
+pub fn encode_list(id: u64, cursor: Option<&str>) -> Vec<u8> {
+    match cursor {
+        None => json!({"jsonrpc": "2.0", "id": id, "method": METHOD_TOOLS_LIST}),
+        Some(cursor) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": METHOD_TOOLS_LIST,
+            "params": {"cursor": cursor},
+        }),
+    }
+    .to_string()
+    .into_bytes()
 }
 
 /// A `tools/call` request (§3.4): the server tool name and arguments that
@@ -658,8 +667,13 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
         );
         assert_eq!(
-            String::from_utf8(encode_list(2)).expect("the encoder wrote UTF-8"),
+            String::from_utf8(encode_list(2, None)).expect("the encoder wrote UTF-8"),
             r#"{"id":2,"jsonrpc":"2.0","method":"tools/list"}"#
+        );
+        // The cursor page names the previous page's successor (P-37e).
+        assert_eq!(
+            String::from_utf8(encode_list(3, Some("p1"))).expect("the encoder wrote UTF-8"),
+            r#"{"id":3,"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"p1"}}"#
         );
         // The -32601 reply echoes the server's id exactly as received:
         // integer or string (§3.5).

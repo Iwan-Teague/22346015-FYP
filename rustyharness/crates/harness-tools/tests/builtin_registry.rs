@@ -1,7 +1,8 @@
-//! The built-in dispatch table (P-02): the manifest, the policy
-//! registration table and the tools dispatch table must list the same twelve
-//! tools in the same order, and the workspace-constructed entries must
-//! build a provider that serves its id over a real workspace root.
+//! The built-in dispatch table (P-02): the manifest, the tools dispatch
+//! table and the policy registration table must list the same fifteen coding
+//! tools in the same order (the policy table adds the two research-only web
+//! ids, P-39b), and the workspace-constructed entries must build a provider
+//! that serves its id over a real workspace root.
 
 #![allow(
     clippy::unwrap_used,
@@ -37,17 +38,24 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// All three tables agree: twelve tools, manifest order. A new built-in
-/// registers in all three or the run cannot dispatch what it grants.
+/// All three tables agree: fifteen coding tools, manifest order. The policy
+/// registration table is the union (P-39b): the same fifteen in order, then
+/// the two web ids the research manifest declares, which no tool provider
+/// serves yet. A new built-in registers in all of them or the run cannot
+/// dispatch what it grants.
 #[test]
-fn builtin_registry_lists_twelve_tools_in_order() {
+fn builtin_registry_lists_fifteen_tools_in_order() {
     let m = manifest_builtin::manifest(&ctx()).unwrap();
     let manifest_ids: Vec<&str> = m.capabilities().iter().map(|c| c.id().as_str()).collect();
     let policy_ids: Vec<&str> = policy_builtin::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
     let tool_ids: Vec<&str> = registry::BUILTIN_TOOLS.iter().map(|t| t.id).collect();
-    assert_eq!(manifest_ids.len(), 12);
-    assert_eq!(policy_ids, manifest_ids);
+    assert_eq!(manifest_ids.len(), 15);
     assert_eq!(tool_ids, manifest_ids);
+    assert_eq!(&policy_ids[..15], manifest_ids.as_slice());
+    assert_eq!(
+        &policy_ids[15..],
+        ["harness.web.fetch", "harness.web.search"]
+    );
 
     // The workspace-constructed entries build providers that serve their
     // id; the run-owned and run-loop entries name their state instead.

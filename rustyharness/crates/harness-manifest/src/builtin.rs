@@ -7,9 +7,11 @@
 //! `harness` namespace and the `builtin` transport.
 //!
 //! It declares the read tools (`harness.fs.read`, `harness.fs.search`,
-//! `harness.fs.list`, `harness.fs.glob` and, since P-24,
+//! `harness.fs.glob`, `harness.fs.list` and, since P-24,
 //! `harness.fs.outline`), the two edit tools
-//! `harness.edit.replace` and `harness.edit.write` (§4.9, H2b), the
+//! `harness.edit.replace` and `harness.edit.write` (§4.9, H2b), the edit
+//! script `harness.edit.patch`, the file operations `harness.edit.delete`
+//! and `harness.edit.move` (P-25), the
 //! command runner `harness.exec.run` (§4.8, H2d) and the submit sentinel
 //! `harness.task.submit` (§2.5, H1e-2). `harness.notes.write` arrives with
 //! the slice that implements it.
@@ -57,7 +59,10 @@
 //! read / operational / own / none, `content: third_party` (its report is
 //! other people's text by default, like the read tools' results).
 
+mod edit_delete;
+mod edit_move;
 mod edit_multi;
+mod edit_patch;
 mod edit_replace;
 mod edit_write;
 mod exec_run;
@@ -71,6 +76,8 @@ mod tail;
 mod task_delegate;
 mod task_submit;
 mod task_todo;
+mod web_fetch;
+mod web_search;
 
 use crate::{parse_with_origin, Manifest, ManifestError, Origin, ValidationContext};
 
@@ -93,6 +100,9 @@ pub fn builtin_manifest_json() -> String {
         edit_replace::EDIT_REPLACE,
         edit_write::EDIT_WRITE,
         edit_multi::EDIT_MULTI,
+        edit_patch::EDIT_PATCH,
+        edit_delete::EDIT_DELETE,
+        edit_move::EDIT_MOVE,
         exec_run::EXEC_RUN,
         task_todo::TASK_TODO,
         task_delegate::TASK_DELEGATE,
@@ -108,13 +118,39 @@ pub fn manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestError> {
     parse_with_origin(builtin_manifest_json().as_bytes(), ctx, Origin::Compiled)
 }
 
+/// The research manifest text (JSON, manifest v1; P-39b, §2.2): the web
+/// airlock's two tools plus the checklist and the submit sentinel, in
+/// manifest order. Assembled from the same fragment literals as the coding
+/// manifest (`task_todo` and `task_submit` reused byte for byte); the
+/// concatenation is pinned by `tests::research_manifest_bytes_pinned`, and
+/// the coding manifest's by `tests::builtin_manifest_bytes_unchanged`, so
+/// neither can drift under the other.
+pub fn research_manifest_json() -> String {
+    [
+        head::HEAD,
+        web_fetch::WEB_FETCH,
+        web_search::WEB_SEARCH,
+        task_todo::TASK_TODO,
+        task_submit::TASK_SUBMIT,
+        tail::TAIL,
+    ]
+    .concat()
+}
+
+/// The research manifest, validated like any other (plus: it shares the
+/// reserved `harness` namespace and the `builtin` transport with the coding
+/// manifest, and a registry admits one or the other, never both, P-39b §2.2).
+pub fn research_manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestError> {
+    parse_with_origin(research_manifest_json().as_bytes(), ctx, Origin::Compiled)
+}
+
 /// The terse tool docs (P-53): one fixed sentence per built-in capability,
 /// naming each of its arguments, for profiles with `tool_docs: "terse"`
 /// (small local models read shorter tool declarations better). The table is
 /// fixed: entries are shorter than the manifest summaries and name every
 /// argument the schema has (both pinned by tests). A capability without an
 /// entry here keeps its full summary, so a provider capability is untouched.
-const TERSE_TABLE: [(&str, &str); 12] = [
+const TERSE_TABLE: [(&str, &str); 15] = [
     (
         "harness.fs.read",
         "Read a window of lines from a file: path, start (the first line, 1-based), lines (at most the run's read window)",
@@ -134,6 +170,18 @@ const TERSE_TABLE: [(&str, &str); 12] = [
     (
         "harness.edit.multi",
         "Make several exact replacements in one file, all or none: path, edits (each old and new)",
+    ),
+    (
+        "harness.edit.patch",
+        "Apply a `*** Begin Patch` script across files, all or none: patch (Add File, Update File and Delete File sections)",
+    ),
+    (
+        "harness.edit.delete",
+        "Delete one read file, keeping a pre-image: path",
+    ),
+    (
+        "harness.edit.move",
+        "Move one read file to a new path, refusing an existing target: path, to",
     ),
     (
         "harness.exec.run",

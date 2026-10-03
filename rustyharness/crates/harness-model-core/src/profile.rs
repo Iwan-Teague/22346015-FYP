@@ -66,6 +66,8 @@ pub enum EditFormat {
     Replace,
     /// Whole-file write.
     Whole,
+    /// Multi-file `*** Begin Patch` scripts (P-25).
+    Patch,
 }
 
 /// How tool declarations describe the tools (P-53).
@@ -564,7 +566,7 @@ impl Profile {
             "tool_choice_required_ok": self.tool_choice_required_ok,
             "grammar": "none",
             "max_active_tools": self.max_active_tools,
-            "edit_format": match self.edit_format { EditFormat::Replace => "replace", EditFormat::Whole => "whole" },
+            "edit_format": match self.edit_format { EditFormat::Replace => "replace", EditFormat::Whole => "whole", EditFormat::Patch => "patch" },
             "recent_turns": self.recent_turns,
             "sampling": {"temperature": s.temperature, "top_p": s.top_p, "max_tokens": s.max_tokens},
         });
@@ -724,6 +726,36 @@ mod tests {
         assert_eq!(p.edit_format(), EditFormat::Replace);
         assert_eq!(p.recent_turns(), 4);
         assert!(!p.validated());
+    }
+
+    // P-25: `"edit_format":"patch"` parses (the enum grows; the default and
+    // every existing profile stay exactly as they were).
+    #[test]
+    fn profile_edit_format_patch_parses() {
+        let p = Profile::parse(with("edit_format", "\"patch\"").as_bytes()).unwrap();
+        assert_eq!(p.edit_format(), EditFormat::Patch);
+        assert_eq!(
+            Profile::conservative_default("m").edit_format(),
+            EditFormat::Replace
+        );
+    }
+
+    // P-25: the new enum arm changes nothing for profiles written before it —
+    // the replace and whole digests are the pre-P-25 values (captured at the
+    // H1h/parallel_tool_calls pins above), so existing stamps stay valid.
+    #[test]
+    fn old_profile_digest_unchanged() {
+        const REPLACE_CONTENT: &str =
+            "b8bf6a5e7b6c3f107548dc8cb096d84b2900f8e0846e474845521be5f8fcfb6f";
+        const WHOLE_CONTENT: &str =
+            "8b851b54c20fa753fcc10026dcad988f1cb83eca160e2c4ad6c1e1b5c7350630";
+        let p = Profile::parse(GOOD.as_bytes()).unwrap();
+        assert_eq!(p.content_sha256().to_string(), REPLACE_CONTENT);
+        let mut o: serde_json::Map<String, serde_json::Value> = serde_json::from_str(GOOD).unwrap();
+        o.insert("edit_format".into(), serde_json::json!("whole"));
+        let w = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
+        assert_eq!(w.edit_format(), EditFormat::Whole);
+        assert_eq!(w.content_sha256().to_string(), WHOLE_CONTENT);
     }
 
     #[test]

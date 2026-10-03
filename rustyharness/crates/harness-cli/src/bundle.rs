@@ -233,9 +233,11 @@ fn check_against_bundle(
     bundle: &Bundle,
 ) -> Result<(), Outcome> {
     let view: BTreeMap<&str, &str> = o.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    // The run digested its effective policy (P-12), so the overlay is on
-    // here unless the flag that turned it off for the run is on too.
+    // The run digested its effective policy (P-12), so the deny overlay is
+    // on here unless the flag that turned it off for the run is on too;
+    // the accept-edits overlay (P-23) rides the same rule.
     let overlay = !o.contains_key("no-default-denies");
+    let accept_edits = o.contains_key("accept-edits");
     let mismatch = |key: &str, path: &str| {
         let why = format!("{key} {path} does not match the digests recorded in the run's bundle");
         note!(cx, "{why}");
@@ -249,7 +251,7 @@ fn check_against_bundle(
                     note!(cx, "{e}");
                     unreadable(e)
                 })?;
-                match parse_digest(key, &bytes, overlay) {
+                match parse_digest(key, &bytes, overlay, accept_edits) {
                     Ok(d) => d,
                     Err(e) => {
                         note!(cx, "{e}");
@@ -259,15 +261,19 @@ fn check_against_bundle(
             }
             None if key == "policy" => {
                 // The default policy as the run itself built it (the P-12
-                // overlay applied unless `--no-default-denies`): one
+                // overlay applied unless `--no-default-denies`, the P-23
+                // accept-edits overlay when that flag is on): one
                 // spelling with `inputs`, so a recomputed digest differs
                 // only on a real mismatch, refused below by name.
-                crate::inputs::default_policy(o.contains_key("no-default-denies"))
-                    .map_err(|e| {
-                        note!(cx, "{e}");
-                        unreadable(e)
-                    })?
-                    .digest()
+                crate::inputs::default_policy(
+                    o.contains_key("no-default-denies"),
+                    o.contains_key("accept-edits"),
+                )
+                .map_err(|e| {
+                    note!(cx, "{e}");
+                    unreadable(e)
+                })?
+                .digest()
             }
             // `--task`/`--profile` missing everything is the verb's usage
             // error; nothing here to compare.
@@ -283,12 +289,17 @@ fn check_against_bundle(
 }
 
 /// The input digest `key` names, from the file's bytes. The policy is
-/// digested the way the run digested it: under the same overlay setting.
-fn parse_digest(key: &str, bytes: &[u8], overlay: bool) -> Result<Digest, String> {
+/// digested the way the run digested it: under the same overlay settings.
+fn parse_digest(
+    key: &str,
+    bytes: &[u8],
+    overlay: bool,
+    accept_edits: bool,
+) -> Result<Digest, String> {
     match key {
         "task" => inputs::task_text(bytes).map(|t| sha256(t.as_bytes())),
         "profile" => inputs::profile_digest(bytes),
-        _ => inputs::policy_digest(bytes, overlay),
+        _ => inputs::policy_digest(bytes, overlay, accept_edits),
     }
 }
 
@@ -317,10 +328,10 @@ impl<'a> BundleSource<'a> {
 /// self-check it: every copied file is re-read, re-parsed and digested, and
 /// must equal the digests the run used (`expected`) and the header's own
 /// `task`/`profile`/`policy` fields. The policy is digested under the run's
-/// own overlay setting (`overlay`, P-12). Any mismatch or write failure
-/// removes `bundle.json` (the copy is never half-trusted) and says why. The
-/// run itself is already committed; the bundle is convenience, so the
-/// caller only reports.
+/// own overlay settings (`overlay`, P-12; `accept_edits`, P-23). Any
+/// mismatch or write failure removes `bundle.json` (the copy is never
+/// half-trusted) and says why. The run itself is already committed; the
+/// bundle is convenience, so the caller only reports.
 pub(crate) fn write_run_bundle(
     run_dir: &Path,
     src: &BundleSource<'_>,
@@ -328,13 +339,14 @@ pub(crate) fn write_run_bundle(
     workspace: &str,
     expected: &InputDigests,
     overlay: bool,
+    accept_edits: bool,
 ) -> Result<(), String> {
     let inputs_dir = run_dir.join("inputs");
     config::create_private_dir(&inputs_dir)?;
     let copy = |name: &str, key: &str, path: &str, want: Digest| -> Result<(), String> {
         let bytes = inputs::read_input(path)?;
         write_private(&inputs_dir.join(name), &bytes)?;
-        let d = parse_digest(key, &bytes, overlay)?;
+        let d = parse_digest(key, &bytes, overlay, accept_edits)?;
         if d != want {
             return Err(format!("{name} digests to {d}, not the run's {want}"));
         }
@@ -363,7 +375,7 @@ pub(crate) fn write_run_bundle(
     let manifest =
         serde_json::to_vec_pretty(&doc).map_err(|e| format!("cannot render {BUNDLE_FILE}: {e}"))?;
     write_private(&inputs_dir.join(BUNDLE_FILE), &manifest)?;
-    match self_check(run_dir, &inputs_dir, expected, overlay) {
+    match self_check(run_dir, &inputs_dir, expected, overlay, accept_edits) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Never leave a manifest that does not describe its copies.
@@ -380,6 +392,7 @@ fn self_check(
     inputs_dir: &Path,
     expected: &InputDigests,
     overlay: bool,
+    accept_edits: bool,
 ) -> Result<(), String> {
     let check = |name: &str, parse: &dyn Fn(&[u8]) -> Result<Digest, String>, want: Digest| {
         let bytes = inputs::read_input(&inputs_dir.join(name).to_string_lossy())
@@ -397,7 +410,7 @@ fn self_check(
     if inputs_dir.join(POLICY_FILE).exists() {
         check(
             POLICY_FILE,
-            &|b| inputs::policy_digest(b, overlay),
+            &|b| inputs::policy_digest(b, overlay, accept_edits),
             expected.policy,
         )?;
     }

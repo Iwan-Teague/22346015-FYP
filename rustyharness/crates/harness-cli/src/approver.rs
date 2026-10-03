@@ -22,10 +22,13 @@ pub enum ApproverSource<'a> {
 
 /// The terminal prompt (§5.3): shows the request on stderr (the approval
 /// request's own display: plain words, the arguments escaped for a
-/// terminal and bounded) and reads one line from stdin. `y` or `yes`
-/// approves this one call; any other line declines; no line by the
-/// deadline, or stdin closed, is no answer (a deny). Lines typed before
-/// the prompt appears are discarded, so a late answer to an earlier
+/// terminal and bounded, plus the edit diff preview the loop attaches) and
+/// reads one line from stdin. `y` or `yes` approves this one call;
+/// `a` allows the call's pattern for the session and `d` denies it for the
+/// session (P-23: journaled as a `RuleGranted`, applied like a policy
+/// rule); `?` shows the request again; any other line declines; no line by
+/// the deadline, or stdin closed, is no answer (a deny). Lines typed
+/// before the prompt appears are discarded, so a late answer to an earlier
 /// request can never approve this one.
 ///
 /// Stdin is read by one background thread for the life of the process
@@ -34,6 +37,28 @@ pub enum ApproverSource<'a> {
 pub struct TerminalApprover<'c, 'a> {
     cx: &'c Cx<'a>,
     lines: std::sync::mpsc::Receiver<String>,
+}
+
+/// The choices an approval prompt offers (P-23).
+const PROMPT: &str = "approve this one call? [y] once [n] no \
+[a] allow this pattern for the session [d] deny this pattern for the session \
+[?] details: ";
+
+/// One line at the prompt, parsed: an answer, or `?` (show the details
+/// again, then prompt once more). Anything else is a decline.
+enum Parsed {
+    Answer(ApprovalAnswer),
+    Details,
+}
+
+fn answer_of(line: &str) -> Parsed {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Parsed::Answer(ApprovalAnswer::Yes),
+        "a" => Parsed::Answer(ApprovalAnswer::AllowSession),
+        "d" => Parsed::Answer(ApprovalAnswer::DenySession),
+        "?" => Parsed::Details,
+        _ => Parsed::Answer(ApprovalAnswer::No),
+    }
 }
 
 impl<'c, 'a> TerminalApprover<'c, 'a> {
@@ -64,20 +89,42 @@ impl Approver for TerminalApprover<'_, '_> {
 
     fn ask(&self, req: &ApprovalRequest, deadline: Instant) -> ApprovalAnswer {
         while self.lines.try_recv().is_ok() {}
-        self.cx.note(&format!(
-            "{req}\napprove this one call? [y/N] (no answer by the deadline is a no): "
-        ));
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match self.lines.recv_timeout(wait) {
-            Ok(line) => {
-                let a = line.trim().to_ascii_lowercase();
-                if a == "y" || a == "yes" {
-                    ApprovalAnswer::Yes
-                } else {
-                    ApprovalAnswer::No
-                }
+        self.cx.note(&format!("{req}\n{PROMPT}"));
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(wait) {
+                Ok(line) => match answer_of(&line) {
+                    Parsed::Answer(a) => return a,
+                    Parsed::Details => self.cx.note(&format!("{req}\n{PROMPT}")),
+                },
+                Err(_) => return ApprovalAnswer::NoAnswer,
             }
-            Err(_) => ApprovalAnswer::NoAnswer,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::answer_of;
+    use super::Parsed;
+    use harness_run::ApprovalAnswer;
+
+    /// The prompt's answers (P-23): once, no, session-allow, session-deny,
+    /// details (`?`, prompt again), and any other line declines.
+    #[test]
+    fn answers_map_and_other_lines_decline() {
+        let ans = |s: &str| -> Option<ApprovalAnswer> {
+            match answer_of(s) {
+                Parsed::Answer(a) => Some(a),
+                Parsed::Details => None,
+            }
+        };
+        assert!(matches!(ans("y"), Some(ApprovalAnswer::Yes)));
+        assert!(matches!(ans("YES"), Some(ApprovalAnswer::Yes)));
+        assert!(matches!(ans(" a "), Some(ApprovalAnswer::AllowSession)));
+        assert!(matches!(ans("d"), Some(ApprovalAnswer::DenySession)));
+        assert!(matches!(ans("n"), Some(ApprovalAnswer::No)));
+        assert!(matches!(ans("later"), Some(ApprovalAnswer::No)));
+        assert!(matches!(answer_of("?"), Parsed::Details));
     }
 }

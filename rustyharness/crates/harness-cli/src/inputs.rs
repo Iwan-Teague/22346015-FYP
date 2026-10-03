@@ -239,8 +239,13 @@ pub(crate) fn inputs(
     // The effective policy — defaults included — is what the run header
     // digests, so replay under a different overlay setting is refused.
     let no_default_denies = o.contains_key("no-default-denies");
+    // The edit auto-allow (P-23): `--accept-edits` overlays an allow rule
+    // for the workspace edits (undoable through the P-22 pre-image store,
+    // so the flag is refused when a build has no store). The effective
+    // policy — this overlay included — is what the header digests.
+    let accept_edits = o.contains_key("accept-edits");
     let policy = match crate::config::value(o, cfg, "policy") {
-        None => default_policy(no_default_denies).map_err(unreadable)?,
+        None => default_policy(no_default_denies, accept_edits).map_err(unreadable)?,
         Some(p) => {
             // v2 (P-08): the policy crate parses the file itself, so the
             // CLI and the audit read one grammar; unknown keys, malformed
@@ -250,11 +255,17 @@ pub(crate) fn inputs(
                 .map_err(|e| unreadable(format!("{p} is not strict JSON: {e}")))?;
             let policy =
                 UserPolicy::from_json(&v).map_err(|e| unreadable(format!("policy: {e}")))?;
-            if no_default_denies {
+            let policy = if no_default_denies {
                 policy
             } else {
                 harness_policy::denies::overlay_default_denies(policy)
                     .map_err(|e| unreadable(format!("policy: {e}")))?
+            };
+            if accept_edits {
+                harness_policy::overlay_accept_edits(policy, harness_tools::PRE_IMAGE_STORE)
+                    .map_err(|e| unreadable(format!("policy: {e}")))?
+            } else {
+                policy
             }
         }
     };
@@ -286,7 +297,10 @@ pub(crate) fn inputs(
         }
         None => crate::exec_presets::section(cx, o, cfg, &task.grants)?,
     };
-    let config = run_config(task.budget.as_ref(), exec.is_some()).map_err(unreadable)?;
+    let mut config = run_config(task.budget.as_ref(), exec.is_some()).map_err(unreadable)?;
+    // Session-scoped grants (P-23, Q-4): default off; the flag lets the
+    // person answer `a`/`d` at an approval prompt.
+    config.allow_session_grants = o.contains_key("allow-session-grants");
     // The checks (H3a): bounded and on the allowlist, in a task that grants
     // the command runner, or the task file is unusable input (exit 4).
     let presubmit = task.presubmit.map(PresubmitFile::spec);
@@ -343,28 +357,47 @@ pub(crate) fn task_budget(bytes: &[u8]) -> Result<Option<Budget>, String> {
 }
 /// The policy a run uses when no `--policy` is given: the empty library
 /// default (OD-2) with the CLI's sensitive-path default denies overlaid
-/// (P-12), unless `--no-default-denies` turns the overlay off. One
+/// (P-12), unless `--no-default-denies` turns the overlay off, and the
+/// edit auto-allow overlaid when `--accept-edits` is on (P-23). One
 /// spelling for the run here and for the bundle's recomputation on
 /// `replay` and `resume` (`bundle::check_against_bundle`), so the digest
 /// a run records and the digest a replay recomputes cannot drift.
-pub(crate) fn default_policy(no_default_denies: bool) -> Result<UserPolicy, String> {
-    if no_default_denies {
-        return Ok(UserPolicy::default());
+pub(crate) fn default_policy(
+    no_default_denies: bool,
+    accept_edits: bool,
+) -> Result<UserPolicy, String> {
+    let mut policy = UserPolicy::default();
+    if !no_default_denies {
+        policy = harness_policy::denies::overlay_default_denies(policy)
+            .map_err(|e| format!("policy: {e}"))?;
     }
-    harness_policy::denies::overlay_default_denies(UserPolicy::default())
-        .map_err(|e| format!("policy: {e}"))
+    if accept_edits {
+        policy = harness_policy::overlay_accept_edits(policy, harness_tools::PRE_IMAGE_STORE)
+            .map_err(|e| format!("policy: {e}"))?;
+    }
+    Ok(policy)
 }
 
 /// The digest of the policy in policy-file bytes, as the run digests it:
 /// the v2 grammar (P-08) lives in the policy crate, and the effective
-/// policy — the CLI's default denies on top (P-12) unless the run turned
-/// the overlay off — is what the header and the bundle record.
-pub(crate) fn policy_digest(bytes: &[u8], overlay: bool) -> Result<harness_core::Digest, String> {
+/// policy — the CLI's overlays (P-12 default denies, P-23 accept-edits) as
+/// the run's flags set them — is what the header and the bundle record.
+pub(crate) fn policy_digest(
+    bytes: &[u8],
+    overlay: bool,
+    accept_edits: bool,
+) -> Result<harness_core::Digest, String> {
     let v = harness_core::strict_json::parse(bytes)
         .map_err(|e| format!("policy file is not strict JSON: {e}"))?;
     let policy = UserPolicy::from_json(&v).map_err(|e| format!("policy: {e}"))?;
     let policy = if overlay {
         harness_policy::denies::overlay_default_denies(policy)
+            .map_err(|e| format!("policy: {e}"))?
+    } else {
+        policy
+    };
+    let policy = if accept_edits {
+        harness_policy::overlay_accept_edits(policy, harness_tools::PRE_IMAGE_STORE)
             .map_err(|e| format!("policy: {e}"))?
     } else {
         policy

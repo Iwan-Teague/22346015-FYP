@@ -162,6 +162,21 @@ grep -qF 'features = ["fault-injection"]' "$copy/crates/harness-sandbox/Cargo.to
 expect_refusal "harness-sandbox enables the journal's fault-injection seam" \
     "a normal dependency edge enables harness-journal/fault-injection"
 
+# The sandbox's own test-only remap seam (P-39f) must not be enabled by a
+# normal dependency either. Planted into harness-mcp: it has no normal edge
+# to harness-sandbox (no duplicate key), harness-sandbox does not depend
+# back (no cycle), mcp sits under no allowlist-checked tree, and the
+# content scans read source files, not manifests.
+fresh
+awk '{ print } /^\[dependencies\]/ { print "harness-sandbox = { path = \"../harness-sandbox\", features = [\"remap\"] }" }' \
+    "$copy/crates/harness-mcp/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-mcp/Cargo.toml" || fail "mv failed"
+grep -qF 'features = ["remap"]' "$copy/crates/harness-mcp/Cargo.toml" ||
+    fail "remap plant did not land"
+expect_refusal "harness-mcp enables the sandbox's remap seam" \
+    "a normal dependency edge enables harness-sandbox/remap"
+
 # INV-24: a TLS crate in the default build is refused (planted as a local
 # crate named `rustls`, depended on by harness-model).
 fresh

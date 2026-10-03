@@ -1,12 +1,16 @@
 //! rustyharness MCP stdio client (design note `docs/slices/P-37-mcp-client.md`).
 //!
-//! This slice (P-37f) adds the pure response renderer ([`render`]) to the
-//! pure wire codec of P-37c ([`wire`]): one raw response line plus the
-//! result cap in, an observation's status, text, cut mark and digest out —
-//! the function audit re-runs from the journaled `mcp_response` line (§12).
-//! The client state machine, the provider and the confined connector are
-//! later slices of P-37; the fake server they are tested against is the
-//! fixture crate.
+//! This slice (P-37e) adds the client state machine ([`client`]) to the
+//! pure wire codec of P-37c ([`wire`]) and the pure response renderer of
+//! P-37f ([`render`]): the lifecycle (§3.3), id discipline (§3.2), noise
+//! caps and `-32601` refusals (§3.5), the bounds of §4, and the
+//! kill-on-any-fault rule, over two seams the caller supplies — a
+//! [`client::Clock`] for the deadlines and a [`client::Transport`] for
+//! the server's pipes. The provider, the connector seam and the confined
+//! connector are later slices of P-37; the fake server the client is
+//! tested against is the fixture crate, whose package hosts this slice's
+//! hostile-server suite (the purity gate scans every file of THIS
+//! package, so its pipes and clocks are named only from outside it).
 //!
 //! The scanned files (`scripts/ci/purity.sh` §2) are pure in the gate's
 //! sense: bytes are fed in and values come out, no facility of the I/O,
@@ -23,5 +27,6 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod client;
 pub mod render;
 pub mod wire;

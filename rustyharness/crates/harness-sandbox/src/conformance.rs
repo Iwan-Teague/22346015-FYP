@@ -67,6 +67,29 @@ pub enum Case {
     /// workspace is refused, so path-based rules cannot be sidestepped by
     /// aliasing an outside file under a workspace path (review LOW-4).
     HardLink,
+    /// P-36a: a bind to `localhost:<granted>` is allowed.
+    PortsBindGranted,
+    /// P-36a: a bind to an ungranted (but free) port is refused.
+    PortsBindUngranted,
+    /// P-36a: a wildcard bind (`0.0.0.0:<granted>`) is refused without a
+    /// LAN grant, so `localhost:<p>` does not admit the whole interface.
+    PortsWildcardNoLan,
+    /// P-36a: a wildcard bind is allowed with a LAN grant (`*:<p>`).
+    PortsWildcardLan,
+    /// P-36a: an outbound connect to a granted port is allowed.
+    PortsConnectGranted,
+    /// P-36a: an outbound connect to an ungranted loopback port is
+    /// refused.
+    PortsConnectUngranted,
+    /// P-36a: a connect to the model server's port is refused, and the
+    /// listener sees no connection (INV-41).
+    PortsModelServer,
+    /// P-36a: under a port profile, outbound to routable addresses, unix
+    /// sockets and the resolver are still refused (FT-1, FT-11, FT-15).
+    PortsKeepFt1Ft11Ft15,
+    /// P-36a: a UDP bind on a TCP-granted port is refused (the grants name
+    /// `tcp` only).
+    PortsUdp,
     /// FT-13 under the proxy profile: a direct connect to a routable
     /// address fails while the granted pump port connects (the positive
     /// control; §5.3).
@@ -107,6 +130,15 @@ impl Case {
             Case::NoBind => "D31-no-bind",
             Case::NestedSandbox => "nested-sandbox",
             Case::HardLink => "hard-link",
+            Case::PortsBindGranted => "ports-bind-granted",
+            Case::PortsBindUngranted => "ports-bind-ungranted",
+            Case::PortsWildcardNoLan => "ports-wildcard-no-lan",
+            Case::PortsWildcardLan => "ports-wildcard-lan",
+            Case::PortsConnectGranted => "ports-connect-granted",
+            Case::PortsConnectUngranted => "ports-connect-ungranted",
+            Case::PortsModelServer => "ports-model-server",
+            Case::PortsKeepFt1Ft11Ft15 => "ports-keep-ft1-ft11-ft15",
+            Case::PortsUdp => "ports-udp",
             Case::Ft13P => "FT-13-proxy",
             Case::Ft15P => "FT-15-proxy",
             Case::Ft19 => "FT-19",
@@ -141,6 +173,23 @@ pub const H2_EXIT_CASES: &[Case] = &[
     Case::NoBind,
     Case::NestedSandbox,
     Case::HardLink,
+];
+
+/// The loopback-port cases (P-36a, §12 `PORTS_CASES`): what SBPL must be
+/// measured to express before any run is granted ports. A backend's row
+/// lists them only when every case's test passed on the minting host, so
+/// `covers(PORTS_CASES)` is the gate `Network::Loopback` validates
+/// against; until then ports are refused everywhere.
+pub const PORTS_CASES: &[Case] = &[
+    Case::PortsBindGranted,
+    Case::PortsBindUngranted,
+    Case::PortsWildcardNoLan,
+    Case::PortsWildcardLan,
+    Case::PortsConnectGranted,
+    Case::PortsConnectUngranted,
+    Case::PortsModelServer,
+    Case::PortsKeepFt1Ft11Ft15,
+    Case::PortsUdp,
 ];
 
 /// What the airlock's fetcher must have witnessed before a research session

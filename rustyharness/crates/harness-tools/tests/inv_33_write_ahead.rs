@@ -21,7 +21,9 @@ use harness_journal::{
 };
 use harness_manifest::admission::{Registry, Tier};
 use harness_manifest::{builtin, ProviderName, SemVer, ValidationContext};
-use harness_policy::{Authorized, Call, Session, SessionSpec, UserPolicy, WorkspaceDecl};
+use harness_policy::{
+    Authorized, Call, Session, SessionKind, SessionSpec, UserPolicy, WorkspaceDecl,
+};
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 use serde_json::json;
 
@@ -61,7 +63,7 @@ impl ToolProvider for Spy {
             truncated: false,
             digest: sha256(b"file text"),
             read: None,
-            edit: None,
+            edits: Vec::new(),
             exec: None,
         })
     }
@@ -89,6 +91,7 @@ fn session() -> Session {
             conformed: false,
             exec_programs: Vec::new(),
             read_window: None,
+            kind: SessionKind::Coding,
         },
         &reg,
         &UserPolicy::default(),

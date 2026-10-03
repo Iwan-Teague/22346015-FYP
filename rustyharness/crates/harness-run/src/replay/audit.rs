@@ -21,6 +21,7 @@ use harness_model::ModelBackend;
 use harness_policy::UserPolicy;
 use serde_json::Value;
 
+use crate::approve::RecordedApproval;
 use crate::driver::step::UserState;
 use crate::driver::{
     commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ExecHeader,
@@ -389,6 +390,14 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         limits: limits.clone(),
         ..RunConfig::defaults(limits.tokens)
     };
+    // The grants re-feed with the answers (P-23): allow them exactly when
+    // the journal holds one, and never ask (an audit has no approver).
+    let granted = rec.approvals.iter().any(|a| {
+        matches!(
+            a,
+            RecordedApproval::AllowSession { .. } | RecordedApproval::DenySession { .. }
+        )
+    });
     let mut lp = Loop::new(LoopInit {
         session,
         registry: a.registry,
@@ -413,7 +422,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         workspace: None,
         // Nobody is asked in an audit: the recorded answers are re-fed and
         // re-minted with their recorded nonces (a reused one refuses).
-        approvals: Approvals::new(a.run, attempt, None, rec.approvals),
+        approvals: Approvals::new(a.run, attempt, None, rec.approvals).may_grant(granted),
         // No provider runs in an audit: a recorded result is re-fed with its
         // recorded sample. A step with no recorded result (an intent a crash
         // cut) ends as a provider failure, whose sample says it was not

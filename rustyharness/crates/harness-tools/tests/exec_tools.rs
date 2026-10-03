@@ -141,6 +141,7 @@ impl Rig {
                 personal_data_granted: false,
                 conformed: true,
                 exec_programs: vec!["perl".into(), "sh".into()],
+                lan_ports: Vec::new(),
                 read_window: None,
                 kind: SessionKind::Coding,
             },

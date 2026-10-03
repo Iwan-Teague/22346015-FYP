@@ -95,7 +95,8 @@ pub mod path;
 pub mod web;
 
 pub use builtin::{
-    CHILD_ELIGIBLE, DELEGATE_ID, EDIT_DEFAULT_RULE, EDIT_IDS, EXEC_DEFAULT_RULE, EXEC_ID, GLOB_ID,
+    is_bg_id, BG_READ_RULE, BG_STOP_RULE, CHILD_ELIGIBLE, DELEGATE_ID, EDIT_DEFAULT_RULE, EDIT_IDS,
+    EXEC_DEFAULT_RULE, EXEC_ID, EXEC_READ_ID, EXEC_START_ID, EXEC_STOP_ID, GLOB_ID, LAN_BIND_RULE,
     LIST_ID, MCP_DEFAULT_RULE, OUTLINE_ID, READ_ID, SEARCH_ID, SUBMIT_ID, TODO_ID, TODO_RULE,
     WEB_ALLOWLIST_RULE, WEB_FETCH_ID, WEB_SEARCH_ID, WEB_SEARCH_RULE,
 };
@@ -788,6 +789,11 @@ pub struct SessionSpec {
     /// The program names on the task's exec allowlist (§4.8, H2d): a
     /// command runs only when its `argv[0]` is one of them (INV-13).
     pub exec_programs: Vec<String>,
+    /// The task's LAN ports (P-36g, §6.1): the granted ports the task
+    /// declared LAN-reachable. A `harness.exec.start` naming one of them
+    /// folds an egress label into the session's trifecta (§6.3) and asks
+    /// every time (§9).
+    pub lan_ports: Vec<u16>,
     /// The run's read window, in lines (H2e: the profile's): a read's
     /// `lines` above it is denied like any argument outside the schema the
     /// model was shown. `None`: the manifest's maximum alone.
@@ -932,6 +938,18 @@ pub fn trifecta(
     active: &[(&CapId, EffectiveClass)],
     workspace: Option<WorkspaceDecl>,
 ) -> Result<(), SessionRefused> {
+    trifecta_with_lan(active, workspace, false)
+}
+
+/// The trifecta over an active set, the workspace and, when the task holds
+/// LAN ports (P-36g, §6.3), a synthetic egress label named `exec.lan_ports`:
+/// a socket bound on the LAN is egress whether or not a capability declares
+/// it, so INV-9 sees it.
+fn trifecta_with_lan(
+    active: &[(&CapId, EffectiveClass)],
+    workspace: Option<WorkspaceDecl>,
+    lan: bool,
+) -> Result<(), SessionRefused> {
     let ws_private = workspace.is_some_and(|w| !w.declared_public);
     let ws_untrusted = workspace.is_some();
     let find = |pred: &dyn Fn(&EffectiveClass) -> bool| {
@@ -944,7 +962,8 @@ pub fn trifecta(
         .or_else(|| ws_private.then(|| "workspace".to_owned()));
     let u = find(&|c| c.content == Content::ThirdParty)
         .or_else(|| ws_untrusted.then(|| "workspace".to_owned()));
-    let e = find(&|c| c.egress != Egress::None);
+    let e =
+        find(&|c| c.egress != Egress::None).or_else(|| lan.then(|| "exec.lan_ports".to_owned()));
     match (p, u, e) {
         (Some(private), Some(untrusted), Some(egress)) => Err(SessionRefused::Trifecta {
             private,
@@ -1003,6 +1022,15 @@ struct Active {
     /// allowlist, and it is allowed only by a user allow rule or an
     /// approval, and only with a conformed sandbox.
     exec: bool,
+    /// The background starter (`harness.exec.start`, P-36g, §3): the
+    /// runner's checks plus the LAN floor of §6.3.
+    exec_start: bool,
+    /// The background reader (`harness.exec.read`, P-36g, §3): allowed by
+    /// its named rule, like a read.
+    exec_read: bool,
+    /// The background stopper (`harness.exec.stop`, P-36g, §3): allowed by
+    /// its named rule, like the sentinel.
+    exec_stop: bool,
     /// The built-in fetch tool (§2.3, P-39b): decided by the web branch,
     /// never by the ask rules.
     web_fetch: bool,
@@ -1034,6 +1062,9 @@ pub struct Session {
     personal_granted: bool,
     conformed: bool,
     exec_programs: BTreeSet<String>,
+    /// The task's LAN ports (P-36g, §6.3), kept so the LAN floor and the
+    /// quarantine trifecta see them.
+    lan_ports: BTreeSet<u16>,
     read_window: Option<u64>,
     /// Rules granted at a prompt for the rest of the session (P-23), per
     /// capability. Session-scoped by construction: never part of the
@@ -1178,7 +1209,7 @@ impl Session {
 
         let labels: Vec<(&CapId, EffectiveClass)> =
             classes.iter().map(|(id, cl, _, _)| (*id, *cl)).collect();
-        trifecta(&labels, spec.workspace)?;
+        trifecta_with_lan(&labels, spec.workspace, !spec.lan_ports.is_empty())?;
 
         // The session kind (§2.2 item 3, P-39b). Coding is the default and
         // changes nothing; Research builds the web state or refuses. The
@@ -1278,6 +1309,9 @@ impl Session {
                     delegate: builtin::is_builtin_delegate(c),
                     edit: builtin::is_builtin_edit(c) || builtin::is_builtin_fileop(c),
                     exec: builtin::is_builtin_exec(c),
+                    exec_start: builtin::is_builtin_exec_start(c),
+                    exec_read: builtin::is_builtin_exec_read(c),
+                    exec_stop: builtin::is_builtin_exec_stop(c),
                     web_fetch: builtin::is_builtin_web_fetch(c),
                     web_search: builtin::is_builtin_web_search(c),
                     mcp: *mcp,
@@ -1311,6 +1345,7 @@ impl Session {
             personal_granted: spec.personal_data_granted,
             conformed: spec.conformed,
             exec_programs: spec.exec_programs.iter().cloned().collect(),
+            lan_ports: spec.lan_ports.iter().copied().collect(),
             read_window: spec.read_window,
             session_deny: BTreeMap::new(),
             session_allow: BTreeMap::new(),
@@ -1375,7 +1410,7 @@ impl Session {
             .filter(|&(k, _)| !self.quarantined.contains(k))
             .map(|(k, a)| (k, a.class))
             .collect();
-        trifecta(&active, self.workspace)
+        trifecta_with_lan(&active, self.workspace, !self.lan_ports.is_empty())
     }
 
     /// The effective class of an active capability.
@@ -1413,6 +1448,8 @@ impl Session {
             && !a.todo
             && !a.edit
             && !a.exec
+            && !a.exec_start
+            && !a.exec_stop
             && !(a.mcp && matches!(cl.effect, Effect::Write | Effect::Execute))
         {
             return deny(
@@ -1517,7 +1554,7 @@ impl Session {
                 }
             }
         }
-        if a.exec {
+        if a.exec || a.exec_start {
             if let Some(p) = call.args.get("cwd") {
                 let checked = p.as_str().map_or(Err(PathRefused::Empty), workspace_path);
                 if let Err(e) = checked {
@@ -1536,6 +1573,22 @@ impl Session {
         }
 
         // ---- 2. Ask rules. ----
+        // The LAN floor (P-36g, §6.3), ahead of every ask and allow rule:
+        // a start naming one of the task's LAN ports is a protected action
+        // under one floor rule, asked every time. A user ask rule cannot
+        // credit it (the tier is above `user_confirm`), a user or session
+        // allow rule is never consulted (this returns first), and with no
+        // approver the ask is a deny. INV-9 keeps the session from planning
+        // at all unless the workspace is public.
+        if a.exec_start && self.names_lan_port(&call.args) {
+            if !self.approver_present {
+                return deny(DenyReason::NoApprover, "deny.no-approver");
+            }
+            return PolicyDecision::Ask {
+                tier: Confirmation::ProtectedAction,
+                rule: RuleId::Builtin(LAN_BIND_RULE),
+            };
+        }
         // An unconditional ask rule raised the floor at plan time; a
         // matcher ask rule (P-08) asks only about the calls it matches.
         // The user rule is credited only when the tier it produced is
@@ -1606,6 +1659,14 @@ impl Session {
                 rule: RuleId::Builtin(MCP_DEFAULT_RULE),
             };
         }
+        // The background reader (P-36g, §9): a plain allow under its own
+        // rule, decided before the default read rule names it — the process
+        // is the run's own.
+        if a.exec_read {
+            return PolicyDecision::Allow {
+                rule: RuleId::Builtin(BG_READ_RULE),
+            };
+        }
         if cl.effect == Effect::Read && cl.sensitivity <= Sensitivity::Operational {
             return PolicyDecision::Allow {
                 rule: RuleId::Builtin("allow.default.read"),
@@ -1621,6 +1682,13 @@ impl Session {
         if a.todo {
             return PolicyDecision::Allow {
                 rule: RuleId::Builtin(TODO_RULE),
+            };
+        }
+        // The background stopper (P-36g, §9): a plain allow — the run
+        // stops what it started.
+        if a.exec_stop {
+            return PolicyDecision::Allow {
+                rule: RuleId::Builtin(BG_STOP_RULE),
             };
         }
         // Built-in workspace edits (H2b). §5.2 allows them by default
@@ -1640,12 +1708,13 @@ impl Session {
                 rule: RuleId::Builtin(EDIT_DEFAULT_RULE),
             };
         }
-        // The command runner (H2d): execute-class asks by default. The
-        // sandbox is the control and the allowlist names the programs, but
-        // a build script is arbitrary code whatever the argv says (§4.8), so
-        // running one is the user's call unless a user allow rule (checked
-        // above) says so. No approver: the ask is a deny (§5.2).
-        if a.exec {
+        // The command runner (H2d) and the background starter (P-36g):
+        // execute-class asks by default. The sandbox is the control and the
+        // allowlist names the programs, but a build script is arbitrary code
+        // whatever the argv says (§4.8), so running one is the user's call
+        // unless a user allow rule (checked above) says so. No approver: the
+        // ask is a deny (§5.2).
+        if a.exec || a.exec_start {
             if !self.approver_present {
                 return deny(DenyReason::NoApprover, "deny.no-approver");
             }
@@ -1685,6 +1754,21 @@ impl Session {
             return Err(ExecRefused::NotAllowlisted);
         }
         Ok(())
+    }
+
+    /// Whether the call's `ports` argument names one of the task's LAN
+    /// ports (§6.3). The schema has already made `ports` a list of integers
+    /// in the unprivileged range; anything above `u16` cannot be a LAN port.
+    fn names_lan_port(&self, args: &Value) -> bool {
+        args.get("ports")
+            .and_then(Value::as_array)
+            .is_some_and(|ports| {
+                ports.iter().any(|p| {
+                    p.as_u64()
+                        .and_then(|n| u16::try_from(n).ok())
+                        .is_some_and(|n| self.lan_ports.contains(&n))
+                })
+            })
     }
 
     /// The web branch (§2.3, P-39b): fetch against the session's allowlist,

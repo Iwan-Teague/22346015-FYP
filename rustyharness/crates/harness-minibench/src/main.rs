@@ -659,6 +659,8 @@ fn spec_of(t: &TaskFile) -> TaskSpec {
         task: TaskText::new(t.task.clone()),
         grants: t.grants.clone(),
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: t.exec.as_ref().map(|e| ExecSpec {
             programs: e
                 .programs

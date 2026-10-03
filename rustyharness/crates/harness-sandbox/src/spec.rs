@@ -70,6 +70,30 @@ pub const PORT_MIN: u16 = 1024;
 /// task-level grant is bounded again by the tools layer.
 pub const PORTS_PER_START: usize = 4;
 
+/// What the live port probe observed (§4.4): the digest over the fixed
+/// observations and the ports they probed. Journalled in the header's
+/// `ports` object (P-36h), so an audit re-feeds what planning measured on
+/// this host; no public constructor, like [`Approved`] — the backend's
+/// probe mints it (macOS: `seatbelt::Seatbelt::probe_ports`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortsWitness {
+    digest: harness_core::Digest,
+}
+
+impl PortsWitness {
+    /// SHA-256 over the profile version, the granted and reserved ports,
+    /// and what the probe observed.
+    pub fn digest(&self) -> &harness_core::Digest {
+        &self.digest
+    }
+
+    /// The witness of one probe's observations (crate-only: the probe is
+    /// the only minter).
+    pub(crate) fn new(digest: harness_core::Digest) -> Self {
+        Self { digest }
+    }
+}
+
 /// A request to run one program confined (design §6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfinedSpec {

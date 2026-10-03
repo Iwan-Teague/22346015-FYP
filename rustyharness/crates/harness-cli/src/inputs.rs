@@ -12,7 +12,7 @@ use harness_manifest::{builtin, SemVer, ValidationContext};
 use harness_model::profile::Profile;
 use harness_model::TaskText;
 use harness_policy::UserPolicy;
-use harness_run::{RunConfig, TaskSpec};
+use harness_run::{RunConfig, TaskSpec, PORTS_PER_TASK};
 use serde::Deserialize;
 
 use crate::args::USAGE;
@@ -107,13 +107,24 @@ where
 /// and its absolute, canonical path), the read-only roots the programs
 /// need, the toolchain variables the task declares, and the limits per
 /// command (defaults: 2048 MiB per process, 128 processes, 600 s of CPU
-/// per process, 1024 MiB files, 1024 KiB kept per stream).
+/// per process, 1024 MiB files, 1024 KiB kept per stream). P-36g adds the
+/// port grants: `ports` for loopback, `lan_ports` for the LAN subset.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecFile {
     programs: Vec<ProgramFile>,
     #[serde(default)]
     read_only: Vec<String>,
+    /// Ports the task may bind on loopback (P-36g §6.1): at most
+    /// [`PORTS_PER_TASK`], each 1024 or above, no duplicates, never the
+    /// model endpoint's own port.
+    #[serde(default)]
+    ports: Vec<u16>,
+    /// Of those, the ports reachable from the LAN (P-36g §6.3): a subset
+    /// of `ports`; each makes `harness.exec.start` naming it an ask, every
+    /// time.
+    #[serde(default)]
+    lan_ports: Vec<u16>,
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
@@ -284,6 +295,8 @@ pub(crate) fn inputs(
     // --preset and --shell describe (P-11). The two never mix: a task file
     // with an exec section already pins its programs, and exec_presets
     // refuses every disagreement as unreadable input (exit 4).
+    let mut task_ports: Vec<u16> = Vec::new();
+    let mut task_lan: Vec<u16> = Vec::new();
     let exec = match task.exec {
         Some(e) => {
             if crate::exec_presets::request(o, cfg).is_some() {
@@ -293,14 +306,37 @@ pub(crate) fn inputs(
                         .into(),
                 ));
             }
+            task_ports = e.ports.clone();
+            task_lan = e.lan_ports.clone();
             Some(e.spec().map_err(unreadable)?)
         }
         None => crate::exec_presets::section(cx, o, cfg, &task.grants)?,
     };
+    // The port grant (P-36g): the task file's lists and the flags, one
+    // union, bounded and duplicate-free, and never the model endpoint's
+    // own port.
+    let mut ports = task_ports;
+    let mut lan = task_lan;
+    ports.extend(port_list(o, "allow-port").map_err(unreadable)?);
+    lan.extend(port_list(o, "allow-lan-port").map_err(unreadable)?);
+    ports_checked(&ports, &lan).map_err(unreadable)?;
+    let model_port = crate::config::value(o, cfg, "endpoint").and_then(loopback_port);
+    if let Some(p) = model_port {
+        if ports.contains(&p) {
+            return Err(unreadable(format!(
+                "exec: port {p} is the model endpoint's own port; it is never a granted port"
+            )));
+        }
+    }
     let mut config = run_config(task.budget.as_ref(), exec.is_some()).map_err(unreadable)?;
     // Session-scoped grants (P-23, Q-4): default off; the flag lets the
     // person answer `a`/`d` at an approval prompt.
     config.allow_session_grants = o.contains_key("allow-session-grants");
+    // The model's own ports (P-36g): reserved, so a port grant is checked
+    // against them. Persisting background processes past the run is
+    // recorded here (P-36i consumes it).
+    config.reserved_ports = model_port.into_iter().collect();
+    config.bg_persist = o.contains_key("bg-persist");
     // The checks (H3a): bounded and on the allowlist, in a task that grants
     // the command runner, or the task file is unusable input (exit 4).
     let presubmit = task.presubmit.map(PresubmitFile::spec);
@@ -313,6 +349,8 @@ pub(crate) fn inputs(
             task: TaskText::new(task.task),
             grants: task.grants,
             workspace_public: task.workspace_public,
+            ports,
+            lan_ports: lan,
             exec,
             presubmit,
             protected: task.protected,
@@ -420,6 +458,69 @@ pub(crate) fn profile_digest(bytes: &[u8]) -> Result<harness_core::Digest, Strin
 /// passes the same limits to the audit, which requires them to equal the
 /// recorded ones (H1 phase-exit review F-1), so an audit or a resume must
 /// be given the task file the run was given.
+/// The task's port grant (P-36g §6.1), as the CLI reads it: bounded, each
+/// port a real high port, no duplicates, and the LAN subset inside it.
+/// The library re-checks all of this at planning; the loader refuses here
+/// so a task file never starts a run it cannot plan (exit 4).
+pub(crate) fn ports_checked(ports: &[u16], lan: &[u16]) -> Result<(), String> {
+    if ports.len() > PORTS_PER_TASK {
+        return Err(format!(
+            "exec: more than {PORTS_PER_TASK} ports are granted"
+        ));
+    }
+    // No duplicates within a list; a LAN port is one of the ports again
+    // (it is their subset), which is not a duplicate.
+    let mut seen = std::collections::BTreeSet::new();
+    for p in ports {
+        if *p < harness_sandbox::PORT_MIN {
+            return Err(format!("exec: port {p} is below 1024 (the reserved range)"));
+        }
+        if !seen.insert(*p) {
+            return Err(format!("exec: port {p} is granted twice"));
+        }
+    }
+    let mut seen_lan = std::collections::BTreeSet::new();
+    for p in lan {
+        if !ports.contains(p) {
+            return Err(format!("exec: lan port {p} is not among the task's ports"));
+        }
+        if !seen_lan.insert(*p) {
+            return Err(format!("exec: lan port {p} is granted twice"));
+        }
+    }
+    Ok(())
+}
+
+/// One `--allow-port` / `--allow-lan-port` value: a comma-separated port
+/// list (`--allow-port 5173,8000`).
+fn port_list(o: &BTreeMap<&str, &str>, k: &str) -> Result<Vec<u16>, String> {
+    let Some(v) = o.get(k) else {
+        return Ok(Vec::new());
+    };
+    v.split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("--{k}: {s:?} is not a port number"))
+        })
+        .collect()
+}
+
+/// The port of a loopback endpoint URL (`http://127.0.0.1:11434/v1`):
+/// `Some` only for a `127.0.0.1`/`localhost` URL that spells its port.
+/// This is the model's own port (P-36g §6.1): recorded as reserved, never
+/// a granted port.
+fn loopback_port(endpoint: &str) -> Option<u16> {
+    let rest = endpoint.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let (host, port) = authority.rsplit_once(':')?;
+    if host != "127.0.0.1" && host != "localhost" {
+        return None;
+    }
+    port.parse().ok()
+}
+
 fn run_config(budget: Option<&BudgetFile>, has_exec: bool) -> Result<RunConfig, String> {
     let mut c = RunConfig::defaults(1_000_000);
     let Some(b) = budget else { return Ok(c) };
@@ -464,7 +565,8 @@ fn builtin_registry() -> Result<Registry, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::TaskFile;
+    use super::{loopback_port, ports_checked, TaskFile, PORTS_PER_TASK};
+    use harness_core::sha256;
 
     /// The `protected` section (P-29): present globs parse; absent, the
     /// task carries only the build's defaults (`None` here, the CLI maps
@@ -481,5 +583,91 @@ mod tests {
         );
         let without: TaskFile = serde_json::from_str(r#"{"task":"t","grants":[]}"#).unwrap();
         assert!(without.protected.is_empty());
+    }
+
+    // ---- P-36g: port grants in the task file and at the flags. ----
+
+    /// A loopback endpoint's port is the model's own port: derived from
+    /// the URL when the host is local and the port is spelled, `None`
+    /// otherwise (a remote endpoint has no port to reserve here).
+    #[test]
+    fn port_grant_refuses_model_server_port() {
+        assert_eq!(loopback_port("http://127.0.0.1:11434/v1"), Some(11434));
+        assert_eq!(loopback_port("http://localhost:8080"), Some(8080));
+        assert_eq!(loopback_port("http://api.example.com/v1"), None);
+        assert_eq!(loopback_port("http://127.0.0.1"), None);
+        // The model's own port, derived above, is never a granted port:
+        // the same check the loader applies to the task's list.
+        let ports = [11434u16];
+        let model = loopback_port("http://127.0.0.1:11434/v1").unwrap();
+        assert!(ports.contains(&model));
+        assert!(ports_checked(&[5173], &[]).is_ok());
+    }
+
+    /// The loader's bounds (§6.1): each port a high port, no duplicates
+    /// within a list, the LAN subset inside the ports (a LAN port names a
+    /// granted port again, which is not a duplicate), and no more than a
+    /// task may hold.
+    #[test]
+    fn port_grant_refuses_below_1024_and_duplicates() {
+        assert!(ports_checked(&[80, 443], &[])
+            .unwrap_err()
+            .contains("below 1024"));
+        assert!(ports_checked(&[5173, 5173], &[])
+            .unwrap_err()
+            .contains("twice"));
+        assert!(ports_checked(&[5173, 8000], &[8000, 8000])
+            .unwrap_err()
+            .contains("twice"));
+        assert!(ports_checked(&[5173], &[8000])
+            .unwrap_err()
+            .contains("not among"));
+        let too_many: Vec<u16> = (0..PORTS_PER_TASK as u16 + 1).map(|i| 5173 + i).collect();
+        assert!(ports_checked(&too_many, &[])
+            .unwrap_err()
+            .contains("more than"));
+        assert!(ports_checked(&[5173, 8000], &[8000]).is_ok());
+    }
+
+    /// The task file's `exec.ports`/`exec.lan_ports` parse (§6.1), and the
+    /// task digest the header records — the sha256 of the task text — is
+    /// unchanged by them.
+    #[test]
+    fn task_file_ports_parse_and_header_digest() {
+        let task = "serve the thing";
+        let with: TaskFile = serde_json::from_str(&format!(
+            r#"{{"task":"{task}","grants":["harness.exec.run","harness.exec.start"],
+                "exec":{{"programs":[{{"name":"cargo","path":"/usr/bin/cargo"}}],
+                        "ports":[5173,8000],"lan_ports":[8000]}}}}"#
+        ))
+        .unwrap();
+        let exec = with.exec.as_ref().unwrap();
+        assert_eq!(exec.ports, vec![5173, 8000]);
+        assert_eq!(exec.lan_ports, vec![8000]);
+        // The digest is over the task text alone (H1f): ports are run
+        // inputs the header records separately, not part of this digest.
+        assert_eq!(
+            sha256(task.as_bytes()).to_string(),
+            "152e49d2939bb209ad46fe35405eab7f99cf8ff499847210d48a6f9ec3c69d2b"
+        );
+    }
+
+    /// A task file from before P-36g reads as before: no `ports` fields,
+    /// the same task digest.
+    #[test]
+    fn old_task_file_digest_unchanged() {
+        let old: TaskFile = serde_json::from_str(
+            r#"{"task":"t","grants":["harness.exec.run"],
+                "exec":{"programs":[{"name":"cargo","path":"/usr/bin/cargo"}]}}"#,
+        )
+        .unwrap();
+        let exec = old.exec.as_ref().unwrap();
+        assert!(exec.ports.is_empty() && exec.lan_ports.is_empty());
+        // Byte-for-byte the digest the pre-P-36g loader computed: the
+        // sha256 of the task text alone (sha256("t")).
+        assert_eq!(
+            sha256(b"t").to_string(),
+            "e3b98a4da31a127d4bde6e43033f66ba274cab0eb7eb1c70ec41402bf6273dd8"
+        );
     }
 }

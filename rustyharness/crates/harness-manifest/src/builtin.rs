@@ -58,6 +58,16 @@
 //! `harness.task.delegate {task}` (P-38) starts a read-only helper run:
 //! read / operational / own / none, `content: third_party` (its report is
 //! other people's text by default, like the read tools' results).
+//!
+//! The background tools (P-36g, §3): `harness.exec.start` starts one
+//! allowed program in the background (execute / operational / own / none,
+//! `content: third_party`, like the runner it extends), `harness.exec.read`
+//! reads a background process's output (read / operational / own / none,
+//! `content: third_party`, like the read tools) and `harness.exec.stop`
+//! stops one (write / operational / own / none, `content: own`, like the
+//! edits: its result is the harness's own report of the stop). All three
+//! exist only when the task grants them and holds an exec setup (§3);
+//! policy decides them in `harness-policy` (§5.2, §9).
 
 mod edit_delete;
 mod edit_move;
@@ -65,7 +75,10 @@ mod edit_multi;
 mod edit_patch;
 mod edit_replace;
 mod edit_write;
+mod exec_read;
 mod exec_run;
+mod exec_start;
+mod exec_stop;
 mod fs_glob;
 mod fs_list;
 mod fs_outline;
@@ -104,6 +117,9 @@ pub fn builtin_manifest_json() -> String {
         edit_delete::EDIT_DELETE,
         edit_move::EDIT_MOVE,
         exec_run::EXEC_RUN,
+        exec_start::EXEC_START,
+        exec_read::EXEC_READ,
+        exec_stop::EXEC_STOP,
         task_todo::TASK_TODO,
         task_delegate::TASK_DELEGATE,
         task_submit::TASK_SUBMIT,
@@ -150,7 +166,7 @@ pub fn research_manifest(ctx: &ValidationContext) -> Result<Manifest, ManifestEr
 /// fixed: entries are shorter than the manifest summaries and name every
 /// argument the schema has (both pinned by tests). A capability without an
 /// entry here keeps its full summary, so a provider capability is untouched.
-const TERSE_TABLE: [(&str, &str); 15] = [
+const TERSE_TABLE: [(&str, &str); 18] = [
     (
         "harness.fs.read",
         "Read a window of lines from a file: path, start (the first line, 1-based), lines (at most the run's read window)",
@@ -186,6 +202,18 @@ const TERSE_TABLE: [(&str, &str); 15] = [
     (
         "harness.exec.run",
         "Run one allowed program with no network: argv (the first item names it), cwd",
+    ),
+    (
+        "harness.exec.start",
+        "Start one allowed program in the background: argv (the first item names it), cwd, ports, scope, lifetime_secs, ready, ready_secs",
+    ),
+    (
+        "harness.exec.read",
+        "Read what a background process printed: id, mode, since_out, since_err, max_bytes, wait_secs",
+    ),
+    (
+        "harness.exec.stop",
+        "Stop one background process: id",
     ),
     (
         "harness.task.todo",

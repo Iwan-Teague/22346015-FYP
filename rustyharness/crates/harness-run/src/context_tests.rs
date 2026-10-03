@@ -148,6 +148,8 @@ fn drive(
         task: TaskText::new("What do the files say?".into()),
         grants: vec!["harness.fs.read".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

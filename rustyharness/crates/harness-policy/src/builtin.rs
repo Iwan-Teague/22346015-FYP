@@ -241,6 +241,81 @@ pub(crate) fn is_builtin_exec(c: &Capability) -> bool {
         && c.confirmation() == Confirmation::None
 }
 
+/// The background starter's id (P-36g, §3): starts one allowed program in
+/// the background. Only the compiled-in `harness` manifest can declare it.
+pub const EXEC_START_ID: &str = "harness.exec.start";
+
+/// The background reader's id (P-36g, §3): reads one background process's
+/// output without blocking.
+pub const EXEC_READ_ID: &str = "harness.exec.read";
+
+/// The background stopper's id (P-36g, §3): stops one background process.
+pub const EXEC_STOP_ID: &str = "harness.exec.stop";
+
+/// The rule that allows a background read (§9): like the fs reads, a plain
+/// allow — the process is the run's own.
+pub const BG_READ_RULE: &str = "allow.exec.bg-read";
+
+/// The rule that allows a background stop (§9): the run stops what it
+/// started.
+pub const BG_STOP_RULE: &str = "allow.exec.bg-stop";
+
+/// The floor rule behind every `harness.exec.start` naming a LAN port
+/// (§6.3): a protected action, asked every time, never covered by a session
+/// grant or lowered by a user allow rule.
+pub const LAN_BIND_RULE: &str = "ask.exec.lan-bind";
+
+/// Whether `c` is the built-in background starter with exactly the labels
+/// §9 gives it: the runner's labels (execute / operational / own / none,
+/// `content: third_party`, no declared confirmation). The capability stays
+/// `egress: none` even though a LAN port grant binds a socket — the egress
+/// label rides the task's `lan_ports` (§6.3), not the tool.
+pub(crate) fn is_builtin_exec_start(c: &Capability) -> bool {
+    c.id().as_str() == EXEC_START_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Execute
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::ThirdParty
+        && c.confirmation() == Confirmation::None
+}
+
+/// Whether `c` is the built-in background reader with exactly the labels
+/// §9 gives it (read / operational / own / none, `content: third_party`,
+/// no declared confirmation).
+pub(crate) fn is_builtin_exec_read(c: &Capability) -> bool {
+    c.id().as_str() == EXEC_READ_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Read
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::ThirdParty
+        && c.confirmation() == Confirmation::None
+}
+
+/// Whether `c` is the built-in background stopper with exactly the labels
+/// §9 gives it (write / operational / own / none, `content: own` — its
+/// result is the harness's own report of the stop).
+pub(crate) fn is_builtin_exec_stop(c: &Capability) -> bool {
+    c.id().as_str() == EXEC_STOP_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Write
+        && c.sensitivity() == Sensitivity::Operational
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::Own
+        && c.confirmation() == Confirmation::None
+}
+
+/// Whether `id` is one of the three background tools (§3): they exist only
+/// when the task grants them and holds an exec setup. Planning (the run
+/// crate) uses this on the task's grant list.
+pub fn is_bg_id(id: &str) -> bool {
+    matches!(id, EXEC_START_ID | EXEC_READ_ID | EXEC_STOP_ID)
+}
+
 /// What kind of built-in tool a registration entry declares. Drives the
 /// planning refusals that used to be scattered id checks: which tools
 /// operate inside the workspace, and which are recognized by labels rather
@@ -262,6 +337,9 @@ pub enum ToolKind {
     Edit,
     /// The command runner (§4.8, H2d).
     Exec,
+    /// A background tool (P-36g, §3): start, read or stop, all operating
+    /// inside the workspace and only with an exec setup held.
+    ExecBg,
     /// A web airlock tool (§2.3, P-39b): needs no workspace; a session
     /// holding one must be a research session.
     Web,
@@ -275,7 +353,7 @@ impl ToolKind {
     pub fn needs_workspace(self) -> bool {
         matches!(
             self,
-            ToolKind::Fs | ToolKind::Edit | ToolKind::Exec | ToolKind::Delegate
+            ToolKind::Fs | ToolKind::Edit | ToolKind::Exec | ToolKind::ExecBg | ToolKind::Delegate
         )
     }
 }
@@ -361,6 +439,23 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         id: "harness.exec.run",
         kind: ToolKind::Exec,
         labels: is_builtin_exec,
+    },
+    // The background tools (P-36g, §3) extend the runner: start, read and
+    // stop, in manifest order.
+    BuiltinTool {
+        id: EXEC_START_ID,
+        kind: ToolKind::ExecBg,
+        labels: is_builtin_exec_start,
+    },
+    BuiltinTool {
+        id: EXEC_READ_ID,
+        kind: ToolKind::ExecBg,
+        labels: is_builtin_exec_read,
+    },
+    BuiltinTool {
+        id: EXEC_STOP_ID,
+        kind: ToolKind::ExecBg,
+        labels: is_builtin_exec_stop,
     },
     BuiltinTool {
         id: "harness.task.todo",

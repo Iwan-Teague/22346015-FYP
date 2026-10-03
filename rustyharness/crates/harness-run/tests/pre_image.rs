@@ -37,6 +37,8 @@ fn spec() -> TaskSpec {
             "harness.edit.write".into(),
         ],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

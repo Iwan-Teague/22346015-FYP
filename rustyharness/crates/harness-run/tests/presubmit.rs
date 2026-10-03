@@ -110,6 +110,8 @@ fn task(grants: &[&str], exec: Option<ExecSpec>, presubmit: Option<PresubmitSpec
         task: TaskText::new("Make the tests pass.".into()),
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec,
         presubmit,
         protected: Vec::new(),

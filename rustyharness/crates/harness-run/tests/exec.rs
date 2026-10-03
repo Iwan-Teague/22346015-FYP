@@ -102,6 +102,8 @@ fn spec_with(grants: &[&str], exec: Option<ExecSpec>) -> TaskSpec {
         task: TaskText::new("Make the tests pass.".into()),
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec,
         presubmit: None,
         protected: Vec::new(),

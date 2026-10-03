@@ -72,6 +72,8 @@ fn spec(task: &str) -> TaskSpec {
         task: TaskText::new(task.into()),
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

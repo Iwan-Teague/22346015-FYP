@@ -11,7 +11,7 @@ use harness_manifest::builtin;
 use harness_model::context::{CONTEXT_FORMAT, RESEARCH_CONTEXT_FORMAT, SESSION_CONTEXT_FORMAT};
 use harness_model::profile::{Profile, Protocol};
 use harness_policy::{SessionKind, UserPolicy, WebConfirmation, SUBMIT_ID};
-use harness_sandbox::Conformed;
+use harness_sandbox::{Conformed, PortsWitness};
 use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::protected::{DEFAULT_ASK, DEFAULT_DENY};
 use harness_tools::Pinned;
@@ -68,6 +68,9 @@ pub(crate) struct HeaderInputs<'a> {
     pub(crate) session: Option<crate::session::TurnLimits>,
     /// The command runner's header fields, with an exec grant (H2d).
     pub(crate) exec: Option<ExecHeader>,
+    /// The task's port grant, with the probed witness (P-36g §6.1); `None`
+    /// without ports, so older journals read as before.
+    pub(crate) ports: Option<PortsHeader>,
     /// The workspace-mode record (P-52); `None` in-place (no field).
     pub(crate) workspace_mode: Option<&'a WorkspaceModeRecord>,
 }
@@ -231,6 +234,102 @@ impl ExecHeader {
     }
 }
 
+/// The header's `ports` object (P-36g §6.1): the granted ports, their LAN
+/// subset, the model's reserved ports, and the probe's digest. A header
+/// input an audit and a resume compare; absent without a port grant, so
+/// older journals read as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortsHeader {
+    /// Every granted port, in the task's order.
+    pub(crate) loopback: Vec<u16>,
+    /// The LAN subset, in the task's order.
+    pub(crate) lan: Vec<u16>,
+    /// The model's own ports, in the caller's order.
+    pub(crate) reserved: Vec<u16>,
+    /// The ports witness's digest ([`harness_sandbox::PortsWitness`]).
+    pub(crate) probe: Digest,
+}
+
+impl PortsHeader {
+    /// The header of a run that holds ports: `None` without a port grant,
+    /// and the witness is there exactly then (planning probes when, and
+    /// only when, the task holds ports).
+    pub(crate) fn of(
+        spec: &TaskSpec,
+        config: &RunConfig,
+        witness: Option<&PortsWitness>,
+    ) -> Option<Self> {
+        if spec.ports.is_empty() {
+            return None;
+        }
+        // Planning probed exactly when the task holds ports, so the
+        // witness is there; without one this is `None` and the header
+        // carries no `ports` key, which an audit or a resume refuses.
+        let probe = *witness?.digest();
+        Some(Self {
+            loopback: spec.ports.clone(),
+            lan: spec.lan_ports.clone(),
+            reserved: config.reserved_ports.clone(),
+            probe,
+        })
+    }
+
+    fn trusted(&self) -> Trusted {
+        Trusted::Obj(vec![
+            (
+                "loopback",
+                Trusted::List(
+                    self.loopback
+                        .iter()
+                        .map(|p| Trusted::U64(u64::from(*p)))
+                        .collect(),
+                ),
+            ),
+            (
+                "lan",
+                Trusted::List(
+                    self.lan
+                        .iter()
+                        .map(|p| Trusted::U64(u64::from(*p)))
+                        .collect(),
+                ),
+            ),
+            (
+                "reserved",
+                Trusted::List(
+                    self.reserved
+                        .iter()
+                        .map(|p| Trusted::U64(u64::from(*p)))
+                        .collect(),
+                ),
+            ),
+            ("probe", Trusted::Digest(self.probe)),
+        ])
+    }
+
+    /// A recorded header's `ports` object, when it is one this build
+    /// writes (an audit re-states it; like [`SandboxRecord::parse`]).
+    pub(crate) fn parse(v: &Value) -> Option<Self> {
+        let o = v.as_object()?;
+        if o.len() != 4 {
+            return None;
+        }
+        let list = |k: &str| -> Option<Vec<u16>> {
+            o.get(k)?
+                .as_array()?
+                .iter()
+                .map(|x| u16::try_from(x.as_u64()?).ok())
+                .collect()
+        };
+        Some(Self {
+            loopback: list("loopback")?,
+            lan: list("lan")?,
+            reserved: list("reserved")?,
+            probe: o.get("probe")?.as_str()?.parse().ok()?,
+        })
+    }
+}
+
 /// The header keys an audit replay or a resume recomputes from its own
 /// inputs and requires to be equal to the recorded ones. `limits` is one
 /// (H1 phase-exit review F-1): the replay recomputes every budget stop
@@ -240,11 +339,13 @@ impl ExecHeader {
 /// harness build: a journal another build wrote is refused by name, never
 /// replayed into a mismatch. `shell_enabled` and `exec` (H2d) are the
 /// task's exec allowlist: absent without an exec grant, so a journal
-/// without one reads as before. `mode` and `turn_limits` (P-05 §1.4) are
+/// without one reads as before. `ports` (P-36g §6.1) is the task's port
+/// grant and its probe: absent without a port grant, so a journal without
+/// one reads as before. `mode` and `turn_limits` (P-05 §1.4) are
 /// the session's: absent in a batch run's header, so such a journal reads
 /// as before. `session_kind` and `web` (P-39i) are a research session's:
 /// absent for a coding session, so coding journals read exactly as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 19] = [
+pub(crate) const HEADER_INPUT_KEYS: [&str; 20] = [
     "task",
     "grants",
     "workspace_public",
@@ -259,6 +360,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 19] = [
     "context_format",
     "limits",
     "exec",
+    "ports",
     "presubmit",
     "mode",
     "turn_limits",
@@ -456,6 +558,12 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
             )
             .field("exec_programs_sha256", Trusted::Digest(e.programs_sha256))
             .field("exec_timeout_ms", Trusted::U64(e.timeout_ms));
+    }
+    // The task's port grant (P-36g §6.1): the ports, their LAN subset, the
+    // model's reserved ports and the probe's digest; no key without a port
+    // grant, so older journals read as before.
+    if let Some(p) = &h.ports {
+        hd = hd.field("ports", p.trusted());
     }
     // The task's pre-submit checks (H3a): a header input, compared by audit
     // and resume; no key without checks, so older journals read as before.

@@ -223,6 +223,8 @@ fn spec() -> TaskSpec {
         task: TaskText::new(TASK.to_owned()),
         grants: GRANTS.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

@@ -97,6 +97,8 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "allow-session-grants",
             "accept-edits",
             "workspace-mode",
+            "allow-port",
+            "allow-lan-port",
         ],
         Verb::Resume => &[
             "run",
@@ -114,6 +116,8 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "no-default-denies",
             "allow-session-grants",
             "accept-edits",
+            "allow-port",
+            "allow-lan-port",
         ],
         Verb::Replay => &[
             "run",
@@ -129,13 +133,22 @@ fn gate_child(cx: &Cx<'_>, rest: &[&str], verb: Verb) -> u8 {
             "shell",
             "no-default-denies",
             "accept-edits",
+            "allow-port",
+            "allow-lan-port",
         ],
     };
     // `scratch-with-git` (P-52) goes with `--workspace-mode scratch`, which
-    // only a run may take; replay has no workspace to copy.
+    // only a run may take; replay has no workspace to copy. `bg-persist`
+    // (P-36g) is a run's or a resume's choice about its own processes.
     let valueless: &[&str] = match verb {
-        Verb::Run => &["shell", "no-default-denies", "scratch-with-git"],
-        Verb::Resume | Verb::Replay => VALUELESS,
+        Verb::Run => &[
+            "shell",
+            "no-default-denies",
+            "scratch-with-git",
+            "bg-persist",
+        ],
+        Verb::Resume => &["shell", "no-default-denies", "bg-persist"],
+        Verb::Replay => VALUELESS,
     };
     let parsed = options(rest, allowed, valueless);
     let gate_text = parsed

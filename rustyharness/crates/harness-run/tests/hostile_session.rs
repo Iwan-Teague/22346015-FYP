@@ -64,6 +64,8 @@ fn spec(task: &str, grants: &[&str]) -> TaskSpec {
         task: TaskText::new(task.into()),
         grants: grants.iter().map(|g| (*g).to_owned()).collect(),
         workspace_public: false,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
         exec: None,
         presubmit: None,
         protected: Vec::new(),

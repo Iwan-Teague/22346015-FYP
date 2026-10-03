@@ -494,9 +494,7 @@ impl Seatbelt {
             Ok(observed)
         })();
         let _ = std::fs::remove_dir_all(&dir);
-        result.map(|observed| PortsWitness {
-            digest: ports_digest(bind, reserved, &observed),
-        })
+        result.map(|observed| PortsWitness::new(ports_digest(bind, reserved, &observed)))
     }
 }
 
@@ -702,22 +700,9 @@ my $p=fork(); if (defined $p && $p==0) { POSIX::setsid(); if (fork()) { POSIX::_
 waitpid($p,0); r('escape', 1);
 "#;
 
-/// What the live port probe observed (§4.4): the digest over the fixed
-/// observations and the ports they probed. Journalled in the header's
-/// `ports` object (P-36h), so an audit re-feeds what planning measured on
-/// this host; no public constructor, like [`Conformed`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortsWitness {
-    digest: harness_core::Digest,
-}
-
-impl PortsWitness {
-    /// SHA-256 over the profile version, the granted and reserved ports,
-    /// and what the probe observed.
-    pub fn digest(&self) -> &harness_core::Digest {
-        &self.digest
-    }
-}
+// The witness type lives with the spec (P-36g): the `Confinement` trait's
+// `probe_ports` is cross-platform, so the type must be too.
+use crate::spec::PortsWitness;
 
 /// The probes the port script reports, each as `<name> ok` (ok: the
 /// observation matched what a conforming host must show).
@@ -1242,7 +1227,7 @@ mod port_probe_tests {
         assert_ne!(a, ports_digest(&[5174], &[11434], o));
         assert_ne!(a, ports_digest(&[5173], &[], o));
         assert_ne!(a, ports_digest(&[5173], &[11434], b"bind-granted FAIL\n"));
-        let w = PortsWitness { digest: a };
+        let w = PortsWitness::new(a);
         assert_eq!(w.digest(), &a);
     }
 }

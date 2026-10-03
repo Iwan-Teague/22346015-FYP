@@ -396,6 +396,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         todo: todo_for(&r.spec.grants),
         notices: BudgetNotices::live(r.config.limits.wall),
         presubmit: PresubmitState::of(&r.spec.presubmit),
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);

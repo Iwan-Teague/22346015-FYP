@@ -18,15 +18,20 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use harness_core::Digest;
+use harness_journal::layout;
+use harness_journal::reader::DirBlobSource;
 use harness_policy::approval::ApprovalRequest;
 use harness_run::{
-    ApprovalAnswer, Approver, ApproverKind, InputEnd, UserInput, UserInputEvent, UserMessage,
-    UserMessageRefused,
+    external_differ, marks_from_records, plan, ApprovalAnswer, Approver, ApproverKind, InputEnd,
+    RestoreCommand, RestoreMark, UserInput, UserInputEvent, UserMessage, UserMessageRefused,
 };
+use harness_tools::builtin::workspace_tree;
 
 use crate::Cx;
 
@@ -203,6 +208,7 @@ impl UserInput for ChatInput<'_, '_> {
                 match self.slash(first.trim(), deadline) {
                     Slash::Continue => continue,
                     Slash::EndSession => return UserInputEvent::End(InputEnd::Exit),
+                    Slash::Restore(cmd) => return UserInputEvent::Restore(cmd),
                 }
             } else {
                 first
@@ -226,6 +232,9 @@ enum Slash {
     Continue,
     /// The command ended the session (`/clear`, `/exit`).
     EndSession,
+    /// A restore command whose pre-check passed (`/undo`, `/rewind`): the
+    /// loop applies and journals it, re-verifying everything.
+    Restore(RestoreCommand),
 }
 
 impl ChatInput<'_, '_> {
@@ -306,15 +315,125 @@ impl ChatInput<'_, '_> {
                     None => note!(self.cx, "no journal yet"),
                 }
             }
+            ("/undo", _) => {
+                let dir = st.attempt_dir.clone();
+                let ws = st.workspace.clone();
+                drop(st);
+                return self.plan_restore(dir, &ws, 1, false);
+            }
+            ("/rewind", _) => {
+                let dir = st.attempt_dir.clone();
+                let ws = st.workspace.clone();
+                drop(st);
+                let mut steps = 1u64;
+                let mut keep = false;
+                for w in words {
+                    if w == "--force-keep-external" {
+                        keep = true;
+                    } else if let Ok(n) = w.parse::<u64>() {
+                        steps = n;
+                    } else {
+                        note!(self.cx, "usage: /rewind [N] [--force-keep-external]");
+                        return Slash::Continue;
+                    }
+                }
+                return self.plan_restore(dir, &ws, steps, keep);
+            }
             _ => note!(self.cx, "unknown command; {HELP}"),
         }
         Slash::Continue
     }
+
+    /// The pre-check and command for `/undo` and `/rewind` (P-26): the
+    /// plan comes from the journal, and — unless keeping external edits —
+    /// a workspace that left the journal's state is refused here, naming
+    /// the files whose digests differ. What passes is handed to the loop
+    /// as a [`UserInputEvent::Restore`]: the loop re-verifies everything
+    /// (the workspace may move between this check and the command) and
+    /// fails closed there. This side only decides what to show.
+    fn plan_restore(&self, dir: Option<PathBuf>, ws: &str, steps: u64, keep: bool) -> Slash {
+        let Some(dir) = dir else {
+            note!(self.cx, "no journal yet");
+            return Slash::Continue;
+        };
+        let Ok(v) = harness_journal::JournalReader::open(&dir) else {
+            note!(self.cx, "no journal yet");
+            return Slash::Continue;
+        };
+        let blobs = DirBlobSource::new(dir.join(layout::BLOBS_DIR));
+        let marks = match marks_from_records(&v, &blobs) {
+            Ok(m) => m,
+            Err(e) => {
+                note!(self.cx, "cannot restore from this journal: {e}");
+                return Slash::Continue;
+            }
+        };
+        let planned = match plan(&marks, steps) {
+            Ok(p) => p,
+            Err(e) => {
+                note!(self.cx, "{e}");
+                return Slash::Continue;
+            }
+        };
+        if !keep {
+            let Some(want) = marks.last().and_then(mark_tree) else {
+                note!(self.cx, "the journal carries no workspace state yet");
+                return Slash::Continue;
+            };
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let root = std::path::Path::new(ws);
+            let measured = match workspace_tree(root, deadline) {
+                Ok(t) => t,
+                Err(e) => {
+                    note!(self.cx, "cannot read the workspace: {e}");
+                    return Slash::Continue;
+                }
+            };
+            if measured.facts().tree != want {
+                note!(
+                    self.cx,
+                    "the workspace changed outside the harness since the last record; restore refused. Files that differ:"
+                );
+                for d in external_differ(root, &marks) {
+                    let journaled = d
+                        .journaled
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "(deleted)".into());
+                    let found = d
+                        .found
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "(gone)".into());
+                    note!(self.cx, "  {}: journal {journaled}, now {found}", d.path);
+                }
+                note!(
+                    self.cx,
+                    "/rewind --force-keep-external restores only the files still as the harness left them"
+                );
+                return Slash::Continue;
+            }
+        }
+        note!(
+            self.cx,
+            "undoing {} file edit(s) back to step {}",
+            planned.files.len(),
+            planned.to_step
+        );
+        Slash::Restore(RestoreCommand {
+            steps,
+            keep_external: keep,
+        })
+    }
+}
+
+/// The tree digest a mark carries.
+fn mark_tree(m: &RestoreMark) -> Option<Digest> {
+    match m {
+        RestoreMark::Tree { tree, .. } | RestoreMark::Edit { tree, .. } => Some(*tree),
+    }
 }
 
 /// The slash commands, as `/help` prints them.
-const HELP: &str =
-    "commands: /help /status /tools /policy /sessions /resume /todo /usage /diff /clear /exit";
+const HELP: &str = "commands: /help /status /tools /policy /sessions /resume /todo /usage /diff /undo /rewind [N] [--force-keep-external] /clear /exit";
 
 /// The terminal prompt for an ask, over the chat's own stdin feed (P-18):
 /// the request itself is shown by the sink's `[approve]` line, so this

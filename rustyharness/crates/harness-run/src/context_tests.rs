@@ -208,6 +208,7 @@ fn drive(
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);

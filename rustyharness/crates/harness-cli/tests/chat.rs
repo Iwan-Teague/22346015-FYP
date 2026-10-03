@@ -202,6 +202,43 @@ fn chat_resume_continues_previous_session() {
 }
 
 #[test]
+fn chat_undo_restores_the_last_edit() {
+    let fx = Fixture::new("chat-undo").unwrap();
+    let base = setup(&fx, &["harness.fs.read", "harness.edit.write"]);
+    let (code, _out, err) = chat_cli(
+        &fx,
+        &argv(&base),
+        &["rewrite a.txt", "/undo"],
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act(
+                "harness.edit.write",
+                r#"{"path":"a.txt","content":"rewritten"}"#,
+            ),
+            say("done"),
+        ],
+        &["y"],
+    );
+    assert_eq!(code, 5, "stderr: {err}");
+    assert!(err.contains("undoing 1 file edit(s)"), "stderr: {err}");
+    assert!(err.contains("[restore] back to step"), "stderr: {err}");
+    assert_eq!(
+        std::fs::read_to_string(fx.workspace().join("a.txt")).unwrap(),
+        "the answer is in here\n"
+    );
+}
+
+#[test]
+fn chat_undo_without_edits_says_nothing_to_undo() {
+    let fx = Fixture::new("chat-undo-nothing").unwrap();
+    let base = setup(&fx, &["harness.fs.read"]);
+    let (code, _out, err) = chat_cli(&fx, &argv(&base), &["hello", "/undo"], vec![say("hi")], &[]);
+    assert_eq!(code, 5, "stderr: {err}");
+    assert!(err.contains("nothing to undo"), "stderr: {err}");
+    assert!(!err.contains("[restore]"), "stderr: {err}");
+}
+
+#[test]
 fn chat_output_has_no_raw_escape_from_model() {
     let fx = Fixture::new("chat-escape").unwrap();
     let base = setup(&fx, &["harness.fs.read"]);

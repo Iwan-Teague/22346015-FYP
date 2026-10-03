@@ -54,5 +54,5 @@ pub use provider::{
     EditRecord, ExecCleanup, ExecEnd, ExecRecord, Image, InvokeCtx, ReadRecord, RefusalKind,
     ToolError, ToolProvider, ToolResult, ToolStatus,
 };
-pub use restore::{restore_file, RestoreError};
+pub use restore::{recreate_file, restore_file, uncreate_file, RestoreError};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};

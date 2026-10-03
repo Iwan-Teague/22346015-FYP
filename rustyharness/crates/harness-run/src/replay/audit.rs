@@ -440,6 +440,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             wall_announced: 0,
         },
         presubmit: PresubmitState::of(&a.spec.presubmit),
+        restore: Default::default(),
         // A session replay opens turns (P-17 §6): the re-fed texts build
         // the users' share of the context, and each turn's budgets are
         // recomputed from the recorded turn limits. It measures nothing

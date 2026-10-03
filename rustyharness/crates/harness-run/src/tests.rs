@@ -216,6 +216,7 @@ fn drive_full(
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -940,6 +941,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         todo: None,
         notices: BudgetNotices::live(cfg.limits.wall),
         presubmit: None,
+        restore: Default::default(),
         user: None,
     });
     let end = lp.drive(&mut w);

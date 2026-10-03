@@ -130,6 +130,10 @@ impl InputEnd {
 pub enum UserInputEvent {
     /// The user's next message.
     Message(UserMessage),
+    /// The user asked to restore an earlier workspace state (`/undo`,
+    /// `/rewind N`, P-26). Handled between turns; a refusal journals
+    /// nothing.
+    Restore(crate::restore::RestoreCommand),
     /// The input ended; the session does too (`RunStopped`,
     /// cause `session_ended`).
     End(InputEnd),
@@ -159,6 +163,16 @@ pub(crate) enum RecordedInput {
     /// A recorded `InputEnded`: its reason is re-fed; its turn number is
     /// recomputed.
     End(InputEnd),
+    /// A recorded `Restored` (P-26): the checkpoint it went back to (the
+    /// step and tree digest the record names). Everything else about the
+    /// restore is recomputed from the marks and compared by the record's
+    /// body.
+    Restore {
+        /// The step the `Restored` record names.
+        to_step: u64,
+        /// The tree digest the `Restored` record names.
+        tree_digest: Digest,
+    },
 }
 
 /// The name a recorded `InputEnded` carries, back to the enum: anything
@@ -445,6 +459,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         todo: crate::driver::todo_for(&s.spec.grants),
         notices: BudgetNotices::live(s.config.run.limits.wall),
         presubmit: PresubmitState::of(&s.spec.presubmit),
+        restore: Default::default(),
         user: Some(UserState {
             limits: s.config.turn,
             turn: 1,
@@ -521,6 +536,10 @@ impl<'a> Loop<'a> {
                 facts: WorkspaceFacts,
                 wall_used_ms: u64,
             },
+            Restore {
+                to_step: u64,
+                tree_digest: Digest,
+            },
             End(InputEnd),
             Spent,
         }
@@ -578,6 +597,13 @@ impl<'a> Loop<'a> {
                             facts,
                             wall_used_ms,
                         },
+                        Some(RecordedInput::Restore {
+                            to_step,
+                            tree_digest,
+                        }) => Next::Restore {
+                            to_step,
+                            tree_digest,
+                        },
                         Some(RecordedInput::End(reason)) => Next::End(reason),
                         None => Next::Spent,
                     }
@@ -614,6 +640,34 @@ impl<'a> Loop<'a> {
                         step: self.step,
                         deliverable,
                     };
+                }
+                // P-26: a restore command runs between turns, consumes no
+                // step and opens no turn. Applied (and journaled) or not,
+                // the loop asks for the next input afterwards.
+                Next::Live(UserInputEvent::Restore(cmd)) => {
+                    if let Err(cause) = self.restore_to_step(w, cmd) {
+                        return self.session_end(cause);
+                    }
+                    self.ui_drain(w);
+                    if w.is_poisoned() {
+                        return self.poisoned();
+                    }
+                    continue;
+                }
+                // P-26: a recorded `Restored` is recomputed from the marks,
+                // never re-applied — the replay has no workspace.
+                Next::Restore {
+                    to_step,
+                    tree_digest,
+                } => {
+                    if let Err(cause) = self.recompute_restore(w, to_step, tree_digest) {
+                        return self.session_end(cause);
+                    }
+                    self.ui_drain(w);
+                    if w.is_poisoned() {
+                        return self.poisoned();
+                    }
+                    continue;
                 }
                 Next::Live(UserInputEvent::Message(m)) => {
                     match self.begin_user_turn(
@@ -802,6 +856,9 @@ impl<'a> Loop<'a> {
 
         // 4. The loop's state moves to the recorded facts (P-05 §5).
         self.tree = measured.tree;
+        // P-26: the measured tree is a checkpoint a `/rewind` can go back
+        // to.
+        self.restore.push_tree(self.step, measured.tree);
         let u = self.user.as_mut().ok_or(StopCause::PolicyAbort)?;
         u.turn += 1;
         u.allowance = allowance;

@@ -59,6 +59,7 @@ pub mod approve;
 pub mod driver;
 pub mod presubmit;
 pub mod replay;
+pub mod restore;
 mod sample;
 pub mod scratch;
 pub mod session;
@@ -73,6 +74,7 @@ pub use replay::{
     audit, audit_session, resume, resume_session, Audit, AuditRefused, AuditReport, Divergence,
     Resume, ResumeSession,
 };
+pub use restore::{external_differ, marks_from_records, plan, RestoreCommand, RestoreMark};
 pub use session::{
     run_session, EventSink, InputEnd, SessionConfig, SessionReport, SessionRun, TurnLimits,
     UiEvent, UserInput, UserInputEvent, UserMessage, UserMessageRefused,

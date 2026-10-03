@@ -95,6 +95,10 @@ pub(crate) struct Loop<'a> {
     /// The task's pre-submit checks and what they did so far (H3a); `None`
     /// for a task without any: a submission is then accepted at once.
     pub(crate) presubmit: Option<PresubmitState>,
+    /// The workspace states the journal carries, for a session's `/undo`
+    /// and `/rewind` (P-26); rebuilt the same way in an audit and a
+    /// resume's catch-up.
+    pub(crate) restore: crate::restore::RestoreLog,
     /// The interactive session's state (P-05); `None` in a batch run, an
     /// audit and a resume's catch-up, which take every batch path unchanged.
     pub(crate) user: Option<UserState<'a>>,
@@ -157,6 +161,7 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) todo: Option<TodoList>,
     pub(crate) notices: BudgetNotices,
     pub(crate) presubmit: Option<PresubmitState>,
+    pub(crate) restore: crate::restore::RestoreLog,
     pub(crate) user: Option<UserState<'a>>,
 }
 
@@ -188,6 +193,7 @@ impl<'a> Loop<'a> {
             todo,
             notices,
             presubmit,
+            restore,
             user,
         } = init;
         Loop {
@@ -216,6 +222,7 @@ impl<'a> Loop<'a> {
             todo,
             notices,
             presubmit,
+            restore,
             user,
         }
     }
@@ -1074,6 +1081,15 @@ impl<'a> Loop<'a> {
                         }
                         ev = ev.field("workspace_tree", Trusted::Digest(tree));
                         w.append(step, ev).map_err(journal)?;
+                        // P-26: the record is a mark a `/rewind` can undo.
+                        self.restore.push_edit(
+                            step,
+                            intent_seq,
+                            e.path.as_str(),
+                            e.before,
+                            e.after,
+                            tree,
+                        );
                         // A written file is the model's latest read of it, so
                         // it may edit it again without re-reading; a deleted
                         // one is forgotten: a further edit needs a fresh read.
@@ -1120,6 +1136,8 @@ impl<'a> Loop<'a> {
                         ev = ev.field("workspace_tree", Trusted::Digest(t));
                         exec_changed = t != self.tree;
                         self.tree = t;
+                        // P-26: a command's measured tree is a checkpoint.
+                        self.restore.push_tree(step, t);
                     }
                     exec_stop = match (x.cleanup, tree) {
                         (ExecCleanup::Unconfirmed, _) => Some(StopCause::SandboxLost),

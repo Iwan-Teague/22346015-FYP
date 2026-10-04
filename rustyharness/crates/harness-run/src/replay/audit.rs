@@ -1138,13 +1138,16 @@ fn audit_child(
     };
     let (report_c, totals) = match audit_inner(child, None, Some(expect)) {
         Ok(x) => x,
-        Err(_) => {
+        Err(e) => {
+            if std::env::var_os("RUSTYHARNESS_DEBUG_CHILD_AUDIT").is_some() {
+                eprintln!("DEBUG child audit_inner refused: {e:?}");
+            }
             return report(
                 f.child.clone(),
                 Some(diverge(r.seq, r.step, "the child's inputs do not plan")),
                 false,
                 UNREADABLE,
-            )
+            );
         }
     };
     if let Some(d) = report_c.divergence {

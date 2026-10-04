@@ -166,6 +166,16 @@ each optional (1 to 500 steps, 1 second to a day; the defaults are 50 steps and
 limits are recorded in the journal's header, so `replay` and `resume` must be
 given the same task file.
 
+A task may also be granted **delegation**: with `harness.task.delegate` in its
+grants — never by default — the model may hand a search or a read to helper
+runs, at most 5 helpers per run. A helper is a read-only helper: it may read,
+list, search and outline the workspace, and nothing else — no edits, no
+commands, no helper of its own. Each helper gets a carve of the parent's
+budget (at most 15 steps, at most 200 000 tokens, at most 10 minutes) and
+returns a short report the parent is told to treat as untrusted input. The
+helpers' journals are recorded in the parent's, and `replay` audits the
+helpers with the run: a helper that does not replay clean fails the replay.
+
 A task that runs commands may also name **pre-submit checks**: commands the
 harness runs, in the same sandbox and under the same policy as the model's own
 commands, when the model calls `harness.task.submit`. If one fails (a non-zero

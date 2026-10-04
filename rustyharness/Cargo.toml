@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 publish = false
@@ -30,6 +30,18 @@ regex = { version = "1.12", default-features = false, features = ["std", "unicod
 # pattern is reported to the model as a static harness message chosen by
 # the error's kind, never as the parser's text (which quotes the pattern).
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }
+# The TLS stack of the web airlock's fetcher (design note `P-39-web-airlock`
+# §5.4, slice P-39n): rustls with the ring provider and NO default features
+# (never aws-lc-rs: no C toolchain on the build path). Optional everywhere;
+# only harness-fetch's `net` feature turns it on.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# The web's public root store (§5.4): Mozilla's set as compiled data, so the
+# fetcher never reads the system trust store.
+webpki-roots = "1.0"
+# Test-only (harness-fetch dev-deps): PEM loading for the static test CA and
+# fixture leaves. PEM parsing is built in from 1.12 (the old feature knobs
+# are gone), so this adds no feature surface.
+rustls-pki-types = "1.12"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

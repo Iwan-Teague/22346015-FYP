@@ -10,14 +10,15 @@ use std::time::Instant;
 use harness_core::{sha256, RunId};
 use harness_journal::layout;
 use harness_manifest::admission::{Registry, Resolved};
+use harness_manifest::Sensitivity;
 use harness_model::context::{self, Fact, FactValue};
 use harness_model::profile::Profile;
 use harness_model::{EndpointClass, ToolSpec};
 use harness_policy::locality::{self, LocalityProbe};
 use harness_policy::{
     is_bg_id, Matcher, PolicyDecision, Rule, Selector, Session, SessionKind, SessionMode,
-    SessionSpec, UserPolicy, WorkspaceDecl, EXEC_ID, EXEC_START_ID, PLAN_SUBMIT_ID, SUBMIT_ID,
-    TODO_ID, WEB_FETCH_ID, WEB_SEARCH_ID,
+    SessionSpec, UserPolicy, WorkspaceDecl, DELEGATE_ID, EXEC_ID, EXEC_START_ID, PLAN_SUBMIT_ID,
+    SUBMIT_ID, TODO_ID, WEB_FETCH_ID, WEB_SEARCH_ID,
 };
 use harness_sandbox::{Confinement, Conformed, PortsWitness};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
@@ -27,6 +28,7 @@ use harness_tools::{
 };
 
 use super::{new_run_id, RunConfig, RunRefused, TaskSpec, PORTS_PER_TASK};
+use crate::delegate;
 use crate::postedit::PostEditRefused;
 use crate::presubmit::PresubmitRefused;
 
@@ -109,6 +111,20 @@ pub(crate) fn prepare(
     confinement: Option<&dyn Confinement>,
     endpoint: EndpointClass,
 ) -> Result<Prepared, RunRefused> {
+    // P-38, fail closed, before anything runs: a task that may delegate
+    // (harness.task.delegate) must hold at least one harness.fs.* grant —
+    // it is the only way it can answer the child's question — and its
+    // profile's context budget must fit the child floor. A profile under
+    // [`CHILD_MIN_BUDGET_TOKENS`] cannot host a useful read-only helper,
+    // so delegation refuses rather than degrade.
+    if spec.grants.iter().any(|g| g == DELEGATE_ID) {
+        if !spec.grants.iter().any(|g| g.starts_with("harness.fs.")) {
+            return Err(RunRefused::Delegate(delegate::REFUSAL_NO_FS));
+        }
+        if context::budget_tokens(profile) < delegate::CHILD_MIN_BUDGET_TOKENS {
+            return Err(RunRefused::Delegate(delegate::REFUSAL_TINY));
+        }
+    }
     match &spec.kind {
         SessionKind::Research(_) => {
             if workspace.is_some() {
@@ -318,6 +334,48 @@ pub(crate) fn check_research_spec(spec: &TaskSpec) -> Result<(), RunRefused> {
         ));
     }
     Ok(())
+}
+
+/// The hosted-profile checks (P-31, fail closed), shared by `prepare`'s
+/// [`plan`] call so a live run, a resume and an audit replay refuse alike:
+/// a hosted run without a price table refuses to start (§2.4), and it takes
+/// no grant at personal sensitivity or above (Q-2: the context — the task,
+/// the rules, every observation — leaves the machine through the loopback
+/// proxy, so it may carry no personal data). Grants that resolve to nothing
+/// here are left to the session plan's own refusal.
+fn check_hosted(spec: &TaskSpec, registry: &Registry, profile: &Profile) -> Result<(), RunRefused> {
+    if !profile.hosted() {
+        return Ok(());
+    }
+    if profile.pricing().is_none() {
+        return Err(RunRefused::Hosted(
+            "a hosted run needs a price table in the profile (a hosted run without one refuses to start, design §2.4)",
+        ));
+    }
+    for g in &spec.grants {
+        if let Resolved::One { capability, .. } = registry.resolve(g) {
+            if hosted_takes_no_personal([capability.sensitivity()]) {
+                return Err(RunRefused::Hosted(
+                    "a hosted run takes no grant at personal sensitivity or above (Q-2: its context is sent to a hosted provider)",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Q-2 (pure, so the rule is testable without a registry): whether the
+/// sensitivities of the grants a hosted run was given reach personal. In
+/// this build no admitted registry can carry such a capability (a Signed
+/// tier waits for H4's signature verification; a Pinned tier refuses the
+/// sensitivity), so this is defence in depth for H4 — and the rule the
+/// day the gate opens.
+pub(crate) fn hosted_takes_no_personal(
+    sensitivities: impl IntoIterator<Item = Sensitivity>,
+) -> bool {
+    sensitivities
+        .into_iter()
+        .any(|s| s >= Sensitivity::Personal)
 }
 
 /// The facts of a session with no workspace (P-39i): an empty walk's
@@ -535,6 +593,9 @@ pub(crate) fn plan(
     // without `prepare`'s witness work) refuses the same specs a live run
     // refuses.
     check_research_spec(spec)?;
+    // P-31: the hosted declaration's own refusals, before anything else
+    // plans, so a live run, a resume and an audit replay all refuse alike.
+    check_hosted(spec, registry, profile)?;
     if let SessionKind::Research(_) = spec.kind {
         // The kind must agree with the registry (§2.2): a research session
         // runs over the research registry, whose web capabilities are

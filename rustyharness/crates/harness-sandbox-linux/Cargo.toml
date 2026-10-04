@@ -30,3 +30,12 @@ unwrap_used = "warn"
 expect_used = "warn"
 indexing_slicing = "warn"
 panic = "warn"
+
+# The supervisor's live tests are NOT libtest: the helper re-execs this very
+# binary as `argv = [bin, "__confine", <spawner pid>]`, and libtest would
+# swallow argv and try to run "__confine" as a test filter. The binary is
+# dispatch-driven instead (see tests/supervisor_live.rs); on non-Linux hosts
+# it builds to an empty main so the crate still tests everywhere.
+[[test]]
+name = "supervisor_live"
+harness = false

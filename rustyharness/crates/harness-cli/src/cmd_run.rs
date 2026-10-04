@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use gate_outcome::{Finding, FindingCode, GateOutcome, IndeterminateKind, Severity};
-use harness_core::RunId;
+use harness_core::{Pricing, RunId};
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_run::{Approver, Resume, Run, RunRefused};
 use harness_sandbox::environment::SystemEnv;
@@ -318,7 +318,7 @@ fn try_run(
         }
     }
     if stream {
-        stream_json(cx, &report);
+        stream_json(cx, &report, inp.profile.pricing());
     }
     Ok(Outcome {
         outcome: report.outcome,
@@ -334,7 +334,7 @@ fn try_run(
 /// the `chain_head` line and the report, which stay the last stdout lines.
 /// A journal that cannot be read does not change the run's report or exit
 /// code: it is noted on stderr and the stream is simply absent.
-fn stream_json(cx: &Cx<'_>, report: &harness_run::RunReport) {
+fn stream_json(cx: &Cx<'_>, report: &harness_run::RunReport, pricing: Option<Pricing>) {
     let attempt_dir = harness_journal::layout::attempt_dir(&report.run_dir, report.attempt);
     let v = match harness_journal::JournalReader::open_expecting(&attempt_dir, &report.run) {
         Ok(v) => v,
@@ -349,7 +349,7 @@ fn stream_json(cx: &Cx<'_>, report: &harness_run::RunReport) {
             say!(cx, "{}", String::from_utf8_lossy(&line));
         }
     }
-    let usage = crate::usage::Usage::from_journal(&v);
+    let usage = crate::usage::Usage::from_journal(&v).priced(pricing);
     say!(cx, "usage {}", usage.to_json());
     note!(cx, "{}", usage.in_words());
 }

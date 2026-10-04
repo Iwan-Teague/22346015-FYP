@@ -10,6 +10,12 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Direct egress in the build tool (P-39f), forwarded from harness-cli/net:
+# turns on harness-sandbox's std::net DirectConnector. No TLS here — the
+# only TLS stack in the workspace lives in harness-fetch/net (INV-52).
+net = ["harness-sandbox/net"]
+
 [dependencies]
 # Design §1.2 edges: the ToolProvider seam (§4.5) takes only
 # Journaled<Authorized<Call>>, so it names harness-journal and harness-policy.

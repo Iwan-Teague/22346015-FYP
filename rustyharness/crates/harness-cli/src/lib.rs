@@ -123,6 +123,7 @@ mod inputs;
 mod render;
 mod repl;
 mod report;
+mod trust;
 mod usage;
 mod workspace_mode;
 

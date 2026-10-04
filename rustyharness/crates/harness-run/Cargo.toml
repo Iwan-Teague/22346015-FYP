@@ -28,5 +28,13 @@ thiserror.workspace = true
 [dev-dependencies]
 # The sealed JournalFile seam's fault-injecting file, for the INV-33 run test.
 harness-journal = { path = "../harness-journal", features = ["fault-injection"] }
+# The web airlock's test doors (P-39j): `net` so a test build can take the
+# direct path at all (INV-52 stays: normal edges never enable it), `remap`
+# so the fixed global test address dials a loopback fixture.
+harness-sandbox = { path = "../harness-sandbox", features = ["net", "remap"] }
 # Shared in-process test fixtures (P-03).
 harness-testkit = { path = "../harness-testkit" }
+# The hostile web suite (P-39k): forges `rh-fetch/1` frames for the lying
+# fetcher and runs the fetcher library in process. Pure (INV-52); it never
+# becomes a normal dependency.
+harness-fetch = { path = "../harness-fetch" }

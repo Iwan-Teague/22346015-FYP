@@ -146,6 +146,7 @@ fn drive_with(
         approver,
         confinement: None,
         input,
+        instructions: None,
         sink: None,
     })
 }

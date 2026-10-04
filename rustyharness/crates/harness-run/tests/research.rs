@@ -370,6 +370,7 @@ fn research_session_has_no_workspace_grant() {
         approver: None,
         confinement: Some(&Real),
         input: &ScriptedInput::of(&["hi"]),
+        instructions: None,
         sink: None,
     })
     .expect_err("a research session is not a coding session");
@@ -587,6 +588,7 @@ fn coding_header_digest_unchanged() {
         approver: None,
         confinement: None,
         input: &ScriptedInput::of(&["what does it say", "thanks"]),
+        instructions: None,
         sink: None,
     })
     .unwrap();
@@ -594,9 +596,10 @@ fn coding_header_digest_unchanged() {
     let head = header_of(&recs);
     assert_eq!(head.get("session_kind"), None, "no kind key for coding");
     assert_eq!(head.get("web"), None, "no web key for coding");
-    // P-28: the session context is rh-context/7 (the mode line and the
-    // approved-plan block); the batch context stays rh-context/5.
-    assert_eq!(head["context_format"], Value::from("rh-context/7"));
+    // P-28 added the mode line and the approved-plan block (rh-context/7),
+    // P-30 the project notes block (rh-context/8); the batch context stays
+    // rh-context/5.
+    assert_eq!(head["context_format"], Value::from("rh-context/8"));
     assert_eq!(head["mode"], Value::from("session"));
 }
 
@@ -662,6 +665,7 @@ fn batch_and_session_context_digests_unchanged() {
             approver: None,
             confinement: None,
             input: &ScriptedInput::of(&["what does it say", "thanks"]),
+            instructions: None,
             sink: None,
         })
         .unwrap();
@@ -678,19 +682,20 @@ fn batch_and_session_context_digests_unchanged() {
     assert_ne!(session_vectors[0][0], batch_digests[0]);
 }
 
-/// The research context is its own format line: `rh-research/1`, in the
+/// The research context is its own format line: `rh-research/2` (P-46
+/// added the citations fact to the research facts block), in the
 /// compiled-in constant and in the research header alike — never a bump
 /// of either `rh-context` line.
 #[test]
-fn research_context_format_is_rh_research_1() {
+fn research_context_format_is_rh_research_2() {
     assert_eq!(
         harness_model::context::RESEARCH_CONTEXT_FORMAT,
-        "rh-research/1"
+        "rh-research/2"
     );
     assert_eq!(harness_model::context::CONTEXT_FORMAT, "rh-context/5");
     assert_eq!(
         harness_model::context::SESSION_CONTEXT_FORMAT,
-        "rh-context/7"
+        "rh-context/8"
     );
 
     let r = go_research(

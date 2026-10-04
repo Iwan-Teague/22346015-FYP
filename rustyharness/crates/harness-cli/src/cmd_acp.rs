@@ -39,8 +39,14 @@ const ALLOWED: &[&str] = &[
     "accept-edits",
 ];
 
-/// The `acp` verb's valueless flags.
-const FLAGS: &[&str] = &["shell", "no-default-denies"];
+/// The `acp` verb's valueless flags (the session-grant flags as on
+/// `chat`, P-23/P-58).
+const FLAGS: &[&str] = &[
+    "shell",
+    "no-default-denies",
+    "allow-session-grants",
+    "accept-edits",
+];
 
 /// The token budget every CLI session is given (`chat`; the task's
 /// `budget` section is not applied to sessions here either).
@@ -276,6 +282,10 @@ fn banner(
         inp.profile.id(),
         endpoint.unwrap_or("(a backend given to the library)")
     );
+    // The hosted disclosure (P-31), the chat banner's line.
+    if inp.profile.hosted() {
+        note!(cx, "context is sent to a hosted provider");
+    }
     if inp.spec.exec.is_some() {
         match harness_sandbox::available() {
             harness_sandbox::Containment::Available(b) => {

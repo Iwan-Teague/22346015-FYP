@@ -2695,6 +2695,54 @@ fn usage_matches_budget_charged() {
     );
 }
 
+// P-31: a hosted profile's footer prices the reported tokens at the
+// profile's own price table, in the JSON object and in the words.
+#[test]
+fn cost_in_usage_footer() {
+    let fx = fixture("cost-footer");
+    // The profile, declared hosted with a price table: 3 micro-USD per
+    // input kilo-token, 15 per output (0.003 and 0.015 per token).
+    let mut p: serde_json::Map<String, serde_json::Value> = serde_json::from_str(PROFILE).unwrap();
+    p.insert("upstream".into(), serde_json::json!("hosted"));
+    p.insert(
+        "price_table".into(),
+        serde_json::json!({"in_micro_per_ktok": 3000, "out_micro_per_ktok": 15000}),
+    );
+    std::fs::write(&fx.profile, serde_json::Value::Object(p).to_string()).unwrap();
+    // The cost budget the run may spend (§2.4: user-set; 100_000 micros is
+    // far above the two replies' 900).
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"What does a.txt say?","grants":["harness.fs.read","harness.fs.list"],"budget":{"cost_micros":100000}}"#,
+    )
+    .unwrap();
+    let m = mock_cached(vec![
+        act("harness.fs.read", r#"{"path":"a.txt"}"#),
+        act("harness.task.submit", r#"{"note":"done"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.extend_from_slice(&["--output", "stream-json"]);
+    let o = cli(&args, true, &fx.marker);
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let lines = stream_lines(&o);
+    let usage_at = lines
+        .iter()
+        .position(|l| l.starts_with("usage {"))
+        .expect("a usage line");
+    let u: serde_json::Value =
+        serde_json::from_str(&lines[usage_at][6..]).expect("the usage object");
+    // 200 in × 3 + 20 out × 15 = 900 micro-USD.
+    assert_eq!(u["cost_micros"], 900);
+    // A local profile's footer has no cost (the default fixture's run
+    // above is the control; here only the key's presence differs).
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("tokens in 200 out 20 (cached 128, server-claimed), cost $0.000900"),
+        "{err}"
+    );
+}
+
 #[test]
 fn final_stdout_line_still_gatereport() {
     let fx = fixture("stream-report");

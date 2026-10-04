@@ -161,8 +161,8 @@ refuse_intruders "$tmpdir/modelcore" "$tmpdir/allowed-modelcore" "harness-model-
 # parsing HERE and nowhere else) — so its dependency tree is allowlisted
 # instead: exactly the reviewed harness-core tree plus harness-fetch itself.
 # serde_json is already inside harness-core's list, so P-39d adds no new
-# registry crate; the TLS-linked `net` feature (P-39n) must extend THIS
-# block with a review note when it lands (INV-52).
+# registry crate; the TLS-linked `net` feature (P-39n) extends THIS block
+# below with its own reviewed allowlist (INV-52).
 tree_names "$tmpdir/fetch" harness-fetch
 grep -qxF harness-core "$tmpdir/fetch" ||
     fail "harness-fetch tree does not contain harness-core (read the wrong tree?)"
@@ -172,6 +172,41 @@ grep -vxF harness-fetch "$tmpdir/allowed-core-raw" >"$tmpdir/allowed-fetch-raw" 
 printf '%s\n' harness-fetch >>"$tmpdir/allowed-fetch-raw" || fail "printf failed"
 sort -u "$tmpdir/allowed-fetch-raw" >"$tmpdir/allowed-fetch" || fail "sort failed"
 refuse_intruders "$tmpdir/fetch" "$tmpdir/allowed-fetch" "harness-fetch"
+
+# harness-fetch with its `net` feature (P-39n, design note `P-39-web-airlock`
+# §5.4): the ONE place a TLS stack may live (INV-52). The reviewed set is the
+# default tree above plus the rustls/ring stack exactly — measured on
+# admission with `cargo tree -p harness-fetch --features net --target all
+# -e normal,build`; anything else an edge pulls in fails below. Review note
+# (the extension this block's P-39d comment asked for): rustls is the TLS
+# client with NO default features (no aws-lc-rs, no logging), ring is the
+# crypto provider — installed per-config, never a process default —
+# rustls-webpki verifies against webpki-roots' compiled-in Mozilla roots
+# (never the system trust store), untrusted, subtle, zeroize, getrandom,
+# wasi, libc and once_cell are that stack's own support crates, and cc
+# (with shlex, find-msvc-tools and its windows-* helpers) is ring's
+# BUILD-time compiler driver for its assembly — build-only, never linked.
+# Every one of them is licensed on deny.toml's reviewed list.
+tree_names "$tmpdir/fetch-net" harness-fetch --features net
+grep -qxF rustls "$tmpdir/fetch-net" ||
+    fail "harness-fetch (net) tree does not contain rustls (read the wrong tree?)"
+grep -qxF ring "$tmpdir/fetch-net" ||
+    fail "harness-fetch (net) tree does not contain ring (read the wrong tree?)"
+grep -qxF webpki-roots "$tmpdir/fetch-net" ||
+    fail "harness-fetch (net) tree does not contain webpki-roots (read the wrong tree?)"
+cp "$tmpdir/allowed-fetch-raw" "$tmpdir/allowed-fetch-net-raw" || fail "cp failed"
+printf '%s\n' \
+    getrandom once_cell ring rustls rustls-pki-types rustls-webpki \
+    subtle untrusted wasi webpki-roots zeroize \
+    cc find-msvc-tools shlex \
+    windows-sys windows-targets \
+    windows_aarch64_gnullvm windows_aarch64_msvc \
+    windows_i686_gnu windows_i686_gnullvm windows_i686_msvc \
+    windows_x86_64_gnu windows_x86_64_gnullvm windows_x86_64_msvc \
+    >>"$tmpdir/allowed-fetch-net-raw" ||
+    fail "printf failed"
+sort -u "$tmpdir/allowed-fetch-net-raw" >"$tmpdir/allowed-fetch-net" || fail "sort failed"
+refuse_intruders "$tmpdir/fetch-net" "$tmpdir/allowed-fetch-net" "harness-fetch (net)"
 
 # --- INV-24 / H1d review F-4: harness-model's dependency tree is allowlisted --
 # harness-model is the crate that talks to the network. Its normal tree may
@@ -211,6 +246,29 @@ if [ -s "$tmpdir/tls-hits" ]; then
 $(cat "$tmpdir/tls-hits")"
 fi
 refuse_intruders "$tmpdir/model" "$tmpdir/allowed-model" "harness-model"
+
+# --- INV-52: harness-cli never links TLS, in ANY feature combination --------
+# The CLI is the only binary that runs untrusted tasks (design note
+# `P-39-web-airlock` §5.1); it must depend on neither harness-fetch nor any
+# TLS/HTTP-client crate. The tree reads the whole graph with --all-features
+# (net, remap, mcp-testing...), so a single feature edge cannot smuggle TLS
+# in. The tree must name harness-cli, so the check reads something.
+cargo tree -p harness-cli --target all -e normal,build --all-features --prefix none >"$tmpdir/cli-raw" ||
+    fail "cargo tree failed: -p harness-cli --all-features"
+awk '{print $1}' "$tmpdir/cli-raw" >"$tmpdir/cli-names" || fail "awk failed on the cli tree"
+grep -qxF harness-cli "$tmpdir/cli-names" ||
+    fail "the harness-cli tree does not name harness-cli (read nothing?)"
+: >"$tmpdir/cli-tls-hits"
+for c in rustls rustls-webpki webpki webpki-roots ring aws-lc-rs aws-lc-sys openssl openssl-sys \
+    native-tls tokio-rustls hyper-rustls reqwest hyper ureq curl curl-sys harness-fetch; do
+    if grep -qxF "$c" "$tmpdir/cli-names"; then
+        printf '%s\n' "$c" >>"$tmpdir/cli-tls-hits"
+    fi
+done
+if [ -s "$tmpdir/cli-tls-hits" ]; then
+    fail "INV-52: TLS/HTTP-client crates linked into harness-cli (--all-features):
+$(cat "$tmpdir/cli-tls-hits")"
+fi
 
 # --- test-only seams stay out of normal builds (H1c review F-3) -------------
 # harness-journal's `fault-injection` feature compiles a JournalFile that
@@ -949,8 +1007,9 @@ normalise "$tmpdir/linux-stripped" "$tmpdir/linux-code"
 awk '{ sub(/^ +/, ""); if (index($0, "#![allow(unsafe_code)]") != 1) exit 1 }' "$tmpdir/linux-code" ||
     fail "INV-23: crates/harness-sandbox-linux/src/lib.rs must open with #![allow(unsafe_code)] (the one named unsafe exception; see design §6.7)"
 
-# The unsafe-site ratchet (S-Lc: the one production seccomp filter apply).
-linux_unsafe_ratchet=1
+# The unsafe-site ratchet (S-Lc: the one production seccomp filter apply;
+# S-Ld: the supervisor's one raw-syscall trampoline, supervisor.rs `sc`).
+linux_unsafe_ratchet=2
 rust_files "$tmpdir/linux-files" crates/harness-sandbox-linux/src
 : >"$tmpdir/linux-tokens"
 while IFS= read -r f; do

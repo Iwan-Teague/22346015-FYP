@@ -102,6 +102,15 @@ struct BudgetFile {
     /// (`exec_timeout_ms`), so an audit reads it from the journal.
     #[serde(default, deserialize_with = "present")]
     exec_secs: Option<u64>,
+    /// The cost budget (P-31), in micro-USD: what a hosted profile's price
+    /// table may charge before the meter stops the run (`Budget(Cost)`).
+    /// It is a header input (the limits' `cost_micros`), so an audit or a
+    /// resume must be given the task the run was given. Absent: 0, "no
+    /// budget in use" for a local model — and, fail closed, an immediate
+    /// stop for a priced hosted one: a hosted run needs a budget the user
+    /// set (§2.4).
+    #[serde(default, deserialize_with = "present")]
+    cost_micros: Option<u64>,
 }
 
 /// The widest step budget a task may set.
@@ -110,6 +119,9 @@ const BUDGET_MAX_STEPS: u32 = 500;
 const BUDGET_MAX_WALL_SECS: u64 = 24 * 60 * 60;
 /// The longest wall clock a task may give one command (H2f): an hour.
 const BUDGET_MAX_EXEC_SECS: u64 = 60 * 60;
+/// The largest cost budget a task may set (P-31): a billion dollars in
+/// micro-USD, a ceiling against typos, not a price.
+const BUDGET_MAX_COST_MICROS: u64 = 1_000_000_000_000_000;
 
 /// An optional field is absent or a value, never `null`.
 fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
@@ -591,6 +603,14 @@ fn run_config(budget: Option<&BudgetFile>, has_exec: bool) -> Result<RunConfig, 
             ));
         }
         c.exec_call_timeout = Duration::from_secs(x);
+    }
+    if let Some(cost) = b.cost_micros {
+        if cost == 0 || cost > BUDGET_MAX_COST_MICROS {
+            return Err(format!(
+                "budget: cost_micros must be from 1 to {BUDGET_MAX_COST_MICROS}"
+            ));
+        }
+        c.limits.cost_micros = cost;
     }
     Ok(c)
 }

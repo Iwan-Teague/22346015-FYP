@@ -21,6 +21,12 @@ pub(crate) struct Usage {
     wall_ms: u64,
     /// Tool calls started, by capability id.
     tools: BTreeMap<String, u64>,
+    /// What the reported tokens cost at the profile's price table (P-31),
+    /// in micro-USD. `None` without pricing (a local model costs nothing,
+    /// §2.4) and only from the tokens the servers reported: replies
+    /// without a usage report are estimated by the meter for the budget
+    /// but contribute nothing here (the footer claims no estimate).
+    cost_micros: Option<u64>,
 }
 
 impl Usage {
@@ -37,6 +43,7 @@ impl Usage {
             tokens_cached: None,
             wall_ms: 0,
             tools: BTreeMap::new(),
+            cost_micros: None,
         };
         for r in &v.records {
             u.steps = u.steps.max(r.step);
@@ -86,6 +93,20 @@ impl Usage {
         &self.tools
     }
 
+    /// Price the reported tokens at the profile's price table (P-31):
+    /// micro-USD per token, saturating, the same derivation the meter's
+    /// `Cost` budget charges with. No pricing, no cost in the footer.
+    pub(crate) fn priced(mut self, pricing: Option<harness_core::Pricing>) -> Self {
+        if let Some(p) = pricing {
+            self.cost_micros = Some(
+                self.tokens_in
+                    .saturating_mul(p.input_micros_per_token)
+                    .saturating_add(self.tokens_out.saturating_mul(p.output_micros_per_token)),
+            );
+        }
+        self
+    }
+
     /// The footer as one compact JSON object, e.g.
     /// `{"model_calls":2,"steps":3,"tokens":{"cached":64,"in":200,"out":20},"tools":{"harness.fs.read":1},"wall_ms":150}`.
     /// (`cached` appears only when some reply claimed cached tokens; keys
@@ -101,6 +122,9 @@ impl Usage {
         m.insert("model_calls".into(), Value::from(self.model_calls));
         m.insert("steps".into(), Value::from(self.steps));
         m.insert("tokens".into(), Value::Object(tokens));
+        if let Some(c) = self.cost_micros {
+            m.insert("cost_micros".into(), Value::from(c));
+        }
         m.insert(
             "tools".into(),
             Value::Object(
@@ -120,6 +144,13 @@ impl Usage {
             Some(c) => format!(" (cached {c}, server-claimed)"),
             None => String::new(),
         };
+        // P-31: the price is the profile's own table (a hosted profile's
+        // `price_table`, micro-USD per kilo-token), so six decimals are
+        // enough to show every whole micro-USD ($0.000001).
+        let cost = match self.cost_micros {
+            Some(c) => format!(", cost ${:.6}", c as f64 / 1_000_000.0),
+            None => String::new(),
+        };
         let tools = if self.tools.is_empty() {
             "none".to_owned()
         } else {
@@ -130,7 +161,7 @@ impl Usage {
                 .join(", ")
         };
         format!(
-            "usage: {} step(s), {} model call(s), tokens in {} out {}{cached}, wall {} ms, tool call(s): {tools}",
+            "usage: {} step(s), {} model call(s), tokens in {} out {}{cached}{cost}, wall {} ms, tool call(s): {tools}",
             self.steps, self.model_calls, self.tokens_in, self.tokens_out, self.wall_ms
         )
     }

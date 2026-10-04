@@ -40,6 +40,7 @@ pub(crate) fn diverge(seq: u64, step: u64, why: &'static str) -> Divergence {
 /// port grant (P-36g §6.1); a resume recomputes it with a fresh probe, an
 /// audit re-states the recorded one (the probe's observation is a past
 /// host's), and `None` recomputes a header without ports.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn expected_inputs(
     spec: &TaskSpec,
     registry: &Registry,
@@ -48,6 +49,7 @@ pub(crate) fn expected_inputs(
     limits: &MeterLimits,
     session: Option<&crate::session::TurnLimits>,
     ports: Option<&PortsHeader>,
+    instructions: Option<&crate::session::Instructions>,
 ) -> Map<String, Value> {
     let mut grants: Vec<Value> = Vec::new();
     let mut names: Vec<&str> = spec.grants.iter().map(String::as_str).collect();
@@ -92,6 +94,15 @@ pub(crate) fn expected_inputs(
         m.insert(
             "tool_docs".into(),
             Value::from(crate::driver::terse_table_sha256().to_string()),
+        );
+    }
+    // P-31, Q-3: the hosted declaration; no key for a local model, as the
+    // header writes it, so every journal written before P-31 compares as
+    // before.
+    if profile.hosted() {
+        m.insert(
+            "endpoint_class".into(),
+            Value::from("loopback-proxy-hosted"),
         );
     }
     // The exec allowlist (H2d): whether a shell is on it, and the spec's
@@ -200,6 +211,12 @@ pub(crate) fn expected_inputs(
             Value::from(crate::driver::web_grant_digest(g).to_string()),
         );
     }
+    // P-30: the trusted project instructions' digest; no key when none
+    // were loaded, as the header writes it, so older journals compare as
+    // before.
+    if let Some(n) = instructions {
+        m.insert("instructions".into(), Value::from(n.digest.to_string()));
+    }
     m
 }
 
@@ -244,10 +261,16 @@ fn header_mismatch(key: &str) -> &'static str {
             "the protected-path lists (task-declared or this build's defaults) differ from the \
              recorded header"
         }
-        "mode" => "the run's mode (batch or session) differs from the recorded header",
+        "mode" => "the run's mode (batch, session or child) differs from the recorded header",
+        "parent" => "the run's parent link differs from the recorded header",
+        "child" => "the child's brief, template or wall limit differs from the recorded header",
         "turn_limits" => "the turn limits given differ from the recorded header",
         "session_kind" => "the session kind differs from the recorded header",
         "web" => "the web grant (allowlist, search, confirmation) differs from the recorded header",
+        "instructions" => "the project instructions differ from the recorded header",
+        "endpoint_class" => {
+            "the profile's endpoint class (local or hosted) differs from the recorded header"
+        }
         "context_format" => {
             "another harness build wrote this journal (its context format differs: since H1h the \
              native protocol shows past actions as tool calls, since H1i each observation keeps \

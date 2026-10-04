@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use harness_core::Digest;
+use harness_core::{Digest, RunId};
 use harness_journal::layout;
 use harness_journal::reader::DirBlobSource;
 use harness_policy::approval::ApprovalRequest;
@@ -80,6 +80,16 @@ pub(crate) struct ChatState {
     pub clear: bool,
     /// `/exit` seen: end the session and the chat.
     pub exit: bool,
+    /// A fork pending for the NEXT session (`/fork RUN@STEP`, P-32): the
+    /// outer loop in `cmd_chat` runs it as `fork_session` instead of a
+    /// fresh `run_session`. Like `clear`/`exit`, a display-state request,
+    /// never an input to a journaled decision.
+    pub fork: Option<(RunId, u64)>,
+    /// The profile declares a hosted upstream (P-31): the session's
+    /// context is sent to a hosted provider. Display only.
+    pub hosted: bool,
+    /// The profile's price table (P-31), for `/usage`'s cost. Display only.
+    pub pricing: Option<harness_core::Pricing>,
 }
 
 /// One tool call in flight, as the tool line needs it.
@@ -150,6 +160,9 @@ pub(crate) struct ChatInput<'c, 'a> {
     cx: &'c Cx<'a>,
     state: Rc<RefCell<ChatState>>,
     lines: Lines,
+    /// Command templates (P-30): `None` disables them (never expected;
+    /// fail closed to the built-ins only).
+    commands: Option<Rc<CommandSources>>,
 }
 
 impl<'c, 'a> ChatInput<'c, 'a> {
@@ -158,11 +171,13 @@ impl<'c, 'a> ChatInput<'c, 'a> {
         cx: &'c Cx<'a>,
         state: Rc<RefCell<ChatState>>,
         feed: Rc<LineFeed>,
+        commands: Option<Rc<CommandSources>>,
     ) -> Self {
         Self {
             cx,
             state,
             lines: Lines::Feed(feed),
+            commands,
         }
     }
 
@@ -171,11 +186,13 @@ impl<'c, 'a> ChatInput<'c, 'a> {
         cx: &'c Cx<'a>,
         state: Rc<RefCell<ChatState>>,
         lines: Vec<String>,
+        commands: Option<Rc<CommandSources>>,
     ) -> Self {
         Self {
             cx,
             state,
             lines: Lines::Given(RefCell::new(lines.into())),
+            commands,
         }
     }
 }
@@ -211,6 +228,8 @@ impl UserInput for ChatInput<'_, '_> {
                     Slash::Restore(cmd) => return UserInputEvent::Restore(cmd),
                     Slash::Plan => return UserInputEvent::Plan,
                     Slash::Build => return UserInputEvent::Build,
+                    Slash::Message(text) => text,
+                    Slash::Fork => return UserInputEvent::End(InputEnd::Exit),
                 }
             } else {
                 first
@@ -242,6 +261,143 @@ enum Slash {
     /// The plan approval (`/build`, P-28): the loop widens the session if
     /// a plan is pending.
     Build,
+    /// A command template's expanded text (P-30): the user's message.
+    Message(String),
+    /// A fork was queued (`/fork RUN@STEP`, P-32): end this session; the
+    /// outer loop starts the forked one.
+    Fork,
+}
+
+/// Where command templates come from (P-30), shared by the chat's input.
+/// A template in the user's config dir (`<config dir>/commands/<name>.md`)
+/// is trusted by its location — only that user can write there. One in
+/// the workspace (`.rustyharness/commands/<name>.md`) is trusted per
+/// template digest, remembered in the trust store like the project notes.
+pub(crate) struct CommandSources {
+    /// The user's config dir, if this platform has one.
+    pub(crate) config_dir: Option<PathBuf>,
+    /// The workspace the session runs in.
+    pub(crate) workspace: PathBuf,
+    /// The trust store the workspace-command approvals go to.
+    pub(crate) trust: Rc<RefCell<crate::trust::Trust>>,
+}
+
+/// The cap on one command template's size, in bytes.
+const TEMPLATE_MAX_BYTES: usize = 64 * 1024;
+
+/// A command template's name: `/name` with a letter first, then letters,
+/// digits, `_` or `-` (a plain file stem; no paths, no dots).
+fn command_name(cmd: &str) -> Option<&str> {
+    let mut chars = cmd.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    cmd.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        .then_some(cmd)
+}
+
+impl ChatInput<'_, '_> {
+    /// The `Lines`' stdin feed, when the input is this process's stdin
+    /// (the only place a trust prompt can be answered).
+    fn feed(&self) -> Option<Rc<LineFeed>> {
+        match &self.lines {
+            Lines::Feed(f) => Some(f.clone()),
+            Lines::Given(_) => None,
+        }
+    }
+
+    /// A `/name args…` line that no built-in command claims (P-30): a
+    /// command template, expanded and handed back as the user's message.
+    /// The config dir's template is trusted by location; the workspace's
+    /// must have its digest approved (asked once at a terminal, then
+    /// remembered). `None` when there is no such command, or it is
+    /// refused.
+    fn expand_command(&self, line: &str, sources: &CommandSources) -> Option<String> {
+        let mut words = line.splitn(2, char::is_whitespace);
+        let name = command_name(words.next()?.trim_start_matches('/'))?;
+        let args = words.next().unwrap_or("").trim();
+        let candidates = [
+            (
+                sources.config_dir.as_deref().map(|d| d.join("commands")),
+                true,
+            ),
+            (
+                Some(sources.workspace.join(".rustyharness").join("commands")),
+                false,
+            ),
+        ];
+        for (dir, by_location) in candidates {
+            let Some(dir) = dir else { continue };
+            let path = dir.join(format!("{name}.md"));
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    note!(self.cx, "cannot read {}: {e}", path.display());
+                    return None;
+                }
+            };
+            if bytes.len() > TEMPLATE_MAX_BYTES {
+                note!(
+                    self.cx,
+                    "{} is over the {TEMPLATE_MAX_BYTES}-byte cap; command refused",
+                    path.display()
+                );
+                return None;
+            }
+            let Ok(template) = String::from_utf8(bytes) else {
+                note!(
+                    self.cx,
+                    "{} is not UTF-8 text; command refused",
+                    path.display()
+                );
+                return None;
+            };
+            if !by_location {
+                let digest = harness_core::sha256(template.as_bytes()).to_string();
+                if !sources.trust.borrow().has_command(&digest)
+                    && !self.approve_template(sources, name, &digest)
+                {
+                    return None;
+                }
+            }
+            return Some(template.replace("$ARGUMENTS", args));
+        }
+        None
+    }
+
+    /// The workspace template's trust prompt (P-30): once at a real
+    /// terminal, then remembered in the trust store by template digest.
+    fn approve_template(&self, sources: &CommandSources, name: &str, digest: &str) -> bool {
+        let Some(feed) = self.feed() else {
+            note!(
+                self.cx,
+                "the workspace command /{name} is not trusted (nobody at a terminal to ask)"
+            );
+            return false;
+        };
+        feed.drain();
+        self.cx.note(&format!(
+            "trust the workspace command template {name} (sha256 {digest}) for this and later chats? [y/N]: "
+        ));
+        let answer = match feed.next_line(Instant::now() + Duration::from_secs(300)) {
+            Some(line) => {
+                let a = line.trim().to_ascii_lowercase();
+                a == "y" || a == "yes"
+            }
+            None => false,
+        };
+        if !answer {
+            note!(self.cx, "not trusted: command refused");
+            return false;
+        }
+        sources.trust.borrow_mut().trust_command(digest);
+        if let Err(e) = sources.trust.borrow().save() {
+            note!(self.cx, "cannot remember the trust decision: {e}");
+        }
+        true
+    }
 }
 
 impl ChatInput<'_, '_> {
@@ -264,16 +420,24 @@ impl ChatInput<'_, '_> {
                 return Slash::EndSession;
             }
             ("/help", _) => note!(self.cx, "{HELP}"),
-            ("/status", _) => note!(
-                self.cx,
-                "workspace {} | state root {} | profile {} | model {} | {} turn(s), {} step(s) so far",
-                st.workspace,
-                st.state_root,
-                st.profile,
-                st.endpoint,
-                st.turns,
-                st.steps
-            ),
+            ("/status", _) => {
+                let hosted = if st.hosted {
+                    " | context is sent to a hosted provider"
+                } else {
+                    ""
+                };
+                note!(
+                    self.cx,
+                    "workspace {} | state root {} | profile {} | model {} | {} turn(s), {} step(s) so far{}",
+                    st.workspace,
+                    st.state_root,
+                    st.profile,
+                    st.endpoint,
+                    st.turns,
+                    st.steps,
+                    hosted
+                )
+            }
             ("/tools", _) => {
                 for t in &st.tools {
                     note!(self.cx, "{t}");
@@ -305,9 +469,16 @@ impl ChatInput<'_, '_> {
             }
             ("/usage", _) => {
                 let dir = st.attempt_dir.clone();
+                let pricing = st.pricing;
                 drop(st);
                 match dir.and_then(|d| harness_journal::JournalReader::open(&d).ok()) {
-                    Some(v) => note!(self.cx, "{}", crate::usage::Usage::from_journal(&v).in_words()),
+                    Some(v) => note!(
+                        self.cx,
+                        "{}",
+                        crate::usage::Usage::from_journal(&v)
+                            .priced(pricing)
+                            .in_words()
+                    ),
                     None => note!(self.cx, "no journal yet"),
                 }
             }
@@ -351,7 +522,34 @@ impl ChatInput<'_, '_> {
             // only hands them over.
             ("/plan", _) => return Slash::Plan,
             ("/build", _) => return Slash::Build,
-            _ => note!(self.cx, "unknown command; {HELP}"),
+            ("/fork", arg) => {
+                let parsed = arg.and_then(crate::cmd_chat::parse_fork);
+                drop(st);
+                match parsed {
+                    Some((run, step)) => {
+                        note!(self.cx, "forking: the next session continues {run}@{step}");
+                        let mut st = self.state.borrow_mut();
+                        st.clear = false;
+                        st.fork = Some((run, step));
+                        return Slash::Fork;
+                    }
+                    None => note!(self.cx, "usage: /fork RUN@STEP"),
+                }
+            }
+            // P-30: a command template, expanded into the user's message.
+            _ => {
+                let sources = match &self.commands {
+                    Some(c) => c.clone(),
+                    None => {
+                        note!(self.cx, "unknown command; {HELP}");
+                        return Slash::Continue;
+                    }
+                };
+                match self.expand_command(line, &sources) {
+                    Some(text) => return Slash::Message(text),
+                    None => note!(self.cx, "unknown command; {HELP}"),
+                }
+            }
         }
         Slash::Continue
     }
@@ -444,8 +642,12 @@ fn mark_tree(m: &RestoreMark) -> Option<Digest> {
     }
 }
 
-/// The slash commands, as `/help` prints them.
-const HELP: &str = "commands: /help /status /tools /policy /sessions /resume /todo /usage /diff /undo /rewind [N] [--force-keep-external] /plan /build /clear /exit";
+/// The slash commands, as `/help` prints them. P-30: a `/name` the
+/// built-ins do not claim runs a command template (`$ARGUMENTS` becomes
+/// the rest of the line) from `<config dir>/commands/name.md` (trusted by
+/// location) or `<workspace>/.rustyharness/commands/name.md` (trusted per
+/// template digest).
+const HELP: &str = "commands: /help /status /tools /policy /sessions /resume /fork RUN@STEP /todo /usage /diff /undo /rewind [N] [--force-keep-external] /plan /build /clear /exit; command templates: /name args (commands/*.md)";
 
 /// The terminal prompt for an ask, over the chat's own stdin feed (P-18):
 /// the request itself is shown by the sink's `[approve]` line, so this

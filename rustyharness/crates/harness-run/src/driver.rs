@@ -52,7 +52,7 @@ use crate::postedit::{PostEditRefused, PostEditReport, PostEditSpec, PostEditSta
 use crate::presubmit::{PresubmitRefused, PresubmitReport, PresubmitSpec, PresubmitState};
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
 use harness_core::environment::EnvProbe;
-use harness_core::{LoopDetector, Meter, MeterLimits, MonoClock, Nonce, RunId, StopCause};
+use harness_core::{LoopDetector, Meter, MeterLimits, MonoClock, Nonce, Pricing, RunId, StopCause};
 use harness_journal::writer::SystemClock;
 use harness_journal::{JournalError, JournalWriter, StartError};
 use harness_manifest::admission::Registry;
@@ -68,7 +68,8 @@ pub(crate) use approvals::Approvals;
 pub use header::WorkspaceModeRecord;
 pub(crate) use header::{
     builtin_manifest_sha256, header, limits_fields, protected_task_digest, terse_table_sha256,
-    web_grant_digest, ExecHeader, HeaderInputs, PortsHeader, SandboxRecord, HEADER_INPUT_KEYS,
+    web_grant_digest, ChildHeader, ExecHeader, HeaderInputs, ParentLink, PortsHeader,
+    SandboxRecord, HEADER_INPUT_KEYS,
 };
 pub(crate) use plan::{
     attempt_check, create_run, loop_facts, no_workspace_facts, plan, prepare, todo_for, Prepared,
@@ -309,6 +310,18 @@ pub enum RunRefused {
     /// short of the web airlock, or the wrong registry. Nothing ran.
     #[error("research session refused: {0}")]
     Research(&'static str),
+    /// A delegating task (`harness.task.delegate`, P-38) cannot be served
+    /// by this run: no `harness.fs.*` grant to answer a child's question
+    /// with, or a profile whose context budget is under the child floor
+    /// ([`crate::delegate::CHILD_MIN_BUDGET_TOKENS`]). Nothing ran.
+    #[error("delegate refused: {0}")]
+    Delegate(&'static str),
+    /// A hosted profile's run is refused (P-31, fail closed): no price
+    /// table (§2.4: a hosted run without one refuses to start), or a grant
+    /// at personal sensitivity or above (Q-2: no personal data to a hosted
+    /// upstream). Nothing ran.
+    #[error("hosted profile refused: {0}")]
+    Hosted(&'static str),
 }
 
 impl RunRefused {
@@ -416,7 +429,10 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         session: None,
         exec: exec_header,
         ports: ports_header,
+        instructions: None,
         workspace_mode: r.config.workspace_mode.as_ref(),
+        parent: None,
+        child: None,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -426,7 +442,11 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
     )?;
 
     // ---- The loop. ----
-    let meter = new_meter(r.config.limits.clone(), Box::new(SystemClock::default()));
+    let meter = new_meter(
+        r.config.limits.clone(),
+        r.profile.pricing(),
+        Box::new(SystemClock::default()),
+    );
     let edit_tools = pre.edit_tools.clone();
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
@@ -465,6 +485,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         post_edit: PostEditState::of(&r.spec.post_edit),
         workspace_root: Some(r.workspace.to_path_buf()),
         restore: Default::default(),
+        instructions: None,
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -493,22 +514,28 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
 pub use harness_tools::{ReadLog, StaleRead};
 
 /// The meter, built here and only here in production code, always with a
-/// clock the caller does not control in [`run`] (the real one).
-pub(crate) fn new_meter(limits: MeterLimits, clock: Box<dyn MonoClock>) -> Meter {
-    // No hosted endpoints in this build, so no price table (§2.4: a hosted
-    // run without one refuses to start, N-7, with the `hosted` feature).
-    Meter::new(limits, None, clock)
+/// clock the caller does not control in [`run`] (the real one). The
+/// profile's price table (P-31) rides along: it is what makes the `Cost`
+/// dimension count, and it is `None` for a local model, which costs
+/// nothing (§2.4).
+pub(crate) fn new_meter(
+    limits: MeterLimits,
+    pricing: Option<Pricing>,
+    clock: Box<dyn MonoClock>,
+) -> Meter {
+    Meter::new(limits, pricing, clock)
 }
 
 /// The meter of a resumed attempt: the wall time the interrupted attempt
 /// already spent (its journal's last monotonic time) is charged from the
-/// start (§2.10).
+/// start (§2.10). The price table rides along exactly as in [`new_meter`].
 pub(crate) fn new_meter_resumed(
     limits: MeterLimits,
+    pricing: Option<Pricing>,
     clock: Box<dyn MonoClock>,
     already_elapsed: Duration,
 ) -> Meter {
-    Meter::new_resumed(limits, None, clock, already_elapsed)
+    Meter::new_resumed(limits, pricing, clock, already_elapsed)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,13 +1,18 @@
 //! The Linux confinement primitives, kept apart so `unsafe` has exactly one
 //! home (design §6.7; docs/slices/S-L-linux-sandbox.md).
 //!
-//! INV-6 is **no containment, no execution**: this crate never contains
-//! anything and never starts anything. It answers one fail-closed question —
+//! INV-6 is **no containment, no execution**: the decision half of this
+//! crate never contains anything and never starts anything. It answers one
+//! fail-closed question —
 //! given what a Linux host measured, is every confinement primitive the
 //! default tier needs PRESENT? An unknown fact is not a present fact, so it
 //! counts as missing. `harness_sandbox::linux::Linux::probe()` delegates the
 //! refusal decision here on `target_os = "linux"`; on every other target the
-//! crate is not even pulled in (the dependency is target-gated).
+//! crate is not even pulled in (the dependency is target-gated). The
+//! supervisor half ([`supervisor`], S-Ld) does start processes — but only as
+//! the containment machinery itself, and it always applies the same
+//! primitives above (Landlock, seccomp, rlimits) before the program's exec;
+//! it never relaxes them.
 //!
 //! The crate is the workspace's single named `unsafe` exception
 //! (`#![allow(unsafe_code)]`, checked first thing by scripts/ci/purity.sh
@@ -25,6 +30,22 @@
 //! ratchet raised to the reviewed count (the allowlist behind it: landlock,
 //! rustix on its libc backend, enumflags2; see deny.toml and the purity.sh
 //! registry list).
+//!
+//! S-Ld lands the third piece, the process-tree supervisor
+//! ([`supervisor`]): the launcher side of §1's "process-tree containment &
+//! reliable kill" row. The supervisor re-execs a helper entry point of the
+//! same binary (`__confine`), which becomes the child's parent, takes the
+//! subreaper bit, keeps the program in its own process group, holds a
+//! `pidfd` on the program and a control pipe back to the spawner — so an
+//! ordinary stop (`SIGKILL` the group, reap the descendants the subreaper
+//! inherited) and a harness crash (control-pipe EOF, plus `PR_SET_PDEATHSIG`
+//! on the program as a kernel backstop) both empty the tree. Like the
+//! seccomp apply, the raw-syscall FFI behind it is exactly one reviewed
+//! `unsafe` site; the frame protocol, report parsing and the output ring are
+//! pure and unit-tested on every OS. The backend-neutral vocabulary
+//! (`ring.rs`, `ConfinedExit`) stays in `harness-sandbox`: this crate cannot
+//! depend on it (the dependency runs the other way), so [`supervisor`]
+//! re-states the ring arithmetic and maps its report into plain fields.
 
 #![allow(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -34,6 +55,7 @@
 )]
 
 pub mod seccomp;
+pub mod supervisor;
 
 /// What the host MEASURED about the confinement primitives of the default
 /// tier (read-only probes of `/proc` and `/sys`; a missing file is recorded

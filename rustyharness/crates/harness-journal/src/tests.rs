@@ -1423,6 +1423,74 @@ fn egress_body_with_extra_key_refused() {
     assert_eq!(v.records.last().unwrap().kind, EventKind::Egress);
 }
 
+/// P-39j: the writer side of the §4.5 body. A live record's runtime
+/// fields enter only through typed constructors — `Ident::from_dns_host`
+/// for the airlock-validated host, `Trusted::Ip` for classified
+/// addresses, `Trusted::Null` for a refusal that chose no address — and
+/// the canonical reader accepts the result unchanged. A host outside the
+/// grammar mints no `Ident`, so the hop is refused with it, never
+/// truncated into the journal.
+#[test]
+fn egress_writer_typed_fields_round_trip() {
+    let (r, w) = rig(FaultPlan::default());
+    let mut w = w.unwrap();
+    let url = w
+        .untrusted(&Untrusted::new(
+            "https://example.com/doc".to_owned(),
+            Source::Model,
+        ))
+        .unwrap();
+    let host = Ident::from_dns_host("example.com").unwrap();
+    let v4: std::net::IpAddr = "93.184.216.34".parse().unwrap();
+    let v6: std::net::IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
+    let allow = Event::new(EventKind::Egress)
+        .field("decision", Trusted::Text("allow"))
+        .field("host", Trusted::Id(host.clone()))
+        .field("hop", Trusted::U64(0))
+        .field("ip", Trusted::Ip(v4))
+        .field("mode", Trusted::Text("direct"))
+        .field("port", Trusted::U64(443))
+        .field("purpose", Trusted::Text("fetch"))
+        .field(
+            "resolved",
+            Trusted::List(vec![Trusted::Ip(v4), Trusted::Ip(v6)]),
+        )
+        .field("url", Trusted::Untrusted(url.clone()));
+    let expected = allow.body().unwrap();
+    w.append(3, allow).unwrap();
+    // A refusal before any address was chosen: `ip` is null, the answer
+    // (here: empty) still rides along.
+    let refuse = Event::new(EventKind::Egress)
+        .field("decision", Trusted::Text("refuse:no-address"))
+        .field("host", Trusted::Id(host))
+        .field("hop", Trusted::U64(1))
+        .field("ip", Trusted::Null)
+        .field("mode", Trusted::Text("direct"))
+        .field("port", Trusted::U64(443))
+        .field("purpose", Trusted::Text("fetch"))
+        .field("resolved", Trusted::List(Vec::new()))
+        .field("url", Trusted::Untrusted(url));
+    w.append(3, refuse).unwrap();
+    let b = bytes(&r);
+    let v = verify(&b, &r.blobs).unwrap();
+    assert_eq!(v.records[1].body, expected, "the allow body round trips");
+    assert_eq!(
+        v.records[2].body.get("ip"),
+        Some(&Value::Null),
+        "an unanswered ip is null on the wire"
+    );
+    for rec in &v.records[1..] {
+        assert_eq!(
+            crate::canon::check_canonical_body(EventKind::Egress, &rec.body),
+            Ok(())
+        );
+    }
+    // The grammar backstop: an invalid host mints nothing.
+    assert!(Ident::from_dns_host("Not A Host").is_none());
+    assert!(Ident::from_dns_host("-lead.example").is_none());
+    assert!(Ident::from_dns_host("").is_none());
+}
+
 /// P-39c (§6, §7): the research-note kinds round trip, each append is
 /// fsynced before it returns (a resume reads its notes back from the
 /// journal), and the imported note's bytes ride in their typed home.

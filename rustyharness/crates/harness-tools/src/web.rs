@@ -36,10 +36,11 @@
 //! allowlist.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use harness_core::display::{sanitize_for_terminal_bounded, DisplayMode};
@@ -53,8 +54,9 @@ use harness_policy::web::{
 };
 use harness_policy::{Authorized, Call, WEB_FETCH_ID, WEB_SEARCH_ID};
 use harness_sandbox::egress::{
-    open_hop, Connector, EgressDecision, EgressLog, EgressMode, EgressPurpose, EgressRecord,
-    HopBudgets, HopRefused, HopRequest, LoopbackConnector, RefuseReason, Resolver,
+    open_hop, replay_hop, Connector, EgressDecision, EgressLog, EgressMode, EgressPurpose,
+    EgressRecord, HopBudgets, HopIo, HopRefused, HopRequest, LoopbackConnector, RefuseReason,
+    ResolveRefused, Resolver,
 };
 use harness_sandbox::{ChildStatus, ConfinedSpec, Confinement, Conformed, Limits, Network};
 use serde_json::{json, Value};
@@ -203,6 +205,108 @@ impl std::fmt::Debug for BoxConnector {
     }
 }
 
+/// The audit's re-fed hop transports (P-39j, §9). Everything measured in a
+/// live hop — the fetcher's frame bytes and the pump's byte counts,
+/// elapsed time and `ended` — is re-fed here in hop order, so the replay
+/// recomputes every derived field without binding a socket or spawning a
+/// fetcher (INV-51). Shared between the provider and its
+/// [`RecordedHopRunner`]; the loop's replay feed fills it from the
+/// journal's `Egress` entries and `ToolFinished` hop bodies.
+#[derive(Default)]
+pub struct RecordedHops {
+    frames: Mutex<VecDeque<Vec<u8>>>,
+    ios: Mutex<VecDeque<HopIo>>,
+}
+
+impl RecordedHops {
+    /// An empty set of re-fed hops.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one hop's recorded transport, in hop order.
+    pub fn push(&self, frame: Vec<u8>, io: HopIo) {
+        if let Ok(mut q) = self.frames.lock() {
+            q.push_back(frame);
+        }
+        if let Ok(mut q) = self.ios.lock() {
+            q.push_back(io);
+        }
+    }
+
+    fn pop_frame(&self) -> Option<Vec<u8>> {
+        let mut q = self.frames.lock().ok()?;
+        q.pop_front()
+    }
+
+    fn pop_io(&self) -> Option<HopIo> {
+        let mut q = self.ios.lock().ok()?;
+        q.pop_front()
+    }
+}
+
+/// The audit's [`HopRunner`] (P-39j): returns the recorded frames in hop
+/// order and spawns nothing — if the replay needs a frame the journal
+/// does not hold, the hop fails typed, never re-runs live (§9, INV-51).
+pub struct RecordedHopRunner {
+    hops: Arc<RecordedHops>,
+}
+
+impl RecordedHopRunner {
+    /// Serve frames from `hops`.
+    pub fn new(hops: Arc<RecordedHops>) -> Self {
+        Self { hops }
+    }
+}
+
+impl HopRunner for RecordedHopRunner {
+    fn run(&mut self, _run: &HopRun<'_>) -> Result<Vec<u8>, RunnerError> {
+        self.hops.pop_frame().ok_or_else(|| {
+            RunnerError::Io("the recorded journal holds no frame for this hop".into())
+        })
+    }
+}
+
+/// The audit's [`Resolver`] (P-39j): re-feeds the recorded answers in hop
+/// order (`Egress.resolved`, or the recorded timeouts) and never touches
+/// the system resolver (§9, INV-51).
+#[derive(Default)]
+pub struct RecordedResolver {
+    answers: Mutex<VecDeque<Result<Vec<std::net::IpAddr>, ResolveRefused>>>,
+}
+
+impl RecordedResolver {
+    /// An empty set of re-fed answers.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one recorded answer, in hop order.
+    pub fn push(&self, answer: Result<Vec<std::net::IpAddr>, ResolveRefused>) {
+        if let Ok(mut q) = self.answers.lock() {
+            q.push_back(answer);
+        }
+    }
+}
+
+impl Resolver for RecordedResolver {
+    fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<std::net::IpAddr>, ResolveRefused> {
+        match self.answers.lock() {
+            Ok(mut q) => q.pop_front().unwrap_or_else(|| {
+                Err(ResolveRefused::Failed(
+                    "the recorded journal holds no answer for this hop".into(),
+                ))
+            }),
+            // A poisoned queue can only mean a panic while holding it; the
+            // recorded answers are still there, and the replay must go on.
+            Err(p) => p
+                .into_inner()
+                .pop_front()
+                .unwrap_or_else(|| Err(ResolveRefused::Failed("no recorded answer".into()))),
+        }
+    }
+}
+
 /// Per-session web budgets (§4.4). One hop's budgets ride along in
 /// [`WebBudgets::hop`].
 #[derive(Debug, Clone)]
@@ -264,11 +368,18 @@ pub struct WebHop {
     pub ip: Option<std::net::IpAddr>,
     /// The `Location` the response named, when it did.
     pub location: Option<String>,
+    /// The whole `rh-fetch/1` frame the fetcher wrote (P-39j: the audit's
+    /// re-fed input — the extraction, the verdicts and the digests are
+    /// recomputed from it offline; §9). `None` for a hop whose frame never
+    /// arrived; cache hits carry no hops at all.
+    pub frame: Option<Vec<u8>>,
 }
 
 /// What one web call produced, beyond its observation (§4.5): the hops it
 /// made and the digest of the text it kept. The run journals this with
-/// `ToolFinished`; audit pairs it with the `Egress` entries (P-39j).
+/// `ToolFinished`; audit pairs it with the `Egress` entries (P-39j). The
+/// session counters are the values AFTER the call (P-46): a resume and an
+/// audit rebuild the provider with exactly the budgets state the run had.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebRecord {
     /// One entry per hop actually opened, in order.
@@ -280,6 +391,15 @@ pub struct WebRecord {
     pub text_sha256: Digest,
     /// The observation came from the session cache, with no egress.
     pub cached: bool,
+    /// Fetches the session has spent, counting this one (`None`-free copy
+    /// of the provider's own counter, P-46).
+    pub fetches: u32,
+    /// Searches the session has spent, counting this one.
+    pub searches: u32,
+    /// Bytes the session has downloaded, after this call's hops.
+    pub bytes_down: u64,
+    /// The next airlock hop number the session will open.
+    pub next_hop: u64,
 }
 
 /// A page kept for the provider's lifetime, so a later window on the same
@@ -439,6 +559,9 @@ pub struct WebTools<'a> {
     egress: Egress,
     runner: Box<dyn HopRunner + 'a>,
     session: Session,
+    /// Set only for the offline audit's replay (P-39j): the re-fed pump
+    /// outcomes, popped in hop order.
+    replay: Option<Arc<RecordedHops>>,
 }
 
 impl<'a> WebTools<'a> {
@@ -468,7 +591,16 @@ impl<'a> WebTools<'a> {
             witness,
             fetcher.path.clone(),
         )?);
-        Self::assemble(web_dir, allowlist, budgets, fetcher, search, egress, runner)
+        Self::assemble(
+            web_dir,
+            allowlist,
+            budgets,
+            Some(fetcher),
+            search,
+            egress,
+            runner,
+            None,
+        )
     }
 
     /// Build the provider with an explicit hop runner: every check of
@@ -488,19 +620,82 @@ impl<'a> WebTools<'a> {
         let web_dir = scratch.join("web");
         make_dir(&web_dir).map_err(io)?;
         let web_dir = fs::canonicalize(&web_dir).map_err(io)?;
-        Self::assemble(web_dir, allowlist, budgets, fetcher, search, egress, runner)
+        Self::assemble(
+            web_dir,
+            allowlist,
+            budgets,
+            Some(fetcher),
+            search,
+            egress,
+            runner,
+            None,
+        )
     }
 
-    /// Shared tail of the constructors: budgets and the fetcher pin are
-    /// checked, then the provider is assembled around the given runner.
+    /// Build the provider for the offline audit's replay (P-39j, §9):
+    /// every decision, redirect re-check, verdict, extraction, observation
+    /// and `Egress` record is recomputed exactly as live, but every
+    /// measured input — the frames, the pump outcomes, the resolver
+    /// answers — is re-fed from `hops` (and the [`Resolver`] inside
+    /// `egress`, which the caller builds as a [`RecordedResolver`]).
+    /// Nothing binds a socket and nothing spawns (INV-51), so no fetcher
+    /// pin is needed. The allowlist and budgets are still checked.
+    pub fn new_replaying(
+        scratch: &Path,
+        allowlist: Allowlist,
+        budgets: WebBudgets,
+        search: Option<Endpoint>,
+        hops: Arc<RecordedHops>,
+        egress: Egress,
+    ) -> Result<Self, WebSetupError> {
+        let io = |e: io::Error| WebSetupError::Scratch(e.to_string());
+        let web_dir = scratch.join("web");
+        make_dir(&web_dir).map_err(io)?;
+        let web_dir = fs::canonicalize(&web_dir).map_err(io)?;
+        let runner = Box::new(RecordedHopRunner::new(hops.clone()));
+        Self::assemble(
+            web_dir,
+            allowlist,
+            budgets,
+            None,
+            search,
+            egress,
+            runner,
+            Some(hops),
+        )
+    }
+
+    /// Carry a resumed session's running counts (P-39j, §9 "Resume"): the
+    /// new attempt continues the previous attempt's budgets and hop
+    /// numbering, so refetched hops are counted with the interrupted ones.
+    #[must_use]
+    pub fn with_counts(
+        mut self,
+        fetches: u32,
+        searches: u32,
+        bytes_down: u64,
+        next_hop: u64,
+    ) -> Self {
+        self.session.fetches = fetches;
+        self.session.searches = searches;
+        self.session.bytes_down = bytes_down;
+        self.session.next_hop = next_hop;
+        self
+    }
+
+    /// Shared tail of the constructors: budgets and, when a fetcher will
+    /// actually run, the fetcher pin are checked; then the provider is
+    /// assembled around the given runner.
+    #[allow(clippy::too_many_arguments)]
     fn assemble<'b>(
         web_dir: PathBuf,
         allowlist: Allowlist,
         budgets: WebBudgets,
-        fetcher: FetcherPin,
+        fetcher: Option<FetcherPin>,
         search: Option<Endpoint>,
         egress: Egress,
         runner: Box<dyn HopRunner + 'b>,
+        replay: Option<Arc<RecordedHops>>,
     ) -> Result<WebTools<'b>, WebSetupError> {
         let ns = ProviderName::new(harness_manifest::BUILTIN_NAMESPACE)
             .map_err(|_| WebSetupError::Scratch("namespace".into()))?;
@@ -516,13 +711,15 @@ impl<'a> WebTools<'a> {
         }
         HopBudgets::new(budgets.hop.wall(), budgets.hop.relay_cap_bytes())
             .map_err(|e| WebSetupError::Budgets(e.to_string()))?;
-        let actual =
-            file_sha256(&fetcher.path).map_err(|e| WebSetupError::Fetcher(e.to_string()))?;
-        if actual != fetcher.sha256 {
-            return Err(WebSetupError::Digest {
-                expected: fetcher.sha256,
-                actual,
-            });
+        if let Some(fetcher) = fetcher {
+            let actual =
+                file_sha256(&fetcher.path).map_err(|e| WebSetupError::Fetcher(e.to_string()))?;
+            if actual != fetcher.sha256 {
+                return Err(WebSetupError::Digest {
+                    expected: fetcher.sha256,
+                    actual,
+                });
+            }
         }
         Ok(WebTools {
             ns,
@@ -533,6 +730,7 @@ impl<'a> WebTools<'a> {
             egress,
             runner,
             session: Session::default(),
+            replay,
         })
     }
 
@@ -640,6 +838,7 @@ impl ToolProvider for WebTools<'_> {
                     final_url: key.clone(),
                     text_sha256: page.text_sha256,
                     cached: true,
+                    ..self.counters()
                 };
                 let header = format!(
                     "fetched {} -> {} {} {}B sha256:{} (cached)",
@@ -776,47 +975,79 @@ impl WebTools<'_> {
         // Journals the decision (allow or refusal) before any byte. The
         // pump dials the loopback endpoint through the dedicated
         // connector; nothing here resolves (§8 steps 1-2).
-        let pump = match open_hop(log, self.egress.resolver.as_ref(), LoopbackConnector, &hreq) {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(self.fail(code::WEB_EGRESS, &egress_msg(&e), request_url, Vec::new()))
+        let (framed, io) = if let Some(hops) = self.replay.clone() {
+            // P-39j (§9): the audit recomputes the decision (identical
+            // `Egress` record, still journal-first) and re-feeds the pump
+            // outcome; no relay is bound and no fetcher runs.
+            if let Err(e) = replay_hop(log, self.egress.resolver.as_ref(), &hreq) {
+                return Ok(self.fail(code::WEB_EGRESS, &egress_msg(&e), request_url, Vec::new()));
             }
+            let Some(io) = hops.pop_io() else {
+                return Ok(self.fail(
+                    code::WEB_FETCHER,
+                    "the recorded journal holds no pump outcome for this hop",
+                    request_url,
+                    Vec::new(),
+                ));
+            };
+            let framed = self.runner.run(&HopRun {
+                req_path: Path::new(""),
+                hop_dir: Path::new(""),
+                proxy_port: 0,
+                wall,
+                output_bytes: SEARCH_BODY_MAX_BYTES + 4096,
+            });
+            (framed, io)
+        } else {
+            let pump = match open_hop(log, self.egress.resolver.as_ref(), LoopbackConnector, &hreq)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(self.fail(
+                        code::WEB_EGRESS,
+                        &egress_msg(&e),
+                        request_url,
+                        Vec::new(),
+                    ))
+                }
+            };
+            let relay_port = pump.port();
+            let hop_dir = self.web_dir.join(format!("hop-{hop_no}"));
+            if let Err(e) = make_dir(&hop_dir) {
+                return Ok(self.fail(
+                    code::WEB_FETCHER,
+                    &format!("hop dir: {e}"),
+                    request_url,
+                    Vec::new(),
+                ));
+            }
+            let req_path = hop_dir.join("req.json");
+            if let Err(e) = write_search_request(
+                &req_path, relay_port, &token, addr_host, port, &target, wall,
+            ) {
+                return Ok(self.fail(
+                    code::WEB_FETCHER,
+                    &format!("request file: {e}"),
+                    request_url,
+                    Vec::new(),
+                ));
+            }
+            let run = HopRun {
+                req_path: &req_path,
+                hop_dir: &hop_dir,
+                proxy_port: relay_port,
+                wall,
+                output_bytes: SEARCH_BODY_MAX_BYTES + 4096,
+            };
+            let framed = self.runner.run(&run);
+            let io = pump.join();
+            // §5.3: the hop directory holds only the request file and is
+            // removed once the hop ends. Best effort: the frame is already
+            // in memory and the egress record already journaled.
+            let _ = fs::remove_dir_all(&hop_dir);
+            (framed, io)
         };
-        let relay_port = pump.port();
-        let hop_dir = self.web_dir.join(format!("hop-{hop_no}"));
-        if let Err(e) = make_dir(&hop_dir) {
-            return Ok(self.fail(
-                code::WEB_FETCHER,
-                &format!("hop dir: {e}"),
-                request_url,
-                Vec::new(),
-            ));
-        }
-        let req_path = hop_dir.join("req.json");
-        if let Err(e) = write_search_request(
-            &req_path, relay_port, &token, addr_host, port, &target, wall,
-        ) {
-            return Ok(self.fail(
-                code::WEB_FETCHER,
-                &format!("request file: {e}"),
-                request_url,
-                Vec::new(),
-            ));
-        }
-        let run = HopRun {
-            req_path: &req_path,
-            hop_dir: &hop_dir,
-            proxy_port: relay_port,
-            wall,
-            output_bytes: SEARCH_BODY_MAX_BYTES + 4096,
-        };
-        let framed = self.runner.run(&run);
-        let io = pump.join();
         self.session.bytes_down += io.bytes_down;
-        // §5.3: the hop directory holds only the request file and is
-        // removed once the hop ends. Best effort: the frame is already
-        // in memory and the egress record already journaled.
-        let _ = fs::remove_dir_all(&hop_dir);
         let record = |frame: Option<&harness_core::fetch_frame::Frame>| WebHop {
             hop: hop_no,
             url: request_url.clone(),
@@ -832,6 +1063,7 @@ impl WebTools<'_> {
             mode: EgressMode::SearchEndpoint.as_str(),
             ip: Some(io.chosen),
             location: None,
+            frame: frame.map(harness_core::fetch_frame::encode_frame),
         };
         let frame = match framed {
             Ok(bytes) => {
@@ -966,6 +1198,7 @@ impl WebTools<'_> {
             final_url: request_url.clone(),
             text_sha256: sha256(obs.as_bytes()),
             cached: false,
+            ..self.counters()
         };
         self.done(&request_url, obs, record)
     }
@@ -1029,62 +1262,92 @@ impl WebTools<'_> {
                 budgets,
             };
             // Journals the decision (allow or refusal) before any byte.
-            let pump = match open_hop(
-                log,
-                self.egress.resolver.as_ref(),
-                self.egress.connector.clone(),
-                &hreq,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
+            let (framed, io) = if let Some(recorded) = self.replay.clone() {
+                // P-39j (§9): the audit recomputes the decision and
+                // re-feeds the recorded pump outcome; nothing binds.
+                if let Err(e) = replay_hop(log, self.egress.resolver.as_ref(), &hreq) {
                     return Ok(self.fail(
                         code::WEB_EGRESS,
                         &egress_msg(&e),
                         current_url(&current),
                         hops,
-                    ))
+                    ));
                 }
+                let Some(io) = recorded.pop_io() else {
+                    return Ok(self.fail(
+                        code::WEB_FETCHER,
+                        "the recorded journal holds no pump outcome for this hop",
+                        current_url(&current),
+                        hops,
+                    ));
+                };
+                let framed = self.runner.run(&HopRun {
+                    req_path: Path::new(""),
+                    hop_dir: Path::new(""),
+                    proxy_port: 0,
+                    wall,
+                    output_bytes: self.budgets.body_max_bytes + 4096,
+                });
+                (framed, io)
+            } else {
+                let pump = match open_hop(
+                    log,
+                    self.egress.resolver.as_ref(),
+                    self.egress.connector.clone(),
+                    &hreq,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Ok(self.fail(
+                            code::WEB_EGRESS,
+                            &egress_msg(&e),
+                            current_url(&current),
+                            hops,
+                        ))
+                    }
+                };
+                let port = pump.port();
+                let hop_dir = self.web_dir.join(format!("hop-{hop_no}"));
+                if let Err(e) = make_dir(&hop_dir) {
+                    return Ok(self.fail(
+                        code::WEB_FETCHER,
+                        &format!("hop dir: {e}"),
+                        current_url(&current),
+                        hops,
+                    ));
+                }
+                let req_path = hop_dir.join("req.json");
+                if let Err(e) = write_request(
+                    &req_path,
+                    port,
+                    &token,
+                    &current,
+                    self.budgets.body_max_bytes,
+                    wall,
+                ) {
+                    return Ok(self.fail(
+                        code::WEB_FETCHER,
+                        &format!("request file: {e}"),
+                        current_url(&current),
+                        hops,
+                    ));
+                }
+                let run = HopRun {
+                    req_path: &req_path,
+                    hop_dir: &hop_dir,
+                    proxy_port: port,
+                    wall,
+                    output_bytes: self.budgets.body_max_bytes + 4096,
+                };
+                let framed = self.runner.run(&run);
+                let io = pump.join();
+                // §5.3: the hop directory holds only the request file and
+                // is removed once the hop ends. Best effort: the frame is
+                // already in memory and the egress record already journaled.
+                let _ = fs::remove_dir_all(&hop_dir);
+                (framed, io)
             };
-            let port = pump.port();
-            let hop_dir = self.web_dir.join(format!("hop-{hop_no}"));
-            if let Err(e) = make_dir(&hop_dir) {
-                return Ok(self.fail(
-                    code::WEB_FETCHER,
-                    &format!("hop dir: {e}"),
-                    current_url(&current),
-                    hops,
-                ));
-            }
-            let req_path = hop_dir.join("req.json");
-            if let Err(e) = write_request(
-                &req_path,
-                port,
-                &token,
-                &current,
-                self.budgets.body_max_bytes,
-                wall,
-            ) {
-                return Ok(self.fail(
-                    code::WEB_FETCHER,
-                    &format!("request file: {e}"),
-                    current_url(&current),
-                    hops,
-                ));
-            }
-            let run = HopRun {
-                req_path: &req_path,
-                hop_dir: &hop_dir,
-                proxy_port: port,
-                wall,
-                output_bytes: self.budgets.body_max_bytes + 4096,
-            };
-            let framed = self.runner.run(&run);
-            let io = pump.join();
             self.session.bytes_down += io.bytes_down;
-            // §5.3: the hop directory holds only the request file and is
-            // removed once the hop ends. Best effort: the frame is already
-            // in memory and the egress record already journaled.
-            let _ = fs::remove_dir_all(&hop_dir);
             let record = |frame: Option<&harness_core::fetch_frame::Frame>| WebHop {
                 hop: hop_no,
                 url: current_url(&current),
@@ -1100,6 +1363,7 @@ impl WebTools<'_> {
                 mode: self.egress.mode.as_str(),
                 ip: Some(io.chosen),
                 location: frame.and_then(|f| f.header.location.clone()),
+                frame: frame.map(harness_core::fetch_frame::encode_frame),
             };
             let frame = match framed {
                 Ok(bytes) => match harness_core::fetch_frame::parse_frame(
@@ -1300,9 +1564,26 @@ impl WebTools<'_> {
             final_url: key.clone(),
             text_sha256: page.text_sha256,
             cached: false,
+            ..self.counters()
         };
         self.session.cache.insert(key.clone(), page);
         Ok(self.done(&key, obs, record))
+    }
+
+    /// The session counters after the call (P-46): every `WebRecord` the
+    /// tools produce carries them, so a resume and an audit rebuild the
+    /// provider exactly where the run's budgets stood.
+    fn counters(&self) -> WebRecord {
+        WebRecord {
+            hops: Vec::new(),
+            final_url: String::new(),
+            text_sha256: sha256(&[]),
+            cached: false,
+            fetches: self.session.fetches,
+            searches: self.session.searches,
+            bytes_down: self.session.bytes_down,
+            next_hop: self.session.next_hop,
+        }
     }
 
     /// A finished, successful observation: bounded, digest over the full
@@ -1351,6 +1632,7 @@ impl WebTools<'_> {
                 final_url,
                 text_sha256: sha256(&[]),
                 cached: false,
+                ..self.counters()
             }),
         }
     }

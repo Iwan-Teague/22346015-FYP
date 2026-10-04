@@ -162,6 +162,7 @@ fn drive(
         approver,
         confinement: None,
         input,
+        instructions: None,
         sink,
     })
 }
@@ -582,8 +583,9 @@ fn session_header_has_mode_turn_limits_context_format7() {
     let tl = head.get("turn_limits").unwrap();
     assert_eq!(tl.get("steps").unwrap(), 50);
     assert_eq!(tl.get("format_errors").unwrap(), 3);
-    // P-28: the session context format is rh-context/7.
-    assert_eq!(head.get("context_format").unwrap(), "rh-context/7");
+    // P-28 added the mode line (rh-context/7); P-30 added the project
+    // notes block (rh-context/8).
+    assert_eq!(head.get("context_format").unwrap(), "rh-context/8");
     // The meter never latches format errors in a session.
     assert_eq!(
         head.get("limits").unwrap().get("format_errors").unwrap(),
@@ -852,4 +854,16 @@ fn user_turn_over_share_refused() {
     assert_eq!(turns[0].get("shown").unwrap(), "over_share");
     let ends = rec_bodies(&r, EventKind::TurnEnded);
     assert_eq!(ends[0].get("reason").unwrap(), "input_refused");
+}
+
+/// P-38: a session header keeps its `mode: session` and gains neither of
+/// the child keys, so session headers (and their audits) are unchanged.
+#[test]
+fn session_header_unchanged_without_delegate() {
+    let fx = Fixture::new("session-header-childless").unwrap();
+    let r = go(&fx, vec![say("hi")], &["hello"]);
+    let head = &records(&r)[0].body;
+    assert_eq!(head.get("mode").unwrap(), "session");
+    assert!(!head.contains_key("parent"), "{head:?}");
+    assert!(!head.contains_key("child"), "{head:?}");
 }

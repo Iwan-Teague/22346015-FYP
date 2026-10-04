@@ -289,8 +289,12 @@ pub struct BudgetError(pub String);
 
 /// The egress journal sink (INV-43). `fsync` happens behind this trait; the
 /// airlock refuses the hop when the append fails.
-pub trait EgressLog: Send + Sync {
+pub trait EgressLog {
     /// Append one record. The hop may proceed only if this returns `Ok`.
+    ///
+    /// No `Send`/`Sync` bound: the log is used only on the caller's
+    /// thread, before anything is bound or spawned (INV-43). A test can
+    /// therefore back it with a non-thread-safe journal seam.
     fn append(&self, record: &EgressRecord) -> Result<(), EgressLogError>;
 }
 
@@ -574,24 +578,30 @@ where
     .map_err(HopRefused::Log)
 }
 
-/// Open one egress hop (§3 steps 4–5): resolve once, classify every
-/// address, journal the decision FIRST (INV-43), then bind the one-shot
-/// loopback pump and return it while the pump thread runs.
+/// The decision phase of one hop (§3 steps 1–3): the build-capability
+/// check, the search-endpoint loopback waiver (no resolution), or one
+/// resolver call with every answer classified (INV-44); then the decision
+/// journalled FIRST (INV-43). Everything measured stays out: no socket is
+/// bound and no thread is started.
 ///
-/// The caller drives the fetcher against [`HopPump::port`] and then calls
-/// [`HopPump::join`] for the hop outcome. The port is known before this
-/// returns; whether the fetcher's byte exchange succeeded is known at
-/// `join`.
-pub fn open_hop<L, R, C>(
-    log: &L,
-    resolver: &R,
-    connector: C,
-    req: &HopRequest<'_>,
-) -> Result<HopPump, HopRefused>
+/// This is the exact decision logic [`open_hop`] runs — one function, so
+/// the offline audit (P-39j, INV-51) recomputes and re-journals precisely
+/// what the live run decided, and then re-feeds the pump outcome.
+pub struct HopPlan {
+    /// The full resolver answer the decision classified (empty for the
+    /// search-endpoint waiver).
+    pub resolved: Vec<IpAddr>,
+    /// The classified address the pump may dial.
+    pub chosen: IpAddr,
+}
+
+/// Recompute and re-journal one hop's decision, binding nothing (§9,
+/// INV-51). Errors carry the same variants [`open_hop`] would return; the
+/// refusal, when journalled, is byte-identical to the live one.
+pub fn replay_hop<L, R>(log: &L, resolver: &R, req: &HopRequest<'_>) -> Result<HopPlan, HopRefused>
 where
     L: EgressLog + ?Sized,
     R: Resolver + ?Sized,
-    C: Connector + Send + 'static,
 {
     // Build-capability refusal (INV-52): before anything else, before any
     // journalling — the build's silence about the network is total.
@@ -632,6 +642,33 @@ where
         ip: Some(chosen),
     })
     .map_err(HopRefused::Log)?;
+    Ok(HopPlan { resolved, chosen })
+}
+
+/// Open one egress hop (§3 steps 4–5): resolve once, classify every
+/// address, journal the decision FIRST (INV-43), then bind the one-shot
+/// loopback pump and return it while the pump thread runs.
+///
+/// The caller drives the fetcher against [`HopPump::port`] and then calls
+/// [`HopPump::join`] for the hop outcome. The port is known before this
+/// returns; whether the fetcher's byte exchange succeeded is known at
+/// `join`.
+pub fn open_hop<L, R, C>(
+    log: &L,
+    resolver: &R,
+    connector: C,
+    req: &HopRequest<'_>,
+) -> Result<HopPump, HopRefused>
+where
+    L: EgressLog + ?Sized,
+    R: Resolver + ?Sized,
+    C: Connector + Send + 'static,
+{
+    // The decision (§3 steps 1–3), shared with the audit's replay:
+    // build-capability check, resolution and classification, and the
+    // journalled allow (INV-43).
+    let plan = replay_hop(log, resolver, req)?;
+    let (resolved, chosen) = (plan.resolved, plan.chosen);
 
     // Bind the one-shot pump on loopback and hand it to a thread.
     let listener =
@@ -777,6 +814,21 @@ impl HopEnded {
             HopEnded::Capped => "capped",
             HopEnded::Aborted => "aborted",
         }
+    }
+
+    /// The hop outcome a journal names (P-46): the exact inverse of
+    /// [`Self::as_str`], so a replay can re-feed what the pump recorded.
+    /// `None` for any other text — not a shape the loop writes.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "relayed" => HopEnded::Relayed,
+            "refused" => HopEnded::Refused,
+            "connect_failed" => HopEnded::ConnectFailed,
+            "timeout" => HopEnded::Timeout,
+            "capped" => HopEnded::Capped,
+            "aborted" => HopEnded::Aborted,
+            _ => return None,
+        })
     }
 }
 

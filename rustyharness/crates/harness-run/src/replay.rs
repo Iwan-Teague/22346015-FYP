@@ -104,8 +104,10 @@
 pub(crate) mod audit;
 pub(crate) mod compare;
 pub(crate) mod feed;
+pub(crate) mod fork;
 pub(crate) mod resume;
 
 pub use audit::{audit, audit_session, Audit, AuditRefused, AuditReport};
 pub use compare::Divergence;
+pub use fork::{fork_session, ForkSession};
 pub use resume::{resume, resume_session, Resume, ResumeSession};

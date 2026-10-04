@@ -10,9 +10,31 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The TLS arm (design note `P-39-web-airlock` §5.4, P-39n): `fetch_over_tls`
+# exists only with it, and an `https` request is refused `tls_unavailable`
+# without it (INV-52). Off by default: the default build links no TLS.
+net = ["dep:rustls", "dep:webpki-roots"]
+
 [dependencies]
 harness-core = { path = "../harness-core" }
 serde_json.workspace = true
+# The reviewed TLS stack (§5.4): rustls with the ring provider, no default
+# features, plus the compiled-in Mozilla roots. Nothing else may ever link
+# these (INV-52); purity.sh allowlists the exact net tree.
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The fixture TLS server of tests/tls.rs (rustls again: the server side of
+# the same reviewed stack) and PEM loading for the committed test CA.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+# Frame parsing and the expected leaf digest in tests/tls.rs.
+harness-core = { path = "../harness-core" }
+# The macOS positive control (`tls_handshake_inside_proxy_sandbox`): the
+# probe binary under the real confined spawn, proxy profile.
+harness-sandbox = { path = "../harness-sandbox" }
 
 [lib]
 path = "src/lib.rs"
@@ -20,3 +42,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "rustyharness-fetch"
 path = "src/main.rs"
+
+# Test-only probe for the macOS positive control (tests/tls.rs
+# `tls_handshake_inside_proxy_sandbox`): the fetcher's own dial-and-fetch
+# path, with the test CA instead of the web roots, run confined under the
+# proxy profile. Built only with `net`; it is NOT shipped tooling.
+[[bin]]
+name = "rustyharness-fetch-probe"
+path = "src/probe.rs"
+required-features = ["net"]

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use gate_outcome::Digest;
-use harness_core::Nonce;
+use harness_core::{Nonce, RunId};
 use harness_journal::{BlobSource, EventKind, Record, Verified};
 use harness_model::profile::Profile;
 use harness_model::replay::{payload_bytes, ReplayBackend};
@@ -35,6 +35,19 @@ pub(crate) struct Recorded {
     /// The turn boundaries (`TurnEnded`) are re-fed by nothing: the replay
     /// recomputes them. Empty for a batch journal.
     pub(crate) inputs: VecDeque<RecordedInput>,
+    /// The `ForkedFrom` record (P-32), if the journal is a fork's: the
+    /// parent run, the parent step the child forked at (the last kept
+    /// step) and the parent prefix's chain head the child recorded. The
+    /// audit re-derives the head from the parent's records and refuses a
+    /// child whose recorded head does not match.
+    pub(crate) fork: Option<RecordedFork>,
+}
+
+/// A fork journal's `ForkedFrom` record, read back (P-32).
+pub(crate) struct RecordedFork {
+    pub(crate) parent_run: RunId,
+    pub(crate) parent_step: u64,
+    pub(crate) parent_chain_head: Digest,
 }
 
 /// A recorded approval answer, in exactly the shape the loop writes: the
@@ -114,6 +127,70 @@ pub(crate) fn digest_at(b: &Map<String, Value>, key: &str) -> Option<Digest> {
     b.get(key)?.as_str()?.parse().ok()
 }
 
+/// The project instructions one `InstructionsLoaded` records (P-30), in
+/// exactly the shape the loop writes: three fields, the file name one of
+/// the two the loop loads, the digest over the full text, and the text as
+/// an untrusted workspace payload whose digest matches the named one.
+fn instructions_record(r: &Record, blobs: &dyn BlobSource) -> Option<crate::session::Instructions> {
+    if r.body.len() != 3
+        || !["path", "digest", "text"]
+            .iter()
+            .all(|k| r.body.contains_key(*k))
+    {
+        return None;
+    }
+    let name = match r.body.get("path")?.as_str()? {
+        "AGENTS.md" => "AGENTS.md",
+        "CLAUDE.md" => "CLAUDE.md",
+        _ => return None,
+    };
+    // The text payload names the workspace file it came from as its
+    // source: anything else is not an `InstructionsLoaded` this loop
+    // writes.
+    let source_kind = r
+        .body
+        .get("text")
+        .and_then(|t| t.get("source"))
+        .and_then(|s| s.get("kind"))
+        .and_then(Value::as_str);
+    if source_kind != Some("workspace") {
+        return None;
+    }
+    let bytes = payload_bytes(r.body.get("text")?, blobs, r.seq).ok()?;
+    let instructions = crate::session::Instructions::new(name, &bytes).ok()?;
+    if instructions.digest != digest_at(&r.body, "digest")? {
+        return None;
+    }
+    Some(instructions)
+}
+
+/// The journal's project instructions (P-30): at most one
+/// `InstructionsLoaded`, and only in a session journal. Scanned before the
+/// header check, so an audit or a resume can recompute the header's
+/// `instructions` digest from what the journal carries.
+pub(crate) fn instructions_of(
+    v: &Verified,
+    blobs: &dyn BlobSource,
+) -> Result<Option<crate::session::Instructions>, Divergence> {
+    let session = v
+        .records
+        .first()
+        .and_then(|h| h.body.get("mode").and_then(Value::as_str))
+        == Some("session");
+    let mut found = None;
+    for r in &v.records {
+        if r.kind != EventKind::InstructionsLoaded {
+            continue;
+        }
+        let bad = || diverge(r.seq, r.step, "a record is not the shape the loop writes");
+        if !session || found.is_some() {
+            return Err(bad());
+        }
+        found = Some(instructions_record(r, blobs).ok_or_else(bad)?);
+    }
+    Ok(found)
+}
+
 /// Read the replay inputs from `records` (already verified).
 pub(crate) fn recorded(
     v: &Verified,
@@ -134,6 +211,7 @@ pub(crate) fn recorded(
     let mut approvals = VecDeque::new();
     let mut walls = BTreeMap::new();
     let mut inputs = VecDeque::new();
+    let mut fork: Option<RecordedFork> = None;
     // The last `UserTurn`'s wall time: a later one's cannot be smaller
     // (P-17 §6) — the clock only moves forward, and an audit re-feeds this
     // rather than recomputing it, so the order is checked here.
@@ -519,6 +597,38 @@ pub(crate) fn recorded(
                     _ => return Err(bad()),
                 }
             }
+            // P-30: the project instructions re-derive as loop state (the
+            // replay rewrites the record from it, and the shapes are
+            // compared); `instructions_of` parsed the same record. Only a
+            // session writes it (a batch loop loads nothing).
+            EventKind::InstructionsLoaded if session => {
+                instructions_record(r, blobs).ok_or_else(bad)?;
+            }
+            // A fork's first record (P-32): the parent run, the kept step
+            // and the parent prefix's chain head. Exactly one, at step 0,
+            // directly after the header.
+            EventKind::ForkedFrom if session => {
+                if fork.is_some() || r.step != 0 || r.body.len() != 3 {
+                    return Err(bad());
+                }
+                let parent_run = r
+                    .body
+                    .get("parent_run")
+                    .and_then(Value::as_str)
+                    .and_then(RunId::parse)
+                    .ok_or_else(bad)?;
+                let parent_step = r
+                    .body
+                    .get("parent_step")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(bad)?;
+                let parent_chain_head = digest_at(&r.body, "parent_chain_head").ok_or_else(bad)?;
+                fork = Some(RecordedFork {
+                    parent_run,
+                    parent_step,
+                    parent_chain_head,
+                });
+            }
             // A record no slice owns yet is not a shape this loop writes
             // (P-17 §6). The background-process kinds are owned from P-36h
             // (canon, the record shapes), but nothing writes them until
@@ -526,7 +636,6 @@ pub(crate) fn recorded(
             // refused like the other reserved names.
             EventKind::ModeChanged
             | EventKind::InstructionsLoaded
-            | EventKind::ForkedFrom
             | EventKind::ChildRun
             | EventKind::BgStopped
             | EventKind::OrphanCheck => return Err(bad()),
@@ -570,6 +679,7 @@ pub(crate) fn recorded(
         approvals,
         walls,
         inputs,
+        fork,
     })
 }
 

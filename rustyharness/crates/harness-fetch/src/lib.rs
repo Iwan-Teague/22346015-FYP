@@ -12,9 +12,14 @@
 //! `harness_core::fetch_frame`). It never decompresses: any `Content-Encoding`
 //! other than `identity` is refused before the body is read, and no
 //! decompressor is linked at all (INV-46). Every budget ends in a typed
-//! refusal (INV-48), and the default build links no TLS: an `https` request
-//! is refused with the `tls_unavailable` kind until the `net` feature lands
-//! (P-39n, INV-52).
+//! refusal (INV-48). The default build links no TLS: an `https` request is
+//! refused with the `tls_unavailable` kind (INV-52). The off-by-default
+//! `net` feature adds exactly one thing, the TLS arm of §5.2 of the design
+//! note (P-39n): rustls with the ring provider and the compiled-in Mozilla
+//! roots, exposed as [`fetch_over_tls`] (see `src/tls.rs`). With `net` on,
+//! an `https` hop handshakes over its tunnel first — SNI is the request's
+//! host, ALPN offers only `http/1.1`, the system trust store is never read
+//! — and the frame carries `tls {version, suite, cert_sha256}`.
 //!
 //! The library API is deliberately small:
 //!
@@ -39,9 +44,15 @@
 
 use std::io::{Read, Write};
 
-use harness_core::fetch_frame::FrameHeader;
 pub use harness_core::fetch_frame::{encode_frame, parse_frame, Frame};
+use harness_core::fetch_frame::{FrameHeader, TlsInfo};
 use harness_core::strict_json;
+
+#[cfg(feature = "net")]
+pub use tls::{fetch_over_tls, fetch_over_tls_with_roots};
+
+#[cfg(feature = "net")]
+mod tls;
 
 /// Hard cap on a request's `max_body`: 2 MiB per hop (design note §4.4).
 pub const MAX_BODY_CAP: u64 = 2 * 1024 * 1024;
@@ -59,7 +70,19 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 /// sandbox enforces its own, shorter wall; this is only an upper bound.
 pub const MAX_TIMEOUT_MS: u64 = 60_000;
 
+/// `https` with the `net` feature OFF (INV-52: the default build links no
+/// TLS, so an https hop is refused before any byte moves). With `net` on
+/// the kind can never be emitted — every TLS failure is [`KIND_TLS_FAILED`]
+/// instead.
+#[cfg(not(feature = "net"))]
 const KIND_TLS_UNAVAILABLE: &str = "tls_unavailable";
+/// A TLS failure with the `net` feature on (P-39n): the handshake itself,
+/// certificate verification (wrong host, expired, untrusted), or the
+/// protocol negotiation failed. Opaque to the caller by design: the reason
+/// text never quotes server-controlled data. Used only by the `net` arm
+/// (`src/tls.rs`).
+#[cfg(feature = "net")]
+pub const KIND_TLS_FAILED: &str = "tls_failed";
 const KIND_CONNECT_FAILED: &str = "connect_failed";
 const KIND_HTTP_PARSE: &str = "http_parse";
 const KIND_ENCODING_REFUSED: &str = "encoding_refused";
@@ -338,30 +361,65 @@ pub fn fetch_over<S: Read + Write>(mut tunnel: S, req: &Request) -> Frame {
 }
 
 fn run<S: Read + Write>(tunnel: &mut S, req: &Request) -> Result<Frame, String> {
-    // No TLS in the default build: refuse at once, before any dial (INV-52).
-    if req.scheme == Scheme::Https {
-        return Err(KIND_TLS_UNAVAILABLE.to_string());
-    }
-
-    if req.mode == Mode::Proxy {
-        let connect = format!(
-            "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n",
-            host = req.host,
-            port = req.port,
-            token = req.token,
-        );
-        tunnel
-            .write_all(connect.as_bytes())
-            .map_err(|_| KIND_CONNECT_FAILED.to_string())?;
-        tunnel
-            .flush()
-            .map_err(|_| KIND_CONNECT_FAILED.to_string())?;
-        let reply = read_head(tunnel, req.max_header_bytes)?;
-        if reply.status != 200 {
-            return Err(KIND_CONNECT_FAILED.to_string());
+    // INV-52: no TLS in this build. Refused before any byte moves — before
+    // the CONNECT too, so the pump never learns of an https hop it cannot
+    // serve.
+    #[cfg(not(feature = "net"))]
+    {
+        if req.scheme == Scheme::Https {
+            return Err(KIND_TLS_UNAVAILABLE.to_string());
         }
     }
 
+    if req.mode == Mode::Proxy {
+        proxy_connect(tunnel, req)?;
+    }
+
+    match req.scheme {
+        // Plain HTTP: the tunnel already reaches the origin.
+        Scheme::Http => http_over(tunnel, req, None),
+        // HTTPS (P-39n, `net` only): the TLS handshake rides the tunnel
+        // first — through the pump's CONNECT when mode is proxy — then the
+        // very same bounded HTTP exchange runs over it.
+        #[cfg(feature = "net")]
+        Scheme::Https => tls::https_over_web_roots(tunnel, req),
+        // INV-52: no TLS in this build; refused before any byte moves. The
+        // match needs the arm to be exhaustive.
+        #[cfg(not(feature = "net"))]
+        Scheme::Https => Err(KIND_TLS_UNAVAILABLE.to_string()),
+    }
+}
+
+/// The pump's CONNECT (mode `proxy`): one request, the reply's status line
+/// checked, the tunnel then carries origin bytes.
+fn proxy_connect<S: Read + Write>(tunnel: &mut S, req: &Request) -> Result<(), String> {
+    let connect = format!(
+        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n",
+        host = req.host,
+        port = req.port,
+        token = req.token,
+    );
+    tunnel
+        .write_all(connect.as_bytes())
+        .map_err(|_| KIND_CONNECT_FAILED.to_string())?;
+    tunnel
+        .flush()
+        .map_err(|_| KIND_CONNECT_FAILED.to_string())?;
+    let reply = read_head(tunnel, req.max_header_bytes)?;
+    if reply.status != 200 {
+        return Err(KIND_CONNECT_FAILED.to_string());
+    }
+    Ok(())
+}
+
+/// The bounded HTTP/1.1 GET and its reply, over an established tunnel
+/// (plain, or TLS-decoded when `tls` is set). This is INV-46's ONLY path
+/// web bytes ever take.
+fn http_over<S: Read + Write>(
+    tunnel: &mut S,
+    req: &Request,
+    tls: Option<TlsInfo>,
+) -> Result<Frame, String> {
     let user_agent = if req.user_agent.is_empty() {
         DEFAULT_USER_AGENT
     } else {
@@ -439,7 +497,7 @@ fn run<S: Read + Write>(tunnel: &mut S, req: &Request) -> Result<Frame, String> 
             location,
             body_len: u64::try_from(body.len()).unwrap_or(u64::MAX),
             truncated,
-            tls: None,
+            tls,
             error: None,
         },
         body,
@@ -960,6 +1018,9 @@ mod tests {
         assert_eq!(kind_of(&frame), Some(KIND_CONNECT_FAILED));
     }
 
+    /// INV-52: the default build (no `net`) refuses https before dialing.
+    /// The net build's https path is exercised by tests/tls.rs instead.
+    #[cfg(not(feature = "net"))]
     #[test]
     fn https_without_net_is_tls_unavailable() {
         let mut req = request();
@@ -969,6 +1030,23 @@ mod tests {
         let frame = fetch_over(tunnel, &req);
         assert_eq!(kind_of(&frame), Some(KIND_TLS_UNAVAILABLE));
         assert!(sent_handle.borrow().is_empty());
+    }
+
+    /// P-39n: with `net` on, an https hop over a tunnel that is not TLS is
+    /// the opaque `tls_failed` kind — and nothing was sent in the clear.
+    #[cfg(feature = "net")]
+    #[test]
+    fn https_over_a_plaintext_tunnel_is_tls_failed() {
+        let mut req = request();
+        req.scheme = Scheme::Https;
+        let tunnel = TestTunnel::new("HTTP/1.1 200 OK\r\n\r\n");
+        let sent_handle = Rc::clone(&tunnel.sent);
+        let frame = fetch_over(tunnel, &req);
+        assert_eq!(kind_of(&frame), Some(KIND_TLS_FAILED));
+        // The client hello may have been written (in vain); whatever moved,
+        // no HTTP request did.
+        let sent = sent_handle.borrow().clone();
+        assert!(!sent.windows(4).any(|w| w == b"GET "));
     }
 
     #[test]
@@ -1147,6 +1225,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "net"))]
     #[test]
     fn request_accepts_https_and_proxy_but_fetch_refuses_tls() {
         let https = request_json("")

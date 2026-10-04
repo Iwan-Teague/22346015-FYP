@@ -1077,7 +1077,7 @@ pub fn spawn(
         sys::pipe2(p).map_err(|_| SpawnFail::Pipe)?;
     }
 
-    let child = sys::fork_prog().map_err(|_| {
+    let child_raw = sys::fork_prog().map_err(|_| {
         for p in [&control, &out, &err, &status] {
             for fd in p {
                 sys::close(*fd);
@@ -1085,7 +1085,7 @@ pub fn spawn(
         }
         SpawnFail::Fork
     })?;
-    if child == 0 {
+    if child_raw == 0 {
         // The helper arm: the four pipes at their fixed numbers, its own
         // process group (the spawner's fallback kill target), a clean fd
         // table, and a re-exec of this binary as the helper. Never returns.
@@ -1099,6 +1099,8 @@ pub fn spawn(
     for fd in [control[0], out[1], err[1], status[1]] {
         sys::close(fd);
     }
+    // pids are positive in practice; a negative one is not a pid we spawn.
+    let child = u32::try_from(child_raw).map_err(|_| SpawnFail::Fork)?;
     if sys::write_all(control[1], &frame).is_err() {
         // The helper is gone or unreadable; kill it and refuse.
         sys::kill_pid(child);
@@ -1244,6 +1246,8 @@ impl Running {
         let (out_total, stdout, _) = snapshot(&self.out);
         let (err_total, stderr, _) = snapshot(&self.err);
         let elapsed = self.started.elapsed();
+        let out_truncated = out_total > stdout.len() as u64;
+        let err_truncated = err_total > stderr.len() as u64;
         match report {
             Some(r) => {
                 let outcome = decode_wait(r.status);
@@ -1267,9 +1271,9 @@ impl Running {
                     },
                     elapsed,
                     stdout,
-                    stdout_truncated: out_total > stdout.len() as u64,
+                    stdout_truncated: out_truncated,
                     stderr,
-                    stderr_truncated: err_total > stderr.len() as u64,
+                    stderr_truncated: err_truncated,
                 }
             }
             None => RawExit {
@@ -1282,9 +1286,9 @@ impl Running {
                 detail: "the supervisor helper did not report; the tree was killed".into(),
                 elapsed,
                 stdout,
-                stdout_truncated: out_total > stdout.len() as u64,
+                stdout_truncated: out_truncated,
                 stderr,
-                stderr_truncated: err_total > stderr.len() as u64,
+                stderr_truncated: err_truncated,
             },
         }
     }
@@ -1443,7 +1447,7 @@ pub fn helper_main() -> ! {
 
     let child = match sys::fork_prog() {
         Ok(0) => child_exec(&frame),
-        Ok(pid) => pid,
+        Ok(pid) => u32::try_from(pid).unwrap_or(u32::MAX),
         Err(()) => sys::raw_exit(93),
     };
     // The helper keeps no copy of the program's stream ends: the pipe EOFs
@@ -1470,7 +1474,10 @@ pub fn helper_main() -> ! {
     // stop, whatever the sweep leaves (it SIGKILLs the program too).
     let mut status = match end {
         Ending::Exited => sys::wait_block(child).map(i64::from).unwrap_or(-1),
-        Ending::Stopped => sys::wait_no_hang(child).map(i64::from).unwrap_or(-1),
+        Ending::Stopped => {
+            let pid = i32::try_from(child).unwrap_or(-1);
+            sys::wait_no_hang(pid).map(i64::from).unwrap_or(-1)
+        }
     };
     let (kills, confirmed) = sweep(child);
     if status < 0 {
@@ -1526,7 +1533,7 @@ fn watch(pidfd: i32) -> Ending {
             continue;
         }
         let pidfd_hit = fds
-            .get(0)
+            .first()
             .is_some_and(|f| f.revents & (sys::POLL_IN | sys::POLL_HUP) != 0);
         if pidfd_hit {
             return Ending::Exited;
@@ -1827,6 +1834,7 @@ mod sys {
     /// `SIGKILL`.
     const SIGKILL: u64 = 9;
     /// `SIGCHLD` (the clone exit signal on aarch64).
+    #[cfg(target_arch = "aarch64")]
     const SIGCHLD: u64 = 17;
     /// `EINTR`.
     const EINTR: i64 = -4;

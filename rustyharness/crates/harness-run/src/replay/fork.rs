@@ -57,7 +57,7 @@ use crate::driver::step::UserState;
 use crate::driver::{
     attempt_check, commit, create_run, exec_tools, header, loop_facts, new_meter_resumed, prepare,
     todo_for, Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource,
-    PortsHeader, Prepared, ReadLog, WorkspaceModeRecord,
+    PortsHeader, Prepared, ReadLog, RepoMapFeed, WorkspaceModeRecord,
 };
 use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
@@ -661,6 +661,9 @@ pub fn fork_session(f: ForkSession<'_>) -> Result<SessionReport, RunRefused> {
         post_edit: PostEditState::of(&f.spec.post_edit),
         workspace_root: f.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
+        // The kept steps' repo maps are re-fed (P-33); the child's live
+        // steps compute from the touched files, like any live run.
+        repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
         // The forked session re-derives the instructions from the parent's
         // journal (P-30) and rewrites the identical `InstructionsLoaded`
         // record in its catch-up, before any recorded input.
@@ -679,6 +682,9 @@ pub fn fork_session(f: ForkSession<'_>) -> Result<SessionReport, RunRefused> {
             blobs: child_blobs,
             sink: f.sink,
         }),
+        // A resumed session cannot delegate yet: the reconstruction slice
+        // rebuilds the context (P-38f); until then the branch fails closed.
+        delegate: None,
     });
     let end = lp.drive_session(
         &mut w,

@@ -27,7 +27,7 @@ use crate::approve::RecordedApproval;
 use crate::driver::step::UserState;
 use crate::driver::{
     commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ExecHeader,
-    HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader, ReadLog, SandboxRecord,
+    HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader, ReadLog, RepoMapFeed, SandboxRecord,
     WorkspaceModeRecord,
 };
 use crate::postedit::PostEditState;
@@ -543,6 +543,10 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         post_edit: PostEditState::of(&a.spec.post_edit),
         workspace_root: None,
         restore: Default::default(),
+        // Every repo map is re-fed (P-33): an audit never reads the
+        // workspace, so the recorded payload stands and is written back
+        // identically.
+        repo_feed: RepoMapFeed::re_feed(rec.repo_maps, u64::MAX),
         // The replay re-derives the instructions from the journal (P-30)
         // and rewrites the identical `InstructionsLoaded` record.
         instructions: recorded_instructions.as_ref(),
@@ -562,6 +566,9 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             blobs: replay_dir.join(layout::BLOBS_DIR),
             sink: None,
         }),
+        // An audit never builds a child: a delegate call diverges here
+        // (P-38f owns the proper re-feed of `ChildRun` and its result).
+        delegate: None,
     });
     let end = match turn {
         None => lp.drive(&mut w),

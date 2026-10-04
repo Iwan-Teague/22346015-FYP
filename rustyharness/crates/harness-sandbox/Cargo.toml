@@ -21,6 +21,11 @@ net = []
 # fixture. Nothing in the workspace enables it; purity.sh refuses any
 # normal dependency edge that does.
 remap = []
+# S-Le's UNCOMMITTED Linux matrix row (linux-landlock-seccomp-nons-v1),
+# behind a gate until S-Lf observes the probe green on a real Linux
+# kernel; only then joins the committed MATRIX. The workspace never
+# enables it in a release build; the probe's VM test binary does.
+linux-probe-row = []
 
 [dependencies]
 # The environment probe measures for the vocabulary and pressure rule in
@@ -44,3 +49,18 @@ harness-sandbox-linux = { path = "../harness-sandbox-linux" }
 # not a new registry dependency; P-39g runs this same protocol over the
 # pump).
 harness-fetch = { path = "../harness-fetch" }
+# S-Lf: the Linux conformance suite runs this crate's own spawn path, and
+# the probe's witness hand-out (the uncommitted Linux row) is gated behind
+# `linux-probe-row`. A dev-dependency on the crate itself turns the
+# feature on for this crate's test builds only — the same sealed-seam
+# pattern as harness-journal's `fault-injection` — so a release build (and
+# every other workspace build) never has it.
+harness-sandbox = { path = ".", features = ["linux-probe-row"] }
+
+# The Linux conformance suite (S-Lf) is a `harness = false` binary: its
+# `main()` is also the supervisor helper (re-exec'd with the `__confine`
+# argument), which a libtest harness would swallow as test filters. It
+# prints libtest-shaped tallies itself and serialises on one thread.
+[[test]]
+name = "conformance_linux"
+harness = false

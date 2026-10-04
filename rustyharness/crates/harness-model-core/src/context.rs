@@ -125,12 +125,16 @@ pub const CONTEXT_FORMAT: &str = "rh-context/5";
 /// also carries the plan-mode line and, after `/build`, the approved plan
 /// block. Since P-30 it also carries the project-notes block when the
 /// session loaded AGENTS.md or CLAUDE.md (its absence changes nothing, so
-/// journals without it still audit). A batch context stays
-/// [`CONTEXT_FORMAT`] (`rh-context/5`): batch headers, journals, context
-/// digests and request bytes are unchanged, and old journals still audit.
-/// Bump both with any change to what this module or `wire::render_request`
+/// journals without it still audit). Since P-33 it also carries the
+/// conversation ledger (the harness's deterministic state block) when the
+/// session has run at least one step, and the repo map when one was built;
+/// both are absent from a session that has not earned them, so their
+/// absence changes nothing. A batch context stays [`CONTEXT_FORMAT`]
+/// (`rh-context/5`): batch headers, journals, context digests and request
+/// bytes are unchanged, and old journals still audit. Bump it with any
+/// change to what the session path of this module or `wire::render_request`
 /// produces.
-pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/8";
+pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/9";
 
 /// The context format of a RESEARCH session (P-39i, §2.2-§2.4): the
 /// session request shape (the conversation block, the users' share) with
@@ -158,6 +162,19 @@ pub const NOTES_SHARE_PERCENT: u64 = 8;
 /// §2.4); the oldest messages beyond the share are dropped, counted and
 /// noticed.
 pub const DROPPED_RESERVE_BYTES: u64 = 512;
+
+/// The share of the context window (in estimate bytes) the conversation
+/// ledger (P-33) lives in: `budget_tokens × 3 × LEDGER_SHARE_PERCENT /
+/// 100`. The ledger is cut to this many bytes (on whole-line boundaries,
+/// keeping the newest lines) and a notice names the cut, so a long session
+/// cannot crowd out the task or the window.
+pub const LEDGER_SHARE_PERCENT: u64 = 4;
+
+/// The share of the context window (in estimate bytes) the repo map (P-33)
+/// lives in: `budget_tokens × 3 × REPO_MAP_SHARE_PERCENT / 100`. The map is
+/// cut to this many bytes (on a character boundary) and a notice names the
+/// cut, so a large map cannot crowd out the task or the window.
+pub const REPO_MAP_SHARE_PERCENT: u64 = 8;
 
 /// How one observation is delimited when it is shown (design row H1i).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -972,6 +989,8 @@ pub fn build(
         task,
         facts,
         None,
+        None,
+        None,
         turns,
         &[],
         shown,
@@ -1050,6 +1069,165 @@ pub fn notes_cap_bytes(profile: &Profile) -> u64 {
         .saturating_div(100)
 }
 
+/// The ledger cap in estimate bytes: 4% of the window (P-33).
+pub fn ledger_cap_bytes(profile: &Profile) -> u64 {
+    budget_tokens(profile)
+        .saturating_mul(3)
+        .saturating_mul(LEDGER_SHARE_PERCENT)
+        .saturating_div(100)
+}
+
+/// The repo-map cap in estimate bytes: 8% of the window (P-33).
+pub fn repo_map_cap_bytes(profile: &Profile) -> u64 {
+    budget_tokens(profile)
+        .saturating_mul(3)
+        .saturating_mul(REPO_MAP_SHARE_PERCENT)
+        .saturating_div(100)
+}
+
+/// One edited file in the ledger's files-touched table (P-33).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerFile {
+    /// The workspace-relative path.
+    pub path: String,
+    /// How many edits the session applied to it.
+    pub edits: u64,
+    /// The digest of the file's content after its last edit, or `None`
+    /// when the last edit deleted it.
+    pub last: Option<String>,
+}
+
+/// One command in the ledger's commands-run list (P-33).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerCommand {
+    /// The command line, as the model called it.
+    pub argv: String,
+    /// The one-line result (exit status or how it ended).
+    pub result: String,
+}
+
+/// One harness event in the ledger (P-33): mode changes and restores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerEvent {
+    /// The user restored the workspace (`/undo` or `//rewind`): `files`
+    /// files were reverted to the tree of step `to_step`.
+    Restored {
+        /// How many files the restore reverted.
+        files: u64,
+        /// The step whose tree the workspace went back to.
+        to_step: u64,
+    },
+    /// The user moved the session into plan mode (`/plan`).
+    Plan,
+    /// The user approved the plan and moved the session into build mode
+    /// (`/build`).
+    Build,
+}
+
+/// The conversation ledger (P-33): the harness's own deterministic record
+/// of what the session did — the checklist state, the files touched, the
+/// commands run and the mode/restore events — kept from the journal, never
+/// model-written, and recomputed or re-fed identically by audit replay.
+/// Plain data, so `build_session` stays pure in its inputs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ledger {
+    /// The checklist's rendered list, when the session keeps one.
+    pub todo: Option<String>,
+    /// The files-touched table, oldest edit first.
+    pub files: Vec<LedgerFile>,
+    /// The commands run, in order.
+    pub commands: Vec<LedgerCommand>,
+    /// The mode and restore events, in order.
+    pub events: Vec<LedgerEvent>,
+}
+
+impl Ledger {
+    /// Whether the ledger has anything to show: an empty ledger renders no
+    /// block at all, so a session's first step (and old journals' steps)
+    /// see no change.
+    pub fn is_empty(&self) -> bool {
+        self.todo.is_none()
+            && self.files.is_empty()
+            && self.commands.is_empty()
+            && self.events.is_empty()
+    }
+
+    /// The ledger's full text, before any cut.
+    pub fn text(&self) -> String {
+        let mut s =
+            String::from("Ledger (kept by the harness; deterministic, from the journal):\n");
+        if let Some(t) = &self.todo {
+            s.push_str("Todo:\n");
+            s.push_str(t);
+            if !t.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+        if !self.files.is_empty() {
+            s.push_str("Files touched:\n");
+            for f in &self.files {
+                match &f.last {
+                    Some(d) => {
+                        s.push_str(&format!(
+                            "- {} — {} edit(s), last sha256 {d}\n",
+                            f.path, f.edits
+                        ));
+                    }
+                    None => {
+                        s.push_str(&format!(
+                            "- {} — {} edit(s), last deleted it\n",
+                            f.path, f.edits
+                        ));
+                    }
+                }
+            }
+        }
+        if !self.commands.is_empty() {
+            s.push_str("Commands run:\n");
+            for c in &self.commands {
+                s.push_str(&format!("- {} — {}\n", c.argv, c.result));
+            }
+        }
+        if !self.events.is_empty() {
+            s.push_str("Events:\n");
+            for e in &self.events {
+                s.push_str(&match e {
+                    LedgerEvent::Restored { files, to_step } => {
+                        format!("- restored {files} file(s) to the tree of step {to_step}\n")
+                    }
+                    LedgerEvent::Plan => String::from("- mode: plan (the user ran /plan)\n"),
+                    LedgerEvent::Build => {
+                        String::from("- mode: build (the user approved the plan with /build)\n")
+                    }
+                });
+            }
+        }
+        s
+    }
+}
+
+/// The repo map (P-33): an outline of the session's recently touched files,
+/// extracted by the harness from the files themselves (P-24 extractor),
+/// ranked by journal-derived recency, recomputed at every build of a live
+/// session and re-fed (not recomputed) by audit replay. Its digest covers
+/// the full text, so the wire delimiters name the text they wrap.
+#[derive(Debug)]
+pub struct RepoMap {
+    /// sha256 of `text`, hex.
+    pub digest: String,
+    /// The map text.
+    pub text: Untrusted<String>,
+}
+
+impl RepoMap {
+    /// Wrap the map text; the digest is taken over the whole text, before
+    /// any cut.
+    pub fn new(text: Untrusted<String>) -> Self {
+        let digest = harness_core::sha256(text.inspect("repo map: digest").as_bytes()).to_string();
+        Self { digest, text }
+    }
+}
+
 /// Build a session turn's context (P-05 §2): the batch blocks and step
 /// turns, plus the conversation block — every user message (`Source::User`)
 /// interleaved at its `before` position, shown verbatim, never compacted,
@@ -1057,9 +1235,14 @@ pub fn notes_cap_bytes(profile: &Profile) -> u64 {
 /// dropped and rendered as one counted notice ([`Built::users_dropped`]).
 /// `mode_view` is the plan-mode state (P-28). `notes` is the project
 /// instructions the session loaded (P-30), shown once as a fixed block
-/// after the facts, cut to [`notes_cap_bytes`] with a notice. Pure in
-/// `(profile, tools, task, facts, notes, turns, users, shown, mode_view)`,
-/// so audit replay recomputes it.
+/// after the facts, cut to [`notes_cap_bytes`] with a notice. `ledger` is
+/// the harness's deterministic conversation ledger (P-33), shown after the
+/// notes, cut to [`ledger_cap_bytes`] keeping the newest lines with a
+/// notice; an empty ledger renders nothing. `repo_map` is the extracted
+/// outline of recently touched files (P-33), shown after the ledger, cut
+/// to [`repo_map_cap_bytes`] with a notice. Pure in
+/// `(profile, tools, task, facts, notes, ledger, repo_map, turns, users,
+/// shown, mode_view)`, so audit replay recomputes it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_session(
     profile: &Profile,
@@ -1067,6 +1250,8 @@ pub fn build_session(
     task: &TaskText,
     facts: &[Fact],
     notes: Option<&ProjectNotes>,
+    ledger: Option<&Ledger>,
+    repo_map: Option<&RepoMap>,
     turns: &[Turn],
     users: &[UserEntry],
     shown: &Renderings,
@@ -1078,6 +1263,8 @@ pub fn build_session(
         task,
         facts,
         notes,
+        ledger,
+        repo_map,
         turns,
         users,
         shown,
@@ -1109,6 +1296,8 @@ pub fn build_research(
         tools,
         task,
         facts,
+        None,
+        None,
         None,
         turns,
         users,
@@ -1170,6 +1359,8 @@ fn build_inner(
     task: &TaskText,
     facts: &[Fact],
     notes: Option<&ProjectNotes>,
+    ledger: Option<&Ledger>,
+    repo_map: Option<&RepoMap>,
     turns: &[Turn],
     users: &[UserEntry],
     shown: &Renderings,
@@ -1195,6 +1386,8 @@ fn build_inner(
             task,
             facts,
             notes,
+            ledger,
+            repo_map,
             mode_view.unwrap_or(&SessionModeView::build()),
         ),
         Mode::Research => research_fixed_messages(profile, tools, task, facts),
@@ -1436,12 +1629,19 @@ fn fixed_messages(
 /// plan renders as one extra user-approved block after the facts. Since
 /// P-30 the project notes render as one extra block after the facts (before
 /// the approved plan), cut to [`notes_cap_bytes`] with a notice when cut.
+/// Since P-33 the ledger renders after the notes (before the repo map),
+/// cut to [`ledger_cap_bytes`] keeping the newest lines with a notice when
+/// cut, and the repo map after it, cut to [`repo_map_cap_bytes`] with a
+/// notice; an empty ledger renders nothing.
+#[allow(clippy::too_many_arguments)]
 fn session_fixed_messages(
     profile: &Profile,
     tools: &[ToolSpec],
     task: &TaskText,
     facts: &[Fact],
     notes: Option<&ProjectNotes>,
+    ledger: Option<&Ledger>,
+    repo_map: Option<&RepoMap>,
     mode_view: &SessionModeView,
 ) -> Vec<Message> {
     let protocol = profile.protocol();
@@ -1504,6 +1704,60 @@ fn session_fixed_messages(
                 "Project notes ({}) were cut to {} of {} bytes to fit the context window; \
                  the full text stays in the journal.",
                 n.name, kept, full
+            ))));
+        }
+    }
+    // The ledger (P-33): harness-written and deterministic — not model or
+    // workspace text — so it renders as a plain harness block, cut to the
+    // ledger cap on whole-line boundaries keeping the newest (bottom)
+    // lines, with a notice when lines were cut. The heading is kept across
+    // a cut, so the block always names itself. An empty ledger renders
+    // nothing, so a session's first steps see no change.
+    if let Some(l) = ledger {
+        if !l.is_empty() {
+            let full = l.text();
+            let cap = ledger_cap_bytes(profile);
+            let (heading, body) = full.split_once('\n').unwrap_or((full.as_str(), ""));
+            let mut heading = String::from(heading);
+            heading.push('\n');
+            let (shown_text, cut) = if len64(heading.len()) >= cap {
+                // Fail-closed: the share cannot even hold the heading, so
+                // nothing shows and the notice says so.
+                (String::new(), Some((0, body.lines().count())))
+            } else {
+                let (kept, cut) = cut_tail(body, cap.saturating_sub(len64(heading.len())));
+                let mut s = heading;
+                s.push_str(&kept);
+                (s, cut)
+            };
+            if !shown_text.is_empty() {
+                out.push(Message::System(HarnessText::rendered(shown_text)));
+            }
+            if let Some((kept, total)) = cut {
+                out.push(Message::System(HarnessText::rendered(format!(
+                    "The ledger was cut to {kept} of {total} lines to fit the context window; \
+                     the full ledger stays in the journal."
+                ))));
+            }
+        }
+    }
+    // The repo map (P-33): the harness extracted it from workspace files,
+    // so its text is workspace data, shown inside its own digest-named
+    // delimiters, cut to the repo-map cap with a notice.
+    if let Some(m) = repo_map {
+        let text = m.text.inspect("context: repo map");
+        let cap = repo_map_cap_bytes(profile);
+        let (shown_text, cut) = cut_notes(text, cap);
+        out.push(Message::Notes {
+            name: String::from("repo-map"),
+            digest: m.digest.clone(),
+            body: Untrusted::new(shown_text, m.text.source().clone()),
+        });
+        if let Some((kept, full)) = cut {
+            out.push(Message::System(HarnessText::rendered(format!(
+                "The repo map was cut to {} of {} bytes to fit the context window; \
+                 the full text stays in the journal.",
+                kept, full
             ))));
         }
     }
@@ -1821,6 +2075,35 @@ fn cut_notes(text: &str, cap: u64) -> (String, Option<(u64, u64)>) {
     let shown = text.get(..end).unwrap_or("").to_owned();
     let kept = len64(shown.len());
     (shown, Some((kept, full)))
+}
+
+/// Cut `text` to at most `cap` bytes on whole-line boundaries, keeping the
+/// newest (bottom) lines — the ledger lists its entries oldest first, so
+/// the newest lines are the ones still current. Returns the kept text and,
+/// when lines were cut, `(kept_lines, total_lines)`. Lines longer than the
+/// whole cap never fit and are dropped like the rest (fail-closed: the
+/// notice still names the cut).
+fn cut_tail(text: &str, cap: u64) -> (String, Option<(usize, usize)>) {
+    let total = text.lines().count();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut acc = 0u64;
+    for line in text.lines().rev() {
+        let cost = len64(line.len()).saturating_add(1);
+        if acc.saturating_add(cost) > cap {
+            break;
+        }
+        acc += cost;
+        kept.push(line);
+    }
+    if kept.len() == total {
+        return (text.to_owned(), None);
+    }
+    kept.reverse();
+    let mut s = kept.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    (s, Some((kept.len(), total)))
 }
 
 /// A message's digest tag and its fields, in order. The tag names the kind,
@@ -3177,6 +3460,8 @@ mod tests {
             &task(),
             &[],
             None,
+            None,
+            None,
             turns,
             users,
             &shown_for(turns),
@@ -3185,12 +3470,15 @@ mod tests {
     }
 
     /// The context format constants: batch stays rh-context/5 (old journals
-    /// still audit), sessions are rh-context/8 (P-28 added the mode line
-    /// and the approved-plan block; P-30 added the project-notes block).
+    /// still audit), sessions are rh-context/9 (P-28 added the mode line
+    /// and the approved-plan block; P-30 the project-notes block; P-33 the
+    /// ledger and the repo map). Research stays rh-research/2, so a P-33
+    /// bump touches the session format only.
     #[test]
-    fn context_format_constants() {
+    fn context_fmt9_only_session_mode() {
         assert_eq!(CONTEXT_FORMAT, "rh-context/5");
-        assert_eq!(SESSION_CONTEXT_FORMAT, "rh-context/8");
+        assert_eq!(SESSION_CONTEXT_FORMAT, "rh-context/9");
+        assert_eq!(RESEARCH_CONTEXT_FORMAT, "rh-research/2");
     }
 
     /// P-30: the project notes render as one fixed block after the facts,
@@ -3207,6 +3495,8 @@ mod tests {
             &task(),
             &[],
             Some(&notes),
+            None,
+            None,
             &[],
             &[],
             &shown_for(&[]),
@@ -3235,6 +3525,8 @@ mod tests {
             &task(),
             &[],
             None,
+            None,
+            None,
             &[],
             &[],
             &shown_for(&[]),
@@ -3261,6 +3553,8 @@ mod tests {
             &task(),
             &[],
             Some(&notes),
+            None,
+            None,
             &[],
             &[],
             &shown_for(&[]),
@@ -3294,6 +3588,8 @@ mod tests {
             &task(),
             &[],
             Some(&notes),
+            None,
+            None,
             &[],
             &[],
             &shown_for(&[]),
@@ -3659,6 +3955,8 @@ by the user. Your edits after that step no longer stand; read a file before you 
             &task(),
             &[],
             None,
+            None,
+            None,
             &turns,
             &[],
             &shown_for(&turns),
@@ -3677,6 +3975,8 @@ by the user. Your edits after that step no longer stand; read a file before you 
             &tools(2),
             &task(),
             &[],
+            None,
+            None,
             None,
             &turns,
             &[],
@@ -3698,6 +3998,8 @@ by the user. Your edits after that step no longer stand; read a file before you 
                 &task(),
                 &[],
                 None,
+                None,
+                None,
                 &turns,
                 &[],
                 &shown_for(&turns),
@@ -3708,6 +4010,261 @@ by the user. Your edits after that step no longer stand; read a file before you 
         assert!(!plain
             .iter()
             .any(|(_, t)| t.contains("Approved plan") || t.contains("Mode: plan")));
+    }
+
+    /// The ledger block (P-33): rendered after the notes as a plain harness
+    /// block; the same ledger and inputs give the same context digest, and
+    /// any change to the ledger's state changes it. An empty ledger renders
+    /// nothing, so a session's first steps see no change.
+    #[test]
+    fn ledger_deterministic_digest() {
+        let turns: Vec<Turn> = Vec::new();
+        let base = |ledger: Option<&Ledger>| {
+            build_session(
+                &profile(),
+                &tools(2),
+                &task(),
+                &[],
+                None,
+                ledger,
+                None,
+                &turns,
+                &[],
+                &shown_for(&turns),
+                &SessionModeView::build(),
+            )
+            .unwrap()
+        };
+        // Empty ledger: no block at all.
+        let empty = base(Some(&Ledger::default()));
+        assert!(!texts(&empty)
+            .iter()
+            .any(|(_, t)| t.contains("Ledger (kept by the harness")));
+        // A populated ledger renders its sections in order.
+        let ledger = Ledger {
+            todo: Some("1. [x] one\n2. [ ] two\n".into()),
+            files: vec![
+                LedgerFile {
+                    path: "src/lib.rs".into(),
+                    edits: 2,
+                    last: Some("abc".into()),
+                },
+                LedgerFile {
+                    path: "gone.txt".into(),
+                    edits: 1,
+                    last: None,
+                },
+            ],
+            commands: vec![LedgerCommand {
+                argv: "cargo test".into(),
+                result: "exited 0".into(),
+            }],
+            events: vec![LedgerEvent::Plan, LedgerEvent::Build],
+        };
+        let built = base(Some(&ledger));
+        let block = texts(&built)
+            .into_iter()
+            .map(|(_, t)| t)
+            .find(|t| t.contains("Ledger (kept by the harness"))
+            .expect("ledger block present");
+        let at = |needle: &str| block.find(needle).unwrap();
+        assert!(
+            at("Ledger (kept by the harness") < at("Todo:")
+                && at("Todo:") < at("Files touched:")
+                && at("Files touched:") < at("Commands run:")
+                && at("Commands run:") < at("Events:")
+        );
+        assert!(block.contains("- src/lib.rs — 2 edit(s), last sha256 abc"));
+        assert!(block.contains("- gone.txt — 1 edit(s), last deleted it"));
+        assert!(block.contains("- cargo test — exited 0"));
+        assert!(block.contains("- mode: plan (the user ran /plan)"));
+        assert!(block.contains("- mode: build (the user approved the plan with /build)"));
+        // Deterministic: the same state twice, the same digest.
+        let again = base(Some(&ledger));
+        assert_eq!(built.digest, again.digest);
+        // Any state change moves the digest.
+        let mut other = ledger.clone();
+        other.files[0].edits = 3;
+        assert_ne!(built.digest, base(Some(&other)).digest);
+        other = ledger.clone();
+        other.commands.push(LedgerCommand {
+            argv: "cargo build".into(),
+            result: "exited 0".into(),
+        });
+        assert_ne!(built.digest, base(Some(&other)).digest);
+        other = ledger.clone();
+        other.events.push(LedgerEvent::Restored {
+            files: 1,
+            to_step: 4,
+        });
+        let restored = base(Some(&other));
+        assert_ne!(built.digest, restored.digest);
+        assert!(texts(&restored)
+            .iter()
+            .any(|(_, t)| t.contains("- restored 1 file(s) to the tree of step 4")));
+        // And with no ledger at all the digest differs again.
+        assert_ne!(built.digest, base(None).digest);
+    }
+
+    /// The ledger survives compaction (P-33): when the window compacts and
+    /// older turns become index lines, the ledger block still lists every
+    /// file the session touched; and a ledger longer than its share is cut
+    /// to whole lines keeping the newest, with a notice naming the cut.
+    #[test]
+    fn ledger_survives_compaction_and_lists_edits() {
+        // Large observations force compaction well before the ledger's cap.
+        let turns: Vec<Turn> = (1..=8).map(|i| obs_turn(i, &"x".repeat(2000))).collect();
+        let ledger = Ledger {
+            files: (1..=6)
+                .map(|i| LedgerFile {
+                    path: format!("src/file{i}.rs"),
+                    edits: u64::try_from(i).unwrap_or(u64::MAX),
+                    last: Some(format!("d{i}")),
+                })
+                .collect(),
+            ..Ledger::default()
+        };
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            None,
+            Some(&ledger),
+            None,
+            &turns,
+            &[],
+            &shown_for(&turns),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        assert!(built.compacted, "the test needs a compacted window");
+        let block = texts(&built)
+            .into_iter()
+            .map(|(_, t)| t)
+            .find(|t| t.contains("Ledger (kept by the harness"))
+            .expect("ledger block present");
+        for i in 1..=6 {
+            assert!(
+                block.contains(&format!("- src/file{i}.rs — {i} edit(s), last sha256 d{i}")),
+                "file {i} listed"
+            );
+        }
+        // A ledger beyond its cap: whole lines cut, newest kept, noticed.
+        let mut big = ledger.clone();
+        big.files = (1..=400)
+            .map(|i| LedgerFile {
+                path: format!("src/very/long/path/number{i}.rs"),
+                edits: 1,
+                last: Some("d".into()),
+            })
+            .collect();
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            None,
+            Some(&big),
+            None,
+            &turns,
+            &[],
+            &shown_for(&turns),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        let cap = ledger_cap_bytes(&profile());
+        let ts = texts(&built);
+        let block = ts
+            .iter()
+            .map(|(_, t)| t.clone())
+            .find(|t| t.contains("Ledger (kept by the harness"))
+            .expect("ledger block present");
+        assert!(
+            u64::try_from(block.len()).unwrap_or(u64::MAX) <= cap,
+            "block within its share"
+        );
+        // The newest file (highest number) survives the tail-keeping cut.
+        assert!(block.contains("number400.rs"));
+        let notice = ts
+            .iter()
+            .map(|(_, t)| t.clone())
+            .find(|t| t.contains("The ledger was cut to"))
+            .expect("cut notice present");
+        assert!(notice.contains("lines"));
+    }
+
+    /// The repo map (P-33): rendered after the ledger as a digest-named
+    /// `p` block, cut to its share of the window with a notice; the digest
+    /// covers the whole text, not the cut.
+    #[test]
+    fn repo_map_respects_budget_share() {
+        let turns: Vec<Turn> = Vec::new();
+        let map_text = "src/lib.rs:\n  fn main\n".repeat(4000);
+        let map = RepoMap::new(Untrusted::new(
+            map_text.clone(),
+            Source::Workspace("repo-map".into()),
+        ));
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            None,
+            None,
+            Some(&map),
+            &turns,
+            &[],
+            &shown_for(&turns),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        let cap = repo_map_cap_bytes(&profile());
+        let notes: Vec<&Message> = built
+            .messages
+            .iter()
+            .filter(|m| matches!(m, Message::Notes { name, .. } if name == "repo-map"))
+            .collect();
+        assert_eq!(notes.len(), 1, "one repo-map block");
+        let (_, f) = fields(notes[0]);
+        assert_eq!(f[0], "repo-map");
+        assert_eq!(f[1], harness_core::sha256(map_text.as_bytes()).to_string());
+        assert!(f[2].len() < map_text.len(), "the map was cut");
+        assert!(
+            u64::try_from(f[2].len()).unwrap_or(u64::MAX) <= cap,
+            "the map fits its share"
+        );
+        assert!(f[2].is_char_boundary(f[2].len()));
+        let notice = texts(&built)
+            .iter()
+            .any(|(_, t)| t.contains("The repo map was cut to"));
+        assert!(notice, "the cut is noticed");
+        // A map within its share shows whole and notices nothing.
+        let small = RepoMap::new(Untrusted::new(
+            String::from("src/main.rs:\n  fn main\n"),
+            Source::Workspace("repo-map".into()),
+        ));
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            None,
+            None,
+            Some(&small),
+            &turns,
+            &[],
+            &shown_for(&turns),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        assert!(built
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Notes { name, .. } if name == "repo-map")));
+        assert!(!texts(&built)
+            .iter()
+            .any(|(_, t)| t.contains("The repo map was cut to")));
     }
 
     /// The session notices are the spec's exact texts.

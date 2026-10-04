@@ -104,6 +104,10 @@ pub enum KillDomain {
     LinuxPidNamespace,
     /// Linux: a systemd user scope / cgroup kill.
     LinuxCgroup,
+    /// Linux: the supervisor helper holds the subreaper bit and sweeps its
+    /// inherited tree (`SIGKILL` the process group, then every orphan that
+    /// reparented to it). The default tier's bar where no cgroup exists.
+    SubreaperSweep,
     /// Windows: a Job Object with kill-on-close.
     JobObject,
 }
@@ -134,6 +138,10 @@ pub enum ProcessGuard {
     MemberCountWatchdog,
     /// Linux: a PID namespace plus cgroup v2 `pids.max` (a hard bound).
     LinuxPidsMax,
+    /// Linux: per-user `RLIMIT_NPROC` (inherited across fork and exec). It
+    /// bounds the user's whole process table, not one sandbox's tree, so it
+    /// is a weaker bar than `pids.max` — the name says exactly that.
+    RlimitNprocPerUser,
     /// Windows: a Job Object active-process limit.
     JobObjectActiveProcess,
 }
@@ -174,6 +182,7 @@ journal_names!(KillDomain {
     GroupAndSandboxSweep => "group-and-sandbox-sweep",
     LinuxPidNamespace => "linux-pid-namespace",
     LinuxCgroup => "linux-cgroup",
+    SubreaperSweep => "subreaper-sweep",
     JobObject => "job-object",
 });
 journal_names!(MemoryGuard {
@@ -184,8 +193,66 @@ journal_names!(MemoryGuard {
 journal_names!(ProcessGuard {
     MemberCountWatchdog => "member-count-watchdog",
     LinuxPidsMax => "linux-pids-max",
+    RlimitNprocPerUser => "rlimit-nproc-per-user",
     JobObjectActiveProcess => "job-object-active-process",
 });
+
+/// What the child's seccomp filter does to denied calls. A journal name:
+/// the header records the exact denial action, not just "seccomp".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompAction {
+    /// Denied calls are killed outright (`SECCOMP_RET_KILL_PROCESS`).
+    KillProcess,
+    /// Denied calls fail with an errno (`SECCOMP_RET_ERRNO`).
+    Errno,
+}
+
+journal_names!(SeccompAction {
+    KillProcess => "kill-process",
+    Errno => "errno",
+});
+
+/// The Linux backend's extra witness detail (L-D7): the ABI actually
+/// enforced, the seccomp denial action, and the digest of the host facts
+/// the refusal decision was made from. Fields are private and there is no
+/// public constructor: only `Linux::probe()` builds one (INV-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxWitness {
+    landlock_abi: u32,
+    seccomp_action: SeccompAction,
+    host_facts: harness_core::Digest,
+}
+
+impl LinuxWitness {
+    /// Crate-private constructor (INV-15).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(
+        landlock_abi: u32,
+        seccomp_action: SeccompAction,
+        host_facts: harness_core::Digest,
+    ) -> Self {
+        LinuxWitness {
+            landlock_abi,
+            seccomp_action,
+            host_facts,
+        }
+    }
+    /// The Landlock ABI level the domain was built and enforced with.
+    #[must_use]
+    pub fn landlock_abi(&self) -> u32 {
+        self.landlock_abi
+    }
+    /// What the seccomp filter does to denied calls.
+    #[must_use]
+    pub fn seccomp_action(&self) -> SeccompAction {
+        self.seccomp_action
+    }
+    /// SHA-256 of the host facts summary behind the decision.
+    #[must_use]
+    pub fn host_facts_digest(&self) -> &harness_core::Digest {
+        &self.host_facts
+    }
+}
 
 /// The evidence that a backend passed conformance on this host (§6.1). Its
 /// fields are private and it has no public constructor: only a backend's
@@ -201,6 +268,7 @@ journal_names!(ProcessGuard {
 ///     memory: harness_sandbox::MemoryGuard::RlimitAddressSpace,
 ///     processes: harness_sandbox::ProcessGuard::MemberCountWatchdog,
 ///     probe_digest: harness_core::sha256(b""),
+///     linux: None,
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +281,7 @@ pub struct Conformed {
     memory: MemoryGuard,
     processes: ProcessGuard,
     probe_digest: harness_core::Digest,
+    linux: Option<LinuxWitness>,
 }
 
 impl Conformed {
@@ -229,6 +298,27 @@ impl Conformed {
             memory: row.memory,
             processes: row.processes,
             probe_digest,
+            linux: None,
+        }
+    }
+    /// Mint a Linux witness, carrying the backend detail L-D7 journals.
+    /// Crate-private (INV-15): called only by `Linux::probe()`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn mint_linux(
+        row: &'static MatrixRow,
+        probe_digest: harness_core::Digest,
+        linux: LinuxWitness,
+    ) -> Self {
+        Conformed {
+            backend: row.backend,
+            matrix_row: row.id,
+            cases: row.cases,
+            network: row.network,
+            kill_domain: row.kill_domain,
+            memory: row.memory,
+            processes: row.processes,
+            probe_digest,
+            linux: Some(linux),
         }
     }
     /// The backend that minted it.
@@ -262,6 +352,11 @@ impl Conformed {
     /// SHA-256 of the live probe's observations.
     pub fn probe_digest(&self) -> &harness_core::Digest {
         &self.probe_digest
+    }
+    /// The Linux backend's extra detail (L-D7), present only on a witness
+    /// the Linux backend minted.
+    pub fn linux(&self) -> Option<&LinuxWitness> {
+        self.linux.as_ref()
     }
     /// Refuse unless every case in `required` is covered.
     pub fn covers(&self, required: &[Case]) -> Result<(), Vec<Case>> {
@@ -410,7 +505,9 @@ pub struct LiveOpts {
 pub struct ConfinedChild {
     #[cfg(target_os = "macos")]
     inner: confine_spawn::Running,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    inner: linux::Child,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     inner: std::convert::Infallible,
 }
 
@@ -428,7 +525,11 @@ impl ConfinedChild {
         {
             self.inner.wait()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.wait()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             match self.inner {}
         }
@@ -442,7 +543,11 @@ impl ConfinedChild {
         {
             self.inner.try_status()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.try_status()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             match self.inner {}
         }
@@ -459,7 +564,11 @@ impl ConfinedChild {
         {
             self.inner.read(stream, since, cap, mode)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.read(stream, since, cap, mode)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             match self.inner {}
         }
@@ -472,7 +581,11 @@ impl ConfinedChild {
         {
             self.inner.totals()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.totals()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             match self.inner {}
         }
@@ -486,7 +599,11 @@ impl ConfinedChild {
         {
             self.inner.stop()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.stop()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             match self.inner {}
         }
@@ -562,7 +679,7 @@ pub fn require() -> Result<Conformed, Refused> {
             reason,
         })
     };
-    let Some(row) = conformance::row(kind, os) else {
+    let Some(row) = row_for(kind, os) else {
         return Err(refuse(UnavailableReason::MatrixRowMissing));
     };
     let missing = conformance::missing(row.cases, conformance::H2_EXIT_CASES);
@@ -570,6 +687,19 @@ pub fn require() -> Result<Conformed, Refused> {
         return Err(refuse(UnavailableReason::MatrixRowIncomplete { missing }));
     }
     platform_probe().map_err(Refused)
+}
+
+/// The committed row for `kind` on `os` — or, when this build carries the
+/// S-Le gate (tests, or the `linux-probe-row` feature), the UNCOMMITTED
+/// Linux row. The gate exists so the probe's live VM tests can run
+/// `require()` end to end before S-Lf observes the row green and commits
+/// it; a release build without the feature never sees it.
+fn row_for(kind: BackendKind, os: &str) -> Option<&'static conformance::MatrixRow> {
+    #[cfg(any(test, feature = "linux-probe-row"))]
+    if kind == BackendKind::Linux {
+        return conformance::row(kind, os).or_else(conformance::linux_row_uncommitted);
+    }
+    conformance::row(kind, os)
 }
 
 #[cfg(target_os = "macos")]
@@ -720,9 +850,14 @@ mod tests {
         } else {
             let e = require().unwrap_err();
             assert!(matches!(available(), Containment::Unavailable(_)));
+            // On Linux the gated S-Le row lets require() reach the live
+            // probe, which refuses under the unit harness (the test binary
+            // is not the supervisor's helper); elsewhere it refuses with no
+            // row or no backend at all. Every one of those is a refusal.
             assert!(
                 e.to_string().contains("no conformance matrix row")
-                    || e.to_string().contains("no confinement backend"),
+                    || e.to_string().contains("no confinement backend")
+                    || e.to_string().contains("was not refused"),
                 "{e}"
             );
             assert_eq!(e.0.kind(), UnavailableKind::CouldNotRun);

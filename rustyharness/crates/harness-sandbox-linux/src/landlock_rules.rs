@@ -381,7 +381,7 @@ mod linux {
                     )));
                 }
             };
-            created
+            created = created
                 .add_rule(PathBeneath::new(fd, to_bitflags(rule.rights)))
                 .map_err(classify)?;
         }
@@ -390,7 +390,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{build, Domain};
+pub use linux::{build, kernel_abi_probe, Domain};
 
 // ---- tests ---------------------------------------------------------------
 

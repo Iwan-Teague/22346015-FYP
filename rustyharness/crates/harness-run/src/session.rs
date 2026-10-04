@@ -51,7 +51,8 @@ use crate::driver::stop::End;
 use crate::driver::{
     attempt_check, commit, create_run, exec_tools, header, loop_facts, new_meter,
     no_workspace_facts, prepare, Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop,
-    LoopInit, NonceSource, PortsHeader, Prepared, RunConfig, RunRefused, RunReport, TaskSpec,
+    LoopInit, NonceSource, PortsHeader, Prepared, RepoMapFeed, RunConfig, RunRefused, RunReport,
+    TaskSpec,
 };
 use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
@@ -550,6 +551,25 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         Box::new(SystemClock::default()),
     );
     let edit_tools = pre.edit_tools.clone();
+    // P-38e: a live session can delegate; the branch reads this context.
+    let delegate = crate::delegate::ChildCtx {
+        state_root: &pre.state_root,
+        workspace: s.workspace,
+        parent_spec: s.spec,
+        registry: s.registry,
+        policy: s.policy,
+        profile: s.profile,
+        backend: s.backend,
+        probe: s.probe,
+        env: s.env,
+        approver: s.approver,
+        parent_run: run_id.clone(),
+        parent_attempt: attempt,
+        live: true,
+        admitted: 0,
+        facts,
+        timeouts: &s.config.run,
+    };
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: s.registry,
@@ -587,6 +607,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         post_edit: crate::postedit::PostEditState::of(&s.spec.post_edit),
         workspace_root: Some(s.workspace.to_path_buf()),
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         instructions: s.instructions,
         user: Some(UserState {
             limits: s.config.turn,
@@ -599,6 +620,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
             blobs,
             sink: s.sink,
         }),
+        delegate: Some(delegate),
     });
     let end = lp.drive_session(&mut w, SessionInputs::Live(s.input), s.config.input_timeout);
     let turns = lp.user.as_ref().map_or(0, |u| u.turn.saturating_sub(1));
@@ -782,6 +804,7 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         post_edit: PostEditState::of(&s.spec.post_edit),
         workspace_root: None,
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         instructions: None,
         user: Some(UserState {
             limits: s.config.turn,
@@ -796,6 +819,9 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
             blobs,
             sink: s.sink,
         }),
+        // A research session has no workspace and no delegate context
+        // (P-38: delegation is a coding-run tool).
+        delegate: None,
     });
     let end = lp.drive_session(&mut w, SessionInputs::Live(s.input), s.config.input_timeout);
     let turns = lp.user.as_ref().map_or(0, |u| u.turn.saturating_sub(1));

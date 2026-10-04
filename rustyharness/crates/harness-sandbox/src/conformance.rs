@@ -102,6 +102,42 @@ pub enum Case {
     Ft19,
     /// FT-20: no bind and no listen, even under the proxy profile.
     Ft20,
+    /// S-Lg: `openat2` (with or without `RESOLVE_BENEATH`) cannot reach
+    /// outside the Landlock read set; `..` and symlinked paths resolve to
+    /// the same denial (the handle model decides, not the path text).
+    LinuxOpenat2,
+    /// S-Lg: `/proc/self/mem` and `/proc/<pid>/mem` are not a write
+    /// channel outside the roots; another confined process's mem is
+    /// unreachable (`ptrace` is seccomp-denied).
+    LinuxProcSelfMem,
+    /// S-Lg: only std{in,out,err} cross `exec` into the program child;
+    /// the helper's fds are closed (`close_range`) before it.
+    LinuxFdInherit,
+    /// S-Lg: the built environment carries no `LD_*` loader variable
+    /// (INV-10), and a planted one in the harness's own environment does
+    /// not reach the child.
+    LinuxLdPreload,
+    /// S-Lg: a setuid-root binary exec'd by the confined child gains no
+    /// privilege (`no_new_privs`); an unconfined control on a permissive
+    /// host does gain it.
+    LinuxSetuid,
+    /// S-Lg: `memfd_create` + `execveat(AT_EMPTY_PATH)` is refused — no
+    /// Landlock execute right exists for an anonymous file, and the
+    /// `AT_EMPTY_PATH` flag itself is seccomp-denied.
+    LinuxMemfdExec,
+    /// S-Lg: the abstract unix namespace is unreachable — `socket(AF_UNIX)`
+    /// is seccomp-denied, and Landlock (below ABI 6) cannot scope it.
+    LinuxAbstractUnix,
+    /// S-Lg: `ptrace(PTRACE_ATTACH)` of a sibling confined process is
+    /// seccomp-denied, so `/proc/<sibling>/mem` stays unreachable.
+    LinuxPtraceSibling,
+    /// S-Lg: a fork bomb whose children `setsid()` and double-fork into
+    /// other process groups is still bounded, and every descendant is
+    /// gone after the stop (the subreaper sweep).
+    LinuxForkBombPgroup,
+    /// S-Lg: `/dev/shm` and any tmpfs outside the read-write roots are
+    /// not writable; a denied write leaves nothing behind.
+    LinuxDevShmTmpfs,
 }
 
 impl Case {
@@ -143,6 +179,16 @@ impl Case {
             Case::Ft15P => "FT-15-proxy",
             Case::Ft19 => "FT-19",
             Case::Ft20 => "FT-20",
+            Case::LinuxOpenat2 => "linux-openat2",
+            Case::LinuxProcSelfMem => "linux-proc-self-mem",
+            Case::LinuxFdInherit => "linux-fd-inherit",
+            Case::LinuxLdPreload => "linux-ld-preload",
+            Case::LinuxSetuid => "linux-setuid",
+            Case::LinuxMemfdExec => "linux-memfd-exec",
+            Case::LinuxAbstractUnix => "linux-abstract-unix",
+            Case::LinuxPtraceSibling => "linux-ptrace-sibling",
+            Case::LinuxForkBombPgroup => "linux-fork-bomb-pgroup",
+            Case::LinuxDevShmTmpfs => "linux-dev-shm-tmpfs",
         }
     }
 }
@@ -190,6 +236,25 @@ pub const PORTS_CASES: &[Case] = &[
     Case::PortsModelServer,
     Case::PortsKeepFt1Ft11Ft15,
     Case::PortsUdp,
+];
+
+/// The Linux escape-surface cases (S-Lg, §12 discipline): each witnesses
+/// an escape a namespace-less Landlock+seccomp row must refuse. None of
+/// them joins a matrix row here — they enter [`MATRIX`] (or the probe row)
+/// only as their tests pass, one by one, on a real Linux kernel; until
+/// then [`missing`] reports them against every row, which is the
+/// fail-closed stance the slice card demands.
+pub const LINUX_ESCAPE_CASES: &[Case] = &[
+    Case::LinuxOpenat2,
+    Case::LinuxProcSelfMem,
+    Case::LinuxFdInherit,
+    Case::LinuxLdPreload,
+    Case::LinuxSetuid,
+    Case::LinuxMemfdExec,
+    Case::LinuxAbstractUnix,
+    Case::LinuxPtraceSibling,
+    Case::LinuxForkBombPgroup,
+    Case::LinuxDevShmTmpfs,
 ];
 
 /// What the airlock's fetcher must have witnessed before a research session
@@ -290,6 +355,38 @@ pub fn row(backend: BackendKind, os: &str) -> Option<&'static MatrixRow> {
     MATRIX.iter().find(|r| r.backend == backend && r.os == os)
 }
 
+/// The Linux default tier's row, NOT yet committed (S-Le): the card lands
+/// the probe with this row behind a test/feature gate, and the row joins
+/// [`MATRIX`] only once S-Lf has run it green on a real Linux kernel. It
+/// is `H2_EXIT_CASES` at the namespace-less default tier's honest bars:
+/// Landlock + seccomp for the network, the subreaper sweep for the kill,
+/// the address-space rlimit for memory (FT-6), per-user `RLIMIT_NPROC`
+/// for processes (FT-5). FT-17 (Seatbelt-specific escape) and FT-18
+/// (macOS launch/keychain surface) are macOS cases a Linux row cannot
+/// exercise; they are absent with that reason, not silently.
+#[cfg(any(test, feature = "linux-probe-row"))]
+pub(crate) const LINUX_ROW_UNCOMMITTED: MatrixRow = MatrixRow {
+    id: "linux-landlock-seccomp-nons-v1",
+    backend: BackendKind::Linux,
+    os: "linux",
+    cases: H2_EXIT_CASES,
+    network: NetworkMechanism::LinuxLandlockSeccomp,
+    kill_domain: KillDomain::SubreaperSweep,
+    memory: MemoryGuard::RlimitAddressSpace,
+    processes: ProcessGuard::RlimitNprocPerUser,
+    evidence: "S-Le live probe (uncommitted until S-Lf passes on a real Linux kernel)",
+};
+
+/// The uncommitted Linux row, when this build carries it (tests, or the
+/// `linux-probe-row` feature). A committed row always wins.
+#[cfg(any(test, feature = "linux-probe-row"))]
+pub(crate) fn linux_row_uncommitted() -> Option<&'static MatrixRow> {
+    match row(BackendKind::Linux, "linux") {
+        Some(r) => Some(r),
+        None => Some(&LINUX_ROW_UNCOMMITTED),
+    }
+}
+
 /// The cases of `required` that `have` lacks.
 pub fn missing(have: &[Case], required: &[Case]) -> Vec<Case> {
     required
@@ -338,5 +435,69 @@ mod tests {
         let r = row(BackendKind::Seatbelt, "macos").unwrap();
         assert!(missing(r.cases, AIRLOCK_CASES).len() == 4);
         assert!(!r.cases.contains(&Case::Ft13P));
+    }
+
+    #[test]
+    fn the_linux_row_stays_uncommitted_until_slf() {
+        // The committed matrix has no Linux row yet: S-Le carries the row
+        // only behind the test/feature gate, and require() on Linux must
+        // not pass until S-Lf observes the row green on a real kernel.
+        assert!(row(BackendKind::Linux, "linux").is_none());
+        // The gated row covers the whole exit set at the default tier's
+        // honest bars, and is the one linux_row_uncommitted hands out.
+        let r = linux_row_uncommitted().unwrap();
+        assert_eq!(r.id, "linux-landlock-seccomp-nons-v1");
+        assert!(missing(r.cases, H2_EXIT_CASES).is_empty());
+        assert_eq!(r.network, NetworkMechanism::LinuxLandlockSeccomp);
+        assert_eq!(r.kill_domain, KillDomain::SubreaperSweep);
+        assert_eq!(r.memory, MemoryGuard::RlimitAddressSpace);
+        assert_eq!(r.processes, ProcessGuard::RlimitNprocPerUser);
+        assert_eq!(r.os, "linux");
+        assert_eq!(r.backend, BackendKind::Linux);
+    }
+
+    #[test]
+    fn the_linux_escape_cases_have_stable_ids_and_are_not_yet_on_any_row() {
+        // The corpus ids are stable API (the witness and journal carry
+        // them); spell them out so a rename cannot slip through.
+        let ids: Vec<&str> = LINUX_ESCAPE_CASES.iter().map(|c| c.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "linux-openat2",
+                "linux-proc-self-mem",
+                "linux-fd-inherit",
+                "linux-ld-preload",
+                "linux-setuid",
+                "linux-memfd-exec",
+                "linux-abstract-unix",
+                "linux-ptrace-sibling",
+                "linux-fork-bomb-pgroup",
+                "linux-dev-shm-tmpfs",
+            ]
+        );
+        // §12 discipline: no row carries them yet — not the committed
+        // macOS row, not the gated Linux probe row, and none of the
+        // named case sets — so `require()` cannot pass on their account
+        // until S-Lg's tests pass on a real kernel and a later slice
+        // commits them.
+        for c in LINUX_ESCAPE_CASES {
+            let mac = row(BackendKind::Seatbelt, "macos").unwrap();
+            assert!(
+                !mac.cases.contains(c),
+                "{} must not be on the macOS row",
+                c.id()
+            );
+            if let Some(r) = linux_row_uncommitted() {
+                assert!(
+                    !r.cases.contains(c),
+                    "{} must not be on the Linux probe row yet",
+                    c.id()
+                );
+            }
+            assert!(!H2_EXIT_CASES.contains(c));
+            assert!(!AIRLOCK_CASES.contains(c));
+            assert!(!PORTS_CASES.contains(c));
+        }
     }
 }

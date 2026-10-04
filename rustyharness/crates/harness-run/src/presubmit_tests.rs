@@ -34,7 +34,7 @@ use crate::driver::plan::{loop_facts, plan};
 use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
 use crate::driver::stop::{commit, End};
 use crate::driver::tools::RecordedResult;
-use crate::driver::{new_meter, ReadLog};
+use crate::driver::{new_meter, ReadLog, RepoMapFeed};
 
 use crate::presubmit::{PresubmitReport, PresubmitResult, PresubmitSpec, PresubmitState};
 use crate::{RunConfig, TaskSpec};
@@ -418,7 +418,9 @@ fn drive(s: Setup<'_>) -> Done {
         post_edit: None,
         workspace_root: None,
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         user: None,
+        delegate: None,
     });
     let end = lp.drive(&mut w);
     let report = lp.presubmit.as_ref().map(PresubmitState::report);
@@ -1049,7 +1051,9 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         post_edit: None,
         workspace_root: None,
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         user: None,
+        delegate: None,
     });
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::SubmittedChecksFailed);

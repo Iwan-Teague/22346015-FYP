@@ -473,13 +473,36 @@ fn ft_bg_lifetime_closer_stops_child_while_parent_blocks() {
 #[test]
 fn ft_bg_output_flood_keeps_memory_bounded() {
     let t = Tree::new("flood");
-    let spec = t.spec(&[PERL, "-e", "$| = 1; print q{x} x 4096 while (1);"]);
+    // The flood ends in a marker write so the exact bookkeeping below is
+    // taken against a finished stream: while a flood still runs, `total`
+    // moves between the `totals()` and `read()` calls and no cross-call
+    // equality can hold.
+    let spec = t.spec(&[
+        PERL,
+        "-e",
+        "$| = 1; \
+         print q{x} x 4096 for 1..8192; \
+         print qq{FLOOD-END\\n}; \
+         sleep 30;",
+    ]);
     let ring: u64 = 64 * KIB;
     let child = spawn_live(&spec, LONG_LIFETIME, ring);
     // Wait until the flood is far past the ring.
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.totals().out_total < 8 * ring {
         assert!(Instant::now() < deadline, "the flood never built up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Wait for the flood to end: the marker is the last write and rings are
+    // pushed in stream order, so once it is in the ring every earlier byte
+    // is counted too and the totals are final.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let c = child.read(Stream::Out, 0, 1 << 20, Mode::Tail);
+        if String::from_utf8_lossy(&c.bytes).contains("FLOOD-END") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the flood never finished");
         std::thread::sleep(Duration::from_millis(20));
     }
     let totals = child.totals();

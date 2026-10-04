@@ -39,7 +39,9 @@ pub(crate) fn diverge(seq: u64, step: u64, why: &'static str) -> Divergence {
 /// which carries neither `mode` nor `turn_limits`. `ports` is the task's
 /// port grant (P-36g §6.1); a resume recomputes it with a fresh probe, an
 /// audit re-states the recorded one (the probe's observation is a past
-/// host's), and `None` recomputes a header without ports.
+/// host's), and `None` recomputes a header without ports. `parent` and
+/// `child` are a child run's delegation header inputs (P-38); `None` for
+/// both recomputes a header without them, as the header writes it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expected_inputs(
     spec: &TaskSpec,
@@ -50,6 +52,8 @@ pub(crate) fn expected_inputs(
     session: Option<&crate::session::TurnLimits>,
     ports: Option<&PortsHeader>,
     instructions: Option<&crate::session::Instructions>,
+    parent: Option<&crate::driver::ParentLink>,
+    child: Option<&crate::driver::ChildHeader>,
 ) -> Map<String, Value> {
     let mut grants: Vec<Value> = Vec::new();
     let mut names: Vec<&str> = spec.grants.iter().map(String::as_str).collect();
@@ -216,6 +220,41 @@ pub(crate) fn expected_inputs(
     // before.
     if let Some(n) = instructions {
         m.insert("instructions".into(), Value::from(n.digest.to_string()));
+    }
+    // P-38: a child run's delegation inputs, exactly as its header writes
+    // them; no key without a delegation, as the header writes it.
+    if let Some(p) = parent {
+        m.insert(
+            "parent".into(),
+            Value::Object({
+                let mut o = Map::new();
+                o.insert("run".into(), Value::from(p.run.to_string()));
+                o.insert("attempt".into(), Value::from(u64::from(p.attempt)));
+                o.insert("step".into(), Value::from(p.step));
+                o.insert("intent_hash".into(), Value::from(p.intent_hash.to_string()));
+                o
+            }),
+        );
+    }
+    if let Some(c) = child {
+        m.insert(
+            "child".into(),
+            Value::Object({
+                let mut o = Map::new();
+                o.insert("template".into(), Value::from(c.template.to_string()));
+                o.insert("brief".into(), Value::from(c.brief.to_string()));
+                // The nonce text, as the header's `Trusted::Id(Ident)`
+                // writes it (the header refuses to start unless the nonce
+                // fits the identifier grammar, and `Nonce::new` checked the
+                // same before it).
+                o.insert("brief_nonce".into(), Value::from(c.brief_nonce.as_str()));
+                o.insert("limits_wall_ms".into(), Value::from(c.limits_wall_ms));
+                o
+            }),
+        );
+        // A child run's header names its mode; a batch parent journal has
+        // no `mode` key, so it is only expected here (P-38f).
+        m.insert("mode".into(), Value::from("child"));
     }
     m
 }

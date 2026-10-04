@@ -8,27 +8,32 @@ use std::time::Duration;
 
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
 use harness_core::environment::{EnvSample, Unmeasured};
-use harness_core::{LoopDetector, MeterLimits, RunId};
+use harness_core::{ChildSpend, LoopDetector, MeterLimits, Nonce, RunId};
 use harness_journal::reader::DirBlobSource;
 use harness_journal::writer::SystemClock;
 use harness_journal::{
     canon::{EventKind, Ident},
     event::{Event, Trusted},
-    layout, verify, JournalReader, JournalWriter, StartError, Verified,
+    layout, verify, JournalReader, JournalWriter, Record, StartError, Verified,
 };
 use harness_manifest::admission::Registry;
 use harness_model::context::Renderings;
 use harness_model::profile::Profile;
+use harness_model::replay::payload_bytes;
+use harness_model::wire::contains_nonce;
 use harness_model::ModelBackend;
+use harness_policy::locality::NoProbe;
 use harness_policy::{SessionKind, UserPolicy};
+use harness_tools::builtin::WorkspaceFacts;
 use serde_json::Value;
 
 use crate::approve::RecordedApproval;
+use crate::delegate::{child_task_text, frame_report, no_report_text, submitted_note};
 use crate::driver::step::UserState;
 use crate::driver::{
-    commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ExecHeader,
-    HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader, ReadLog, RepoMapFeed, SandboxRecord,
-    WorkspaceModeRecord,
+    commit, header, loop_facts, new_meter, plan, todo_for, Approvals, BudgetNotices, ChildHeader,
+    ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, ParentLink, PortsHeader, ReadLog,
+    RepoMapFeed, SandboxRecord, WorkspaceModeRecord,
 };
 use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
@@ -67,6 +72,37 @@ pub struct Audit<'a> {
     /// replay recomputes every budget stop from them (H1 phase-exit review
     /// F-1).
     pub limits: &'a MeterLimits,
+    /// Whether the audit also opens and replays the child runs the journal
+    /// delegated to (P-38f). The default.
+    pub children: ChildAudit,
+}
+
+/// Whether an audit replays a journal's child runs (P-38f).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ChildAudit {
+    /// Open every recorded child's journal, replay it against the parent's
+    /// `ChildRun` record, and cross-check the two (the default).
+    #[default]
+    Verify,
+    /// Audit the parent journal alone; the report's `children` stays
+    /// empty. A child journal's own audit sets this: children do not
+    /// delegate.
+    Skip,
+}
+
+/// What a child audit found (P-38f).
+#[derive(Debug)]
+pub struct ChildAuditReport {
+    /// The child run.
+    pub run: RunId,
+    /// Whether the parent's recorded chain head matched the child
+    /// journal's (the anchor against wholesale replacement).
+    pub anchored: bool,
+    /// The first divergence, if any.
+    pub divergence: Option<Divergence>,
+    /// The child's recorded outcome, or unreadable evidence on any
+    /// divergence or a stop the replay could not recompute.
+    pub outcome: GateOutcome,
 }
 
 /// What an audit found.
@@ -103,6 +139,10 @@ pub struct AuditReport {
     /// an anchor matched; otherwise the recorded outcome (`CouldNotRun`
     /// for an attempt that never committed).
     pub outcome: GateOutcome,
+    /// What each recorded child's audit found (P-38f), in journal order.
+    /// Empty for a diverged parent, a skipped audit, and a child journal
+    /// (children do not delegate).
+    pub children: Vec<ChildAuditReport>,
 }
 
 /// An audit that could not even start (nothing to replay).
@@ -125,6 +165,25 @@ pub enum AuditRefused {
 pub(crate) const UNREADABLE: GateOutcome = GateOutcome::Indeterminate {
     why: IndeterminateKind::UnreadableEvidence,
 };
+
+/// How much longer than its own wall limit a killed child's recorded spend
+/// may claim (P-38f): the kill samples the clock, so the last charge can
+/// lag the recorded wall by a small grace.
+const CHILD_KILL_GRACE_MS: u64 = 5_000;
+
+/// The delegation header inputs a child journal's header is checked
+/// against (P-38f): the parent link the parent's own records name, and the
+/// child header recomputed from the parent's `ChildRun` record.
+pub(crate) struct ChildExpect {
+    pub(crate) parent: ParentLink,
+    pub(crate) child: ChildHeader,
+}
+
+/// What a child replay measured, for the parent's cross-checks (P-38f):
+/// the replay meter's absorbed child spend.
+pub(crate) struct ReplayTotals {
+    spend: ChildSpend,
+}
 
 /// The attempt numbers under `run_dir`, highest first.
 pub(crate) fn attempts_desc(run_dir: &Path) -> io::Result<Vec<u32>> {
@@ -186,7 +245,7 @@ fn recorded_outcome(v: &Verified) -> GateOutcome {
 
 /// Replay a recorded attempt and compare (see the module docs).
 pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
-    audit_inner(a, None)
+    audit_inner(a, None, None).map(|(r, _)| r)
 }
 
 /// Replay a recorded session attempt and compare (P-17 §6): the re-drive
@@ -196,10 +255,14 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
 /// and stops `Cancelled` where the recorded inputs run out. `turn` must be
 /// the session's recorded turn limits, which the header check enforces.
 pub fn audit_session(a: Audit<'_>, turn: &TurnLimits) -> Result<AuditReport, AuditRefused> {
-    audit_inner(a, Some(turn))
+    audit_inner(a, Some(turn), None).map(|(r, _)| r)
 }
 
-fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, AuditRefused> {
+fn audit_inner(
+    a: Audit<'_>,
+    turn: Option<&TurnLimits>,
+    expect: Option<ChildExpect>,
+) -> Result<(AuditReport, Option<ReplayTotals>), AuditRefused> {
     let run_dir = run_dir_of(a.state_root, a.run).map_err(AuditRefused::NoRun)?;
     // By default the latest attempt with a durable header: a start that
     // failed before its header is skipped, and named (H1 phase-exit review
@@ -219,16 +282,22 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             (found.ok_or(AuditRefused::NoAttempt)?, skipped)
         }
     };
-    let failed = |d: Divergence, replay_dir| AuditReport {
-        attempt,
-        skipped_attempts: skipped_attempts.clone(),
-        replay_dir,
-        matched: 0,
-        wall_skipped: 0,
-        stop_recomputed: false,
-        anchored: false,
-        divergence: Some(d),
-        outcome: UNREADABLE,
+    let failed = |d: Divergence, replay_dir| {
+        (
+            AuditReport {
+                attempt,
+                skipped_attempts: skipped_attempts.clone(),
+                replay_dir,
+                matched: 0,
+                wall_skipped: 0,
+                stop_recomputed: false,
+                anchored: false,
+                divergence: Some(d),
+                outcome: UNREADABLE,
+                children: Vec::new(),
+            },
+            None,
+        )
     };
     let attempt_dir = layout::attempt_dir(&run_dir, attempt);
     let v = match JournalReader::open_expecting(&attempt_dir, a.run) {
@@ -297,6 +366,8 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             turn,
             recorded_ports.as_ref(),
             recorded_instructions.as_ref(),
+            expect.as_ref().map(|e| &e.parent),
+            expect.as_ref().map(|e| &e.child),
         ),
     ) {
         return Ok(failed(d, None));
@@ -491,6 +562,29 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             RecordedApproval::AllowSession { .. } | RecordedApproval::DenySession { .. }
         )
     });
+    // The loop's delegate side is rebuilt so a recorded delegation
+    // re-decides exactly what the live one did (P-38f): admission and the
+    // carve are recomputed, the child itself is never built (`live` is
+    // false), and the `ChildRun` record is rewritten from the re-fed and
+    // recomputed fields before the recorded result is re-fed after it.
+    let delegate = crate::delegate::ChildCtx {
+        state_root: a.state_root,
+        workspace: a.state_root,
+        parent_spec: a.spec,
+        registry: a.registry,
+        policy: a.policy,
+        profile: a.profile,
+        backend: &rec.backend,
+        probe: &NoProbe,
+        env: &NOT_SAMPLED,
+        approver: None,
+        parent_run: a.run.clone(),
+        parent_attempt: attempt,
+        live: false,
+        admitted: 0,
+        facts,
+        timeouts: &config,
+    };
     let mut lp = Loop::new(LoopInit {
         session,
         registry: a.registry,
@@ -566,9 +660,9 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             blobs: replay_dir.join(layout::BLOBS_DIR),
             sink: None,
         }),
-        // An audit never builds a child: a delegate call diverges here
-        // (P-38f owns the proper re-feed of `ChildRun` and its result).
-        delegate: None,
+        // A recorded delegation is re-decided and rewritten (P-38f): the
+        // live side is switched off, so no child journal is ever built.
+        delegate: Some(delegate),
     });
     let end = match turn {
         None => lp.drive(&mut w),
@@ -577,6 +671,11 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         // which only a prefix of an uncommitted journal compares against.
         Some(_) => lp.drive_session(&mut w, SessionInputs::Replay(rec.inputs), Duration::ZERO),
     };
+    // What the replay measured, for a child audit's cross-checks (P-38f):
+    // the absorbed child spend and where the replay stopped.
+    let totals = expect.as_ref().map(|_| ReplayTotals {
+        spend: ChildSpend::measured(&lp.meter),
+    });
     let released = commit(w, &end, None);
     if released.error.is_some() {
         return Ok(failed(
@@ -612,18 +711,501 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             } else {
                 recorded_outcome(&v)
             };
-            AuditReport {
-                attempt,
-                skipped_attempts,
-                replay_dir: Some(replay_dir),
-                matched: c.matched,
-                wall_skipped: c.wall_skipped,
-                stop_recomputed: c.stop_recomputed,
-                anchored,
-                divergence: None,
-                outcome,
-            }
+            // The parent matched: each recorded delegation's child is
+            // audited in turn (P-38f). A child journal never holds a
+            // `ChildRun`, so a child's own audit finds none to audit.
+            let children = if a.children == ChildAudit::Verify {
+                children_reports(&a, attempt, &v, &blobs, facts)
+            } else {
+                Vec::new()
+            };
+            (
+                AuditReport {
+                    attempt,
+                    skipped_attempts,
+                    replay_dir: Some(replay_dir),
+                    matched: c.matched,
+                    wall_skipped: c.wall_skipped,
+                    stop_recomputed: c.stop_recomputed,
+                    anchored,
+                    divergence: None,
+                    outcome,
+                    children,
+                },
+                totals,
+            )
         }
         Err(d) => failed(d, Some(replay_dir)),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Child audits (P-38f).
+// ---------------------------------------------------------------------------
+
+/// A `ChildRun` record's fields, read back for the child audit.
+struct ChildRunFields {
+    intent_seq: u64,
+    child: RunId,
+    stop: String,
+    brief: Digest,
+    template: Digest,
+    grants: Vec<String>,
+    limits_steps: u32,
+    limits_tokens: u64,
+    limits_wall_ms: u64,
+    spend_steps: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    estimated: bool,
+    spend_wall_ms: u64,
+    chain_head: Digest,
+    result: Option<Digest>,
+}
+
+fn parse_child_run(r: &Record) -> Option<ChildRunFields> {
+    let n = |k: &str| r.body.get(k).and_then(Value::as_u64);
+    let child = r
+        .body
+        .get("child")
+        .and_then(Value::as_str)
+        .and_then(RunId::parse)?;
+    let stop = r.body.get("stop").and_then(Value::as_str)?.to_owned();
+    let grants: Vec<String> = r
+        .body
+        .get("grants")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()?;
+    let limits = r.body.get("limits")?.as_object()?;
+    let spend = r.body.get("spent")?.as_object()?;
+    let ln = |o: &serde_json::Map<String, Value>, k: &str| o.get(k).and_then(Value::as_u64);
+    Some(ChildRunFields {
+        intent_seq: n("intent_seq")?,
+        child,
+        stop,
+        brief: digest_at(&r.body, "brief")?,
+        template: digest_at(&r.body, "template")?,
+        grants,
+        limits_steps: u32::try_from(ln(limits, "steps")?).ok()?,
+        limits_tokens: ln(limits, "tokens")?,
+        limits_wall_ms: ln(limits, "wall_ms")?,
+        spend_steps: u32::try_from(ln(spend, "steps")?).ok()?,
+        tokens_in: ln(spend, "tokens_in")?,
+        tokens_out: ln(spend, "tokens_out")?,
+        estimated: spend.get("estimated").and_then(Value::as_bool)?,
+        spend_wall_ms: ln(spend, "wall_ms")?,
+        chain_head: digest_at(&r.body, "chain_head")?,
+        result: r
+            .body
+            .contains_key("result")
+            .then(|| digest_at(&r.body, "result"))
+            .flatten(),
+    })
+}
+
+/// The parent's workspace tree at a step: the last tree digest its journal
+/// states at or before `step` (the header's start tree, then edits and
+/// measured commands), which is what the child's own header must record.
+fn parent_tree_at(records: &[Record], step: u64, start: Digest) -> Option<Digest> {
+    let mut tree = Some(start);
+    for r in records {
+        if r.step > step {
+            break;
+        }
+        if let Some(t) =
+            digest_at(&r.body, "workspace_tree").or_else(|| digest_at(&r.body, "tree_digest"))
+        {
+            tree = Some(t);
+        }
+    }
+    tree
+}
+
+/// Audit every `ChildRun` the parent journal records (P-38f): open the
+/// child's journal, replay it against the parent's record, and cross-check
+/// the two. A child that cannot be audited is reported in place; it never
+/// changes the parent's own verdict.
+fn children_reports(
+    a: &Audit<'_>,
+    attempt: u32,
+    v: &Verified,
+    blobs: &DirBlobSource,
+    facts: WorkspaceFacts,
+) -> Vec<ChildAuditReport> {
+    let mut out = Vec::new();
+    for r in &v.records {
+        if r.kind != EventKind::ChildRun {
+            continue;
+        }
+        let fields = parse_child_run(r);
+        // The parent's result for this call: the payload its `ToolFinished`
+        // carried (absent when a crash cut the journal after the
+        // `ChildRun`).
+        let output = fields.as_ref().and_then(|f| {
+            v.records
+                .iter()
+                .find(|x| {
+                    x.kind == EventKind::ToolFinished
+                        && x.body.get("intent_seq").and_then(Value::as_u64) == Some(f.intent_seq)
+                })
+                .and_then(|x| {
+                    x.body
+                        .get("output")
+                        .and_then(|o| payload_bytes(o, blobs, x.seq).ok())
+                })
+        });
+        out.push(audit_child(
+            a,
+            attempt,
+            v,
+            facts,
+            r,
+            fields,
+            output.as_deref(),
+        ));
+    }
+    out
+}
+
+fn audit_child(
+    a: &Audit<'_>,
+    attempt: u32,
+    v: &Verified,
+    facts: WorkspaceFacts,
+    r: &Record,
+    fields: Option<ChildRunFields>,
+    output: Option<&[u8]>,
+) -> ChildAuditReport {
+    let report = |run: RunId, divergence: Option<Divergence>, anchored, outcome| ChildAuditReport {
+        run,
+        anchored,
+        divergence,
+        outcome,
+    };
+    let Some(f) = fields else {
+        return report(
+            a.run.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "a record is not the shape the loop writes",
+            )),
+            false,
+            UNREADABLE,
+        );
+    };
+    let missing = |why| {
+        report(
+            f.child.clone(),
+            Some(diverge(r.seq, r.step, why)),
+            false,
+            UNREADABLE,
+        )
+    };
+    // The child's run directory, in the same state root.
+    let Ok(child_dir) = run_dir_of(a.state_root, &f.child) else {
+        return missing("child journal missing");
+    };
+    // A child is never resumed: it has exactly one attempt.
+    if attempts_desc(&child_dir).unwrap_or_default() != [1] {
+        return missing("child journal missing");
+    }
+    let attempt_dir = layout::attempt_dir(&child_dir, 1);
+    let Ok(cv) = JournalReader::open_expecting(&attempt_dir, &f.child) else {
+        return missing("child journal missing");
+    };
+    // The parent's recorded chain head anchors the child journal: only the
+    // anchor proves nothing was cut or replaced.
+    if cv.check_anchor(&f.chain_head).is_err() {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child journal's chain head is not the recorded chain head",
+            )),
+            false,
+            UNREADABLE,
+        );
+    }
+    let Some(head) = cv.records.first() else {
+        return missing("child journal missing");
+    };
+    // The delegation header inputs the child's header is checked against:
+    // the parent link, from the parent's own records, and the child
+    // header, recomputed from the parent's record.
+    let Some(intent) = v
+        .records
+        .iter()
+        .find(|x| x.kind == EventKind::ToolStarted && x.seq == f.intent_seq)
+    else {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "a record is not the shape the loop writes",
+            )),
+            false,
+            UNREADABLE,
+        );
+    };
+    let Some(nonce) = head
+        .body
+        .get("child")
+        .and_then(|c| c.get("brief_nonce"))
+        .and_then(Value::as_str)
+        .and_then(Nonce::new)
+    else {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's header is not one this build writes",
+            )),
+            false,
+            UNREADABLE,
+        );
+    };
+    // The brief travels as the header's untrusted claim; its bytes must
+    // hash to the digest the parent recorded, and must not carry the
+    // child's own nonce.
+    let cblobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
+    let brief_bytes = head
+        .body
+        .get("child_brief")
+        .and_then(|c| payload_bytes(c, &cblobs, head.seq).ok());
+    let Some(brief_bytes) = brief_bytes else {
+        return report(
+            f.child.clone(),
+            Some(diverge(r.seq, r.step, "the child's brief is missing")),
+            false,
+            UNREADABLE,
+        );
+    };
+    if harness_core::sha256(&brief_bytes) != f.brief {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's brief digest differs from the parent's record",
+            )),
+            false,
+            UNREADABLE,
+        );
+    }
+    let Ok(brief) = std::str::from_utf8(&brief_bytes) else {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's brief is not the text this build writes",
+            )),
+            false,
+            UNREADABLE,
+        );
+    };
+    if contains_nonce(brief, &nonce) {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's brief carries its own nonce",
+            )),
+            false,
+            UNREADABLE,
+        );
+    }
+    // The child saw the parent's workspace as it stood at the delegation:
+    // its header's facts must say so, with the parent's file counts.
+    let Some(cfacts) = recorded_facts(head) else {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's header lacks the workspace facts",
+            )),
+            false,
+            UNREADABLE,
+        );
+    };
+    let tree = parent_tree_at(&v.records, intent.step, facts.tree).unwrap_or(facts.tree);
+    if cfacts.tree != tree || cfacts.files != facts.files || cfacts.oversize != facts.oversize {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's workspace facts differ from the parent's at the delegation",
+            )),
+            false,
+            UNREADABLE,
+        );
+    }
+    // The grants, read back from the child's header, are the parent's
+    // record's (the header check re-derives them too).
+    let grants = head
+        .body
+        .get("grants")
+        .and_then(|g| g.as_array())
+        .and_then(|l| {
+            l.iter()
+                .map(|x| x.as_str().map(str::to_owned))
+                .collect::<Option<Vec<String>>>()
+        });
+    if grants.as_deref() != Some(f.grants.as_slice()) {
+        return report(
+            f.child.clone(),
+            Some(diverge(
+                r.seq,
+                r.step,
+                "the child's grants differ from the parent's record",
+            )),
+            false,
+            UNREADABLE,
+        );
+    }
+    let Ok(policy) = plan::protected_policy(a.policy) else {
+        return report(
+            f.child.clone(),
+            Some(diverge(r.seq, r.step, "the child's policy does not plan")),
+            false,
+            UNREADABLE,
+        );
+    };
+    let spec = TaskSpec {
+        task: child_task_text(brief, &nonce),
+        grants: f.grants.clone(),
+        workspace_public: a.spec.workspace_public,
+        ports: Vec::new(),
+        lan_ports: Vec::new(),
+        exec: None,
+        presubmit: None,
+        post_edit: None,
+        protected: a.spec.protected.clone(),
+        kind: SessionKind::Coding,
+    };
+    let limits = MeterLimits {
+        steps: f.limits_steps,
+        tokens: f.limits_tokens,
+        wall: Duration::from_millis(f.limits_wall_ms),
+        cost_micros: 0,
+        format_errors: 3,
+        repair_rounds: 0,
+    };
+    let child = Audit {
+        state_root: a.state_root,
+        run: &f.child,
+        attempt: Some(1),
+        anchor: Some(f.chain_head),
+        spec: &spec,
+        registry: a.registry,
+        policy: &policy,
+        profile: a.profile,
+        limits: &limits,
+        children: ChildAudit::Skip,
+    };
+    let expect = ChildExpect {
+        parent: ParentLink {
+            run: a.run.clone(),
+            attempt,
+            step: intent.step,
+            intent_hash: intent.hash,
+        },
+        child: ChildHeader {
+            template: f.template,
+            brief: f.brief,
+            brief_nonce: nonce,
+            limits_wall_ms: f.limits_wall_ms,
+        },
+    };
+    let (report_c, totals) = match audit_inner(child, None, Some(expect)) {
+        Ok(x) => x,
+        Err(_) => {
+            return report(
+                f.child.clone(),
+                Some(diverge(r.seq, r.step, "the child's inputs do not plan")),
+                false,
+                UNREADABLE,
+            )
+        }
+    };
+    if let Some(d) = report_c.divergence {
+        return report(
+            f.child.clone(),
+            Some(d),
+            report_c.anchored,
+            report_c.outcome,
+        );
+    }
+    let Some(totals) = totals else {
+        return report(f.child.clone(), None, report_c.anchored, report_c.outcome);
+    };
+    // The child's replay matched its journal. Now the two journals must
+    // agree with each other: the stop, the spend, the wall time, the
+    // report and its digest.
+    let cross = |why| {
+        report(
+            f.child.clone(),
+            Some(diverge(r.seq, r.step, why)),
+            report_c.anchored,
+            UNREADABLE,
+        )
+    };
+    let Some(stopped) = cv.records.iter().find(|x| x.kind == EventKind::RunStopped) else {
+        return cross("the child journal has no recorded stop");
+    };
+    if stopped.body.get("cause").and_then(Value::as_str) != Some(f.stop.as_str()) {
+        return cross("the child's recorded stop differs from the parent's record");
+    }
+    if totals.spend.steps() != f.spend_steps
+        || totals.spend.tokens() != (f.tokens_in, f.tokens_out)
+        || totals.spend.estimated() != f.estimated
+    {
+        return cross("the child's recorded spend differs from its journal");
+    }
+    let span = cv
+        .records
+        .last()
+        .map_or(0, |l| l.t_mono_ms)
+        .saturating_sub(cv.records.first().map_or(0, |fr| fr.t_mono_ms));
+    if f.spend_wall_ms > span + CHILD_KILL_GRACE_MS
+        || f.spend_wall_ms > f.limits_wall_ms + CHILD_KILL_GRACE_MS
+    {
+        return cross("the child's recorded wall time exceeds what its journal accounts for");
+    }
+    match submitted_note(&child_dir, 1) {
+        Ok(Some(note)) => {
+            if f.result != Some(harness_core::sha256(note.as_bytes())) {
+                return cross("the child's recorded result differs from its report");
+            }
+            if let Some(out) = output {
+                let (text, _) =
+                    frame_report(&f.child, stopped.step, f.limits_steps, &note, a.profile);
+                if text.into_bytes() != out {
+                    return cross("the child's report does not match the parent's recorded result");
+                }
+            }
+        }
+        Ok(None) => {
+            if f.result.is_some() {
+                return cross("the child's recorded result differs from its report");
+            }
+            if let Some(out) = output {
+                let text = no_report_text(&f.child, &f.stop, stopped.step, f.limits_steps);
+                if text.into_bytes() != out {
+                    return cross("the child's report does not match the parent's recorded result");
+                }
+            }
+        }
+        Err(_) => return cross("the child's submit note cannot be read back"),
+    }
+    report(f.child.clone(), None, report_c.anchored, report_c.outcome)
 }

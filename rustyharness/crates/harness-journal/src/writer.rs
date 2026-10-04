@@ -914,6 +914,37 @@ pub fn stop_cause_name(c: &StopCause) -> &'static str {
     }
 }
 
+/// The stop cause behind a wire name: the inverse of [`stop_cause_name`]
+/// (P-38f: the replay re-writes a delegation's recorded stop, and trusted
+/// text is compile-time only, so the name is parsed back to the constant
+/// the loop would write).
+pub fn stop_cause_named(name: &str) -> Option<&'static str> {
+    use harness_core::{BudgetDim, LoopKind};
+    let all = [
+        StopCause::Submitted,
+        StopCause::SubmittedChecksFailed,
+        StopCause::Budget(BudgetDim::Steps),
+        StopCause::FormatErrors,
+        StopCause::Loop(LoopKind::Repeat),
+        StopCause::Loop(LoopKind::EditChurn),
+        StopCause::Loop(LoopKind::NoProgress),
+        StopCause::Loop(LoopKind::Denied),
+        StopCause::ContextExhausted,
+        StopCause::PolicyAbort,
+        StopCause::ModelUnavailable,
+        StopCause::Cancelled,
+        StopCause::SessionEnded,
+        StopCause::SandboxLost,
+        StopCause::JournalUnavailable {
+            op: String::new(),
+            error: String::new(),
+        },
+    ];
+    all.into_iter()
+        .map(|c| stop_cause_name(&c))
+        .find(|k| *k == name)
+}
+
 /// Wire name of a gate outcome.
 pub fn outcome_name(o: &GateOutcome) -> &'static str {
     match o {

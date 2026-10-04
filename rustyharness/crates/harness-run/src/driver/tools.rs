@@ -99,6 +99,10 @@ pub(crate) struct RecordedResult {
     /// What a recorded command did, and the tree digest measured after it
     /// (`None`: not measured), from its `ToolFinished` (H2d).
     pub(crate) exec: Option<(ExecRecord, Option<Digest>)>,
+    /// What a delegate result recorded about its child (P-38f): a started
+    /// child's re-fed identity and spend, a refusal, or a child that never
+    /// started. `None` for any other capability.
+    pub(crate) child: Option<crate::replay::feed::RecordedChild>,
 }
 
 impl RecordedResult {

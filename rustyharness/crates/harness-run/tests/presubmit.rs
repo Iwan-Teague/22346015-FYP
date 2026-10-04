@@ -341,6 +341,7 @@ mod live {
             policy: &allow_all(),
             profile: &Profile::conservative_default("m"),
             limits: &cfg().limits,
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap()
     }
@@ -470,6 +471,7 @@ mod live {
             policy: &allow_all(),
             profile: &Profile::conservative_default("m"),
             limits: &c.limits,
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap();
         assert_eq!(a.divergence, None, "{a:?}");
@@ -714,6 +716,7 @@ mod live {
             policy: &allow_all(),
             profile: &Profile::conservative_default("m"),
             limits: &cfg().limits,
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap()
     }

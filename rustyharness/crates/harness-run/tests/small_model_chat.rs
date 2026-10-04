@@ -173,6 +173,7 @@ fn audit_of(state: &Path, run: &RunId, profile: &Profile) -> AuditReport {
         policy: &UserPolicy::default(),
         profile,
         limits: &limits(),
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }

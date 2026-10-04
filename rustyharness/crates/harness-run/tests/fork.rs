@@ -235,6 +235,7 @@ fn audit_child(fx: &Fixture, child: &SessionReport) -> harness_run::AuditReport 
             policy: &allow_edits(),
             profile: &Profile::conservative_default("m"),
             limits: &limits,
+            children: harness_run::ChildAudit::Skip,
         },
         &config.turn,
     )

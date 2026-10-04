@@ -861,7 +861,7 @@ fn ft17_ft18_hold_under_proxy_profile() {
 #[test]
 fn inv6_spawn_needs_this_backends_witness_and_an_enforceable_spec() {
     let t = Tree::new("inv6");
-    let linux = harness_sandbox::linux::Linux;
+    let linux = harness_sandbox::linux::Linux::default();
     assert!(matches!(
         linux.spawn(&t.spec(&["/bin/echo"]), witness()),
         Err(SpawnError::WrongWitness)

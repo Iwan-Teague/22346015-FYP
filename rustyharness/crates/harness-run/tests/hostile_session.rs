@@ -215,6 +215,7 @@ fn audit_clean(fx: &Fixture, r: &SessionReport, policy: &UserPolicy) -> harness_
             policy,
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(),
+            children: harness_run::ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     )
@@ -239,6 +240,7 @@ fn audit_anchored(
             policy,
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(),
+            children: harness_run::ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     )
@@ -944,6 +946,7 @@ fn hostile_journal_tampering_detected_by_audit_and_anchor() {
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(),
+            children: harness_run::ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     );

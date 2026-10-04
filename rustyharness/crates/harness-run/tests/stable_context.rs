@@ -154,6 +154,7 @@ fn audit_of(state: &Path, run: &RunId, attempt: Option<u32>, p: &Profile) -> Aud
         policy: &UserPolicy::default(),
         profile: p,
         limits: &limits(),
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }

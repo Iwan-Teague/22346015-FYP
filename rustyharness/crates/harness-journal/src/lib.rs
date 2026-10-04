@@ -73,8 +73,8 @@ pub use reader::{verify, BlobSource, BreakKind, Broken, JournalReader, Record, V
 pub use scan::{scan_runs, ScanError, ScannedRun};
 pub use tail::{JournalTail, Poll};
 pub use writer::{
-    BlobSink, Clock, Header, JournalError, JournalFile, JournalWriter, Journaled, Released,
-    StartError,
+    stop_cause_name, stop_cause_named, BlobSink, Clock, Header, JournalError, JournalFile,
+    JournalWriter, Journaled, Released, StartError,
 };
 
 #[cfg(test)]

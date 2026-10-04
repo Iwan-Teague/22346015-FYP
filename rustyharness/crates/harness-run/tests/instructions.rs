@@ -269,6 +269,7 @@ fn audit(fx: &Fixture, r: &SessionReport, policy: &UserPolicy) -> harness_run::A
             policy,
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(),
+            children: harness_run::ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     )

@@ -80,7 +80,7 @@ mod imp {
     fn witness() -> &'static Conformed {
         static W: OnceLock<Conformed> = OnceLock::new();
         W.get_or_init(|| {
-            harness_sandbox::linux::Linux
+            harness_sandbox::linux::Linux::default()
                 .probe()
                 .expect("the Linux live probe must pass")
         })
@@ -137,7 +137,7 @@ mod imp {
     }
 
     fn run(spec: &ConfinedSpec) -> ConfinedExit {
-        harness_sandbox::linux::Linux
+        harness_sandbox::linux::Linux::default()
             .spawn(spec, witness())
             .unwrap()
             .wait()

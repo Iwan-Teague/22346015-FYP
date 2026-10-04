@@ -33,9 +33,9 @@ use harness_model::{Completion, ModelBackend, ModelError, ModelIdentity, ModelRe
 use harness_policy::locality::{FsQuery, LocalityProbe};
 use harness_policy::UserPolicy;
 use harness_run::{
-    audit_session, run_session, ApprovalAnswer, Approver, ApproverKind, Audit, InputEnd,
-    RestoreCommand, SessionConfig, SessionReport, SessionRun, TaskSpec, UserInput, UserInputEvent,
-    UserMessage,
+    audit_session, run_session, ApprovalAnswer, Approver, ApproverKind, Audit, ChildAudit,
+    InputEnd, RestoreCommand, SessionConfig, SessionReport, SessionRun, TaskSpec, UserInput,
+    UserInputEvent, UserMessage,
 };
 use harness_testkit::{act, registry, say, Fixture};
 
@@ -451,6 +451,7 @@ fn restored_event_audited_clean() {
             policy: &allow_edits(),
             profile: &Profile::conservative_default("m"),
             limits: &limits,
+            children: ChildAudit::Skip,
         },
         &config.turn,
     )

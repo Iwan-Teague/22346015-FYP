@@ -859,6 +859,7 @@ fn recorded_check_results_are_re_fed_and_never_run_again() {
                     },
                     Some(tree.digest()),
                 )),
+                child: None,
             }
         })
         .collect();
@@ -877,6 +878,7 @@ fn recorded_check_results_are_re_fed_and_never_run_again() {
             environment: None,
             edits: Vec::new(),
             exec: None,
+            child: None,
         },
     );
     let mut s = Setup::new(spec_of(BUILD_TEST, 2), replies(), Vec::new());
@@ -933,6 +935,7 @@ fn a_forged_check_result_changes_what_the_replay_writes() {
             },
             Some(tree.digest()),
         )),
+        child: None,
     };
     let mut s = Setup::new(spec_of(&[&["cargo", "build"]], 1), replies(), Vec::new());
     // Both recorded results now say the command passed.

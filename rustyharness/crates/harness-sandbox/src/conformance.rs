@@ -238,6 +238,27 @@ pub const PORTS_CASES: &[Case] = &[
     Case::PortsUdp,
 ];
 
+/// The loopback-port subset the namespace tier (S-Lj) can honestly be
+/// measured against: every grant is bound to a named TCP port, so the
+/// tier's empty netns bounds each grant's reach. The wildcard pair
+/// ([`Case::PortsWildcardNoLan`] / [`Case::PortsWildcardLan`]) is absent
+/// with a written reason: the tier's seccomp filter cannot inspect a
+/// `bind()` sockaddr (it would have to allow all AF_INET binds), and the
+/// tier's netns makes a wildcard bind unreachable from other hosts
+/// anyway, so neither "refused because expressed" nor "allowed with a LAN
+/// grant" is a truthful statement here. LAN grants are refused at this
+/// tier in code (`spec.rs`); a future mount-namespace tier that
+/// bind-mounts per-port sockets can carry the pair.
+pub const PORTS_CASES_NETNS: &[Case] = &[
+    Case::PortsBindGranted,
+    Case::PortsBindUngranted,
+    Case::PortsConnectGranted,
+    Case::PortsConnectUngranted,
+    Case::PortsModelServer,
+    Case::PortsKeepFt1Ft11Ft15,
+    Case::PortsUdp,
+];
+
 /// The Linux escape-surface cases (S-Lg, §12 discipline): each witnesses
 /// an escape a namespace-less Landlock+seccomp row must refuse. None of
 /// them joins a matrix row here — they enter [`MATRIX`] (or the probe row)
@@ -377,6 +398,60 @@ pub(crate) const LINUX_ROW_UNCOMMITTED: MatrixRow = MatrixRow {
     evidence: "S-Le live probe (uncommitted until S-Lf passes on a real Linux kernel)",
 };
 
+/// The namespace tier's row (S-Lj), NOT yet committed: where
+/// `HostFacts.userns_usable()` is true, the Linux backend may opt into an
+/// unprivileged user+net+pid namespace with the harness-process forwarder.
+/// It carries the whole H2 exit set PLUS the netns-port subset
+/// ([`PORTS_CASES_NETNS`]) — the only tier whose row lists any ports
+/// cases, because only here a port grant is structurally bounded (empty
+/// netns) rather than expressed in a filter that cannot read sockaddrs.
+/// Guards: Landlock + seccomp (now `linux-net-namespace`) for the
+/// network, the PID-namespace init for the kill domain, the same rlimit
+/// bars for memory and processes. FT-17/FT-18 stay macOS-only as on the
+/// default row; the wildcard port pair is absent for the reason written
+/// on [`PORTS_CASES_NETNS`].
+#[cfg(any(test, feature = "linux-probe-row"))]
+pub(crate) const LINUX_NETNS_ROW_UNCOMMITTED: MatrixRow = MatrixRow {
+    id: "linux-netns-pidns-v1",
+    backend: BackendKind::Linux,
+    os: "linux",
+    cases: &[
+        Case::Ft1,
+        Case::Ft2,
+        Case::Ft3,
+        Case::Ft4,
+        Case::Ft5,
+        Case::Ft6,
+        Case::Ft7,
+        Case::Ft8,
+        Case::Ft9,
+        Case::Ft10,
+        Case::Ft11,
+        Case::Ft12,
+        Case::Ft13,
+        Case::Ft15,
+        Case::Ft16,
+        Case::Ft16Setsid,
+        Case::Ft17,
+        Case::Ft18,
+        Case::NoBind,
+        Case::NestedSandbox,
+        Case::HardLink,
+        Case::PortsBindGranted,
+        Case::PortsBindUngranted,
+        Case::PortsConnectGranted,
+        Case::PortsConnectUngranted,
+        Case::PortsModelServer,
+        Case::PortsKeepFt1Ft11Ft15,
+        Case::PortsUdp,
+    ],
+    network: NetworkMechanism::LinuxNetNamespace,
+    kill_domain: KillDomain::LinuxPidNamespace,
+    memory: MemoryGuard::RlimitAddressSpace,
+    processes: ProcessGuard::RlimitNprocPerUser,
+    evidence: "S-Lj live probe (uncommitted until the netns tier passes on a real Linux kernel)",
+};
+
 /// The uncommitted Linux row, when this build carries it (tests, or the
 /// `linux-probe-row` feature). A committed row always wins.
 #[cfg(any(test, feature = "linux-probe-row"))]
@@ -384,6 +459,17 @@ pub(crate) fn linux_row_uncommitted() -> Option<&'static MatrixRow> {
     match row(BackendKind::Linux, "linux") {
         Some(r) => Some(r),
         None => Some(&LINUX_ROW_UNCOMMITTED),
+    }
+}
+
+/// The uncommitted namespace-tier row, when this build carries it. The
+/// selector is called only after `namespaces::tier_for` said this host is
+/// a netns-tier host; a committed row always wins.
+#[cfg(any(test, feature = "linux-probe-row"))]
+pub(crate) fn linux_netns_row_uncommitted() -> Option<&'static MatrixRow> {
+    match row(BackendKind::Linux, "linux") {
+        Some(r) if r.network == NetworkMechanism::LinuxNetNamespace => Some(r),
+        _ => Some(&LINUX_NETNS_ROW_UNCOMMITTED),
     }
 }
 
@@ -399,6 +485,7 @@ pub fn missing(have: &[Case], required: &[Case]) -> Vec<Case> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Conformed;
 
     #[test]
     fn the_macos_row_now_covers_the_whole_exit_set() {
@@ -454,6 +541,70 @@ mod tests {
         assert_eq!(r.processes, ProcessGuard::RlimitNprocPerUser);
         assert_eq!(r.os, "linux");
         assert_eq!(r.backend, BackendKind::Linux);
+    }
+
+    #[test]
+    fn the_netns_row_covers_the_exit_set_and_the_netns_port_subset() {
+        // The gated namespace-tier row carries the whole exit set ...
+        let r = linux_netns_row_uncommitted().unwrap();
+        assert_eq!(r.id, "linux-netns-pidns-v1");
+        assert!(missing(r.cases, H2_EXIT_CASES).is_empty());
+        // ... plus exactly the netns-port subset (not the wildcard pair):
+        // the row is the exit set + the subset, nothing more.
+        assert!(missing(r.cases, PORTS_CASES_NETNS).is_empty());
+        assert_eq!(r.cases.len(), H2_EXIT_CASES.len() + PORTS_CASES_NETNS.len());
+        // The wildcard pair is absent with the written reason, so the row
+        // is NOT a full PORTS_CASES row.
+        let short = missing(r.cases, PORTS_CASES);
+        assert_eq!(
+            short,
+            vec![Case::PortsWildcardNoLan, Case::PortsWildcardLan]
+        );
+        assert_eq!(r.network, NetworkMechanism::LinuxNetNamespace);
+        assert_eq!(r.kill_domain, KillDomain::LinuxPidNamespace);
+        assert_eq!(r.memory, MemoryGuard::RlimitAddressSpace);
+        assert_eq!(r.processes, ProcessGuard::RlimitNprocPerUser);
+        assert_eq!(r.os, "linux");
+        assert_eq!(r.backend, BackendKind::Linux);
+        assert_eq!(Case::PortsBindGranted.id(), "ports-bind-granted");
+        assert_eq!(Case::PortsUdp.id(), "ports-udp");
+    }
+
+    /// The covers() gate behind "ports are refused on the default tier"
+    /// (§1 ports row): a default-tier witness covers none of the port
+    /// cases, so `Network::Loopback` is refused with
+    /// `SpecError::Unsupported` before any process is spawned. Runs on
+    /// every OS: the witness is minted from the static committed row
+    /// (pure data), no live probe involved.
+    #[test]
+    fn default_tier_witness_refuses_loopback_ports() {
+        let row = row(BackendKind::Seatbelt, "macos").unwrap();
+        let ev = Conformed::mint(row, harness_core::sha256(b"gate-test"));
+        assert_eq!(ev.network(), NetworkMechanism::SeatbeltDenyAll);
+        let refused = ev
+            .covers(PORTS_CASES)
+            .expect_err("default tier must refuse ports");
+        assert_eq!(refused, PORTS_CASES.to_vec());
+        // The namespace-tier witness is the only one that lifts the
+        // refusal, and even it keeps the wildcard pair refused.
+        let netns = linux_netns_row_uncommitted().unwrap();
+        let ev_netns = Conformed::mint(netns, harness_core::sha256(b"gate-test"));
+        assert_eq!(ev_netns.network(), NetworkMechanism::LinuxNetNamespace);
+        assert!(ev_netns.covers(PORTS_CASES_NETNS).is_ok());
+        let still_refused = ev_netns
+            .covers(PORTS_CASES)
+            .expect_err("wildcard pair stays off the netns row");
+        assert_eq!(
+            still_refused,
+            vec![Case::PortsWildcardNoLan, Case::PortsWildcardLan]
+        );
+        // The default Linux tier's row refuses every port case too.
+        let default_linux = linux_row_uncommitted().unwrap();
+        let ev_default = Conformed::mint(default_linux, harness_core::sha256(b"gate-test"));
+        assert_eq!(
+            ev_default.covers(PORTS_CASES).unwrap_err(),
+            PORTS_CASES.to_vec()
+        );
     }
 
     #[test]

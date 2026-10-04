@@ -50,8 +50,8 @@ use harness_model::{Completion, TaskText};
 use harness_policy::locality::{FsQuery, LocalityProbe};
 use harness_policy::UserPolicy;
 use harness_run::{
-    audit, audit_session, run, ApprovalAnswer, Approver, ApproverKind, Audit, Run, RunConfig,
-    RunRefused, RunReport, SessionConfig, SessionReport, TaskSpec,
+    audit, audit_session, run, ApprovalAnswer, Approver, ApproverKind, Audit, ChildAudit, Run,
+    RunConfig, RunRefused, RunReport, SessionConfig, SessionReport, TaskSpec,
 };
 
 /// The token budget every scripted run is given. An audit must be given
@@ -314,6 +314,7 @@ pub fn assert_audit_clean_policy(
         policy,
         profile: &Profile::conservative_default("m"),
         limits: &RunConfig::defaults(TOKEN_BUDGET).limits,
+        children: ChildAudit::default(),
     })
     .map_err(|e| format!("audit refused: {e}"))?;
     if let Some(d) = &a.divergence {
@@ -381,6 +382,7 @@ pub fn assert_session_audit_clean_with(
             policy,
             profile,
             limits: &limits,
+            children: ChildAudit::default(),
         },
         &config.turn,
     )

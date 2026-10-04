@@ -193,6 +193,7 @@ fn audit_session_with(
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(&config),
+            children: harness_run::ChildAudit::Skip,
         },
         &turn_limits(),
     )
@@ -466,6 +467,7 @@ fn batch_audit_unchanged() {
         policy: &UserPolicy::default(),
         profile: &Profile::conservative_default("m"),
         limits: &harness_run::RunConfig::defaults(TOKENS).limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap();
     assert_eq!(a.divergence, None);
@@ -487,6 +489,7 @@ fn batch_audit_unchanged() {
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(&config),
+            children: harness_run::ChildAudit::Skip,
         },
         &turn_limits(),
     )

@@ -140,6 +140,7 @@ fn audit_of(state: &Path, run: &RunId, attempt: Option<u32>) -> AuditReport {
         policy: &UserPolicy::default(),
         profile: &native(),
         limits: &limits(),
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }
@@ -720,6 +721,7 @@ fn a_journal_from_before_h1i_is_refused_by_name_by_audit_and_resume() {
                 policy: &UserPolicy::default(),
                 profile: &profile,
                 limits: &limits(),
+                children: harness_run::ChildAudit::Skip,
             })
             .unwrap();
             assert_eq!(a.outcome, UNREADABLE, "{case} {recorded:?}");

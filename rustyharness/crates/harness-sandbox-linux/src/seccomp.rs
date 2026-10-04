@@ -99,6 +99,17 @@ const AT_EMPTY_PATH: u32 = 0x1000;
 /// modelled arch (asm-generic).
 const CLONE3_NR: u32 = 435;
 
+// ---- socket constants for the netns ports prelude ----
+
+/// `AF_INET`.
+const AF_INET: u32 = 2;
+/// `AF_INET6`.
+const AF_INET6: u32 = 10;
+/// `SOCK_STREAM` (the low bits of `socket`'s type arg; `SOCK_NONBLOCK`
+/// (0x800) and `SOCK_CLOEXEC` (0x80000) sit above the 8-bit mask, as on
+/// the kernel's own `SOCK_TYPE_MASK`).
+const SOCK_STREAM: u32 = 1;
+
 /// The network grant the filter is built for — a mirror of the spec's
 /// `Network` enum (harness-sandbox depends on this crate, not the other way
 /// around), narrowed to what a seccomp filter can actually express.
@@ -106,12 +117,27 @@ const CLONE3_NR: u32 = 435;
 pub enum NetworkMode {
     /// `Network::None`: no socket of any family may be opened.
     None,
-    /// A port grant (`Network::Proxy`/`Network::Loopback`). seccomp cannot
-    /// inspect a `sockaddr` (it sits behind a pointer), so this tier cannot
-    /// express those grants and the supervisor refuses them upstream; should
-    /// one ever reach this filter anyway it compiles the *identical*
-    /// deny-all ladder — a grant can never widen this filter.
+    /// A port grant (`Network::Proxy`/`Network::Loopback`) at the default
+    /// tier. seccomp cannot inspect a `sockaddr` (it sits behind a
+    /// pointer), so this tier cannot express those grants and the
+    /// supervisor refuses them upstream; should one ever reach this filter
+    /// anyway it compiles the *identical* deny-all ladder — a grant can
+    /// never widen this filter.
     Granted,
+    /// The namespace tier (S-Lj): the worker runs in an empty
+    /// user/net/pid namespace, so the kernel's namespace boundary, not
+    /// this filter, is what bounds a grant's reach. With `ports: false`
+    /// this compiles the identical deny-all ladder as [`NetworkMode::None`]
+    /// (a namespace alone grants no socket). With `ports: true` the ladder
+    /// additionally allows `socket(AF_INET/AF_INET6, SOCK_STREAM)` and the
+    /// stream-socket calls — still no `AF_UNIX`, no datagram/raw sockets,
+    /// no `socketpair`, and the escape surface unchanged: a `bind`
+    /// sockaddr stays seccomp-blind, which is exactly why only this tier
+    /// (where the netns makes every bind netns-local) may list port cases.
+    Netns {
+        /// Whether TCP port grants accompany the namespace.
+        ports: bool,
+    },
 }
 
 /// One denylist row: syscall `nr` is answered `SECCOMP_RET_ERRNO` with
@@ -133,6 +159,15 @@ struct ArchRules {
     clone_nr: u32,
     /// `execveat`: allowed, but arg-filtered on `AT_EMPTY_PATH`.
     execveat_nr: u32,
+    /// `socket`: denied wholesale at the default tier; at the netns ports
+    /// tier the prelude arg-filters it instead (family ∈ {AF_INET,
+    /// AF_INET6}, type ≡ SOCK_STREAM) and this row leaves the deny list.
+    socket_nr: u32,
+    /// Rows of `socket_family` that stay denied even at the netns ports
+    /// tier: `socketpair` (AF-agnostic — it reaches unix sockets, which
+    /// share the tier's filesystem view) and the mmsg vectors (unneeded
+    /// for a stream grant, so not granted).
+    socket_keep_denied: &'static [u32],
 }
 
 const fn denied(nr: u32, errno: u32) -> Rule {
@@ -209,6 +244,8 @@ const X86_64: ArchRules = ArchRules {
     ],
     clone_nr: 56,
     execveat_nr: 322,
+    socket_nr: 41,
+    socket_keep_denied: &[53, 299, 307], // socketpair, recvmmsg, sendmmsg
 };
 
 /// aarch64 numbers (asm-generic gnu/b64/aarch64 table; verified in S-Lc).
@@ -281,6 +318,8 @@ const AARCH64: ArchRules = ArchRules {
     ],
     clone_nr: 220,
     execveat_nr: 281,
+    socket_nr: 198,
+    socket_keep_denied: &[199, 243, 269], // socketpair, recvmmsg, sendmmsg
 };
 
 /// The modelled architectures, in dispatch order.
@@ -326,34 +365,97 @@ const fn ladder_fixed() -> usize {
     1 + 2 * 5 // ld nr; clone filter (5) + execveat filter (5)
 }
 
-/// Compiled ladder length for `rules`.
-const fn ladder_len(rules: &ArchRules) -> usize {
-    ladder_fixed() + 2 * rules.socket_family.len() + 2 * rules.escape_surface.len() + 1
+/// The netns ports prelude: `jeq socket` + family check (2× `jeq`) + type
+/// check (`ld`, `and`, `jeq`) + the shared `ret EACCES` for a refused
+/// socket. Not emitted unless [`NetworkMode::Netns`] carries `ports: true`.
+const PRELUDE_LEN: usize = 8;
+
+/// Compiled ladder length for `rules` in `ports` mode. In ports mode the
+/// deny chain keeps only the AF-agnostic rows (`socket_keep_denied`) —
+/// every named stream call is granted, bounded by the netns — and the
+/// `socket` row is prelude-filtered, so the chain shortens accordingly.
+const fn ladder_len_mode(rules: &ArchRules, ports: bool) -> usize {
+    let socket_rows = if ports {
+        rules.socket_keep_denied.len()
+    } else {
+        rules.socket_family.len()
+    };
+    let prelude = if ports { PRELUDE_LEN } else { 0 };
+    ladder_fixed() + prelude + 2 * (socket_rows + rules.escape_surface.len()) + 1
     // trailing ja → allow
 }
 
-// Classic-BPF jumps are forward-only u8 offsets relative to the next
-// instruction, so the JEQ chain must reach the last ladder and its
-// fall-through target within one byte each. The largest such distance is
-// `sum of all ladder lengths` (from the first JEQ to the unknown-arch deny);
-// the const assert turns any future table growth that could overflow it into
-// a compile error, which is why no runtime guard is needed on the casts in
-// [`assemble`].
+// Classic-BPF conditional jumps are forward-only u8 offsets relative to the
+// next instruction. In the assembled program the only such jump with a
+// data-dependent distance is the *last* arch `jeq`, whose `jt` reaches its
+// ladder over the whole preceding ladder (its `jf` falls through into the
+// `ret ENOSYS` that now sits before the ladders, so it is always 0). The
+// const assert turns any future table growth that could overflow that byte
+// into a compile error, which is why no runtime guard is needed on the
+// casts in [`assemble`].
 const _: () = assert!(
-    ladder_len(&X86_64) + ladder_len(&AARCH64) < 256,
-    "arch JEQ chain would exceed u8 jump range; split the ladder"
+    ladder_len_mode(&X86_64, false) < 256 && ladder_len_mode(&X86_64, true) < 256,
+    "x86 ladder would exceed the last arch JEQ's u8 jt range; split the ladder"
 );
 
-/// Ladder body for one architecture: load `nr`, deny each listed rule, then
-/// the two arg filters (`clone`'s namespace flags, `execveat`'s
-/// `AT_EMPTY_PATH`). The caller appends the jump-to-allow.
-fn ladder(rules: &ArchRules) -> Vec<SockFilter> {
-    let rules_len = rules.socket_family.len() + rules.escape_surface.len();
+/// The netns ports prelude for `rules`: allow `socket` only for
+/// `AF_INET`/`AF_INET6` stream sockets; everything else (wrong family,
+/// wrong type, or `socket` reached with any other args) falls into the
+/// deny chain, where the rest of the socket family is still denied. The
+/// caller emits the prelude right after the `ld [nr]` and puts the deny
+/// chain immediately after it.
+///
+/// ```text
+///   jeq socket_nr → ld args0, → deny chain     (jf lands past the prelude)
+///   ld [args0]                                 (domain)
+///   jeq AF_INET  → +1, fall through
+///   jeq AF_INET6 → +1, → ret EACCES            (jf: neither INET family)
+///   ld [args1]                                 (type)
+///   and 0xff
+///   jeq SOCK_STREAM → deny chain, → ret EACCES (a stream socket is granted)
+///   ret EACCES                                 (shared wrong-family/type deny)
+/// ```
+fn socket_prelude(rules: &ArchRules) -> Vec<SockFilter> {
+    vec![
+        // True (a socket call) inspects the args; false joins the deny
+        // chain, where every other listed nr is denied as usual.
+        jeq(rules.socket_nr, 0, 7),
+        load_abs(OFF_ARGS),
+        // AF_INET: jump over the AF_INET6 check into the type check.
+        jeq(AF_INET, 1, 0),
+        // AF_INET6: into the type check; anything else shares the ret.
+        jeq(AF_INET6, 0, 3),
+        load_abs(OFF_ARGS + 8),
+        alu_and(0xff),
+        // A stream socket is granted (falls into the deny chain, which no
+        // longer lists `socket`); any other type shares the ret.
+        jeq(SOCK_STREAM, 1, 0),
+        ret_errno(EACCES),
+    ]
+}
+
+/// Ladder body for one architecture: load `nr`, then — in ports mode — the
+/// socket prelude, then deny each listed rule, then the two arg filters
+/// (`clone`'s namespace flags, `execveat`'s `AT_EMPTY_PATH`). The caller
+/// appends the jump-to-allow.
+fn ladder(rules: &ArchRules, ports: bool) -> Vec<SockFilter> {
+    let socket_rows = if ports {
+        rules.socket_keep_denied.len()
+    } else {
+        rules.socket_family.len()
+    };
+    let rules_len = socket_rows + rules.escape_surface.len();
     let mut out = Vec::with_capacity(ladder_fixed() + 2 * rules_len);
     out.push(load_abs(OFF_NR));
+    if ports {
+        out.extend(socket_prelude(rules));
+    }
     for rule in rules
         .socket_family
         .iter()
+        // In ports mode the prelude owns `socket` and every named stream
+        // call is granted; only the AF-agnostic rows keep their deny.
+        .filter(|r| !ports || rules.socket_keep_denied.contains(&r.nr))
         .chain(rules.escape_surface.iter())
     {
         out.push(jeq(rule.nr, 0, 1));
@@ -386,18 +488,21 @@ fn ladder(rules: &ArchRules) -> Vec<SockFilter> {
 /// ```text
 ///   ld [arch]
 ///   jeq x86_64 → ladder_x86   (else fall through)
-///   jeq aarch64 → ladder_arm  (else → deny_unknown_arch)
+///   jeq aarch64 → ladder_arm  (else fall through)
+///   deny_unknown_arch: ret ENOSYS
 ///   ladder_x86 … ja → allow
 ///   ladder_arm … ja → allow
-///   deny_unknown_arch: ret ENOSYS
 ///   allow: ret SECCOMP_RET_ALLOW
 /// ```
 ///
 /// The guard runs before any allow exists, so an unmodelled ABI (including
-/// x32) gets `−ENOSYS` for *everything* — fail closed.
-fn assemble(arches: &[&ArchRules]) -> BpfProgram {
-    let ladders: Vec<Vec<SockFilter>> = arches.iter().map(|rules| ladder(rules)).collect();
-    let header_len = 1 + arches.len(); // ld + one jeq per arch
+/// x32) gets `−ENOSYS` for *everything* — fail closed. The `ret ENOSYS`
+/// sits *before* the ladders so the last arch `jeq`'s false arm falls
+/// straight into it (no long u8 jump); the only u8-bounded distance left,
+/// that `jeq`'s `jt` over the preceding ladder, is const-asserted above.
+fn assemble(arches: &[&ArchRules], ports: bool) -> BpfProgram {
+    let ladders: Vec<Vec<SockFilter>> = arches.iter().map(|rules| ladder(rules, ports)).collect();
+    let header_len = 1 + arches.len() + 1; // ld + one jeq per arch + ret ENOSYS
     let mut starts = Vec::with_capacity(arches.len());
     let mut end = header_len;
     for ladder_body in &ladders {
@@ -405,24 +510,24 @@ fn assemble(arches: &[&ArchRules]) -> BpfProgram {
         // +1: the trailing ja → allow appended to each ladder below.
         end += ladder_body.len() + 1;
     }
-    let deny_unknown = end;
-    let allow = end + 1;
+    let allow = end;
 
-    let total: usize = arches.iter().map(|rules| ladder_len(rules)).sum();
-    let mut program = BpfProgram::with_capacity(header_len + total + 2);
+    let total: usize = arches
+        .iter()
+        .map(|rules| ladder_len_mode(rules, ports))
+        .sum();
+    let mut program = BpfProgram::with_capacity(header_len + total + 1);
     program.push(load_abs(OFF_ARCH));
     for ((i, rules), start) in arches.iter().enumerate().zip(starts.iter()) {
         // Jump offsets are relative to the instruction after the jump, at
         // position `here`; the const assert above bounds every distance.
         let here = 1 + i + 1;
         let jt = (*start - here) as u8;
-        let jf = if i + 1 < arches.len() {
-            0 // false arm falls through to the next arch check
-        } else {
-            (deny_unknown - here) as u8
-        };
-        program.push(jeq(rules.audit_arch, jt, jf));
+        // A miss falls through: to the next arch check, or — for the last
+        // one — straight into the `ret ENOSYS` that precedes the ladders.
+        program.push(jeq(rules.audit_arch, jt, 0));
     }
+    program.push(ret_errno(ENOSYS));
     // Append each ladder at its jump target; the running program length
     // tracks where the next ladder starts.
     let mut next_start = header_len;
@@ -434,7 +539,6 @@ fn assemble(arches: &[&ArchRules]) -> BpfProgram {
         program.append(&mut ladder_body);
         next_start = program.len();
     }
-    program.push(ret_errno(ENOSYS));
     program.push(ret_allow());
     program
 }
@@ -458,9 +562,13 @@ impl SeccompFilter for Denylist {
     fn bpf_program(&self) -> BpfProgram {
         match self.network {
             // One shape per tier: `None` denies the whole socket family, and
-            // a grant (which this tier cannot express) gets the same ladder
-            // rather than a wider one.
-            NetworkMode::None | NetworkMode::Granted => assemble(ARCHES),
+            // a default-tier grant (which that tier cannot express) gets the
+            // same ladder rather than a wider one.
+            NetworkMode::None | NetworkMode::Granted => assemble(ARCHES, false),
+            // The namespace tier: `ports: false` compiles the identical
+            // deny-all ladder; `ports: true` adds the socket prelude and
+            // unlists the `socket` row.
+            NetworkMode::Netns { ports } => assemble(ARCHES, ports),
         }
     }
 }
@@ -732,13 +840,127 @@ mod tests {
 
     #[test]
     fn filter_data_is_deterministic() {
-        let a = program(NetworkMode::None);
-        let b = program(NetworkMode::None);
-        assert_eq!(a, b, "the same policy must compile byte-identically");
-        // A grant cannot widen this tier's filter: identical program.
-        assert_eq!(a, program(NetworkMode::Granted));
-        // And the program stays within the kernel's instruction cap.
-        assert!(a.len() <= 4096);
+        for network in [
+            NetworkMode::None,
+            NetworkMode::Granted,
+            NetworkMode::Netns { ports: false },
+            NetworkMode::Netns { ports: true },
+        ] {
+            let a = program(network);
+            let b = program(network);
+            assert_eq!(a, b, "the same policy must compile byte-identically");
+            // The program stays within the kernel's instruction cap.
+            assert!(a.len() <= 4096);
+        }
+        // A default-tier grant cannot widen the filter: identical program.
+        assert_eq!(program(NetworkMode::None), program(NetworkMode::Granted));
+        // A namespace without ports is exactly the deny-all ladder too.
+        assert_eq!(
+            program(NetworkMode::None),
+            program(NetworkMode::Netns { ports: false })
+        );
+        // Ports widen it (the prelude) without losing the deny chain.
+        assert_ne!(
+            program(NetworkMode::None),
+            program(NetworkMode::Netns { ports: true })
+        );
+    }
+
+    #[test]
+    fn netns_ports_ladder_grants_only_inet_stream_sockets() {
+        /// `SOCK_DGRAM` — the type the UDP case refuses.
+        const SOCK_DGRAM: u32 = 2;
+        /// `SOCK_NONBLOCK | SOCK_CLOEXEC`, the flags a real listener sets.
+        const SOCK_FLAGS: u64 = 0x800 | 0x8_0000;
+        for rules in ARCHES {
+            let prog = program(NetworkMode::Netns { ports: true });
+            let arch = rules.audit_arch;
+            let granted = SECCOMP_RET_ALLOW;
+            let refused = SECCOMP_RET_ERRNO | EACCES;
+            // Stream sockets in both INET families are allowed, flags and all…
+            for family in [AF_INET, AF_INET6] {
+                assert_eq!(
+                    eval(
+                        &prog,
+                        rules.socket_nr,
+                        arch,
+                        [family as u64, SOCK_STREAM as u64, 0, 0, 0, 0]
+                    ),
+                    granted,
+                    "arch {arch:#x}: socket(inet stream) must be allowed"
+                );
+                assert_eq!(
+                    eval(
+                        &prog,
+                        rules.socket_nr,
+                        arch,
+                        [family as u64, SOCK_STREAM as u64 | SOCK_FLAGS, 0, 0, 0, 0]
+                    ),
+                    granted,
+                    "arch {arch:#x}: socket(inet stream | flags) must be allowed"
+                );
+                // …datagram sockets are not (the UDP case)…
+                assert_eq!(
+                    eval(
+                        &prog,
+                        rules.socket_nr,
+                        arch,
+                        [family as u64, SOCK_DGRAM as u64, 0, 0, 0, 0]
+                    ),
+                    refused,
+                    "arch {arch:#x}: socket(inet dgram) must answer EACCES"
+                );
+            }
+            // …AF_UNIX is not (FT-11 holds at the ports tier: unix sockets
+            // share the tier's filesystem view)…
+            assert_eq!(
+                eval(
+                    &prog,
+                    rules.socket_nr,
+                    arch,
+                    [1, SOCK_STREAM as u64, 0, 0, 0, 0]
+                ),
+                refused,
+                "arch {arch:#x}: socket(AF_UNIX) must answer EACCES"
+            );
+            // …and a made-up family neither.
+            assert_eq!(
+                eval(
+                    &prog,
+                    rules.socket_nr,
+                    arch,
+                    [77, SOCK_STREAM as u64, 0, 0, 0, 0]
+                ),
+                refused
+            );
+            // The rest of the stream API is granted — the netns, not this
+            // filter, is what bounds it — except the AF-agnostic rows,
+            // which keep EACCES (see `socket_keep_denied`).
+            for rule in rules.socket_family {
+                let expect = if rule.nr == rules.socket_nr {
+                    // Bare `socket` with zero args: the prelude refuses the
+                    // family-0 call (the granted shapes were checked above).
+                    refused
+                } else if rules.socket_keep_denied.contains(&rule.nr) {
+                    refused
+                } else {
+                    granted
+                };
+                assert_eq!(
+                    eval(&prog, rule.nr, arch, [0; 6]),
+                    expect,
+                    "arch {arch:#x}: nr {} netns-ports verdict must hold",
+                    rule.nr
+                );
+            }
+            // The escape surface is unchanged.
+            for rule in rules.escape_surface {
+                assert_eq!(
+                    eval(&prog, rule.nr, arch, [0; 6]),
+                    SECCOMP_RET_ERRNO | rule.errno
+                );
+            }
+        }
     }
 
     #[test]
@@ -807,7 +1029,12 @@ mod tests {
 
     #[test]
     fn every_jump_lands_inside_the_program() {
-        for network in [NetworkMode::None, NetworkMode::Granted] {
+        for network in [
+            NetworkMode::None,
+            NetworkMode::Granted,
+            NetworkMode::Netns { ports: false },
+            NetworkMode::Netns { ports: true },
+        ] {
             let prog = program(network);
             for (i, insn) in prog.iter().enumerate() {
                 match insn.code {

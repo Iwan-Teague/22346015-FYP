@@ -198,6 +198,7 @@ mod live {
             read_write: Vec::new(),
             protected: Vec::new(),
             limits,
+            netns: None,
         }
     }
 

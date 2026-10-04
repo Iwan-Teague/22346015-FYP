@@ -65,6 +65,40 @@ fn run() {
     println!("require_passes_on_linux_when_the_probe_passes ...");
     require_passes_on_linux_when_the_probe_passes();
     println!("ok");
+    println!("the_tier_follows_the_host_facts ...");
+    the_tier_follows_the_host_facts();
+    println!("ok");
+    println!("the_netns_probe_runs_when_userns_is_usable ...");
+    the_netns_probe_runs_when_userns_is_usable();
+    println!("ok");
+}
+
+/// Which tier this host's facts pick, and the row each tier must name.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn tier_shape() -> (
+    bool,
+    &'static str,
+    harness_sandbox::NetworkMechanism,
+    harness_sandbox::KillDomain,
+) {
+    let facts = harness_sandbox::linux::host_facts();
+    match facts.userns_usable() {
+        Some(true) => (
+            true,
+            "linux-netns-pidns-v1",
+            harness_sandbox::NetworkMechanism::LinuxNetNamespace,
+            harness_sandbox::KillDomain::LinuxPidNamespace,
+        ),
+        _ => (
+            false,
+            "linux-landlock-seccomp-nons-v1",
+            harness_sandbox::NetworkMechanism::LinuxLandlockSeccomp,
+            harness_sandbox::KillDomain::SubreaperSweep,
+        ),
+    }
 }
 
 #[cfg(all(
@@ -72,11 +106,15 @@ fn run() {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn probe_mints_only_when_every_canary_is_refused() {
-    let w = harness_sandbox::linux::Linux
-        .probe()
+    let (netns, row, network, kill) = tier_shape();
+    let w = harness_sandbox::Backend::probe(&harness_sandbox::linux::Linux::default())
         .expect("the live probe must mint when every canary is refused");
     assert_eq!(w.backend(), harness_sandbox::BackendKind::Linux);
-    assert_eq!(w.matrix_row(), "linux-landlock-seccomp-nons-v1");
+    // The tier the facts picked is the tier the witness names.
+    assert_eq!(w.matrix_row(), row);
+    assert_eq!(w.network(), network);
+    assert_eq!(w.kill_domain(), kill);
+    assert_eq!(netns, w.network() == network, "facts and row must agree");
     let lw = w.linux().expect("a Linux witness carries its detail");
     assert_eq!(lw.landlock_abi(), 3);
     assert_eq!(lw.seccomp_action(), harness_sandbox::SeccompAction::Errno);
@@ -87,15 +125,14 @@ fn probe_mints_only_when_every_canary_is_refused() {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn require_passes_on_linux_when_the_probe_passes() {
+    let (_, row, network, kill) = tier_shape();
     let w = harness_sandbox::require()
         .expect("require() must pass on Linux when the live probe passes");
     assert_eq!(w.backend(), harness_sandbox::BackendKind::Linux);
-    // The guards the default tier really met, by name:
-    assert_eq!(
-        w.network(),
-        harness_sandbox::NetworkMechanism::LinuxLandlockSeccomp
-    );
-    assert_eq!(w.kill_domain(), harness_sandbox::KillDomain::SubreaperSweep);
+    // The guards the chosen tier really met, by name:
+    assert_eq!(w.matrix_row(), row);
+    assert_eq!(w.network(), network);
+    assert_eq!(w.kill_domain(), kill);
     assert_eq!(w.memory(), harness_sandbox::MemoryGuard::RlimitAddressSpace);
     assert_eq!(
         w.processes(),
@@ -104,6 +141,49 @@ fn require_passes_on_linux_when_the_probe_passes() {
     assert!(w
         .covers(harness_sandbox::conformance::H2_EXIT_CASES)
         .is_ok());
+}
+
+/// The namespace tier, when this host can serve it: its probe runs the
+/// same canaries through the empty netns/pidns and its witness names the
+/// tier. On a default-tier host this is recorded as skipped, not passed
+/// silently (an AppArmor-restricted VM, say, stays on the default tier by
+/// design, L-Q8).
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn the_tier_follows_the_host_facts() {
+    let (netns, row, network, kill) = tier_shape();
+    let w = harness_sandbox::Backend::probe(&harness_sandbox::linux::Linux::default())
+        .expect("the probe mints for the tier the facts pick");
+    assert_eq!(w.matrix_row(), row);
+    assert_eq!(w.network(), network);
+    assert_eq!(w.kill_domain(), kill);
+    if !netns {
+        println!("  (host userns not usable: netns tier skipped, default tier served)");
+    }
+}
+
+/// The netns probe itself, on a host where the tier is usable: the raw
+/// observation must carry every canary as refused.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn the_netns_probe_runs_when_userns_is_usable() {
+    let (netns, ..) = tier_shape();
+    if !netns {
+        println!("  (host userns not usable: live_probe_netns skipped)");
+        return;
+    }
+    let helper = std::env::current_exe().expect("this binary is the helper");
+    let obs = harness_sandbox_linux::probe::live_probe_netns(helper.as_os_str())
+        .expect("the netns probe must see every canary refused");
+    for name in harness_sandbox_linux::probe::PROBES {
+        assert!(obs.contains(&format!("{name} ok\n")), "{obs}");
+    }
+    assert!(obs.contains("--memory--\napplied\n"));
+    assert!(obs.contains("forked="));
 }
 
 #[cfg(not(all(

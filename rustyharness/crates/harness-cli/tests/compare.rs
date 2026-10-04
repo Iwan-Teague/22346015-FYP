@@ -516,6 +516,7 @@ fn compare_each_arm_audits_clean() {
             policy: &policy,
             profile: &profile,
             limits: &limits,
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap_or_else(|e| panic!("audit refused for {}: {e}", a["run"]));
         assert!(a.divergence.is_none(), "{}", a.divergence.unwrap().why);

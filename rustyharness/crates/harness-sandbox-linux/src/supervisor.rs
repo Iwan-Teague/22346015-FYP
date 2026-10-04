@@ -53,6 +53,8 @@
 // (cfg-gated) owns the rest.
 use std::time::Duration;
 
+use crate::namespaces::NetnsSpec;
+
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
@@ -122,6 +124,11 @@ pub struct Program {
     pub protected: Vec<String>,
     /// The rlimits the program runs under.
     pub limits: Limits,
+    /// The namespace tier (S-Lj): when `Some`, the helper forks an nsprep
+    /// that unshares userns/netns/pidns/ipc and execs the program as the
+    /// namespace's PID 1, with the relay at the given directory. `None` is
+    /// the default (no-namespace) tier.
+    pub netns: Option<NetnsSpec>,
 }
 
 /// The rlimits of a [`Program`]. The wall clock is not here: it is the
@@ -253,6 +260,10 @@ pub fn frame(prog: &Program) -> Option<Vec<u8>> {
             .chain(&prog.read_write)
             .chain(&prog.protected)
             .any(|p| nul(p.as_bytes()))
+        || prog
+            .netns
+            .as_ref()
+            .is_some_and(|ns| nul(ns.relay_dir.as_bytes()))
         || prog.argv.len() > u16::MAX as usize
         || prog.env.len() > u16::MAX as usize
     {
@@ -304,6 +315,23 @@ pub fn frame(prog: &Program) -> Option<Vec<u8>> {
     put_list(&mut out, "ro", &strs(&prog.read_only));
     put_list(&mut out, "rw", &strs(&prog.read_write));
     put_list(&mut out, "px", &strs(&prog.protected));
+    // The namespace tier (S-Lj): `net -` or a `net ns` section with the
+    // relay directory and the two port grant lists.
+    match &prog.netns {
+        None => out.extend_from_slice(b"net -\n"),
+        Some(ns) => {
+            out.extend_from_slice(b"net ns\n");
+            put_bytes(&mut out, ns.relay_dir.as_bytes());
+            out.extend_from_slice(format!("bind {}\n", ns.bind.len()).as_bytes());
+            for port in &ns.bind {
+                out.extend_from_slice(format!("{port}\n").as_bytes());
+            }
+            out.extend_from_slice(format!("con {}\n", ns.connect.len()).as_bytes());
+            for port in &ns.connect {
+                out.extend_from_slice(format!("{port}\n").as_bytes());
+            }
+        }
+    }
     if out.len() > MAX_FRAME_BYTES {
         return None;
     }
@@ -351,6 +379,20 @@ pub fn parse_frame(bytes: &[u8]) -> Option<ParsedFrame> {
     let read_only = strings(r.list("ro")?)?;
     let read_write = strings(r.list("rw")?)?;
     let protected = strings(r.list("px")?)?;
+    let netns = if r.eat_tag("net -\n")? {
+        None
+    } else if r.eat_tag("net ns\n")? {
+        let relay_dir = String::from_utf8(r.bytes()?.to_vec()).ok()?;
+        let bind = r.port_list("bind")?;
+        let connect = r.port_list("con")?;
+        Some(NetnsSpec {
+            relay_dir,
+            bind,
+            connect,
+        })
+    } else {
+        return None;
+    };
     if r.at != bytes.len() {
         return None;
     }
@@ -363,6 +405,7 @@ pub fn parse_frame(bytes: &[u8]) -> Option<ParsedFrame> {
             read_write,
             protected,
             limits,
+            netns,
         },
     })
 }
@@ -425,6 +468,22 @@ impl<'a> Reader<'a> {
         let mut out = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
             out.push(self.bytes()?.to_vec());
+        }
+        Some(out)
+    }
+
+    /// A port grant list (`tag N\n` then N decimal lines). A count beyond
+    /// the spec's port budget plus slack refuses (no unbounded reads).
+    fn port_list(&mut self, tag: &str) -> Option<Vec<u16>> {
+        let line = self.line()?;
+        let rest = line.strip_prefix(tag)?;
+        let n = rest.strip_prefix(' ')?.parse::<usize>().ok()?;
+        if n > 1024 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.line()?.parse().ok()?);
         }
         Some(out)
     }
@@ -884,10 +943,11 @@ fn ring_put(buf: &mut [u8], start: usize, data: &[u8]) {
 // ---- the Linux process layer ------------------------------------------------
 
 /// The exit-code window that names a failed program setup (94 setpgid
-/// missing … 102 `execve` refused); a setup failure is never mistaken for a
-/// program result.
+/// missing … 102 `execve` refused; 103 the helper's own re-exec; 104..=106
+/// the namespace tier's nsprep setup, S-Lj); a setup failure is never
+/// mistaken for a program result.
 const EXEC_FAIL_FLOOR: i32 = 94;
-const EXEC_FAIL_CEIL: i32 = 102;
+const EXEC_FAIL_CEIL: i32 = 106;
 
 /// Why a spawn was refused or failed. Nothing unconfined ever ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1446,7 +1506,18 @@ pub fn helper_main() -> ! {
     sys::close(FD_CONTROL_R);
 
     let child = match sys::fork_prog() {
-        Ok(0) => child_exec(&frame),
+        Ok(0) => {
+            // Namespace tier (S-Lj): the fork's child is the nsprep — it
+            // unshares the namespaces and execs the program as the
+            // namespace's PID 1 (its exit code maps the program's ending).
+            // Everything the helper does below (pidfd, hello, watch,
+            // sweep) is unchanged: the pidfd now covers nsprep, whose exit
+            // is the kernel tearing the namespace down.
+            if frame.netns.is_some() {
+                crate::namespaces::nsprep_main(&frame);
+            }
+            child_exec(&frame);
+        }
         Ok(pid) => u32::try_from(pid).unwrap_or(u32::MAX),
         Err(()) => sys::raw_exit(93),
     };
@@ -1629,20 +1700,24 @@ fn report_and_exit(fd: i32, status: i64, end: &str, kills: u32, confirmed: bool)
     sys::raw_exit(if confirmed { 0 } else { 3 });
 }
 
-/// The forked program's setup: die-with-helper, own process group, the
-/// streams, the working directory, then the confinement domain
-/// (no_new_privs via Landlock, Landlock, seccomp, rlimits), a clean fd
-/// table, and `execve`. Every failure exits with a code in the
-/// exec-failure window; nothing half-configured execs. Never returns.
+/// The forked program's setup: die-with-parent, own process group (unless
+/// the namespace tier keeps it in nsprep's group), the streams, the
+/// working directory, then the confinement domain (no_new_privs via
+/// Landlock, Landlock, seccomp, rlimits), a clean fd table, and `execve`.
+/// Every failure exits with a code in the exec-failure window; nothing
+/// half-configured execs. Never returns.
 #[cfg(target_os = "linux")]
-fn child_exec(prog: &Program) -> ! {
-    // Die with the helper: any helper death ends the program even if the
-    // control-pipe sweep was cut short.
+pub(crate) fn child_exec(prog: &Program) -> ! {
+    // Die with the parent (the helper, or nsprep on the namespace tier):
+    // any ancestor death ends the program even if a sweep was cut short.
     if sys::prctl_pdeathsig().is_err() {
         sys::raw_exit(94);
     }
-    // Own process group: the kill domain is the whole tree at once.
-    if sys::setpgid_self().is_err() {
+    // Own process group: the kill domain is the whole tree at once. On the
+    // namespace tier nsprep already leads the group, and the program stays
+    // in it — one group kill covers nsprep, the program and its forks on
+    // the host's pid terms (the pidns init death is the backstop).
+    if prog.netns.is_none() && sys::setpgid_self().is_err() {
         sys::raw_exit(95);
     }
     if sys::dup2(FD_OUT_W, 1).is_err() || sys::dup2(FD_ERR_W, 2).is_err() {
@@ -1672,7 +1747,17 @@ fn child_exec(prog: &Program) -> ! {
     if domain.apply().is_err() {
         sys::raw_exit(99);
     }
-    let filter = crate::LinuxBackend::seccomp_denylist(crate::seccomp::NetworkMode::None);
+    // The seccomp shape: the default tier's deny-all, or the namespace
+    // tier's ladder (with an empty netns, `ports: false` compiles the same
+    // deny-all; a port grant adds only AF_INET/6 stream sockets — still no
+    // unix sockets, dgram, raw, or socketpair).
+    let mode = match prog.netns.as_ref() {
+        Some(ns) => crate::seccomp::NetworkMode::Netns {
+            ports: ns.has_ports(),
+        },
+        None => crate::seccomp::NetworkMode::None,
+    };
+    let filter = crate::LinuxBackend::seccomp_denylist(mode);
     if crate::seccomp::SeccompFilter::apply(&filter).is_err() {
         sys::raw_exit(100);
     }
@@ -1722,11 +1807,13 @@ fn modelled_arch() -> bool {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-mod sys {
+pub(crate) mod sys {
     //! Thin `syscall(2)` wrappers. Every `unsafe` block is one raw syscall
     //! whose pointer arguments address memory this module or its caller
     //! owns for the call's duration; every failure surfaces as `Err`/`-1`,
     //! and a caller that cannot complete a step refuses — never continues.
+    //! The namespace tier's nsprep (`crate::namespaces`) reuses these
+    //! wrappers for the calls it shares.
 
     use super::Limits;
 
@@ -1826,9 +1913,9 @@ mod sys {
     const RLIMIT_NPROC: i64 = 6;
     const RLIMIT_AS: i64 = 9;
     /// `POLLIN`.
-    pub(super) const POLL_IN: i16 = 0x001;
+    pub(crate) const POLL_IN: i16 = 0x001;
     /// `POLLHUP`.
-    pub(super) const POLL_HUP: i16 = 0x010;
+    pub(crate) const POLL_HUP: i16 = 0x010;
     /// `WNOHANG`.
     const WNOHANG: u64 = 1;
     /// `SIGKILL`.
@@ -1843,8 +1930,10 @@ mod sys {
         fn syscall(num: i64, ...) -> i64;
     }
 
-    /// The one variadic raw call every wrapper funnels through.
-    fn sc(num: i64, a: u64, b: u64, c: u64, d: u64, e: u64) -> i64 {
+    /// The one variadic raw call every wrapper funnels through. Also the
+    /// funnel for the namespace tier's own wrappers (`crate::namespaces`),
+    /// so the crate keeps exactly one `unsafe` site.
+    pub(crate) fn sc(num: i64, a: u64, b: u64, c: u64, d: u64, e: u64) -> i64 {
         // SAFETY: the module's ONE raw variadic call. Every argument is a
         // value the kernel reads only (or a pointer, as each wrapper's own
         // SAFETY note describes); the return value is the kernel's.
@@ -1877,7 +1966,7 @@ mod sys {
     }
 
     /// `close(fd)`.
-    pub(super) fn close(fd: i32) {
+    pub(crate) fn close(fd: i32) {
         // SAFETY: a plain fd close of an fd this process owns.
         let _ = sc(SYS_CLOSE, fd as u64, 0, 0, 0, 0);
     }
@@ -1898,7 +1987,7 @@ mod sys {
 
     /// `prctl(PR_SET_PDEATHSIG, SIGKILL)` — on the program, whose parent is
     /// the helper.
-    pub(super) fn prctl_pdeathsig() -> Result<(), ()> {
+    pub(crate) fn prctl_pdeathsig() -> Result<(), ()> {
         // SAFETY: immediate option values only.
         ok(sc(SYS_PRCTL, PR_SET_PDEATHSIG as u64, SIGKILL, 0, 0, 0))
     }
@@ -1912,7 +2001,7 @@ mod sys {
     }
 
     /// `setpgid(0, 0)`: the caller becomes its own group leader.
-    pub(super) fn setpgid_self() -> Result<(), ()> {
+    pub(crate) fn setpgid_self() -> Result<(), ()> {
         // SAFETY: immediate values only.
         ok(sc(SYS_SETPGID, 0, 0, 0, 0, 0))
     }
@@ -1920,7 +2009,7 @@ mod sys {
     /// `fork()` (x86_64) or `clone(SIGCHLD, …)` (aarch64): the supervisor's
     /// forks happen only in the fresh single-threaded helper (or the
     /// spawner's pre-exec child, before any thread exists).
-    pub(super) fn fork_prog() -> Result<i32, ()> {
+    pub(crate) fn fork_prog() -> Result<i32, ()> {
         // SAFETY: no pointer arguments; the return value distinguishes the
         // child (0) from the parent (the child's pid).
         #[cfg(target_arch = "x86_64")]
@@ -1966,7 +2055,7 @@ mod sys {
 
     /// `pidfd_open(pid)`: a stable handle whose pollability replaces
     /// SIGCHLD plumbing.
-    pub(super) fn pidfd_open(pid: u32) -> Result<i32, ()> {
+    pub(crate) fn pidfd_open(pid: u32) -> Result<i32, ()> {
         // SAFETY: immediate values; the return value is an fd.
         let rc = sc(SYS_PIDFD_OPEN, pid as u64, 0, 0, 0, 0);
         if rc == -1 {
@@ -1978,7 +2067,7 @@ mod sys {
 
     /// One `pollfd` (the kernel's layout on both arches).
     #[repr(C)]
-    pub(super) struct PollFd {
+    pub(crate) struct PollFd {
         /// The fd to watch.
         pub fd: i32,
         /// The events requested.
@@ -1988,7 +2077,7 @@ mod sys {
     }
 
     /// `ppoll(fds, nfds, timeout)` with a relative timeout.
-    pub(super) fn ppoll(fds: &mut [PollFd], timeout: std::time::Duration) -> i64 {
+    pub(crate) fn ppoll(fds: &mut [PollFd], timeout: std::time::Duration) -> i64 {
         #[repr(C)]
         struct Timespec {
             sec: i64,
@@ -2032,7 +2121,7 @@ mod sys {
     }
 
     /// `wait4(pid, &status, 0, NULL)`, blocking: the raw wait status.
-    pub(super) fn wait_block(pid: u32) -> Option<i32> {
+    pub(crate) fn wait_block(pid: u32) -> Option<i32> {
         let mut st: i32 = 0;
         // SAFETY: the kernel writes one int into the caller-owned slot.
         let rc = sc(
@@ -2181,7 +2270,7 @@ mod sys {
 
     /// `_exit(code)`: the helper and the pre-exec arms never unwind, and a
     /// half-configured process must not run destructors.
-    pub(super) fn raw_exit(code: i32) -> ! {
+    pub(crate) fn raw_exit(code: i32) -> ! {
         // SAFETY: an immediate value; this never returns, so the loop
         // below is unreachable by construction and keeps the fn `!`-typed
         // without a panic (the panic set is denied here).
@@ -2212,6 +2301,7 @@ mod tests {
                 memory: Some(1 << 30),
                 processes: Some(64),
             },
+            netns: None,
         }
     }
 
@@ -2229,6 +2319,45 @@ mod tests {
         p.limits = Limits::default();
         let bytes = frame(&p).expect("frames");
         assert_eq!(parse_frame(&bytes).expect("parses").program, p);
+    }
+
+    #[test]
+    fn frame_round_trips_a_netns_spec() {
+        let mut p = sample();
+        p.netns = Some(NetnsSpec {
+            relay_dir: "/tmp/rh-relay-xyz".into(),
+            bind: vec![8080, 8443],
+            connect: vec![9090],
+        });
+        let bytes = frame(&p).expect("frames");
+        assert_eq!(parse_frame(&bytes).expect("parses").program, p);
+        // The wire names the tier and carries the grants in order.
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        assert!(text.contains("net ns\n"), "the ns marker is on the wire");
+        assert!(text.contains("bind 2\n8080\n8443\n"));
+        assert!(text.contains("con 1\n9090\n"));
+        // An empty grant list still marks the tier (`ports: false` shape).
+        let mut empty = sample();
+        empty.netns = Some(NetnsSpec::default());
+        assert_eq!(
+            parse_frame(&frame(&empty).expect("frames"))
+                .expect("parses")
+                .program,
+            empty
+        );
+        // The no-namespace marker round-trips as None (covered by the
+        // sample's round-trip above), and a truncated ns section refuses.
+        let bytes = frame(&p).expect("frames");
+        let cut = bytes.len() - 1;
+        assert!(parse_frame(&bytes[..cut]).is_none());
+        // A relay directory with an interior NUL refuses to frame.
+        let mut nul = sample();
+        nul.netns = Some(NetnsSpec {
+            relay_dir: "/tmp/r\0elay".into(),
+            bind: Vec::new(),
+            connect: Vec::new(),
+        });
+        assert_eq!(frame(&nul), None);
     }
 
     #[test]
@@ -2345,10 +2474,13 @@ mod tests {
 
     #[test]
     fn exec_failure_codes_are_the_setup_window() {
-        assert!(is_exec_failure(94));
-        assert!(is_exec_failure(102));
+        // 94..=102 the program's setup steps, 103 the helper's re-exec,
+        // 104..=106 the namespace tier's nsprep (S-Lj).
+        for code in 94..=106 {
+            assert!(is_exec_failure(code), "{code} is a setup failure");
+        }
         assert!(!is_exec_failure(93));
-        assert!(!is_exec_failure(103));
+        assert!(!is_exec_failure(107));
         assert!(!is_exec_failure(0));
     }
 

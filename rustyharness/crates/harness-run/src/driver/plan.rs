@@ -135,7 +135,15 @@ pub(crate) fn prepare(
             // P-39i research checks (fail closed): web ids (P-39j wires
             // them), exec, pre-submit, protected paths, a workspace.
             check_research_spec(spec)?;
-            let (session, tools) = plan(spec, registry, policy, profile, approver_present, true)?;
+            let (session, tools) = plan(
+                spec,
+                registry,
+                policy,
+                profile,
+                approver_present,
+                true,
+                true,
+            )?;
             let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
             let state_str = state_root.to_str().ok_or_else(|| {
                 RunRefused::StateRoot(io::Error::new(
@@ -205,6 +213,7 @@ pub(crate) fn prepare(
                 profile,
                 approver_present,
                 pinned.is_some(),
+                true,
             )?;
             // The read window is the profile's (H2e): what a read returns,
             // and what the context shows of one observation.
@@ -581,6 +590,9 @@ pub(crate) fn facts_block(f: &WorkspaceFacts) -> Vec<Fact> {
 /// audit, held) a `Conformed` witness (H2d: an exec grant plans only with
 /// one, INV-6; P-39i: a research session plans only with one covering the
 /// web airlock — `prepare` has checked the witness, so it passes `true`).
+/// `floor`: whether the protected-path ask floor still has to be applied
+/// to the policy (P-38g: a delegate child's audit plans with the policy
+/// that already carries it, as the live child did).
 pub(crate) fn plan(
     spec: &TaskSpec,
     registry: &Registry,
@@ -588,6 +600,7 @@ pub(crate) fn plan(
     profile: &Profile,
     approver_present: bool,
     conformed: bool,
+    floor: bool,
 ) -> Result<(Session, Vec<ToolSpec>), RunRefused> {
     // P-39i: the research-spec checks, so the audit path (which plans
     // without `prepare`'s witness work) refuses the same specs a live run
@@ -620,7 +633,7 @@ pub(crate) fn plan(
     // The P-29 ask floor (Cargo.lock, .github/**): decided with here, so a
     // live run, a resume and an audit replay all ask about the same edits.
     // A research session (P-39i) has no edit tools, so it takes no floor.
-    let policy = if research {
+    let policy = if research || !floor {
         policy.clone()
     } else {
         protected_policy(policy)?

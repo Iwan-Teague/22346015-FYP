@@ -593,8 +593,28 @@ confine_case "a relative program in confine_spawn.rs" 'Command::new("/bin/kill")
     "crates/harness-sandbox/src/confine_spawn.rs is not the reviewed version"
 confine_case "the start canary removed in confine_spawn.rs" "if(\$pp<=1 || kill(0,\$pp) || (\$!+0)!=1)" "if(0)" \
     "crates/harness-sandbox/src/confine_spawn.rs is not the reviewed version"
-confine_case "the per-pass canary weakened in confine_spawn.rs" "if(\$hit || (\$en!=1 && \$en!=3))" "if(0)" \
+confine_case "the per-pass canary weakened in confine_spawn.rs" "if(\$hit ? getppid()==\$pp : (\$en!=1 && \$en!=3))" "if(0)" \
     "crates/harness-sandbox/src/confine_spawn.rs is not the reviewed version"
+# The file-op stub (P-36d): pinned, spawns nothing. Any change without a
+# re-pin is refused by the pin; a fork in the stub text is refused by the
+# same pin (the stub holds no spawn facility the word scan could miss:
+# the pin IS the fork control).
+fileop_case() {
+    fresh
+    awk -v from="$2" -v to="$3" '{ i = index($0, from); if (i) $0 = substr($0, 1, i - 1) to substr($0, i + length(from)); print }' \
+        "$copy/crates/harness-sandbox/src/fileop_stub.rs" >"$tmpdir/fileop.planted" || fail "awk failed"
+    mv "$tmpdir/fileop.planted" "$copy/crates/harness-sandbox/src/fileop_stub.rs" || fail "mv failed"
+    grep -qF "$3" "$copy/crates/harness-sandbox/src/fileop_stub.rs" || fail "fileop plant '$1' did not land"
+    expect_refusal "$1" "$4"
+}
+fileop_case "the fileop stub changed without re-pin" \
+    'rh-stub/1 confirmed status=0 end=exit kills=0 exec=ok' \
+    'rh-stub/1 confirmed status=0 end=stop kills=0 exec=ok' \
+    "crates/harness-sandbox/src/fileop_stub.rs is not the reviewed version"
+fileop_case "a fork added to the fileop stub" \
+    'use strict;' \
+    'use strict; fork || exit 1;' \
+    "crates/harness-sandbox/src/fileop_stub.rs is not the reviewed version"
 # cargo metadata failing, or printing targets in a shape the gate does not
 # read, fails the gate.
 mkdir "$tmpdir/metashim" || fail "mkdir metashim failed"

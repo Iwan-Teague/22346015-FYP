@@ -197,7 +197,7 @@ fn drive_full_profile(
         kind: harness_policy::SessionKind::Coding,
     };
     let policy = UserPolicy::default();
-    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false, true).unwrap();
     let backend = ScriptedBackend::new(profile.clone(), replies);
     let invoked = Rc::new(Cell::new(0));
     let mut cfg = RunConfig::defaults(1_000_000);
@@ -922,7 +922,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         kind: harness_policy::SessionKind::Coding,
     };
     let policy = UserPolicy::new(&[], &[], &["harness.edit.replace"]).unwrap();
-    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, false, true).unwrap();
     let backend = ScriptedBackend::new(
         profile.clone(),
         vec![

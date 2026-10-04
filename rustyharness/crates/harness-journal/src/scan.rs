@@ -10,6 +10,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use serde_json::Value;
+
 use harness_core::RunId;
 
 use crate::layout;
@@ -22,6 +24,33 @@ pub struct ScannedRun {
     pub run: RunId,
     /// The latest attempt's verified journal, or why it could not be read.
     pub journal: Result<Verified, ScanError>,
+    /// The parent link from the run's header, when the run is a delegate
+    /// child (`mode: "child"`). Absent for batch and session runs, and for
+    /// unreadable journals (nothing can be claimed about them).
+    pub child_of: Option<ChildLink>,
+}
+
+/// The parent link a child run records in its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildLink {
+    /// The parent run id.
+    pub run: String,
+    /// The parent step that delegated this child.
+    pub step: u64,
+}
+
+/// Read the parent link out of a verified journal's `RunStarted` header.
+/// A header that is not a child header, or whose parent object is
+/// malformed, yields `None` — the run then simply lists as a plain run.
+fn child_link_of(verified: &Verified) -> Option<ChildLink> {
+    let header = verified.records.first()?;
+    if header.body.get("mode").and_then(Value::as_str) != Some("child") {
+        return None;
+    }
+    let parent = header.body.get("parent")?;
+    let run = parent.get("run")?.as_str()?.to_owned();
+    let step = parent.get("step")?.as_u64()?;
+    Some(ChildLink { run, step })
 }
 
 /// Why a run's journal could not be read during a scan.
@@ -93,7 +122,12 @@ fn scan_run(run_dir: &Path, run: RunId) -> ScannedRun {
         Ok(None) => Err(ScanError::NoAttempt(run.as_str().to_owned())),
         Err(e) => Err(ScanError::Read(ReadError::Io(e.to_string()))),
     };
-    ScannedRun { run, journal }
+    let child_of = journal.as_ref().ok().and_then(child_link_of);
+    ScannedRun {
+        run,
+        journal,
+        child_of,
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +135,7 @@ mod tests {
     use super::*;
     use crate::writer::{Header, JournalWriter};
     use crate::Ident;
+    use harness_core::sha256;
 
     fn temp_root(name: &str) -> io::Result<std::path::PathBuf> {
         let base = std::env::temp_dir().join(format!("rh-scan-{name}-{}", std::process::id()));
@@ -120,6 +155,32 @@ mod tests {
         JournalWriter::create(&attempt, run, 1, Header::new(Ident::new("0.0.1").unwrap()))
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
+    }
+
+    fn make_child_run(state_root: &Path, run: RunId, parent: RunId, step: u64) -> io::Result<()> {
+        let run_dir = state_root.join("runs").join(run.as_str());
+        let attempt = run_dir.join("attempt-1");
+        fs::create_dir_all(&attempt)?;
+        let header = Header::new(Ident::new("0.0.1").unwrap())
+            .field("mode", crate::event::Trusted::Text("child"))
+            .field(
+                "parent",
+                crate::event::Trusted::Obj(vec![
+                    (
+                        "run",
+                        crate::event::Trusted::Id(Ident::new(parent.as_str()).unwrap()),
+                    ),
+                    ("attempt", crate::event::Trusted::U64(1)),
+                    ("step", crate::event::Trusted::U64(step)),
+                    (
+                        "intent_hash",
+                        crate::event::Trusted::Digest(sha256(b"intent")),
+                    ),
+                ]),
+            );
+        JournalWriter::create(&attempt, run, 1, header)
+            .map(|_| ())
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     #[test]
@@ -157,6 +218,45 @@ mod tests {
             &scanned[0].journal,
             Err(ScanError::NoAttempt(id)) if *id == run.as_str()
         ));
+    }
+
+    #[test]
+    fn child_headers_report_their_parent_link() {
+        let root = temp_root("childlink").unwrap();
+        make_run(&root, rid(3)).unwrap();
+        make_child_run(&root, rid(4), rid(3), 2).unwrap();
+
+        let mut scanned = scan_runs(&root).unwrap();
+        scanned.sort_by(|a, b| a.run.as_str().cmp(b.run.as_str()));
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].child_of, None);
+        assert_eq!(
+            scanned[1].child_of,
+            Some(ChildLink {
+                run: rid(3).as_str().to_owned(),
+                step: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_parent_link_is_not_a_child() {
+        let root = temp_root("badparent").unwrap();
+        let run = rid(5);
+        let run_dir = root.join("runs").join(run.as_str());
+        let attempt = run_dir.join("attempt-1");
+        fs::create_dir_all(&attempt).unwrap();
+        let header = Header::new(Ident::new("0.0.1").unwrap())
+            .field("mode", crate::event::Trusted::Text("child"))
+            .field(
+                "parent",
+                crate::event::Trusted::Obj(vec![("attempt", crate::event::Trusted::U64(1))]),
+            );
+        JournalWriter::create(&attempt, run, 1, header).unwrap();
+
+        let scanned = scan_runs(&root).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].child_of, None);
     }
 
     #[test]

@@ -1823,7 +1823,8 @@ mod tests {
         let policy = UserPolicy::default();
         let mut config = RunConfig::defaults(1_000_000);
         config.limits.steps = 10;
-        let (session, tools) = plan::plan(&spec, &reg, &policy, &profile, false, false).unwrap();
+        let (session, tools) =
+            plan::plan(&spec, &reg, &policy, &profile, false, false, true).unwrap();
         let file = FaultFile::new(FaultPlan::default());
         let blobs = MemBlobs::default();
         let run_id = RunId::new(9, [2; 10]);
@@ -2185,7 +2186,8 @@ mod tests {
         )
         .unwrap();
         let read_tools = ReadTools::new(&ws).unwrap();
-        let (session, tools) = plan::plan(&spec, &reg, &policy, &profile, false, false).unwrap();
+        let (session, tools) =
+            plan::plan(&spec, &reg, &policy, &profile, false, false, true).unwrap();
         let ctx = ChildCtx {
             state_root: &state,
             workspace: &ws,

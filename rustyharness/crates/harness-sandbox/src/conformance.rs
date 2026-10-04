@@ -102,6 +102,23 @@ pub enum Case {
     Ft19,
     /// FT-20: no bind and no listen, even under the proxy profile.
     Ft20,
+    /// P-36d (§7.2): the file-op helper's kernel view — a symlink planted
+    /// or swapped inside the workspace is never followed to outside the
+    /// profile's roots, measured at the open/rename moment.
+    FileOpKernelView,
+    /// P-36d (§7.1): the file-op helper cannot fork — the stub never does
+    /// and the profile refuses it, so the instance holds one process.
+    FileOpNoFork,
+    /// P-36d (§7.2): a FIFO swapped into a requested path is refused fast,
+    /// not read or written.
+    FileOpFifo,
+    /// P-36d (§7.1): writes under a protected overlay are refused while
+    /// the same write succeeds unconfined.
+    FileOpProtected,
+    /// P-36d (§7.2): a hard link from outside the workspace cannot be the
+    /// target of a replace (nlink refusal), so outside content cannot be
+    /// smuggled in or clobbered through one.
+    FileOpHardLink,
     /// S-Lg: `openat2` (with or without `RESOLVE_BENEATH`) cannot reach
     /// outside the Landlock read set; `..` and symlinked paths resolve to
     /// the same denial (the handle model decides, not the path text).
@@ -179,6 +196,11 @@ impl Case {
             Case::Ft15P => "FT-15-proxy",
             Case::Ft19 => "FT-19",
             Case::Ft20 => "FT-20",
+            Case::FileOpKernelView => "fileop-kernel-view",
+            Case::FileOpNoFork => "fileop-no-fork",
+            Case::FileOpFifo => "fileop-fifo",
+            Case::FileOpProtected => "fileop-protected",
+            Case::FileOpHardLink => "fileop-hard-link",
             Case::LinuxOpenat2 => "linux-openat2",
             Case::LinuxProcSelfMem => "linux-proc-self-mem",
             Case::LinuxFdInherit => "linux-fd-inherit",
@@ -310,6 +332,18 @@ pub const AIRLOCK_CASES: &[Case] = &[
     Case::Ft20,
 ];
 
+/// What the file-op helper conformance adds to the macOS row (P-36d, §12):
+/// the kernel-view pair, the fork refusal, the fast FIFO refusal, the
+/// protected-overlay refusal and the hard-link refusal. These live in
+/// `tests/conformance_fileop_macos.rs` so the existing suite is untouched.
+pub const FILEOP_CASES: &[Case] = &[
+    Case::FileOpKernelView,
+    Case::FileOpNoFork,
+    Case::FileOpFifo,
+    Case::FileOpProtected,
+    Case::FileOpHardLink,
+];
+
 /// One committed row of the pass matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatrixRow {
@@ -360,6 +394,13 @@ pub const MATRIX: &[MatrixRow] = &[MatrixRow {
         Case::NoBind,
         Case::NestedSandbox,
         Case::HardLink,
+        // P-36d: the file-op helper's kernel-view cases (§12), green on
+        // this host in tests/conformance_fileop_macos.rs.
+        Case::FileOpKernelView,
+        Case::FileOpNoFork,
+        Case::FileOpFifo,
+        Case::FileOpProtected,
+        Case::FileOpHardLink,
     ],
     network: NetworkMechanism::SeatbeltDenyAll,
     kill_domain: KillDomain::GroupAndSandboxSweep,
@@ -368,7 +409,7 @@ pub const MATRIX: &[MatrixRow] = &[MatrixRow {
     // process rlimit exists on macOS without privilege). See the H2c report.
     memory: MemoryGuard::RlimitAddressSpace,
     processes: ProcessGuard::MemberCountWatchdog,
-    evidence: "harness-sandbox tests/conformance_macos.rs, macOS 26.5.1 (25F80) arm64, 2026-09-28 (local; CI pending)",
+    evidence: "harness-sandbox tests/conformance_macos.rs + tests/conformance_fileop_macos.rs, macOS 26.5.1 (25F80) arm64, H2 cases 2026-09-28, fileop cases 2026-10-03 (local; CI pending)",
 }];
 
 /// The row for `backend` on `os`, if one is committed.
@@ -522,6 +563,28 @@ mod tests {
         let r = row(BackendKind::Seatbelt, "macos").unwrap();
         assert!(missing(r.cases, AIRLOCK_CASES).len() == 4);
         assert!(!r.cases.contains(&Case::Ft13P));
+    }
+
+    #[test]
+    fn fileop_cases_are_in_the_macos_row() {
+        // P-36d (§12): the five file-op cases are committed on the same
+        // row, with stable ids for the journal.
+        let r = row(BackendKind::Seatbelt, "macos").unwrap();
+        assert!(missing(r.cases, FILEOP_CASES).is_empty());
+        assert_eq!(FILEOP_CASES.len(), 5);
+        assert_eq!(Case::FileOpKernelView.id(), "fileop-kernel-view");
+        assert_eq!(Case::FileOpNoFork.id(), "fileop-no-fork");
+        assert_eq!(Case::FileOpFifo.id(), "fileop-fifo");
+        assert_eq!(Case::FileOpProtected.id(), "fileop-protected");
+        assert_eq!(Case::FileOpHardLink.id(), "fileop-hard-link");
+        // The ids are distinct from every other case id.
+        let mut ids: Vec<&str> = r.cases.iter().map(|c| c.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), r.cases.len());
+        // The evidence names the fileop suite and its date.
+        assert!(r.evidence.contains("tests/conformance_fileop_macos.rs"));
+        assert!(r.evidence.contains("2026-10-03"));
     }
 
     #[test]

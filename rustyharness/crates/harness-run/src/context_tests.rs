@@ -158,7 +158,7 @@ fn drive(
         kind: harness_policy::SessionKind::Coding,
     };
     let policy = UserPolicy::default();
-    let (session, tools) = plan(&spec, &reg, &policy, profile, false, false).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, profile, false, false, true).unwrap();
     let backend = Seen {
         profile: profile.clone(),
         inner: ScriptedBackend::new(profile.clone(), replies),

@@ -427,6 +427,7 @@ fn drive(s: Setup<'_>) -> Done {
         workspace_root: None,
         restore: Default::default(),
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: None,
         user: None,
         delegate: None,
     });
@@ -1063,6 +1064,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         workspace_root: None,
         restore: Default::default(),
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: None,
         user: None,
         delegate: None,
     });

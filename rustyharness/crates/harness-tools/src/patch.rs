@@ -54,8 +54,8 @@ use harness_policy::{workspace_path, Authorized, Call, WorkspacePath};
 use serde_json::Value;
 
 use crate::builtin::{
-    canonical_root, code, err, finish, ok, refused, resolve as resolve_path, Out, ResolveErr,
-    RootRefused,
+    canonical_root, code, err, finish, ok, refused, resolve as resolve_path, timeout, Out,
+    ResolveErr, RootRefused,
 };
 use crate::edit::{
     check_cap, check_new_parents, check_pre_image, create_parents, crlf_dominant, find_offsets,
@@ -1089,6 +1089,9 @@ fn edit_like_err(e: &EditError) -> Out {
             code::STALE_READ,
             "file changed since read; re-read first: call harness.fs.read on this path, then copy the section's context from the fresh text and repeat this call",
         ),
+        // A file call that ran past its per-call deadline ends in the
+        // timeout status (§7.5; the read path's `io_out` names the kind).
+        EditError::Io(e) if e.kind() == io::ErrorKind::TimedOut => timeout(),
         EditError::Io(_) => err(code::IO, "the file system refused the operation: check the path with harness.fs.list; if it keeps failing, leave the file and say so in the submit note"),
         other => err(
             code::IO,

@@ -666,6 +666,7 @@ pub fn fork_session(f: ForkSession<'_>) -> Result<SessionReport, RunRefused> {
         // The kept steps' repo maps are re-fed (P-33); the child's live
         // steps compute from the touched files, like any live run.
         repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
+        file_ops_stop: pre.file_ops_stop.clone(),
         // The forked session re-derives the instructions from the parent's
         // journal (P-30) and rewrites the identical `InstructionsLoaded`
         // record in its catch-up, before any recorded input.

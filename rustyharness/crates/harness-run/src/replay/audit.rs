@@ -645,6 +645,7 @@ fn audit_inner(
         // workspace, so the recorded payload stands and is written back
         // identically.
         repo_feed: RepoMapFeed::re_feed(rec.repo_maps, u64::MAX),
+        file_ops_stop: None,
         // The replay re-derives the instructions from the journal (P-30)
         // and rewrites the identical `InstructionsLoaded` record.
         instructions: recorded_instructions.as_ref(),

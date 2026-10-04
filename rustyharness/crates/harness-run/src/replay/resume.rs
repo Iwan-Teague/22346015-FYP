@@ -439,6 +439,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         // The kept steps' repo maps are re-fed (P-33); the live steps after
         // them compute from the touched files, like any live run.
         repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
+        // The catch-up re-feeds recorded results; no provider runs here.
+        file_ops_stop: None,
         instructions: None,
         user: None,
         // The catch-up re-feeds the completed delegate calls; a new intent
@@ -871,6 +873,9 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         // The kept steps' repo maps are re-fed (P-33); the live steps after
         // them compute from the touched files, like any live run.
         repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
+        // The helper's stop flag rides the live loop (the catch-up's own
+        // loop, above, re-feeds and never calls a provider).
+        file_ops_stop: pre.file_ops_stop.clone(),
         // The resumed session re-derives the instructions from the journal
         // (P-30) and rewrites the identical `InstructionsLoaded` record in
         // its catch-up, before any recorded input.

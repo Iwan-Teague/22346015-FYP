@@ -75,8 +75,8 @@ use harness_policy::{workspace_path, Authorized, Call, WorkspacePath};
 use serde_json::Value;
 
 use crate::builtin::{
-    canonical_root, code, err, finish, ok, refused, resolve as resolve_path, Out, ResolveErr,
-    RootRefused,
+    canonical_root, code, err, finish, ok, refused, resolve as resolve_path, timeout, Out,
+    ResolveErr, RootRefused,
 };
 use crate::file_ops::{FileOps, InProcess, Kind};
 use crate::protected::Protected;
@@ -1322,6 +1322,17 @@ impl EditTools {
         }
     }
 
+    /// The same tools over another [`FileOps`] implementation (P-36f): the
+    /// engine's root check already ran on construction; every later file
+    /// access goes through the implementation given here.
+    #[must_use]
+    pub fn with_file_ops(self, ops: Box<dyn FileOps>) -> Self {
+        Self {
+            ns: self.ns,
+            engine: self.engine.with_file_ops(ops),
+        }
+    }
+
     /// The canonical workspace root.
     pub fn root(&self) -> &Path {
         self.engine.root()
@@ -1704,6 +1715,9 @@ fn edit_err(e: &EditError) -> Out {
             code::UNVERIFIED,
             "the edit was written but the file does not hold the expected content: read the file with harness.fs.read to see what it holds now before any other edit",
         ),
+        // A file call that ran past its per-call deadline ends in the
+        // timeout status (§7.5; the read path's `io_out` names the kind).
+        EditError::Io(e) if e.kind() == io::ErrorKind::TimedOut => timeout(),
         EditError::Io(_) => err(code::IO, "the file system refused the operation: check the path with harness.fs.list; if it keeps failing, leave the file and say so in the submit note"),
         EditError::Unverified(_) => err(
             code::UNVERIFIED,
@@ -1924,6 +1938,29 @@ mod tests {
         assert_eq!(log.get("f"), Some(d));
         assert_eq!(log.check("f", d), Ok(()));
         assert_eq!(log.check("f", sha256(b"y")), Err(StaleRead::Changed));
+    }
+
+    // §7.5: a file call that ran past its per-call deadline ends in the
+    // timeout status, not the error status (P-36f: the confined helper's
+    // losses are otherwise ordinary results of the call).
+    #[test]
+    fn a_timed_out_file_call_ends_in_the_timeout_status() {
+        let out = edit_err(&EditError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the file helper passed its deadline",
+        )));
+        assert_eq!(out.status, crate::provider::ToolStatus::Timeout);
+        assert_eq!(out.text, "error: the per-call deadline passed");
+        let out = edit_err(&EditError::Io(io::Error::other("denied")));
+        assert_eq!(
+            out.status,
+            crate::provider::ToolStatus::Error { code: code::IO }
+        );
+        assert!(
+            out.text.contains("the file system refused the operation"),
+            "{}",
+            out.text
+        );
     }
 
     // --- P-16: the preview ---

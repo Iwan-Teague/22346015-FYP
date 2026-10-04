@@ -608,6 +608,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         workspace_root: Some(s.workspace.to_path_buf()),
         restore: Default::default(),
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: pre.file_ops_stop.clone(),
         instructions: s.instructions,
         user: Some(UserState {
             limits: s.config.turn,
@@ -805,6 +806,7 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         workspace_root: None,
         restore: Default::default(),
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: pre.file_ops_stop.clone(),
         instructions: None,
         user: Some(UserState {
             limits: s.config.turn,

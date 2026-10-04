@@ -324,6 +324,11 @@ pub enum RunRefused {
     /// upstream). Nothing ran.
     #[error("hosted profile refused: {0}")]
     Hosted(&'static str),
+    /// The confined file-op helper an execute-class run needs (P-36f,
+    /// INV-42) could not be started or did not pass its view check:
+    /// refused, never run with in-process file tools (§7.5). Nothing ran.
+    #[error("file-op helper refused: {0}")]
+    FileOps(String),
 }
 
 impl RunRefused {
@@ -508,6 +513,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         workspace_root: Some(r.workspace.to_path_buf()),
         restore: Default::default(),
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: pre.file_ops_stop.clone(),
         instructions: None,
         user: None,
         delegate: Some(delegate),

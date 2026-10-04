@@ -5,7 +5,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{atomic::AtomicBool, Arc};
+use std::time::{Duration, Instant};
 
 use harness_core::{sha256, RunId};
 use harness_journal::layout;
@@ -22,6 +23,8 @@ use harness_policy::{
 };
 use harness_sandbox::{Confinement, Conformed, PortsWitness};
 use harness_tools::builtin::{workspace_tree, WorkspaceFacts, WorkspaceTree};
+#[cfg(target_os = "macos")]
+use harness_tools::file_ops::{Confined, FileOps};
 use harness_tools::protected::{Protected, ProtectedError, DEFAULT_ASK};
 use harness_tools::{
     EditTools, ExecSpec, ExecTools, PatchTools, Pinned, ReadTools, TodoList, ToolProvider,
@@ -60,6 +63,12 @@ pub(crate) struct Prepared {
     /// [`DEFAULT_DENY`] plus the task's declared list, compiled. Empty for
     /// a research session (P-39i: no workspace, no protected paths).
     pub(crate) protected: Protected,
+    /// The confined file helper's stop flag (P-36f): set after the
+    /// helper's third loss of the attempt; the loop stops with
+    /// [`harness_core::StopCause::SandboxLost`]. `Some` for every coding
+    /// run (the flag is only ever set when a helper is in play), `None`
+    /// for a research session.
+    pub(crate) file_ops_stop: Option<Arc<AtomicBool>>,
 }
 
 impl Prepared {
@@ -190,6 +199,7 @@ pub(crate) fn prepare(
                 ports: None,
                 protected: Protected::new(&[])
                     .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+                file_ops_stop: None,
             })
         }
         SessionKind::Coding => {
@@ -249,13 +259,13 @@ pub(crate) fn prepare(
                 ))
             })?;
             locality::check(probe, state_str)?;
-            let tree = workspace_tree(workspace, Instant::now() + config.facts_timeout)
-                .map_err(RunRefused::Facts)?;
             // INV-6: the witness, last, before anything is written; no
             // confinement, or a refusal, refuses the run (there is no
             // unconfined fallback). A port grant (P-36g §6.1) probes the
             // same way, after the checks above, and keeps its own witness
-            // for the header.
+            // for the header. Both come before the facts: with an exec
+            // grant, the facts walk is the confined helper's tree op
+            // (P-36f), which needs the witness first.
             let mut witness: Option<Conformed> = None;
             let exec = match pinned {
                 None => None,
@@ -283,6 +293,53 @@ pub(crate) fn prepare(
                         .map_err(|e| RunRefused::Confinement(harness_sandbox::Refused(e)))?,
                 )
             };
+            // P-36f (INV-42): a run that may execute commands does its
+            // file work through the confined helper. The helper starts
+            // after the witness (it refuses to start without one) and
+            // serves every file tool; the opening facts are measured
+            // through its `tree` op. A helper that cannot start, or that
+            // fails its view check, refuses the run — there is no
+            // in-process fallback (§7.5). Without an exec grant the tools
+            // stay in process and the facts are measured as before.
+            let file_ops_stop = Arc::new(AtomicBool::new(false));
+            let (read_tools, edit_tools, patch_tools, tree) = {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some((_, w)) = exec.as_ref() {
+                        let read_write = spec.grants.iter().any(|g| g.starts_with("harness.edit."));
+                        let mut helper =
+                            start_file_ops(workspace, w, &spec.protected, read_write, &state_root)?;
+                        helper
+                            .ping(FILEOP_PROBE, Confined::PING_DEADLINE)
+                            .map_err(|e| {
+                                RunRefused::FileOps(format!("the helper's view check failed: {e}"))
+                            })?;
+                        let mut confined = Confined::new(
+                            ws.clone(),
+                            helper,
+                            config.tool_call_timeout,
+                            Arc::clone(&file_ops_stop),
+                        );
+                        let tree = confined
+                            .tree(config.facts_timeout)
+                            .map_err(RunRefused::Facts)?;
+                        let read_tools = read_tools.with_file_ops(confined.clone_box());
+                        let edit_tools = edit_tools.with_file_ops(confined.clone_box());
+                        let patch_tools = patch_tools.with_file_ops(confined.clone_box());
+                        (read_tools, edit_tools, patch_tools, tree)
+                    } else {
+                        let tree = workspace_tree(workspace, Instant::now() + config.facts_timeout)
+                            .map_err(RunRefused::Facts)?;
+                        (read_tools, edit_tools, patch_tools, tree)
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let tree = workspace_tree(workspace, Instant::now() + config.facts_timeout)
+                        .map_err(RunRefused::Facts)?;
+                    (read_tools, edit_tools, patch_tools, tree)
+                }
+            };
             Ok(Prepared {
                 session,
                 tools,
@@ -296,6 +353,7 @@ pub(crate) fn prepare(
                 ports,
                 protected: Protected::new(&spec.protected)
                     .map_err(|ProtectedError::Glob(m)| RunRefused::Protected(m))?,
+                file_ops_stop: Some(file_ops_stop),
             })
         }
     }
@@ -737,4 +795,72 @@ pub(crate) fn create_run(state_root: &Path) -> Result<(RunId, PathBuf), RunRefus
 /// `harness.task.todo` is granted, else none.
 pub(crate) fn todo_for(grants: &[String]) -> Option<TodoList> {
     grants.iter().any(|g| g == TODO_ID).then(TodoList::default)
+}
+
+// ---------------------------------------------------------------------------
+// The confined file-op helper (P-36f, §7).
+// ---------------------------------------------------------------------------
+
+/// Where the helper's view check probes outside the workspace (§7.1): the
+/// stub must refuse to read it, or the confinement is not what the profile
+/// says and the run is refused.
+#[cfg(target_os = "macos")]
+const FILEOP_PROBE: &str = "/etc/hosts";
+
+/// The stub process's outer wall. One request is bounded by the run's own
+/// tool-call timeout (handed to the helper with every call); this is the
+/// bound the profile itself carries, as the conformance suite's does.
+#[cfg(target_os = "macos")]
+const FILEOP_WALL: Duration = Duration::from_secs(60);
+
+/// How long a lost stub may lie around before the sandbox's reaper
+/// collects it (the conformance suite's sweep, P-36d).
+#[cfg(target_os = "macos")]
+const FILEOP_SWEEP: Duration = Duration::from_secs(3);
+
+/// Build and start the confined file-op helper for one run (P-36f, §7.1):
+/// the stub interpreter, fork-less, under a file-op profile that sees the
+/// workspace read-write with an edit grant and read-only without, the
+/// task's literal protected paths denied, no network. `private_root` is
+/// the canonical state root — outside the workspace (checked above), so
+/// the helper's private directory never becomes workspace content.
+#[cfg(target_os = "macos")]
+fn start_file_ops(
+    workspace: &Path,
+    witness: &Conformed,
+    protected: &[String],
+    read_write: bool,
+    private_root: &Path,
+) -> Result<harness_sandbox::fileop::FileOpHelper, RunRefused> {
+    use std::ffi::OsString;
+
+    use harness_sandbox::fileop::FileOpHelper;
+    use harness_sandbox::{ConfinedSpec, Limits, Network};
+
+    let ws = workspace.to_path_buf();
+    // Only literal paths reach the helper's profile: a glob keeps its
+    // enforcement in the tools' own protected check (which these tools
+    // carry regardless of the `FileOps` behind them), and a stub that took
+    // a pattern for a literal name would deny the wrong thing.
+    let protected = protected
+        .iter()
+        .filter(|p| !p.contains(['*', '?', '[', ']', '{', '}']))
+        .map(|p| ws.join(p))
+        .collect();
+    let spec = ConfinedSpec {
+        argv: vec![OsString::from("/usr/bin/perl")],
+        cwd: ws.clone(),
+        env: Vec::new(),
+        read_only: if read_write {
+            Vec::new()
+        } else {
+            vec![ws.clone()]
+        },
+        read_write: if read_write { vec![ws] } else { Vec::new() },
+        protected,
+        network: Network::None,
+        limits: Limits::wall(FILEOP_WALL),
+    };
+    FileOpHelper::start(&spec, witness, None, private_root, FILEOP_SWEEP)
+        .map_err(|e| RunRefused::FileOps(format!("the file-op helper could not start: {e}")))
 }

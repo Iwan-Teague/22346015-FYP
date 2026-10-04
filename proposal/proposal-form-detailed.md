@@ -1,15 +1,14 @@
-# FYP Proposal Form — detailed version (written as a plan; nothing here assumes work already done)
+# FYP Proposal Form — detailed version
 
 | Field | Entry |
 |---|---|
 | Name | Iwan Teague |
 | Student ID | 22346015 |
 | Course | LM051 Computer Systems |
-| Supervisor Name | Jim Buckley |
+| Supervisor Name | Dr Jim Buckley |
 
 ## Project Title (initial or working title)
 
-Option A or B:
 - A. *Benchmarking Local Large Language Models on Rust Code Generation: Capability, Failure Modes and Hardware Throughput*
 - B. *Where Local LLMs Fail at Rust: Measuring Capability, Failure Modes and Throughput on Consumer Hardware*
 
@@ -94,13 +93,15 @@ Build and use a benchmark that answers these three questions for local models, a
 - The OS, hardware, model file, quantisation, context size and harness version are captured automatically for every run.
 
 #### 5.6b Power and energy (RQ2)
-For a home user, electricity and heat matter as much as speed, so every run also records how much energy the machine used.
-- **Primary method: whole-machine wall power.** A plug-in power meter or smart plug (a low-cost device, logging watts at least once a second) measures the whole system, the same way on the MacBook and on the Linux PC. This is directly comparable across machines, and includes the CPU, GPU, memory and fan power that a home user pays for. The meter's readings are timestamped and aligned with the run journal.
-- **Cross-check: software counters where available.** NVIDIA GPU power through `nvidia-smi` on the Linux PC; CPU package power through Intel/AMD RAPL counters on Linux; `powermetrics` on the Mac if administrator access is granted. These give a per-component breakdown but are not comparable across machines, so they support the wall-power figure and never replace it.
-- **Baseline:** each session begins with an idle measurement, and the idle draw is reported so that "extra energy for this task" can be separated from what the machine uses anyway.
-- **Metrics (defined in advance):** energy per task in watt-hours; **energy per correct task**; correct tasks per kilowatt-hour; average and peak watts; joules per generated token; energy split between prefill (reading the prompt) and generation; and estimated electricity cost at a stated tariff. Agent mode is compared with single-answer mode on energy as well as accuracy, since a loop that takes many steps may cost far more energy for a small gain.
-- **Scope:** power is measured for all four models on both machines where the meter is available. If a machine lacks a usable meter, its energy results are reported as estimates from software counters and labelled as such.
-- **Limitations stated up front:** wall meters include the rest of the machine (display, background tasks), which is controlled by fixed display and background settings; battery-powered runs on the MacBook are excluded (mains only), and the meter's accuracy is checked against a known load.
+For a home user, electricity and heat matter as much as speed, so every run records how much energy the agent used. The measurement is built into Rustybenchmark and rustyharness and runs automatically on every run; nobody reads a meter by hand.
+- **Primary method: software energy counters, read by the code.** The harness samples the counters at the start and end of each run, and at a fixed interval in between, and writes the readings into the run journal with timestamps. On the Linux PC: GPU energy from the NVIDIA management library (NVML, joules since boot, read as a before-and-after delta) and CPU package energy from the RAPL counters in `/sys/class/powercap`. On the Mac: `powermetrics` (CPU, GPU and Neural Engine power) and per-process counters from the operating system where they exist. All readers are written in Rust.
+- **Only the agent is counted.** Energy is counted from the start of the agent run to the moment the model calls submit. Grading (rebuilding in a clean directory, running hidden tests, Miri) starts only at submit and is excluded, so the figure is the energy the agent used to produce its answer, not the cost of checking it.
+- **Attributed to the agent, not the machine.** The model server (llama.cpp) and the tool processes the harness starts (`cargo build`, `test`, `clippy`) are tracked separately by process or cgroup, so other work on the computer is not counted. GPU energy is taken directly while llama.cpp is the only process using the GPU; CPU energy is the package counter apportioned by each process's share of CPU time. This also splits each run into model energy and tool energy, which RQ4 uses to compare agent mode with a single answer.
+- **Baseline:** each session begins with an idle measurement, and the idle draw is reported so that "extra energy for this task" can be separated from what the machine uses anyway. A run is flagged if other heavy processes were seen during it.
+- **Validation: a wall power meter.** A plug-in power meter or smart plug (a low-cost device I will buy myself) measures the whole machine on a sample of runs and on known loads. This checks the software figures and puts an error bar on them. The meter does not supply the headline number.
+- **Metrics (defined in advance):** energy per task in watt-hours; **energy per correct task**; correct tasks per kilowatt-hour; average and peak watts; joules per generated token; energy split between prefill (reading the prompt) and generation, and between model and tool processes; and estimated electricity cost at a stated tariff. Agent mode is compared with single-answer mode on energy as well as accuracy, since a loop that takes many steps may cost far more energy for a small gain.
+- **Scope:** software energy is recorded for all four models on both machines. If a counter is unavailable on a machine, the run records which one and the result is labelled as an estimate.
+- **Limitations stated up front:** software counters are estimates; CPU attribution by time share is a model, not a measurement. Package counters omit parts of the system such as fans, the power supply and the display. The Mac and Linux counters are different instruments, so cross-machine energy comparisons carry the meter's error bar, and battery-powered Mac runs are excluded (mains only).
 
 #### 5.7 Failure classification (RQ1)
 - Compiler errors classified into borrow-check, lifetime, trait, type, syntax, name resolution and idiom, using error codes and message patterns (codes alone are ambiguous for about a third of errors).
@@ -110,7 +111,7 @@ For a home user, electricity and heat matter as much as speed, so every run also
 
 #### 5.8 Models and machines
 - At least four open-weight models spanning sizes (for example roughly 4B, 8B, 14B and 30B parameters, at least one code-specialised), run locally with llama.cpp on quantised weights.
-- At least two machines: an Apple M5 MacBook (macOS) and a Linux PC with an NVIDIA RTX 3070. I will also ask CSIS whether a GPU machine can be provided, to widen the hardware comparison.
+- At least two machines: an Apple M5 MacBook (macOS) and a Linux PC with an NVIDIA RTX 3070 Ti. I will also ask CSIS whether a mid-range GPU machine can be provided, to widen the hardware comparison. The project targets consumer and hobbyist hardware, so top-end hardware is not needed.
 
 #### 5.9 Statistics and testing the benchmark (RQ3, RQ4)
 - **Sample size:** at least 100 generated tasks per model per machine for the headline Level 1 results, spread over skill areas, with several seeds per family.
@@ -150,7 +151,7 @@ A trustworthy, contamination-resistant Rust benchmark with published methodology
 | Field | Entry |
 |---|---|
 | Supervisor Signature | |
-| Supervisor Name | Jim Buckley |
+| Supervisor Name | Dr Jim Buckley |
 | Date (dd/mm/yyyy) | |
 
 ## Environment Required
@@ -159,8 +160,8 @@ A trustworthy, contamination-resistant Rust benchmark with published methodology
 |---|---|
 | Operating system | Mac (macOS) and Linux |
 | Languages | Rust throughout: benchmark, agent harness and data analysis |
-| Specialist software / hardware | Open-weight LLMs served locally with llama.cpp; the Rust toolchain (rustc, cargo, clippy, Miri). Hardware: my own machines (below) for certain. I will also ask CSIS whether a GPU machine can be made available, to widen the hardware comparison, and will use any other hardware I can get access to. A plug-in mains power meter or smart plug (a low-cost item I will buy myself) to measure energy use; administrator access on my own machines for power counters |
-| Your computer | Yes. Apple M5 MacBook, portable. Plus my own Linux PC with an NVIDIA RTX 3070 (not portable) for GPU runs |
+| Specialist software / hardware | Open-weight LLMs served locally with llama.cpp; the Rust toolchain (rustc, cargo, clippy, Miri). Hardware: my own machines (below) for certain. I will also ask CSIS whether a mid-range GPU machine (consumer and hobbyist class, not top end) can be made available, to widen the hardware comparison, and will use any other hardware I can get access to. A plug-in mains power meter or smart plug (a low-cost item I will buy myself) to check the software energy readings; administrator access on my own machines for the power counters |
+| Your computer | Yes. Apple M5 MacBook, portable. Plus my own Linux PC with an NVIDIA RTX 3070 Ti (not portable) for GPU runs |
 
 ## Declarations
 

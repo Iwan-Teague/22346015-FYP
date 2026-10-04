@@ -31,8 +31,8 @@ use harness_model::scripted::ScriptedBackend;
 use harness_model::{Completion, ModelError};
 use harness_policy::UserPolicy;
 use harness_run::{
-    audit_session, run_session, ApprovalAnswer, Approver, ApproverKind, Audit, InputEnd,
-    SessionConfig, SessionReport, SessionRun, UserInput, UserInputEvent, UserMessage,
+    audit_session, run_session, ApprovalAnswer, Approver, ApproverKind, Audit, ChildAudit,
+    InputEnd, SessionConfig, SessionReport, SessionRun, UserInput, UserInputEvent, UserMessage,
 };
 use harness_testkit::{act, assert_session_audit_clean, registry, say, Fixture, Local};
 use serde_json::Value;
@@ -216,6 +216,7 @@ fn audit(fx: &Fixture, r: &SessionReport, anchor: Option<Digest>) -> harness_run
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &session_limits(),
+            children: ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     )

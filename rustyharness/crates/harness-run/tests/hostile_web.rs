@@ -986,6 +986,7 @@ fn hostile_web_note_poisoning() {
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &limits,
+            children: harness_run::ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     )

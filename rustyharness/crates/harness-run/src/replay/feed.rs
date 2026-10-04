@@ -7,7 +7,8 @@ use harness_core::{Nonce, RunId};
 use harness_journal::{BlobSource, EventKind, Record, Verified};
 use harness_model::profile::Profile;
 use harness_model::replay::{payload_bytes, ReplayBackend};
-use harness_policy::{SUBMIT_ID, TODO_ID};
+use harness_policy::{DELEGATE_ID, SUBMIT_ID, TODO_ID};
+use harness_tools::builtin::code::{DELEGATE_NOT_STARTED, DELEGATE_NO_REPORT, DELEGATE_REFUSED};
 use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::{RefusalKind, ToolStatus};
 use serde_json::{Map, Value};
@@ -54,6 +55,45 @@ pub(crate) struct RecordedFork {
     pub(crate) parent_run: RunId,
     pub(crate) parent_step: u64,
     pub(crate) parent_chain_head: Digest,
+}
+
+/// What a delegate `ToolFinished` recorded about its child (P-38f). The
+/// replay recomputes the admission, the carve and the parent link; what
+/// only the child's run knows is re-fed from here and re-written into the
+/// `ChildRun` record it came from.
+#[derive(Debug, Clone)]
+pub(crate) enum RecordedChild {
+    /// A child started: its `ChildRun` record is re-written from these
+    /// re-fed fields and the recomputed ones.
+    Started(Box<StartedChild>),
+    /// The child never started: a `provider_error` result with
+    /// `DELEGATE_NOT_STARTED`. `stopped`: the recorded run stopped right
+    /// after (`journal_unavailable`), so the replay reproduces the stop.
+    NotStarted { stopped: bool },
+    /// The call was refused before any child: an `error` result with
+    /// `DELEGATE_REFUSED`. The refusal text is recomputed, never re-fed
+    /// (a tampered text diverges at the record comparison).
+    Refused,
+}
+
+/// The re-fed fields of a started child's `ChildRun` (P-38f): the child's
+/// identity and outcome (only its own journal knows them) and the spend
+/// the parent's meter absorbs. The brief, the template, the grants and the
+/// carve limits are recomputed and compared, so they are not carried.
+#[derive(Debug, Clone)]
+pub(crate) struct StartedChild {
+    pub(crate) child: RunId,
+    pub(crate) chain_head: Digest,
+    pub(crate) stop: String,
+    pub(crate) result: Option<Digest>,
+    /// The parent's wall time when it handed off (before the pause): the
+    /// replay recomputes the carve's wall from it.
+    pub(crate) wall_used_ms: u64,
+    pub(crate) spend_steps: u32,
+    pub(crate) tokens_in: u64,
+    pub(crate) tokens_out: u64,
+    pub(crate) estimated: bool,
+    pub(crate) spend_wall_ms: u64,
 }
 
 /// A recorded approval answer, in exactly the shape the loop writes: the
@@ -212,6 +252,13 @@ pub(crate) fn recorded(
         .first()
         .and_then(|h| h.body.get("mode").and_then(Value::as_str))
         == Some("session");
+    // A child journal (P-38) holds no delegations of its own: a `ChildRun`
+    // there is a shape no loop writes.
+    let child_mode = v
+        .records
+        .first()
+        .and_then(|h| h.body.get("mode").and_then(Value::as_str))
+        == Some("child");
     let mut nonces = BTreeMap::new();
     let mut feed = VecDeque::new();
     let mut approvals = VecDeque::new();
@@ -219,17 +266,21 @@ pub(crate) fn recorded(
     let mut inputs = VecDeque::new();
     let mut repo_maps = BTreeMap::new();
     let mut fork: Option<RecordedFork> = None;
-    // The last `UserTurn`'s wall time: a later one's cannot be smaller
-    // (P-17 §6) — the clock only moves forward, and an audit re-feeds this
-    // rather than recomputing it, so the order is checked here.
-    let mut last_turn_wall: Option<u64> = None;
+    // The last `UserTurn`'s or `ChildRun`'s wall time: a later one's cannot
+    // be smaller (P-17 §6; P-38f) — the clock only moves forward, and an
+    // audit re-feeds these rather than recomputing them, so the order is
+    // checked here.
+    let mut last_clock_wall: Option<u64> = None;
     let mut intents: BTreeMap<u64, String> = BTreeMap::new();
     // `EditApplied` records waiting for their `ToolFinished` (H2b), by the
     // intent they answer, with each record's own seq: several since P-25
     // (a patch touches several files, a move two), in journal order.
     let mut edits: BTreeMap<u64, Vec<(u64, RecordedEdit)>> = BTreeMap::new();
+    // A delegate intent's `ChildRun`, by the intent it answers (P-38f):
+    // consumed by the step's own `ToolFinished`.
+    let mut children: BTreeMap<u64, (u64, StartedChild)> = BTreeMap::new();
     let last_seq = v.records.last().map_or(0, |r| r.seq);
-    for r in &v.records {
+    for (i, r) in v.records.iter().enumerate() {
         let bad = || diverge(r.seq, r.step, "a record is not the shape the loop writes");
         match r.kind {
             // The nonce drawn for the observation a request showed first
@@ -385,6 +436,84 @@ pub(crate) fn recorded(
                 } else {
                     (Vec::new(), false, harness_core::sha256(b""))
                 };
+                // A delegate's result (P-38f): no edits (checked above), no
+                // read digest, no command, no sample — the loop writes none
+                // of them. What it does write is the child's state: a
+                // started child (its `ChildRun` already parsed), a refusal
+                // (recomputed at the replay, never re-fed), or a child that
+                // never started.
+                if cap == DELEGATE_ID {
+                    if r.body.contains_key("read_sha256")
+                        || r.body.contains_key("exec")
+                        || r.body.contains_key("workspace_tree")
+                        || r.body.contains_key("environment")
+                    {
+                        return Err(bad());
+                    }
+                    let child = match children.remove(&seq) {
+                        Some((at, st)) => {
+                            // The report framing decides the status: an ok
+                            // result carries the report's digest, a
+                            // no-report error carries none.
+                            let fits = matches!(
+                                (st.result.as_ref(), status),
+                                (Some(_), Some(ToolStatus::Ok))
+                                    | (
+                                        None,
+                                        Some(ToolStatus::Error {
+                                            code: DELEGATE_NO_REPORT,
+                                        })
+                                    )
+                            );
+                            if !fits {
+                                return Err(diverge(
+                                    at,
+                                    r.step,
+                                    "a delegate result does not match its child record",
+                                ));
+                            }
+                            RecordedChild::Started(Box::new(st))
+                        }
+                        None => match status {
+                            Some(ToolStatus::Error {
+                                code: DELEGATE_REFUSED,
+                            }) => RecordedChild::Refused,
+                            None => {
+                                if r.body.get("code").and_then(Value::as_u64)
+                                    != Some(u64::from(DELEGATE_NOT_STARTED))
+                                {
+                                    return Err(bad());
+                                }
+                                // The loop writes `journal_unavailable` and
+                                // stops right after when it cannot read the
+                                // child back; any other `provider_error`
+                                // keep going.
+                                let stopped = matches!(
+                                    v.records.get(i + 1),
+                                    Some(n)
+                                        if n.kind == EventKind::RunStopped
+                                            && n.body.get("cause").and_then(Value::as_str)
+                                                == Some("journal_unavailable")
+                                );
+                                RecordedChild::NotStarted { stopped }
+                            }
+                            _ => return Err(bad()),
+                        },
+                    };
+                    feed.push_back(RecordedResult {
+                        capability: cap,
+                        status,
+                        output,
+                        truncated,
+                        digest,
+                        read_sha256: None,
+                        environment: None,
+                        edits: Vec::new(),
+                        exec: None,
+                        child: Some(child),
+                    });
+                    continue;
+                }
                 // §7.1: exactly the timeout, crashed and provider-failure
                 // (None) results carry a sample, in exactly the shape the
                 // loop writes; only an ok read carries a read digest.
@@ -426,6 +555,7 @@ pub(crate) fn recorded(
                     environment,
                     edits: edit.into_iter().map(|(_, e)| e).collect(),
                     exec,
+                    child: None,
                 });
             }
             EventKind::ApprovalGranted | EventKind::ApprovalDenied | EventKind::ApprovalExpired => {
@@ -545,14 +675,14 @@ pub(crate) fn recorded(
                 ) else {
                     return Err(bad());
                 };
-                if last_turn_wall.is_some_and(|prev| wall_used_ms < prev) {
+                if last_clock_wall.is_some_and(|prev| wall_used_ms < prev) {
                     return Err(diverge(
                         r.seq,
                         r.step,
                         "a user turn's wall time is before the last one's",
                     ));
                 }
-                last_turn_wall = Some(wall_used_ms);
+                last_clock_wall = Some(wall_used_ms);
                 let facts = WorkspaceFacts {
                     tree: digest_at(&r.body, "workspace_tree").ok_or_else(bad)?,
                     files,
@@ -655,6 +785,146 @@ pub(crate) fn recorded(
                     parent_chain_head,
                 });
             }
+            // A delegation's record (P-38f), in exactly the shape the loop
+            // writes: ten fields plus `result` when the child reported.
+            // Everything the parent recomputes (the brief, the template, the
+            // grants, the carve) is shape-checked here and re-derived at the
+            // replay; what only the child's run knows (its identity, its
+            // chain head, its stop, its spend) is re-fed. Never in a child
+            // journal: a child runs with no delegate context.
+            EventKind::ChildRun => {
+                if child_mode {
+                    return Err(diverge(
+                        r.seq,
+                        r.step,
+                        "a child journal holds no delegation records",
+                    ));
+                }
+                let required = [
+                    "intent_seq",
+                    "child",
+                    "stop",
+                    "brief",
+                    "template",
+                    "grants",
+                    "limits",
+                    "wall_used_ms",
+                    "spent",
+                    "chain_head",
+                ];
+                let extra = r.body.len() == required.len() + 1 && r.body.contains_key("result");
+                if (r.body.len() != required.len() && !extra)
+                    || !required.iter().all(|k| r.body.contains_key(*k))
+                {
+                    return Err(bad());
+                }
+                let intent_seq = r
+                    .body
+                    .get("intent_seq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(bad)?;
+                // The record answers a delegate intent that has no result
+                // yet; anything else is a shape the loop does not write.
+                if intents.get(&intent_seq).map(String::as_str) != Some(DELEGATE_ID)
+                    || children.contains_key(&intent_seq)
+                {
+                    return Err(bad());
+                }
+                let child = r
+                    .body
+                    .get("child")
+                    .and_then(Value::as_str)
+                    .and_then(RunId::parse)
+                    .ok_or_else(bad)?;
+                let stop = r
+                    .body
+                    .get("stop")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(bad)?
+                    .to_owned();
+                // The brief, the template and the grants are recomputed at
+                // the replay and compared by the record comparison; here it
+                // only has to be the shape the loop writes (digests, a
+                // non-empty list of ids).
+                digest_at(&r.body, "brief").ok_or_else(bad)?;
+                digest_at(&r.body, "template").ok_or_else(bad)?;
+                let chain_head = digest_at(&r.body, "chain_head").ok_or_else(bad)?;
+                let result = match r.body.get("result") {
+                    None => None,
+                    Some(_) => Some(digest_at(&r.body, "result").ok_or_else(bad)?),
+                };
+                // The grants are a non-empty list of capability ids, and the
+                // limits and spend objects name exactly the fields the loop
+                // writes.
+                let list = |k: &str| -> Option<Vec<String>> {
+                    let l = r.body.get(k)?.as_array()?;
+                    l.iter().map(|v| v.as_str().map(str::to_owned)).collect()
+                };
+                let grants = list("grants").ok_or_else(bad)?;
+                if grants.is_empty() {
+                    return Err(bad());
+                }
+                let obj = |k: &str| r.body.get(k)?.as_object().cloned();
+                let n = |o: &Map<String, Value>, k: &str| o.get(k).and_then(Value::as_u64);
+                let limits = obj("limits").ok_or_else(bad)?;
+                if limits.len() != 3 {
+                    return Err(bad());
+                }
+                if n(&limits, "wall_ms").is_none()
+                    || n(&limits, "steps").is_none()
+                    || n(&limits, "tokens").is_none()
+                {
+                    return Err(bad());
+                }
+                let spend = obj("spent").ok_or_else(bad)?;
+                if spend.len() != 5 {
+                    return Err(bad());
+                }
+                let Some(spend_steps) = n(&spend, "steps").and_then(|s| u32::try_from(s).ok())
+                else {
+                    return Err(bad());
+                };
+                let (Some(tokens_in), Some(tokens_out), Some(estimated)) = (
+                    n(&spend, "tokens_in"),
+                    n(&spend, "tokens_out"),
+                    spend.get("estimated").and_then(Value::as_bool),
+                ) else {
+                    return Err(bad());
+                };
+                let spend_wall_ms = n(&spend, "wall_ms").ok_or_else(bad)?;
+                let wall_used_ms = r
+                    .body
+                    .get("wall_used_ms")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(bad)?;
+                if last_clock_wall.is_some_and(|prev| wall_used_ms < prev) {
+                    return Err(diverge(
+                        r.seq,
+                        r.step,
+                        "a delegation's wall time is before the last one's",
+                    ));
+                }
+                last_clock_wall = Some(wall_used_ms);
+                children.insert(
+                    intent_seq,
+                    (
+                        r.seq,
+                        StartedChild {
+                            child,
+                            chain_head,
+                            stop,
+                            result,
+                            wall_used_ms,
+                            spend_steps,
+                            tokens_in,
+                            tokens_out,
+                            estimated,
+                            spend_wall_ms,
+                        },
+                    ),
+                );
+            }
             // A record no slice owns yet is not a shape this loop writes
             // (P-17 §6). The background-process kinds are owned from P-36h
             // (canon, the record shapes), but nothing writes them until
@@ -662,7 +932,6 @@ pub(crate) fn recorded(
             // refused like the other reserved names.
             EventKind::ModeChanged
             | EventKind::InstructionsLoaded
-            | EventKind::ChildRun
             | EventKind::BgStopped
             | EventKind::OrphanCheck => return Err(bad()),
             _ => {}
@@ -695,8 +964,40 @@ pub(crate) fn recorded(
                 environment: None,
                 edits: vec![e],
                 exec: None,
+                child: None,
             });
         }
+    }
+    // A delegation whose `ChildRun` is the journal's very last record is a
+    // crash between the two writes (P-38f): the `ChildRun` itself belongs to
+    // the kept prefix an audit must reproduce, so the pending child re-feeds
+    // as the result its record implies — the replay writes the same
+    // `ChildRun` again and then a result the comparison never reaches (the
+    // journal ends). A child left pending any earlier is a shape the loop
+    // does not write.
+    for (_, (at, st)) in children {
+        if at != last_seq {
+            return Err(diverge(at, 0, "a record is not the shape the loop writes"));
+        }
+        let status = if st.result.is_some() {
+            ToolStatus::Ok
+        } else {
+            ToolStatus::Error {
+                code: DELEGATE_NO_REPORT,
+            }
+        };
+        feed.push_back(RecordedResult {
+            capability: DELEGATE_ID.to_owned(),
+            status: Some(status),
+            output: Vec::new(),
+            truncated: false,
+            digest: harness_core::sha256(b""),
+            read_sha256: None,
+            environment: None,
+            edits: vec![],
+            exec: None,
+            child: Some(RecordedChild::Started(Box::new(st))),
+        });
     }
     Ok(Recorded {
         backend,

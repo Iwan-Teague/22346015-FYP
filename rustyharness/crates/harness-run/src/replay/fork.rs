@@ -399,6 +399,8 @@ pub fn fork_session(f: ForkSession<'_>) -> Result<SessionReport, RunRefused> {
             Some(&f.config.turn),
             ports_header.as_ref(),
             recorded_instructions.as_ref(),
+            None,
+            None,
         ),
     )
     .map_err(|d| not_resumable(d.why))?;

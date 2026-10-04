@@ -315,6 +315,7 @@ fn chat_live(protocol: &str) {
             policy: &policy(&fx),
             profile: &Profile::parse(&std::fs::read(&fx.profile).unwrap()).unwrap(),
             limits: &session_limits,
+            children: harness_run::ChildAudit::Skip,
         },
         &config.turn,
     )

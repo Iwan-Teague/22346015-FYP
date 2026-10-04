@@ -714,7 +714,7 @@ fn platform_probe() -> Result<Conformed, Unavailable> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_probe() -> Result<Conformed, Unavailable> {
-    linux::Linux.probe()
+    linux::Linux::default().probe()
 }
 
 /// Where a run gets its confinement (H2d): [`require`] and the platform
@@ -780,7 +780,7 @@ impl Confinement for SystemConfinement {
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            linux::Linux.spawn(spec, ev)
+            linux::Linux::default().spawn(spec, ev)
         }
     }
 
@@ -800,7 +800,7 @@ impl Confinement for SystemConfinement {
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            linux::Linux.spawn_live(spec, ev, live)
+            linux::Linux::default().spawn_live(spec, ev, live)
         }
     }
 

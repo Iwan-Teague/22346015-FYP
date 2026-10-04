@@ -258,6 +258,16 @@ pub(crate) fn frame_report(
     (text, cut > 0)
 }
 
+/// The delegate tool's result when the child stopped without submitting
+/// (design §6.2): a fixed text naming the run, its stop cause and the step
+/// count. Shared with the replay, which rewrites the same bytes.
+pub(crate) fn no_report_text(run: &RunId, stop: &str, steps: u64, limit: u32) -> String {
+    format!(
+        "The helper (run {run}) stopped without a report: {stop}, after {steps} of {limit} steps. \
+         Its work is not available; do it yourself or ask a narrower question."
+    )
+}
+
 /// What the delegating side holds once, so every child of a run is built
 /// the same way (design §2.1). Built by the run's driver (or a session's);
 /// the loop's `delegate` branch reads it for admission and construction.
@@ -605,7 +615,10 @@ pub(crate) fn run_child(
 /// The child's submitted note, read back from its journal: the payload of
 /// the `SubmitRequested` record's `note` field, inline or in the blob
 /// store. `None` when the child never submitted.
-fn submitted_note(run_dir: &std::path::Path, attempt: u32) -> Result<Option<String>, ChildRefused> {
+pub(crate) fn submitted_note(
+    run_dir: &std::path::Path,
+    attempt: u32,
+) -> Result<Option<String>, ChildRefused> {
     let dir = layout::attempt_dir(run_dir, attempt);
     let v = JournalReader::open(&dir).map_err(ChildRefused::ReadBack)?;
     let Some(rec) = v
@@ -1137,6 +1150,7 @@ mod tests {
             policy: &policy,
             profile: &s.profile,
             limits: &limits,
+            children: crate::replay::ChildAudit::Skip,
         })
         .unwrap();
         let d = report

@@ -183,6 +183,7 @@ fn hosted_declared_header_recorded_and_audited() {
         policy: &UserPolicy::default(),
         profile: &profile,
         limits: &cfg.limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap();
     assert!(a.divergence.is_none(), "{:?}", a.divergence);
@@ -203,6 +204,7 @@ fn hosted_declared_header_recorded_and_audited() {
             policy: &UserPolicy::default(),
             profile: &profile,
             limits: &cfg.limits,
+            children: harness_run::ChildAudit::Skip,
         }
     })
     .unwrap();

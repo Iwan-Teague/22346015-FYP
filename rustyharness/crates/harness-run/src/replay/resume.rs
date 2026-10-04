@@ -200,6 +200,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             None,
             ports_header.as_ref(),
             None,
+            None,
+            None,
         ),
     )
     .map_err(|d| not_resumable(d.why))?;
@@ -359,6 +361,32 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             RecordedApproval::AllowSession { .. } | RecordedApproval::DenySession { .. }
         )
     });
+    // P-38f: a resumed run can delegate again. The catch-up re-feeds the
+    // completed delegate calls (a child is never resumed); the trailing
+    // intent, if any, is re-decided live and starts a new child, linked to
+    // this attempt. Without a workspace a child has nothing to read; the
+    // path is a stand-in that never serves a real delegation.
+    let child_workspace = r
+        .workspace
+        .map_or_else(|| run_dir.join("workspace"), std::path::Path::to_path_buf);
+    let delegate = crate::delegate::ChildCtx {
+        state_root: r.state_root,
+        workspace: child_workspace.as_path(),
+        parent_spec: r.spec,
+        registry: r.registry,
+        policy: r.policy,
+        profile: r.profile,
+        backend: r.backend,
+        probe: r.probe,
+        env: r.env,
+        approver: r.approver,
+        parent_run: r.run.clone(),
+        parent_attempt: attempt,
+        live: true,
+        admitted: 0,
+        facts: start,
+        timeouts: r.config,
+    };
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: r.registry,
@@ -413,8 +441,9 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
         instructions: None,
         user: None,
-        // A resumed run cannot delegate yet (P-38f rebuilds the context).
-        delegate: None,
+        // The catch-up re-feeds the completed delegate calls; a new intent
+        // delegates into a new child linked to this attempt (P-38f).
+        delegate: Some(delegate),
     });
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);
@@ -574,6 +603,8 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             Some(&r.config.turn),
             ports_header.as_ref(),
             recorded_instructions.as_ref(),
+            None,
+            None,
         ),
     )
     .map_err(|d| not_resumable(d.why))?;
@@ -761,6 +792,32 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             RecordedApproval::AllowSession { .. } | RecordedApproval::DenySession { .. }
         )
     });
+    // P-38f: a resumed session can delegate again. The catch-up re-feeds
+    // the completed delegate calls (a child is never resumed); the trailing
+    // intent, if any, is re-decided live and starts a new child, linked to
+    // this attempt. Without a workspace a child has nothing to read; the
+    // path is a stand-in that never serves a real delegation.
+    let child_workspace = r
+        .workspace
+        .map_or_else(|| run_dir.join("workspace"), std::path::Path::to_path_buf);
+    let delegate = crate::delegate::ChildCtx {
+        state_root: r.state_root,
+        workspace: child_workspace.as_path(),
+        parent_spec: r.spec,
+        registry: r.registry,
+        policy: r.policy,
+        profile: r.profile,
+        backend: r.backend,
+        probe: r.probe,
+        env: r.env,
+        approver: r.approver,
+        parent_run: r.run.clone(),
+        parent_attempt: attempt,
+        live: true,
+        admitted: 0,
+        facts: start,
+        timeouts: &r.config.run,
+    };
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: r.registry,
@@ -834,8 +891,9 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             blobs: layout::attempt_dir(&run_dir, attempt).join(layout::BLOBS_DIR),
             sink: r.sink,
         }),
-        // A resumed session cannot delegate yet (P-38f rebuilds it).
-        delegate: None,
+        // The catch-up re-feeds the completed delegate calls; a new intent
+        // delegates into a new child linked to this attempt (P-38f).
+        delegate: Some(delegate),
     });
     let end = lp.drive_session(
         &mut w,

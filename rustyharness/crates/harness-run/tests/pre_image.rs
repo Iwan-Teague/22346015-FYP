@@ -216,6 +216,7 @@ fn blob_tamper_detected_by_audit() {
         policy: &allow_edits(),
         profile: &Profile::conservative_default("m"),
         limits: &RunConfig::defaults(1_000_000).limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap();
     assert_eq!(

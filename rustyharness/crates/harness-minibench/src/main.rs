@@ -782,6 +782,7 @@ fn audit_run(
         policy,
         profile,
         limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .map_err(|e| format!("the audit did not start: {e}"))?;
     if let Some(d) = &a.divergence {

@@ -85,6 +85,7 @@ fn audit_with(
         policy,
         profile: &Profile::conservative_default("m"),
         limits: &limits(),
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }
@@ -266,6 +267,7 @@ fn inv_20_an_anchor_catches_a_replaced_journal() {
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &limits(),
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap()
     };
@@ -353,6 +355,7 @@ fn audit_given(
         policy: &UserPolicy::default(),
         profile: &Profile::conservative_default("m"),
         limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }

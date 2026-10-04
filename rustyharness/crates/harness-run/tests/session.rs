@@ -612,6 +612,7 @@ fn batch_audit_refuses_session_journal_by_mode() {
         policy: &UserPolicy::default(),
         profile: &Profile::conservative_default("m"),
         limits: &limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap();
     let d = a
@@ -915,6 +916,7 @@ fn repo_map_recomputed_identically_by_audit() {
             policy: &UserPolicy::default(),
             profile: &Profile::conservative_default("m"),
             limits: &limits,
+            children: harness_run::ChildAudit::Skip,
         },
         &SessionConfig::defaults(TOKENS).turn,
     )

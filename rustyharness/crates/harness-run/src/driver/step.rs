@@ -48,6 +48,7 @@ use crate::delegate::{
     check_admission, frame_report, run_child, ChildRefused, NOT_STARTED_TEXT, REFUSAL_CARVE,
 };
 use crate::presubmit::{PresubmitResult, PresubmitState, Round};
+use crate::replay::feed::RecordedChild;
 use crate::sample;
 
 // ---------------------------------------------------------------------------
@@ -1434,7 +1435,7 @@ impl<'a> Loop<'a> {
             // §5.1: what is left of the parent's budgets now, this step's
             // own charge already taken. In a session the turn's allowance
             // bounds the carve too. The wall never gates admission (§4).
-            let carve = {
+            let (carve_steps, carve_tokens) = {
                 let steps_base = u64::from(
                     self.config
                         .limits
@@ -1451,13 +1452,209 @@ impl<'a> Loop<'a> {
                     .limits
                     .tokens
                     .saturating_sub(tokens_in.saturating_add(tokens_out));
-                harness_core::carve(
-                    u32::try_from(steps_left).unwrap_or(u32::MAX),
-                    tokens_left,
-                    self.remaining_wall(),
-                    budget_tokens(self.profile),
-                )
+                (u32::try_from(steps_left).unwrap_or(u32::MAX), tokens_left)
             };
+
+            // P-38f: an audit replay (and a resume's catch-up) never runs a
+            // child. The admission and the carve are recomputed — so a
+            // refusal is re-derived, never re-fed — and a started child's
+            // record is re-written from what the child's own run alone
+            // knows (its identity, its chain head, its stop, its spend)
+            // plus what the replay recomputes (the carve, the grants, the
+            // digests, the parent link into the child's own journal).
+            let replaying = !ctx.live || !self.feed.is_empty();
+            if replaying {
+                let rec = match self.feed.pop_front() {
+                    Some(r) if r.capability == tool => r,
+                    // An admitted delegation with nothing recorded for it:
+                    // a committed journal would differ here (divergence);
+                    // a crash-cut prefix has no such step re-fed at all
+                    // (its catch-up simply never reaches this branch with
+                    // an empty feed — this arm is a harness bug).
+                    _ => return Err(StopCause::PolicyAbort),
+                };
+                let Some(child) = rec.child else {
+                    return Err(StopCause::PolicyAbort);
+                };
+                // The wall never gates anything here (§4), so the replay's
+                // refusal decision needs no wall time at all; a started
+                // child's carve gets the hand-off time back from the
+                // record.
+                let refusal = match check_admission(&ctx, brief) {
+                    Ok(()) => match harness_core::carve(
+                        carve_steps,
+                        carve_tokens,
+                        self.config.limits.wall,
+                        budget_tokens(self.profile),
+                    ) {
+                        Ok(_) => None,
+                        Err(_) => Some(REFUSAL_CARVE.to_owned()),
+                    },
+                    Err(text) => Some(text),
+                };
+                let wall_left = |used_ms: u64| {
+                    self.config
+                        .limits
+                        .wall
+                        .saturating_sub(Duration::from_millis(used_ms))
+                };
+                return match (refusal, child) {
+                    (Some(text), RecordedChild::Refused) => self.delegate_finish(
+                        w,
+                        step,
+                        intent_seq,
+                        reply,
+                        shown,
+                        notice,
+                        tool,
+                        "error",
+                        Some(DELEGATE_REFUSED),
+                        text,
+                        false,
+                        None,
+                    ),
+                    (None, RecordedChild::NotStarted { stopped: true }) => {
+                        // The recorded run stopped right after: the child's
+                        // journal could not be read back. The error text is
+                        // static (§10: nothing of the child's work), and the
+                        // stop it produced is reproduced.
+                        self.delegate_journal_lost(w, step, intent_seq, NOT_STARTED_TEXT.to_owned())
+                    }
+                    (None, RecordedChild::NotStarted { stopped: false }) => self.delegate_finish(
+                        w,
+                        step,
+                        intent_seq,
+                        reply,
+                        shown,
+                        notice,
+                        tool,
+                        "provider_error",
+                        Some(DELEGATE_NOT_STARTED),
+                        NOT_STARTED_TEXT.to_owned(),
+                        false,
+                        None,
+                    ),
+                    (None, RecordedChild::Started(st)) => {
+                        let Ok(carve) = harness_core::carve(
+                            carve_steps,
+                            carve_tokens,
+                            wall_left(st.wall_used_ms),
+                            budget_tokens(self.profile),
+                        ) else {
+                            // The recorded carve cannot be re-derived: the
+                            // parent journal would differ here.
+                            return Err(StopCause::PolicyAbort);
+                        };
+                        let Some(spec_grants) =
+                            crate::delegate::child_spec(&ctx.parent_spec.grants, self.profile)
+                        else {
+                            return Err(StopCause::PolicyAbort);
+                        };
+                        let mut grants = Vec::with_capacity(spec_grants.len());
+                        for g in &spec_grants {
+                            let harness_manifest::admission::Resolved::One { capability, .. } =
+                                ctx.registry.resolve(g)
+                            else {
+                                return Err(StopCause::PolicyAbort);
+                            };
+                            let Some(id) = Ident::from_capability(capability) else {
+                                return Err(StopCause::PolicyAbort);
+                            };
+                            grants.push(Trusted::Id(id));
+                        }
+                        let Some(child_id) = Ident::from_trusted(&st.child) else {
+                            return Err(StopCause::PolicyAbort);
+                        };
+                        let Some(stop) = harness_journal::stop_cause_named(&st.stop) else {
+                            return Err(StopCause::PolicyAbort);
+                        };
+                        let Ok(text) = String::from_utf8(rec.output) else {
+                            return Err(StopCause::PolicyAbort);
+                        };
+                        let (status, code) = match rec.status {
+                            Some(ToolStatus::Ok) => ("ok", None),
+                            Some(ToolStatus::Error {
+                                code: DELEGATE_NO_REPORT,
+                            }) => ("error", Some(DELEGATE_NO_REPORT)),
+                            _ => return Err(StopCause::PolicyAbort),
+                        };
+                        let brief = brief.unwrap_or_default();
+                        let mut child_ev = Event::new(EventKind::ChildRun)
+                            .field("intent_seq", Trusted::U64(intent_seq))
+                            .field("child", Trusted::Id(child_id))
+                            .field("stop", Trusted::Text(stop))
+                            .field("brief", Trusted::Digest(sha256(brief.as_bytes())))
+                            .field(
+                                "template",
+                                Trusted::Digest(crate::delegate::child_template_digest()),
+                            )
+                            .field("grants", Trusted::List(grants))
+                            .field(
+                                "limits",
+                                Trusted::Obj(vec![
+                                    ("steps", Trusted::U64(u64::from(carve.steps))),
+                                    ("tokens", Trusted::U64(carve.tokens)),
+                                    (
+                                        "wall_ms",
+                                        Trusted::U64(
+                                            u64::try_from(carve.wall.as_millis())
+                                                .unwrap_or(u64::MAX),
+                                        ),
+                                    ),
+                                ]),
+                            )
+                            .field("wall_used_ms", Trusted::U64(st.wall_used_ms))
+                            .field(
+                                "spent",
+                                Trusted::Obj(vec![
+                                    ("steps", Trusted::U64(u64::from(st.spend_steps))),
+                                    ("tokens_in", Trusted::U64(st.tokens_in)),
+                                    ("tokens_out", Trusted::U64(st.tokens_out)),
+                                    ("estimated", Trusted::Bool(st.estimated)),
+                                    ("wall_ms", Trusted::U64(st.spend_wall_ms)),
+                                ]),
+                            )
+                            .field("chain_head", Trusted::Digest(st.chain_head));
+                        if let Some(result) = st.result {
+                            child_ev = child_ev.field("result", Trusted::Digest(result));
+                        }
+                        w.append(step, child_ev).map_err(journal)?;
+                        if let Some(c) = self.delegate.as_mut() {
+                            c.admitted += 1;
+                        }
+                        let spend = ChildSpend::recorded(
+                            st.spend_steps,
+                            st.tokens_in,
+                            st.tokens_out,
+                            st.estimated,
+                            Duration::from_millis(st.spend_wall_ms),
+                        );
+                        self.delegate_finish(
+                            w,
+                            step,
+                            intent_seq,
+                            reply,
+                            shown,
+                            notice,
+                            tool,
+                            status,
+                            code,
+                            text,
+                            rec.truncated,
+                            Some(&spend),
+                        )
+                    }
+                    _ => Err(StopCause::PolicyAbort),
+                };
+            }
+
+            // §5.1: what is left of the parent's wall time now.
+            let carve = harness_core::carve(
+                carve_steps,
+                carve_tokens,
+                self.remaining_wall(),
+                budget_tokens(self.profile),
+            );
 
             // §4: admission, in order — the run's cap, the brief, the
             // child's plannable scope, then the carve.
@@ -1562,13 +1759,11 @@ impl<'a> Loop<'a> {
             let (text, truncated) = match &done.note {
                 Some(note) => frame_report(&done.run, done.steps, carve.steps, note, self.profile),
                 None => (
-                    format!(
-                        "The helper (run {}) stopped without a report: {}, after {} of {} steps. \
-                         Its work is not available; do it yourself or ask a narrower question.",
-                        done.run,
+                    crate::delegate::no_report_text(
+                        &done.run,
                         stop_cause_name(&done.stop),
                         done.steps,
-                        carve.steps
+                        carve.steps,
                     ),
                     false,
                 ),

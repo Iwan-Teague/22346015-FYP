@@ -84,6 +84,7 @@ fn try_replay(
         policy: &inp.policy,
         profile: &inp.profile,
         limits: &inp.config.limits,
+        children: harness_run::ChildAudit::default(),
     })
     .map_err(|e| {
         note!(cx, "the replay did not start: {e}");

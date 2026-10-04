@@ -172,6 +172,7 @@ fn audited(state: &Path, r: &RunReport, policy: &UserPolicy) -> harness_run::Aud
         policy,
         profile: &Profile::conservative_default("m"),
         limits: &RunConfig::defaults(1_000_000).limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }
@@ -658,6 +659,7 @@ fn h2b_a_kill_after_an_edit_then_a_resume_never_applies_it_again() {
         policy: &allow_edits(),
         profile: &Profile::conservative_default("m"),
         limits: &RunConfig::defaults(1_000_000).limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap();
     assert_eq!(a.divergence, None, "{a:?}");
@@ -698,6 +700,7 @@ fn h2b_a_kill_between_an_edit_and_its_result_refuses_the_resume() {
             policy: &allow_edits(),
             profile: &Profile::conservative_default("m"),
             limits: &RunConfig::defaults(1_000_000).limits,
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap();
         assert_eq!(a.divergence, None, "{cut_before}: {a:?}");
@@ -900,6 +903,7 @@ fn audit_unanchored(state: &Path, r: &RunReport) -> harness_run::AuditReport {
         policy: &allow_edits(),
         profile: &Profile::conservative_default("m"),
         limits: &RunConfig::defaults(1_000_000).limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }

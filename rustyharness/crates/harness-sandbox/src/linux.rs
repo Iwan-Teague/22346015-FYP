@@ -25,12 +25,29 @@
 //! observation mints. Load-shaped failures (a spawn that failed, a run
 //! that never reported) retry on the H2f backoffs; a canary that was not
 //! refused is final.
+//!
+//! Since S-Lj the host facts also pick the TIER: where unprivileged user
+//! namespaces are usable (`HostFacts::userns_usable`), the opt-in
+//! namespace tier probes through the empty netns/pidns
+//! (`live_probe_netns`) and mints against its own row
+//! (`linux-netns-pidns-v1`, `NetworkMechanism::LinuxNetNamespace`,
+//! `KillDomain::LinuxPidNamespace`) — the only tier whose row lists port
+//! cases, and the only one `Network::Loopback` grants validate on. Where
+//! they are not (AppArmor-restricted hosts, L-Q8), the default tier stands
+//! and loopback grants stay refused by validation; nothing here refuses
+//! outright while the default primitives are present. A failed namespace
+//! probe is a refusal, never a silent fall-back: the tiers' witnesses name
+//! different rows and are not interchangeable.
 
 use crate::conformance::MatrixRow;
 use crate::{
     Backend, BackendKind, ConfinedChild, ConfinedSpec, Conformed, LinuxWitness, SeccompAction,
     SpawnError, Unavailable, UnavailableReason,
 };
+// The network mechanism names the tier's conformance row; only the
+// (linux-gated) spawn path reads it.
+#[cfg(target_os = "linux")]
+use crate::NetworkMechanism;
 
 // The spawn path exists only where the supervisor does; elsewhere the
 // backend refuses with [`UnavailableReason::NoBackendForOs`] and nothing
@@ -117,9 +134,26 @@ impl HostFacts {
     }
 }
 
-/// The Linux backend (facts only in H2a).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Linux;
+/// The Linux backend: it picks its TIER from the host facts at probe time
+/// (S-Lj) — the default namespace-less tier, or the opt-in namespace tier
+/// ([`NetworkMechanism::LinuxNetNamespace`]) where unprivileged user
+/// namespaces are usable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Linux {
+    /// Ports no grant may name (the model port at least, INV-41): refused
+    /// as grants at validation. Empty until a caller says otherwise; the
+    /// run layer passes the endpoint's port (P-36g), as on macOS.
+    reserved_ports: Vec<u16>,
+}
+
+impl Linux {
+    /// Refuse every grant of these ports (§4.3): the model port at least
+    /// (INV-41).
+    pub fn with_reserved_ports(mut self, ports: Vec<u16>) -> Self {
+        self.reserved_ports = ports;
+        self
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn read_small(path: &str) -> Option<String> {
@@ -283,6 +317,20 @@ fn live_attempt() -> impl FnMut() -> Result<String, Unavailable> {
     }
 }
 
+/// The namespace tier's live attempt: the same helper binary, the probe
+/// through the empty netns/pidns.
+#[cfg(all(target_os = "linux", not(test)))]
+fn live_attempt_netns() -> impl FnMut() -> Result<String, Unavailable> {
+    || {
+        let helper = std::env::current_exe().map_err(|e| Unavailable {
+            backend: Some(BackendKind::Linux),
+            reason: UnavailableReason::Io(e.to_string()),
+        })?;
+        harness_sandbox_linux::probe::live_probe_netns(helper.as_os_str())
+            .map_err(|f| live_refusal(f.probe, f.observed, f.load_shaped))
+    }
+}
+
 /// Under the unit-test harness the live probe does not run: the test
 /// binary does not dispatch the supervisor's `__confine` helper, so a
 /// probe here would only burn its backoffs on a helper that never
@@ -332,28 +380,94 @@ fn linux_row_gated() -> Option<&'static MatrixRow> {
     None
 }
 
+/// The namespace tier's row when this build carries it (tests, or the
+/// `linux-probe-row` feature); `None` otherwise, so a plain release build
+/// still refuses. The selector prefers a committed row, but only one whose
+/// network mechanism really is the namespace tier.
+#[cfg(any(test, feature = "linux-probe-row"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_netns_row_gated() -> Option<&'static MatrixRow> {
+    crate::conformance::linux_netns_row_uncommitted()
+}
+
+/// The release-build twin: the gate is off, there is no netns row.
+#[cfg(not(any(test, feature = "linux-probe-row")))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_netns_row_gated() -> Option<&'static MatrixRow> {
+    None
+}
+
 /// A live Linux call: the supervisor's handle plus the spec's output cap,
 /// mapped onto this crate's vocabulary exactly as the macOS stub's handle
-/// is. Constructed only by [`start`], behind a minted witness.
+/// is. Constructed only by [`start`], behind a minted witness. A namespace
+/// tier child additionally owns the host half of the port forwarder and
+/// the relay directory (P-36 §8 point 3): both end with the call.
 #[cfg(target_os = "linux")]
 pub(crate) struct Child {
-    inner: harness_sandbox_linux::supervisor::Running,
+    inner: Option<harness_sandbox_linux::supervisor::Running>,
     output_bytes: u64,
+    /// The host-side forwarder and its relay directory, for a namespace
+    /// tier child; dropped with the child, so the host ports close and the
+    /// sockets vanish however the call ends.
+    netns: Option<NetnsHold>,
+}
+
+/// What a namespace tier [`Child`] owns on the host side.
+#[cfg(target_os = "linux")]
+struct NetnsHold {
+    forwarder: harness_sandbox_linux::namespaces::Forwarder,
+    relay_dir: std::path::PathBuf,
 }
 
 #[cfg(target_os = "linux")]
 impl Child {
-    pub(crate) fn wait(self) -> ConfinedExit {
-        finish(self.inner.wait(), self.output_bytes)
+    /// The forwarder and the relay directory end with the call, whatever
+    /// path it took.
+    fn end_netns(&mut self) {
+        if let Some(hold) = self.netns.take() {
+            drop(hold.forwarder);
+            let _ = std::fs::remove_dir_all(&hold.relay_dir);
+        }
+    }
+
+    pub(crate) fn wait(mut self) -> ConfinedExit {
+        let raw = match self.inner.take() {
+            Some(r) => r.wait(),
+            None => {
+                self.end_netns();
+                return ConfinedExit {
+                    status: ChildStatus::Unknown,
+                    stdout: Vec::new(),
+                    stdout_truncated: false,
+                    stderr: Vec::new(),
+                    stderr_truncated: false,
+                    domain: DomainCleanup::Unconfirmed("the child was already collected".into()),
+                    elapsed: std::time::Duration::ZERO,
+                };
+            }
+        };
+        let out = finish(raw, self.output_bytes);
+        self.end_netns();
+        out
     }
 
     pub(crate) fn try_status(&mut self) -> Option<ConfinedExit> {
-        Some(finish(self.inner.try_status()?, self.output_bytes))
+        let raw = self.inner.as_mut()?.try_status()?;
+        Some(finish(raw, self.output_bytes))
     }
 
     pub(crate) fn read(&self, stream: Stream, since: u64, cap: usize, mode: Mode) -> Chunk {
         use harness_sandbox_linux::supervisor::{RawMode, RawStream};
-        let raw = self.inner.read(
+        let Some(running) = self.inner.as_ref() else {
+            return Chunk {
+                from: since,
+                to: since,
+                dropped: 0,
+                skipped: 0,
+                bytes: Vec::new(),
+            };
+        };
+        let raw = running.read(
             match stream {
                 Stream::Out => RawStream::Out,
                 Stream::Err => RawStream::Err,
@@ -376,7 +490,15 @@ impl Child {
 
     pub(crate) fn totals(&self) -> StreamTotals {
         use harness_core::Digest;
-        let t = self.inner.totals();
+        let Some(running) = self.inner.as_ref() else {
+            return StreamTotals {
+                out_total: 0,
+                out_sha: Digest::from_bytes([0u8; 32]),
+                err_total: 0,
+                err_sha: Digest::from_bytes([0u8; 32]),
+            };
+        };
+        let t = running.totals();
         StreamTotals {
             out_total: t.out_total,
             out_sha: Digest::from_bytes(t.out_sha),
@@ -385,8 +507,34 @@ impl Child {
         }
     }
 
-    pub(crate) fn stop(self) -> ConfinedExit {
-        finish(self.inner.stop(), self.output_bytes)
+    pub(crate) fn stop(mut self) -> ConfinedExit {
+        let raw = match self.inner.take() {
+            Some(r) => r.stop(),
+            None => {
+                self.end_netns();
+                return ConfinedExit {
+                    status: ChildStatus::Unknown,
+                    stdout: Vec::new(),
+                    stdout_truncated: false,
+                    stderr: Vec::new(),
+                    stderr_truncated: false,
+                    domain: DomainCleanup::Unconfirmed("the child was already collected".into()),
+                    elapsed: std::time::Duration::ZERO,
+                };
+            }
+        };
+        let out = finish(raw, self.output_bytes);
+        self.end_netns();
+        out
+    }
+}
+
+/// A dropped child ends its namespace-tier resources too (the supervisor's
+/// own `Drop` stops the tree).
+#[cfg(target_os = "linux")]
+impl Drop for Child {
+    fn drop(&mut self) {
+        self.end_netns();
     }
 }
 
@@ -467,12 +615,40 @@ fn private_dir(tag: &str) -> std::io::Result<std::path::PathBuf> {
 /// Validate and start through the real supervisor: the Linux twin of
 /// `Seatbelt::start`. No profile is rendered and no stub is written — the
 /// helper is this binary itself, re-exec'd with the `__confine` argument,
-/// and the domain is built in the program child. The network tiers
-/// (`Loopback`/`Proxy`) are refused by validation here: the namespace-less
-/// row's seccomp filter denies `socket()` outright, so no network grant is
-/// enforceable (fail closed, not best effort).
+/// and the domain is built in the program child.
+///
+/// The witness's row picks the tier (S-Lj). On the DEFAULT tier no network
+/// grant is enforceable (the seccomp filter denies `socket()` outright).
+/// On the NAMESPACE tier (`NetworkMechanism::LinuxNetNamespace`) a
+/// `Loopback` grant validates only when the witness covers the tier's port
+/// cases ([`PORTS_CASES_NETNS`]); `lan` grants are refused (the empty
+/// netns cannot express them, fail closed); the bind/connect grants become
+/// a host-side forwarder ([`namespaces::Forwarder`], P-36 §8 point 3) the
+/// child owns until it ends.
 #[cfg(target_os = "linux")]
-fn start(spec: &ConfinedSpec) -> Result<ConfinedChild, SpawnError> {
+fn start(linux: &Linux, spec: &ConfinedSpec, ev: &Conformed) -> Result<ConfinedChild, SpawnError> {
+    use crate::conformance::PORTS_CASES_NETNS;
+    use crate::spec::Network;
+    use crate::spec::SpecError;
+    use harness_sandbox_linux::namespaces::{self, NetnsSpec};
+
+    let netns_tier = ev.network() == NetworkMechanism::LinuxNetNamespace;
+    // The tier cannot express a LAN grant: refuse it here, by name, before
+    // anything is built (fail closed, never best effort).
+    if netns_tier {
+        if let Network::Loopback { lan, .. } = &spec.network {
+            if !lan.is_empty() {
+                return Err(SpawnError::Spec(SpecError::Unsupported(
+                    "lan grants (not enforceable on this tier)",
+                )));
+            }
+        }
+    }
+    // The partial gate: the namespace row deliberately does NOT carry the
+    // wildcard cases (seccomp cannot inspect a sockaddr), so coverage of
+    // the tier's own case set is what permits a loopback grant here.
+    let ports_conformed = netns_tier && ev.covers(PORTS_CASES_NETNS).is_ok();
+
     let dir = private_dir("call").map_err(|e| SpawnError::Io(e.to_string()))?;
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let cx = Context {
@@ -482,8 +658,8 @@ fn start(spec: &ConfinedSpec) -> Result<ConfinedChild, SpawnError> {
             memory: true,
             processes: true,
         },
-        reserved_ports: &[],
-        ports_conformed: false,
+        reserved_ports: &linux.reserved_ports,
+        ports_conformed,
         proxy: false,
     };
     let approved = match spec::validate(spec, &cx) {
@@ -494,6 +670,39 @@ fn start(spec: &ConfinedSpec) -> Result<ConfinedChild, SpawnError> {
         }
     };
     let _ = std::fs::remove_dir_all(&dir);
+
+    // The namespace tier's host half: a relay directory (it must exist
+    // before the spawn — nsprep binds its socket into it) and a forwarder
+    // holding exactly the granted bind ports. Both are owned by the child
+    // and end with it. A failure here is a spawn refusal; nothing ran.
+    let mut hold = None;
+    let netns = if netns_tier {
+        let relay = private_dir("relay").map_err(|e| SpawnError::Io(e.to_string()))?;
+        match namespaces::Forwarder::start(
+            relay.to_string_lossy().as_ref(),
+            &approved.ports.bind,
+            &approved.ports.connect,
+        ) {
+            Ok(forwarder) => {
+                hold = Some(NetnsHold {
+                    forwarder,
+                    relay_dir: relay.clone(),
+                });
+                Some(NetnsSpec {
+                    relay_dir: relay.to_string_lossy().into_owned(),
+                    bind: approved.ports.bind.clone(),
+                    connect: approved.ports.connect.clone(),
+                })
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&relay);
+                return Err(SpawnError::Io(e.to_string()));
+            }
+        }
+    } else {
+        None
+    };
+
     let v = approved.spec;
     let program = harness_sandbox_linux::supervisor::Program {
         argv: v.argv,
@@ -508,6 +717,7 @@ fn start(spec: &ConfinedSpec) -> Result<ConfinedChild, SpawnError> {
             memory: v.limits.memory,
             processes: v.limits.processes,
         },
+        netns,
     };
     // The helper is this very binary: whoever runs a confined call (the
     // harness, or the conformance suite) carries the `__confine` entry
@@ -520,12 +730,20 @@ fn start(spec: &ConfinedSpec) -> Result<ConfinedChild, SpawnError> {
         // cap bounds what `wait` hands back either way.
         v.limits.output_bytes.max(1),
         v.limits.wall,
-    )
-    .map_err(|e| SpawnError::Io(e.to_string()))?;
+    );
+    if child.is_err() {
+        // No tree was started: end the tier's host-side half at once.
+        if let Some(mut h) = hold.take() {
+            drop(h.forwarder);
+            let _ = std::fs::remove_dir_all(&h.relay_dir);
+        }
+    }
+    let child = child.map_err(|e| SpawnError::Io(e.to_string()))?;
     Ok(ConfinedChild {
         inner: Child {
-            inner: child,
+            inner: Some(child),
             output_bytes: v.limits.output_bytes,
+            netns: hold,
         },
     })
 }
@@ -555,6 +773,34 @@ impl Backend for Linux {
             // A committed row always wins; the S-Le gate hands out the
             // uncommitted one until S-Lf observes it green on a real
             // kernel.
+            //
+            // The TIER (S-Lj) comes from the same facts: where unprivileged
+            // user namespaces are usable, the opt-in namespace tier probes
+            // and mints against its own row. Where they are not
+            // (AppArmor-restricted, say — L-Q8) the host stays on the
+            // default tier and loopback grants stay refused; never an
+            // outright refusal while the default primitives are present.
+            // The facts decide upfront: a failed namespace probe is a
+            // refusal, never a silent fall-back (the tiers' witnesses name
+            // different rows and must not be interchangeable).
+            if harness_sandbox_linux::namespaces::tier_for(facts.userns_usable())
+                == harness_sandbox_linux::namespaces::Tier::Netns
+            {
+                let Some(row) = crate::conformance::row(BackendKind::Linux, "linux")
+                    .filter(|r| r.network == NetworkMechanism::LinuxNetNamespace)
+                    .or_else(linux_netns_row_gated)
+                else {
+                    return Err(linux_refusal(None));
+                };
+                return probe_with(
+                    &facts,
+                    abi,
+                    row,
+                    live_attempt_netns(),
+                    PROBE_BACKOFFS_MS,
+                    |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+                );
+            }
             let Some(row) =
                 crate::conformance::row(BackendKind::Linux, "linux").or_else(linux_row_gated)
             else {
@@ -579,7 +825,7 @@ impl Backend for Linux {
         }
         #[cfg(target_os = "linux")]
         {
-            start(spec)
+            start(self, spec, ev)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -653,7 +899,50 @@ mod tests {
     // probe refuses there too. Either way it never mints HERE.
     #[test]
     fn the_linux_backend_never_mints_under_the_unit_harness() {
-        assert!(Linux.probe().is_err());
+        assert!(Linux::default().probe().is_err());
+    }
+
+    // The tier decision is the facts', made before anything probes: an
+    // AppArmor-restricted host (L-Q8) stays on the default tier — loopback
+    // grants stay refused there — and never refuses outright while the
+    // default primitives stand. The decision lives in the linux-gated
+    // crate, so the test does too.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_tier_follows_the_userns_facts() {
+        use harness_sandbox_linux::namespaces::Tier;
+        let restricted = facts_full();
+        assert_eq!(
+            harness_sandbox_linux::namespaces::tier_for(restricted.userns_usable()),
+            Tier::Default
+        );
+        let mut capable = facts_full();
+        capable.apparmor_restricts_userns = Some(false);
+        assert_eq!(
+            harness_sandbox_linux::namespaces::tier_for(capable.userns_usable()),
+            Tier::Netns
+        );
+        // Unknown facts are not usable facts: default tier, still serving.
+        capable.max_user_namespaces = None;
+        assert_eq!(
+            harness_sandbox_linux::namespaces::tier_for(capable.userns_usable()),
+            Tier::Default
+        );
+    }
+
+    // The namespace tier's row is handed out only by the S-Lj gate (tests,
+    // or the feature); the witness it would mint names the tier and its
+    // port-case set.
+    #[test]
+    fn the_netns_row_is_gated_like_the_default_row() {
+        let row = linux_netns_row_gated().expect("the test build carries the linux-probe-row gate");
+        assert_eq!(row.id, "linux-netns-pidns-v1");
+        // The release twin refuses to hand it out; both twins must agree
+        // the DEFAULT row's gate is a separate one.
+        assert_eq!(
+            linux_row_gated().unwrap().id,
+            "linux-landlock-seccomp-nons-v1"
+        );
     }
 
     #[test]
@@ -864,7 +1153,7 @@ mod tests {
     fn probe_delegates_to_the_linux_crate() {
         // Under the unit harness the live probe refuses without running,
         // naming itself; a non-test build would run the real canaries.
-        let err = Linux.probe().unwrap_err();
+        let err = Linux::default().probe().unwrap_err();
         assert_eq!(err.backend, Some(BackendKind::Linux));
         assert!(matches!(
             err.reason,

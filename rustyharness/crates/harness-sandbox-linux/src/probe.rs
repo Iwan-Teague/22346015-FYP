@@ -25,7 +25,18 @@
 //!
 //! This module is pure orchestration over std and [`crate::supervisor`]:
 //! no FFI here, the crate's reviewed sites stay the ones S-Lc/S-Ld
-//! landed.
+//! landed (S-Lj added the namespace tier's own wrappers in
+//! [`crate::namespaces`]; this module calls no syscall itself).
+//!
+//! The namespace tier ([`crate::namespaces`], S-Lj) probes through the
+//! SAME canaries ([`live_probe_netns`]): the program child runs inside the
+//! empty netns/pidns behind `nsprep`, with no ports granted, so every
+//! network canary must still be refused — the tier grants nothing until a
+//! port is. Two judgement differences, both structural: the sweep's kill
+//! count may be 0 (the kernel ends the whole pidns when its init dies, so
+//! the setsid escapee is gone before the helper's sweep looks), and a
+//! failed `unshare` (the 104..=106 window) is a final refusal, never
+//! load-shaped.
 
 use std::net::TcpListener;
 use std::os::unix::ffi::OsStrExt as _;
@@ -175,9 +186,10 @@ fn wait_sound(raw: RawExit, what: &'static str) -> Result<RawExit, ProbeFail> {
         });
     }
     if !raw.exec_ok {
-        // The child's sandbox setup or the exec itself failed (codes
-        // 90..=102): a primitive that will not apply refuses the probe,
-        // and no retry changes that.
+        // The child's sandbox setup or the exec itself failed (the
+        // 94..=106 window; on the namespace tier this is nsprep's unshare,
+        // id-map or lo-up step): a primitive that will not apply refuses
+        // the probe, and no retry changes that.
         return Err(ProbeFail::new(what, run_observed(&raw)));
     }
     Ok(raw)
@@ -185,13 +197,17 @@ fn wait_sound(raw: RawExit, what: &'static str) -> Result<RawExit, ProbeFail> {
 
 /// Spawn a canary child (the probe script with `args` and `limits`). The
 /// child's working directory and only writable root is the probe's own
-/// workspace, as in a real run.
+/// workspace, as in a real run. `netns` is `Some` only for the namespace
+/// tier's probe: the child then runs as the pidns init behind `nsprep`,
+/// with the relay directory prepared (it must exist before the spawn —
+/// `nsprep` binds its relay socket there).
 fn spawn_child(
     helper: &std::ffi::OsStr,
     script: &str,
     args: &[Vec<u8>],
     limits: Limits,
     root: &Path,
+    netns: Option<crate::namespaces::NetnsSpec>,
 ) -> Result<supervisor::Running, ProbeFail> {
     let mut argv = vec![
         b"/usr/bin/perl".to_vec(),
@@ -208,6 +224,7 @@ fn spawn_child(
         read_write: vec![root],
         protected: Vec::new(),
         limits,
+        netns,
     };
     supervisor::spawn(&prog, helper, PROBE_RING, PROBE_WALL).map_err(|e| ProbeFail {
         probe: "spawn",
@@ -228,6 +245,8 @@ fn run_canaries(
     canary: &Path,
     link: &Path,
     home: &[u8],
+    netns: Option<crate::namespaces::NetnsSpec>,
+    expect_sweep_kills: bool,
 ) -> Result<String, ProbeFail> {
     let args = vec![
         listener
@@ -241,7 +260,7 @@ fn run_canaries(
         link.as_os_str().as_bytes().to_vec(),
         home.to_vec(),
     ];
-    let child = spawn_child(helper, PROBE_SCRIPT, &args, Limits::default(), ws)?;
+    let child = spawn_child(helper, PROBE_SCRIPT, &args, Limits::default(), ws, netns)?;
     let raw = wait_sound(child.wait(), "run")?;
     let out = String::from_utf8_lossy(&raw.stdout).into_owned();
     for name in PROBES {
@@ -267,8 +286,12 @@ fn run_canaries(
             "the file outside the roots exists".to_string(),
         ));
     }
-    // FT-16-setsid, parent side: the escapee was swept (at least one kill).
-    if !raw.confirmed || raw.kills < 1 {
+    // FT-16-setsid, parent side. The default tier needs a swept escapee
+    // (at least one kill). The namespace tier may see zero kills: the
+    // kernel SIGKILLs every pidns member when its init dies, so the
+    // escapee is gone before the helper's sweep looks — what must hold is
+    // only the confirmed-empty verdict.
+    if !raw.confirmed || (expect_sweep_kills && raw.kills < 1) {
         return Err(ProbeFail::new(
             "sweep",
             format!(
@@ -286,7 +309,7 @@ fn run_memory_canary(helper: &std::ffi::OsStr, ws: &Path) -> Result<String, Prob
         memory: Some(MEM_PROBE_BUDGET),
         ..Limits::default()
     };
-    let child = spawn_child(helper, MEM_PROBE_SCRIPT, &[], limits, ws).map_err(|mut e| {
+    let child = spawn_child(helper, MEM_PROBE_SCRIPT, &[], limits, ws, None).map_err(|mut e| {
         e.probe = "mem-spawn";
         e
     })?;
@@ -316,10 +339,11 @@ fn run_process_canary(helper: &std::ffi::OsStr, ws: &Path) -> Result<String, Pro
         processes: Some(PROC_PROBE_CAP),
         ..Limits::default()
     };
-    let child = spawn_child(helper, PROC_PROBE_SCRIPT, &[], limits, ws).map_err(|mut e| {
-        e.probe = "proc-spawn";
-        e
-    })?;
+    let child =
+        spawn_child(helper, PROC_PROBE_SCRIPT, &[], limits, ws, None).map_err(|mut e| {
+            e.probe = "proc-spawn";
+            e
+        })?;
     let raw = wait_sound(child.wait(), "proc-run")?;
     let out = String::from_utf8_lossy(&raw.stdout).into_owned();
     let mut forked = None;
@@ -355,6 +379,22 @@ fn run_process_canary(helper: &std::ffi::OsStr, ws: &Path) -> Result<String, Pro
 /// not run, a sweep that did not confirm — is [`ProbeFail`], and the
 /// caller must not mint.
 pub fn live_probe(helper: &std::ffi::OsStr) -> Result<String, ProbeFail> {
+    live_probe_inner(helper, false)
+}
+
+/// The namespace tier's live probe ([`live_probe`], through the empty
+/// netns/pidns): the same canaries, with the child running as the pidns
+/// init behind `nsprep` and no port granted. The observation text has the
+/// same shape; the digest binds the tier's row id, so the two tiers'
+/// witnesses can never stand for each other.
+pub fn live_probe_netns(helper: &std::ffi::OsStr) -> Result<String, ProbeFail> {
+    live_probe_inner(helper, true)
+}
+
+/// The shared probe body. `netns` selects the tier: the relay directory is
+/// prepared before the spawn (nsprep binds its socket into it), and the
+/// sweep-kill expectation drops (see [`run_canaries`]).
+fn live_probe_inner(helper: &std::ffi::OsStr, netns: bool) -> Result<String, ProbeFail> {
     // A scratch directory of our own: the canaries need paths outside the
     // child's read-write root that only this probe created.
     let nanos = std::time::SystemTime::now()
@@ -381,8 +421,25 @@ pub fn live_probe(helper: &std::ffi::OsStr) -> Result<String, ProbeFail> {
     let home = std::env::var_os("HOME")
         .map(|h| h.as_bytes().to_vec())
         .unwrap_or_default();
+    // The tier: on the namespace tier the relay directory must exist
+    // before the spawn — `nsprep` binds its relay socket into it — and the
+    // spec carries no port at all (the tier grants nothing until a port
+    // is; the canaries must all be refused anyway).
+    let netns_spec = if netns {
+        let relay = dir.join("relay");
+        std::fs::create_dir_all(&relay).map_err(io)?;
+        Some(crate::namespaces::NetnsSpec {
+            relay_dir: relay.to_string_lossy().into_owned(),
+            bind: Vec::new(),
+            connect: Vec::new(),
+        })
+    } else {
+        None
+    };
 
-    let run = run_canaries(helper, &listener, &ws, &written, &canary, &link, &home);
+    let run = run_canaries(
+        helper, &listener, &ws, &written, &canary, &link, &home, netns_spec, !netns,
+    );
     let mem = run_memory_canary(helper, &ws);
     let procs = run_process_canary(helper, &ws);
     // Best effort: the scratch tree is disposable.

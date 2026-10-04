@@ -46,6 +46,16 @@
 //! (`ring.rs`, `ConfinedExit`) stays in `harness-sandbox`: this crate cannot
 //! depend on it (the dependency runs the other way), so [`supervisor`]
 //! re-states the ring arithmetic and maps its report into plain fields.
+//!
+//! S-Lj lands the fourth piece, the namespace tier ([`namespaces`]): where
+//! the host measured an unprivileged userns as usable, the opt-in tier
+//! runs the same Landlock/seccomp/rlimit domain inside an unprivileged
+//! userns/netns/pidns (the program as the namespace's PID 1, killed whole
+//! by the init's death), and a harness-process forwarder relays
+//! `127.0.0.1` loopback ports through a unix-socket pair — the only tier
+//! whose matrix row lists the PORTS cases. The tier selection is
+//! fail-closed ([`namespaces::tier_for`]): an unknown or restricted userns
+//! stays on the default tier, refusing ports but never the backend.
 
 #![allow(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -54,6 +64,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod namespaces;
 pub mod seccomp;
 pub mod supervisor;
 

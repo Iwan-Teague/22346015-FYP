@@ -186,6 +186,7 @@ impl Setup {
             policy: &self.policy,
             profile: &self.profile,
             limits: &self.config.limits,
+            children: harness_run::ChildAudit::Skip,
         })
         .unwrap()
     }

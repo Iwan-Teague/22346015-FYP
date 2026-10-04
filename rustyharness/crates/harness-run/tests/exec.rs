@@ -236,7 +236,7 @@ mod live {
 
     use harness_core::StopCause;
     use harness_model::{ModelBackend, ModelIdentity, ModelRequest};
-    use harness_run::{audit, Audit, Resume};
+    use harness_run::{audit, Audit, ChildAudit, Resume};
     use harness_sandbox::{
         ConfinedChild, ConfinedSpec, Confinement, Conformed, Refused, SpawnError, SystemConfinement,
     };
@@ -320,6 +320,7 @@ mod live {
             policy: &allow_all(),
             profile: &Profile::conservative_default("m"),
             limits: &RunConfig::defaults(1_000_000).limits,
+            children: ChildAudit::Skip,
         })
         .unwrap()
     }
@@ -813,6 +814,7 @@ mod live {
             policy: &allow_all(),
             profile: &Profile::conservative_default("m"),
             limits: &RunConfig::defaults(1_000_000).limits,
+            children: ChildAudit::Skip,
         })
         .unwrap()
     }

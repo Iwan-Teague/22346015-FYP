@@ -81,7 +81,7 @@ pub use postedit::{PostEditCheck, PostEditRefused, PostEditReport, PostEditResul
 pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
 pub use replay::{
     audit, audit_session, fork_session, resume, resume_session, Audit, AuditRefused, AuditReport,
-    Divergence, ForkSession, Resume, ResumeSession,
+    ChildAudit, ChildAuditReport, Divergence, ForkSession, Resume, ResumeSession,
 };
 pub use restore::{external_differ, marks_from_records, plan, RestoreCommand, RestoreMark};
 pub use session::{

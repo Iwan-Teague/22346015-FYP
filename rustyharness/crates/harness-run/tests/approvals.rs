@@ -243,6 +243,7 @@ fn audited(state: &Path, run: &RunId, attempt: Option<u32>) -> harness_run::Audi
         policy: &UserPolicy::default(),
         profile: &Profile::conservative_default("m"),
         limits: &config().limits,
+        children: harness_run::ChildAudit::Skip,
     })
     .unwrap()
 }

@@ -1070,7 +1070,7 @@ fn hostile_web_note_poisoning() {
     let head = &recs2.first().unwrap().body;
     assert_eq!(head.get("session_kind"), None, "no kind key for coding");
     assert_eq!(head.get("web"), None, "no web key for coding");
-    assert_eq!(head["context_format"], Value::from("rh-context/8"));
+    assert_eq!(head["context_format"], Value::from("rh-context/9"));
     assert_eq!(head["mode"], Value::from("session"));
     let coding_text: String = recs2
         .iter()

@@ -37,6 +37,7 @@
 pub(crate) mod approvals;
 pub(crate) mod header;
 pub(crate) mod plan;
+pub(crate) mod repomap;
 pub(crate) mod step;
 pub(crate) mod stop;
 pub(crate) mod tools;
@@ -74,6 +75,7 @@ pub(crate) use header::{
 pub(crate) use plan::{
     attempt_check, create_run, loop_facts, no_workspace_facts, plan, prepare, todo_for, Prepared,
 };
+pub(crate) use repomap::RepoMapFeed;
 pub(crate) use step::{BudgetNotices, Loop, LoopInit, NonceSource};
 pub(crate) use stop::commit;
 pub(crate) use tools::{exec_tools, is_edit, is_exec, parse_exec, RecordedEdit, RecordedResult};
@@ -448,6 +450,26 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         Box::new(SystemClock::default()),
     );
     let edit_tools = pre.edit_tools.clone();
+    // P-38e: a live batch run can delegate. The context is built once,
+    // here, and the loop's branch reads it for admission and construction.
+    let delegate = crate::delegate::ChildCtx {
+        state_root: &pre.state_root,
+        workspace: r.workspace,
+        parent_spec: r.spec,
+        registry: r.registry,
+        policy: r.policy,
+        profile: r.profile,
+        backend: r.backend,
+        probe: r.probe,
+        env: r.env,
+        approver: r.approver,
+        parent_run: run_id.clone(),
+        parent_attempt: attempt,
+        live: true,
+        admitted: 0,
+        facts,
+        timeouts: r.config,
+    };
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: r.registry,
@@ -485,8 +507,10 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         post_edit: PostEditState::of(&r.spec.post_edit),
         workspace_root: Some(r.workspace.to_path_buf()),
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         instructions: None,
         user: None,
+        delegate: Some(delegate),
     });
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);

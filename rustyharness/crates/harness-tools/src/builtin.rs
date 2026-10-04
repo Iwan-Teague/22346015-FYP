@@ -193,6 +193,18 @@ pub mod code {
     /// The search endpoint answered non-200, or with a body that is not
     /// usable SearXNG JSON (P-39h).
     pub const WEB_SEARCH_PARSE: u16 = 37;
+    /// Delegation refused at admission (P-38e): over the per-run cap, an
+    /// empty or oversized brief, no read tool for the child, or no budget
+    /// left to carve. Static harness text; no child started. (The design
+    /// note's 25-27 are taken; the next free block is used — see
+    /// docs/slices/P-38e.md.)
+    pub const DELEGATE_REFUSED: u16 = 38;
+    /// The child stopped without submitting a report (P-38e): its journal
+    /// is fine, its work is simply not available.
+    pub const DELEGATE_NO_REPORT: u16 = 39;
+    /// The child could not be started at all (P-38e): its header or
+    /// journal could not be created and verified.
+    pub const DELEGATE_NOT_STARTED: u16 = 40;
 }
 
 const READ: &str = "harness.fs.read";

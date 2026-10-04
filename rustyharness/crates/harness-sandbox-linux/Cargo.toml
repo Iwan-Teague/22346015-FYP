@@ -25,6 +25,19 @@ missing_docs = "warn"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 
+# S-Le's live VM tests: this binary IS the supervisor's helper (it
+# dispatches `__confine`, like supervisor_live), and the only place the
+# probe runs for real. The dev-dependency carries the `linux-probe-row`
+# gate: the UNCOMMITTED Linux matrix row, so `require()` can be exercised
+# end to end before S-Lf commits the row. Not a registry dep: a path dep
+# inside crates/, read whole by scripts/ci/purity.sh §2f/§5.
+[[test]]
+name = "probe_live"
+harness = false
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+harness-sandbox = { path = "../harness-sandbox", features = ["linux-probe-row"] }
+
 [lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"

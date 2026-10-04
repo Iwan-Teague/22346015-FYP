@@ -29,7 +29,7 @@ use crate::driver::approvals::Approvals;
 use crate::driver::plan::plan;
 use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
 use crate::driver::stop::commit;
-use crate::driver::{new_meter, ReadLog};
+use crate::driver::{new_meter, ReadLog, RepoMapFeed};
 use crate::{RunConfig, TaskSpec};
 
 const NA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -218,8 +218,10 @@ fn drive(
         presubmit: None,
         post_edit: None,
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         workspace_root: None,
         user: None,
+        delegate: None,
     });
     let end = lp.drive(&mut w);
     commit(w, &end, None);

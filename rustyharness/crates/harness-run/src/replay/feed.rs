@@ -41,6 +41,12 @@ pub(crate) struct Recorded {
     /// audit re-derives the head from the parent's records and refuses a
     /// child whose recorded head does not match.
     pub(crate) fork: Option<RecordedFork>,
+    /// The repo map each session `ContextBuilt` carried (P-33), by step:
+    /// the untrusted workspace payload's text. An audit and a resume's
+    /// catch-up re-feed it (the workspace is not read in a replay); the
+    /// replay writes the identical payload back, and the context digest
+    /// covers the text either way.
+    pub(crate) repo_maps: BTreeMap<u64, String>,
 }
 
 /// A fork journal's `ForkedFrom` record, read back (P-32).
@@ -211,6 +217,7 @@ pub(crate) fn recorded(
     let mut approvals = VecDeque::new();
     let mut walls = BTreeMap::new();
     let mut inputs = VecDeque::new();
+    let mut repo_maps = BTreeMap::new();
     let mut fork: Option<RecordedFork> = None;
     // The last `UserTurn`'s wall time: a later one's cannot be smaller
     // (P-17 §6) — the clock only moves forward, and an audit re-feeds this
@@ -604,6 +611,25 @@ pub(crate) fn recorded(
             EventKind::InstructionsLoaded if session => {
                 instructions_record(r, blobs).ok_or_else(bad)?;
             }
+            // P-33: the repo map a coding session's context showed, as an
+            // untrusted workspace payload. Re-fed, never recomputed: an
+            // audit never reads the workspace. Its source must name the
+            // workspace (the only source the loop writes it with), and its
+            // bytes must be UTF-8 text (the map is text by construction).
+            EventKind::ContextBuilt => {
+                if let Some(t) = r.body.get("repo_map") {
+                    let source_kind = t
+                        .get("source")
+                        .and_then(|s| s.get("kind"))
+                        .and_then(Value::as_str);
+                    if source_kind != Some("workspace") {
+                        return Err(bad());
+                    }
+                    let bytes = payload_bytes(t, blobs, r.seq).map_err(|_| bad())?;
+                    let text = String::from_utf8(bytes).map_err(|_| bad())?;
+                    repo_maps.insert(r.step, text);
+                }
+            }
             // A fork's first record (P-32): the parent run, the kept step
             // and the parent prefix's chain head. Exactly one, at step 0,
             // directly after the header.
@@ -680,6 +706,7 @@ pub(crate) fn recorded(
         walls,
         inputs,
         fork,
+        repo_maps,
     })
 }
 

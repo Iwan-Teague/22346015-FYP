@@ -26,9 +26,9 @@ use harness_model::scripted::ScriptedBackend;
 use harness_model::{Completion, ModelError, TaskText};
 use harness_policy::UserPolicy;
 use harness_run::{
-    audit, run_session, ApprovalAnswer, Approver, ApproverKind, Audit, EventSink, InputEnd,
-    RunRefused, SessionConfig, SessionReport, SessionRun, TaskSpec, TurnLimits, UiEvent, UserInput,
-    UserInputEvent, UserMessage,
+    audit, audit_session, run_session, ApprovalAnswer, Approver, ApproverKind, Audit, EventSink,
+    InputEnd, RunRefused, SessionConfig, SessionReport, SessionRun, TaskSpec, TurnLimits, UiEvent,
+    UserInput, UserInputEvent, UserMessage,
 };
 use harness_testkit::{act, registry, run_scripted, say, submit, Fixture, Local};
 
@@ -583,9 +583,10 @@ fn session_header_has_mode_turn_limits_context_format7() {
     let tl = head.get("turn_limits").unwrap();
     assert_eq!(tl.get("steps").unwrap(), 50);
     assert_eq!(tl.get("format_errors").unwrap(), 3);
-    // P-28 added the mode line (rh-context/7); P-30 added the project
-    // notes block (rh-context/8).
-    assert_eq!(head.get("context_format").unwrap(), "rh-context/8");
+    // P-28 added the mode line (rh-context/7); P-30 the project notes
+    // block (rh-context/8); P-33 the ledger and the repo map
+    // (rh-context/9).
+    assert_eq!(head.get("context_format").unwrap(), "rh-context/9");
     // The meter never latches format errors in a session.
     assert_eq!(
         head.get("limits").unwrap().get("format_errors").unwrap(),
@@ -854,6 +855,73 @@ fn user_turn_over_share_refused() {
     assert_eq!(turns[0].get("shown").unwrap(), "over_share");
     let ends = rec_bodies(&r, EventKind::TurnEnded);
     assert_eq!(ends[0].get("reason").unwrap(), "input_refused");
+}
+
+/// P-33: after an edit, a coding session's context carries the repo map —
+/// an outline of the touched file — as an untrusted payload named by its
+/// `ContextBuilt` record; the audit re-feeds the recorded map (it never
+/// reads the workspace) and writes the identical payload back, so the
+/// whole journal audits clean.
+#[test]
+fn repo_map_recomputed_identically_by_audit() {
+    let fx = Fixture::with_spec(
+        "session-repo-map-audit",
+        spec(
+            "read lib.rs, edit it, then read it back",
+            &["harness.fs.read", "harness.edit.write"],
+        ),
+    )
+    .unwrap();
+    fx.write("lib.rs", "fn first() {}\n").unwrap();
+    let r = drive(
+        &fx,
+        vec![
+            Ok(act("harness.fs.read", "{\"path\":\"lib.rs\"}")),
+            Ok(act(
+                "harness.edit.write",
+                "{\"path\":\"lib.rs\",\"content\":\"fn first() {}\\nfn second() {}\\n\"}",
+            )),
+            Ok(act("harness.fs.read", "{\"path\":\"lib.rs\"}")),
+            Ok(say("Updated and re-read.")),
+        ],
+        &ScriptedInput::of(&["edit lib.rs", "read it back"]),
+        &SessionConfig::defaults(TOKENS),
+        Some(&Yes),
+        None,
+    )
+    .unwrap();
+    assert_eq!(r.run.cause, StopCause::SessionEnded);
+    assert_eq!(count(&r, EventKind::EditApplied), 1);
+    // A build after the edit showed the map: at least one `ContextBuilt`
+    // names a `repo_map` payload.
+    let recs = records(&r);
+    let with_map = bodies(&recs, EventKind::ContextBuilt)
+        .iter()
+        .filter(|b| b.contains_key("repo_map"))
+        .count();
+    assert!(with_map > 0, "a build after the edit carries the repo map");
+    // The audit re-feeds the recorded maps and recomputes everything else,
+    // so every record matches.
+    let mut limits = SessionConfig::defaults(TOKENS).run.limits;
+    limits.format_errors = u32::MAX;
+    let a = audit_session(
+        Audit {
+            state_root: fx.state_root(),
+            run: &r.run.run,
+            attempt: None,
+            anchor: r.run.chain_head,
+            spec: &fx.spec,
+            registry: &registry().unwrap(),
+            policy: &UserPolicy::default(),
+            profile: &Profile::conservative_default("m"),
+            limits: &limits,
+        },
+        &SessionConfig::defaults(TOKENS).turn,
+    )
+    .unwrap();
+    assert_eq!(a.divergence, None, "{a:?}");
+    assert!(a.stop_recomputed);
+    assert_eq!(a.matched, recs.len() - 1);
 }
 
 /// P-38: a session header keeps its `mode: session` and gains neither of

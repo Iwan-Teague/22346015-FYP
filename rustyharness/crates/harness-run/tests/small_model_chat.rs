@@ -498,3 +498,127 @@ fn replay_audits_clean_with_terse_docs() {
     assert!(a.stop_recomputed);
     assert_eq!(a.matched, recs.len() - 1);
 }
+
+/// P-33: with terse tool docs every request is smaller than the full-docs
+/// run's (the declaration block shrinks; everything else is equal), which
+/// is what `full_docs_digest_unchanged` pins from the other side.
+#[test]
+fn terse_docs_reduce_tool_block_bytes() {
+    let (state, ws) = scratch("terse-bytes");
+    let full = native();
+    let full_mimic = Mimic::with(full.clone(), plan(), None);
+    let fr = go(&state, &ws, &full, &full_mimic);
+    assert_eq!(fr.cause, StopCause::Submitted);
+
+    let (state2, ws2) = scratch("terse-bytes-terse");
+    let tp = terse();
+    let terse_mimic = Mimic::with(tp.clone(), plan(), None);
+    let tr = go(&state2, &ws2, &tp, &terse_mimic);
+    assert_eq!(tr.cause, StopCause::Submitted);
+
+    let bytes = |m: &Mimic| {
+        m.requests
+            .borrow()
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>()
+    };
+    assert!(
+        bytes(&terse_mimic) < bytes(&full_mimic),
+        "terse requests ({}) must be smaller than full ones ({})",
+        bytes(&terse_mimic),
+        bytes(&full_mimic)
+    );
+}
+
+/// P-33: `tool_docs` defaults to `full`, so an explicit `"full"` profile
+/// renders byte-for-byte the requests the default profile renders — no
+/// digest moves for runs that never opted in to terse.
+#[test]
+fn full_docs_digest_unchanged() {
+    let explicit = Profile::parse(
+        br#"{"profile_version":1,"id":"small-test","model":"m","context_window":32768,
+        "fill_ratio":0.6,"protocol":"native","tool_choice_required_ok":false,"grammar":"none",
+        "max_active_tools":6,"edit_format":"replace","recent_turns":5,"tool_docs":"full",
+        "sampling":{"temperature":0.2,"top_p":0.95,"seed":7,"max_tokens":1024}}"#,
+    )
+    .unwrap();
+    assert_eq!(explicit.tool_docs(), harness_model::profile::ToolDocs::Full);
+
+    let (state, ws) = scratch("full-default");
+    let default = native();
+    let default_mimic = Mimic::with(default.clone(), plan(), None);
+    let dr = go(&state, &ws, &default, &default_mimic);
+    assert_eq!(dr.cause, StopCause::Submitted);
+
+    let (state2, ws2) = scratch("full-explicit");
+    let explicit_mimic = Mimic::with(explicit.clone(), plan(), None);
+    let er = go(&state2, &ws2, &explicit, &explicit_mimic);
+    assert_eq!(er.cause, StopCause::Submitted);
+
+    // The two runs' rendered requests, with each observation's nonce
+    // replaced (a nonce is drawn fresh per run; every other byte must
+    // match).
+    fn norm(v: &Value) -> String {
+        let s = v.to_string();
+        let b = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0usize;
+        while let Some(p) = s[i..].find("untrusted ") {
+            let at = i + p;
+            // A delimiter only when it opens as `<<untrusted` (its opening
+            // form) or `<</untrusted` (its closing form); any other
+            // occurrence of the word is text, kept verbatim.
+            let tag = if at >= 2 && &b[at - 2..at] == b"<<" {
+                "<<untrusted "
+            } else if at >= 3 && &b[at - 3..at] == b"<</" {
+                "<</untrusted "
+            } else {
+                i = at + 1;
+                out.push_str(s.get(i - 1..i).unwrap_or(""));
+                continue;
+            };
+            let j = at + "untrusted ".len();
+            let hex = &s[j..(j + 32).min(s.len())];
+            if hex.len() == 32 && hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                out.push_str(
+                    s.get(i..at - (tag.len() - "untrusted ".len()))
+                        .unwrap_or(""),
+                );
+                out.push_str(tag);
+                out.push('N');
+                i = j + 32;
+            } else {
+                i = at + 1;
+                out.push_str(s.get(i - 1..i).unwrap_or(""));
+            }
+        }
+        out.push_str(s.get(i..).unwrap_or(""));
+        out
+    }
+    let left: Vec<String> = default_mimic.requests.borrow().iter().map(norm).collect();
+    let right: Vec<String> = explicit_mimic.requests.borrow().iter().map(norm).collect();
+    assert_eq!(left.len(), right.len(), "the same number of requests");
+    for (i, (a, b)) in left.iter().zip(&right).enumerate() {
+        if a != b {
+            let at = a
+                .bytes()
+                .zip(b.bytes())
+                .position(|(x, y)| x != y)
+                .unwrap_or(a.len().min(b.len()));
+            let lo = at.saturating_sub(80);
+            panic!(
+                "request {i} differs at byte {at}:\nL ...{}\nR ...{}",
+                a.get(lo..(at + 120).min(a.len())).unwrap_or(""),
+                b.get(lo..(at + 120).min(b.len())).unwrap_or("")
+            );
+        }
+    }
+    // The header of neither run carries a `tool_docs` key (only a terse
+    // run stamps one), so the journal headers compare equal too.
+    let head = |r: &RunReport| records(r, 1)[0].body.clone();
+    let h1 = head(&dr);
+    let h2 = head(&er);
+    assert_eq!(h1.get("tool_docs"), None);
+    assert_eq!(h2.get("tool_docs"), None);
+}

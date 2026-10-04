@@ -552,6 +552,13 @@ impl<'a> Loop<'a> {
             .field("tree_digest", Trusted::Digest(tree_digest))
             .field("files", Trusted::Untrusted(f));
         w.append(self.step, ev).map_err(journal)?;
+        // P-33: the ledger gains the restore event here — one place, so a
+        // live run and an audit's recompute push it alike.
+        self.ledger_events
+            .push(harness_model::context::LedgerEvent::Restored {
+                files: u64::try_from(files.len()).unwrap_or(u64::MAX),
+                to_step,
+            });
         // The model is told through the next request (the same slot the
         // other harness notices use): its later edits no longer stand.
         let text = restored_notice_text(files.len(), to_step);

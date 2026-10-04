@@ -29,7 +29,9 @@ use crate::driver::plan::{hosted_takes_no_personal, plan, prepare};
 use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
 use crate::driver::stop::{commit, End};
 use crate::driver::tools::{bg_fields, exec_fields, parse_bg, parse_exec};
-use crate::driver::{header, new_meter, new_nonce, new_run_id, HeaderInputs, PortsHeader, ReadLog};
+use crate::driver::{
+    header, new_meter, new_nonce, new_run_id, HeaderInputs, PortsHeader, ReadLog, RepoMapFeed,
+};
 
 use crate::{RunConfig, RunRefused, TaskSpec};
 
@@ -253,8 +255,10 @@ fn drive_full_profile(
         presubmit: None,
         post_edit: None,
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         workspace_root: None,
         user: None,
+        delegate: None,
     });
     let end = lp.drive(&mut w);
     let pressure = lp.pressure.clone();
@@ -987,8 +991,10 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         presubmit: None,
         post_edit: None,
         restore: Default::default(),
+        repo_feed: RepoMapFeed::live(),
         workspace_root: None,
         user: None,
+        delegate: None,
     });
     let end = lp.drive(&mut w);
     assert_eq!(end.cause, StopCause::PolicyAbort);

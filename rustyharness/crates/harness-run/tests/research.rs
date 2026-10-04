@@ -597,9 +597,9 @@ fn coding_header_digest_unchanged() {
     assert_eq!(head.get("session_kind"), None, "no kind key for coding");
     assert_eq!(head.get("web"), None, "no web key for coding");
     // P-28 added the mode line and the approved-plan block (rh-context/7),
-    // P-30 the project notes block (rh-context/8); the batch context stays
-    // rh-context/5.
-    assert_eq!(head["context_format"], Value::from("rh-context/8"));
+    // P-30 the project notes block (rh-context/8), P-33 the ledger and the
+    // repo map (rh-context/9); the batch context stays rh-context/5.
+    assert_eq!(head["context_format"], Value::from("rh-context/9"));
     assert_eq!(head["mode"], Value::from("session"));
 }
 
@@ -695,7 +695,7 @@ fn research_context_format_is_rh_research_2() {
     assert_eq!(harness_model::context::CONTEXT_FORMAT, "rh-context/5");
     assert_eq!(
         harness_model::context::SESSION_CONTEXT_FORMAT,
-        "rh-context/8"
+        "rh-context/9"
     );
 
     let r = go_research(

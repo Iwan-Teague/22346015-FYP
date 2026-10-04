@@ -7,18 +7,19 @@ use std::time::{Duration, Instant};
 use gate_outcome::Digest;
 use harness_core::environment::EnvProbe;
 use harness_core::{
-    sha256, BudgetDim, LoopDetector, LoopEvent, LoopKind, LoopSignal, Meter, Nonce, Source,
-    StopCause, TokenUsage, Untrusted,
+    sha256, BudgetDim, ChildSpend, LoopDetector, LoopEvent, LoopKind, LoopSignal, Meter, Nonce,
+    Source, StopCause, TokenUsage, Untrusted,
 };
 use harness_journal::{
-    BlobSink, Clock, Condition, ConditionKind, Event, EventKind, Ident, JournalError, JournalFile,
-    JournalWriter, Trusted,
+    writer::stop_cause_name, BlobSink, Clock, Condition, ConditionKind, Event, EventKind, Ident,
+    JournalError, JournalFile, JournalWriter, Trusted,
 };
 use harness_manifest::admission::Registry;
 use harness_model::context::{
-    self, budget_notice, budget_notice_session, step_notice, valid_wall_notice, wall_threshold,
-    BudgetNotice, ContextError, Delimiting, Fact, Feedback, Renderings, SessionModeView, Shown,
-    ShownCall, Turn, UserEntry, SUBMIT_ACCEPTED_FAILING_TEXT, SUBMIT_ACCEPTED_TEXT,
+    self, budget_notice, budget_notice_session, budget_tokens, step_notice, valid_wall_notice,
+    wall_threshold, BudgetNotice, ContextError, Delimiting, Fact, Feedback, Renderings,
+    SessionModeView, Shown, ShownCall, Turn, UserEntry, SUBMIT_ACCEPTED_FAILING_TEXT,
+    SUBMIT_ACCEPTED_TEXT,
 };
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
@@ -28,10 +29,11 @@ use harness_model::{
     Completion, HarnessText, ModelBackend, ModelError, ModelRequest, TaskText, ToolSpec,
 };
 use harness_policy::{
-    is_plan_tool_id, Call, Matcher, PolicyDecision, Session, SessionMode, PLAN_SUBMIT_ID,
-    SUBMIT_ID, TODO_ID,
+    is_plan_tool_id, Call, Matcher, PolicyDecision, Session, SessionMode, DELEGATE_ID,
+    PLAN_SUBMIT_ID, SUBMIT_ID, TODO_ID,
 };
-use harness_tools::builtin::WorkspaceTree;
+use harness_tools::builtin::code::{DELEGATE_NOT_STARTED, DELEGATE_NO_REPORT, DELEGATE_REFUSED};
+use harness_tools::builtin::{WorkspaceFacts, WorkspaceTree};
 use harness_tools::{
     EditRecord, ExecCleanup, Image, InvokeCtx, ReadLog, TodoList, ToolProvider, ToolStatus,
 };
@@ -41,7 +43,10 @@ use super::approvals::Approvals;
 use super::new_nonce;
 use super::stop::{denied_text, End};
 use super::tools::{exec_fields, is_edit, is_exec, is_read, status_name, RecordedResult};
-use super::RunConfig;
+use super::{ParentLink, RunConfig};
+use crate::delegate::{
+    check_admission, frame_report, run_child, ChildRefused, NOT_STARTED_TEXT, REFUSAL_CARVE,
+};
 use crate::presubmit::{PresubmitResult, PresubmitState, Round};
 use crate::sample;
 
@@ -124,6 +129,11 @@ pub(crate) struct Loop<'a> {
     /// the context as the fixed project-notes block and the nonce draw
     /// refuses a nonce the notes carry.
     pub(crate) instructions: Option<&'a crate::session::Instructions>,
+    /// What a `harness.task.delegate` call needs to admit and build a
+    /// child (P-38e): `None` in a child (the depth limit, §11 — the branch
+    /// stops on it), in an audit and in a resume's catch-up until the
+    /// reconstruction slice lands (P-38f).
+    pub(crate) delegate: Option<crate::delegate::ChildCtx<'a>>,
     /// The plan awaiting `/build` (P-28): set by an accepted
     /// `harness.plan.submit`, taken by an approval. Not in `LoopInit`: it
     /// always starts empty, in a live run, an audit and a resume alike — a
@@ -133,6 +143,20 @@ pub(crate) struct Loop<'a> {
     /// as the user's own approved intent. Also always starts empty and is
     /// re-derived the same way.
     pub(crate) plan_approved: Option<String>,
+    /// The ledger's commands-run list (P-33): each command's argv and its
+    /// one-line end, in call order, captured where the result is journaled
+    /// (a replay re-derives it from the re-parsed call and the re-fed
+    /// exec record, which are identical). Always starts empty, like the
+    /// plan state.
+    pub(crate) ledger_commands: Vec<context::LedgerCommand>,
+    /// The ledger's events (P-33): the mode changes and the restores, in
+    /// order, pushed where their records are written. Also always starts
+    /// empty and is re-derived by re-driving.
+    pub(crate) ledger_events: Vec<context::LedgerEvent>,
+    /// Where each build's repo map comes from (P-33): a live run computes
+    /// it from the touched files; an audit and a resume's catch-up re-feed
+    /// the recorded one (the workspace is not read in a replay).
+    pub(crate) repo_feed: super::repomap::RepoMapFeed,
 }
 
 /// A submitted plan awaiting the user's `/build` (P-28): the validated
@@ -301,6 +325,8 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) user: Option<UserState<'a>>,
     pub(crate) research: bool,
     pub(crate) instructions: Option<&'a crate::session::Instructions>,
+    pub(crate) repo_feed: super::repomap::RepoMapFeed,
+    pub(crate) delegate: Option<crate::delegate::ChildCtx<'a>>,
 }
 
 impl<'a> Loop<'a> {
@@ -337,6 +363,8 @@ impl<'a> Loop<'a> {
             user,
             research,
             instructions,
+            repo_feed,
+            delegate,
         } = init;
         Loop {
             session,
@@ -370,9 +398,42 @@ impl<'a> Loop<'a> {
             user,
             research,
             instructions,
+            repo_feed,
+            delegate,
             plan_pending: None,
             plan_approved: None,
+            ledger_commands: Vec::new(),
+            ledger_events: Vec::new(),
         }
+    }
+}
+
+/// The command line a ledger entry names (P-33): the call's `argv` array
+/// joined with spaces. `None` when the arguments are not that shape (fail
+/// closed: never fabricate an entry — the exec schema always sends one,
+/// so this is defence in depth).
+fn exec_argv(args: &Value) -> Option<String> {
+    let items = args.get("argv")?.as_array()?;
+    let mut out = String::new();
+    for (i, v) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(v.as_str()?);
+    }
+    Some(out)
+}
+
+/// A command's one-line end, as the ledger names it (P-33): the same ends
+/// the `exec` record's `end` field names, in words.
+fn exec_end_text(x: &harness_tools::ExecRecord) -> String {
+    match x.end {
+        harness_tools::ExecEnd::Exited(c) => format!("exited {c}"),
+        harness_tools::ExecEnd::Signaled(n) => format!("signaled {n}"),
+        harness_tools::ExecEnd::TimedOut => String::from("timed out"),
+        harness_tools::ExecEnd::ProcessLimit => String::from("process limit"),
+        harness_tools::ExecEnd::ExecFailed => String::from("exec failed"),
+        harness_tools::ExecEnd::Unknown => String::from("unknown"),
     }
 }
 
@@ -584,6 +645,68 @@ impl<'a> Loop<'a> {
         })
     }
 
+    /// The checklist as the ledger shows it (P-33): one line per item,
+    /// `None` when the run keeps no checklist or an empty one. The texts
+    /// are the model's own words but the ledger is the harness's rendering
+    /// of state it applied itself (each item went through
+    /// `TodoList::apply`), so it is ledger material, not model-written
+    /// text the harness vouches for.
+    fn ledger_todo(&self) -> Option<String> {
+        let t = self.todo.as_ref()?;
+        if t.items().is_empty() {
+            return None;
+        }
+        let mut s = String::new();
+        for i in t.items() {
+            let status = match i.status {
+                harness_tools::TodoStatus::Pending => "pending",
+                harness_tools::TodoStatus::InProgress => "in progress",
+                harness_tools::TodoStatus::Done => "done",
+            };
+            s.push_str(&format!("- [{status}] {}\n", i.text));
+        }
+        Some(s)
+    }
+
+    /// The conversation ledger as the session context shows it (P-33): a
+    /// pure function of the loop state — the checklist, the files-touched
+    /// table from the restore log's edit marks, the commands run and the
+    /// mode/restore events — so audit replay recomputes it.
+    fn ledger_view(&self) -> context::Ledger {
+        let mut files = Vec::new();
+        for f in super::repomap::touched_files(self.restore.marks()) {
+            files.push(context::LedgerFile {
+                path: f.path,
+                edits: f.edits,
+                last: f.last.map(|d| d.to_string()),
+            });
+        }
+        context::Ledger {
+            todo: self.ledger_todo(),
+            files,
+            commands: self.ledger_commands.clone(),
+            events: self.ledger_events.clone(),
+        }
+    }
+
+    /// The repo map this build shows (P-33): computed live from the
+    /// touched files when the workspace is readable, re-fed from the
+    /// journal in an audit and a resume's catch-up. `Some` exactly when
+    /// the context carries a map, so the `ContextBuilt` record names it
+    /// exactly then.
+    fn repo_map_for_build(&mut self) -> Option<Untrusted<String>> {
+        if self.research || self.user.is_none() {
+            return None;
+        }
+        let root = self.user.as_ref().and_then(|u| u.root.clone());
+        super::repomap::for_build(
+            &mut self.repo_feed,
+            root.as_deref(),
+            self.step,
+            self.restore.marks(),
+        )
+    }
+
     /// `/plan` (P-28): narrow the session to the plan set. A research
     /// session or a batch loop has no plan mode (fail closed: refuse
     /// silently, journal nothing). Idempotent: `/plan` twice journals one
@@ -603,6 +726,7 @@ impl<'a> Loop<'a> {
             return Ok(());
         }
         self.session.enter_plan();
+        self.ledger_events.push(context::LedgerEvent::Plan);
         w.append(
             self.step,
             Event::new(EventKind::ModeChanged).field("mode", Trusted::Text("plan")),
@@ -656,6 +780,7 @@ impl<'a> Loop<'a> {
             self.session.grant_plan(&cap, m);
         }
         self.plan_approved = Some(pending.block_text());
+        self.ledger_events.push(context::LedgerEvent::Build);
         w.append(
             self.step,
             Event::new(EventKind::ModeChanged)
@@ -801,6 +926,13 @@ impl<'a> Loop<'a> {
         // P-28: in plan mode the request names and shows only the plan set
         // (the read tools, the checklist, the plan sentinel).
         let tools = self.active_tools();
+        // P-33: the session context carries the ledger and, when this
+        // build shows one, the repo map. The ledger is a pure function of
+        // the loop state; the map is computed live or re-fed (see
+        // `repo_map_for_build`), and its text is journaled with the
+        // `ContextBuilt` record exactly when it is shown.
+        let ledger = self.ledger_view();
+        let repo_map = self.repo_map_for_build().map(context::RepoMap::new);
         let built = match (&self.user, self.research) {
             (Some(u), true) => context::build_research(
                 self.profile,
@@ -817,6 +949,8 @@ impl<'a> Loop<'a> {
                 self.task,
                 &self.facts,
                 self.session_notes().as_ref(),
+                Some(&ledger),
+                repo_map.as_ref(),
                 &self.turns,
                 &u.users,
                 &self.nonces.assigned,
@@ -854,6 +988,21 @@ impl<'a> Loop<'a> {
         if self.user.is_some() {
             // P-05 §1.1: only a session's ContextBuilt carries this.
             ev = ev.field("users_dropped", Trusted::U64(users_dropped));
+        }
+        // P-33: a coding session names the repo map it showed, as an
+        // untrusted workspace payload. An audit and a resume's catch-up
+        // re-feed the recorded text (the workspace is not read in a
+        // replay) and write the identical payload back; the context digest
+        // covers the text either way. Research sessions and batch runs
+        // never carry one.
+        if let Some(map) = &repo_map {
+            let tok = w
+                .untrusted(&Untrusted::new(
+                    map.text.inspect("context: repo map").clone(),
+                    Source::Workspace(super::repomap::REPO_MAP_NAME.to_owned()),
+                ))
+                .map_err(journal)?;
+            ev = ev.field("repo_map", Trusted::Untrusted(tok));
         }
         w.append(step, ev).map_err(journal)?;
 
@@ -973,6 +1122,9 @@ impl<'a> Loop<'a> {
         let capability = self.capability(&tool)?;
         let args = Value::Object(parsed.action.args);
         let args_text = args.to_string();
+        // P-33: the ledger's commands-run argv, taken before `args` moves
+        // into the policy call (re-derived identically in a replay).
+        let ledger_argv = exec_argv(&args);
         // The action as the native protocol shows it back (H1h): the active
         // tool's id and the canonical JSON of the arguments policy decides
         // on, beside the reply's text; never the raw call the server sent.
@@ -1236,6 +1388,282 @@ impl<'a> Loop<'a> {
             self.meter.tick_wall()?;
             self.observe_budgets(w, step)?;
             return Ok(Flow::Continue);
+        }
+
+        // The delegate sentinel (P-38e, design §4-§7): admit the call,
+        // carve this step's remaining budget for one helper, run the child
+        // synchronously (§12: at most one request in flight, this thread),
+        // and land its report as an ordinary untrusted observation. A
+        // refusal is a plain tool error with static text (§6.3) and no
+        // child record; a started child always leaves a `ChildRun` record
+        // before the step's own `ToolFinished` (§6.1).
+        if tool == DELEGATE_ID {
+            let intent_seq = journaled.intent_seq();
+            let intent_hash = journaled.intent_hash();
+            let args = journaled.call().call().args.clone();
+            drop(journaled);
+
+            // §11: depth one. A child runs with no delegate context, and
+            // so do an audit and a resume's catch-up until the
+            // reconstruction slice lands (P-38f): reaching this branch
+            // without one is a harness bug — stop.
+            let ctx = match self.delegate.as_ref() {
+                Some(c) => crate::delegate::ChildCtx {
+                    state_root: c.state_root,
+                    workspace: c.workspace,
+                    parent_spec: c.parent_spec,
+                    registry: c.registry,
+                    policy: c.policy,
+                    profile: c.profile,
+                    backend: c.backend,
+                    probe: c.probe,
+                    env: c.env,
+                    approver: c.approver,
+                    parent_run: c.parent_run.clone(),
+                    parent_attempt: c.parent_attempt,
+                    live: c.live,
+                    admitted: c.admitted,
+                    facts: c.facts,
+                    timeouts: c.timeouts,
+                },
+                None => return Err(StopCause::PolicyAbort),
+            };
+
+            let brief = args.get("task").and_then(Value::as_str);
+
+            // §5.1: what is left of the parent's budgets now, this step's
+            // own charge already taken. In a session the turn's allowance
+            // bounds the carve too. The wall never gates admission (§4).
+            let carve = {
+                let steps_base = u64::from(
+                    self.config
+                        .limits
+                        .steps
+                        .saturating_sub(self.meter.steps_spent()),
+                );
+                let steps_left = match &self.user {
+                    Some(u) => steps_base.min(u.allowance.saturating_sub(u.used)),
+                    None => steps_base,
+                };
+                let (tokens_in, tokens_out) = self.meter.tokens_spent();
+                let tokens_left = self
+                    .config
+                    .limits
+                    .tokens
+                    .saturating_sub(tokens_in.saturating_add(tokens_out));
+                harness_core::carve(
+                    u32::try_from(steps_left).unwrap_or(u32::MAX),
+                    tokens_left,
+                    self.remaining_wall(),
+                    budget_tokens(self.profile),
+                )
+            };
+
+            // §4: admission, in order — the run's cap, the brief, the
+            // child's plannable scope, then the carve.
+            let refusal = match check_admission(&ctx, brief) {
+                Ok(()) => match carve {
+                    Ok(_) => None,
+                    Err(_) => Some(REFUSAL_CARVE.to_owned()),
+                },
+                Err(text) => Some(text),
+            };
+            if let Some(text) = refusal {
+                return self.delegate_finish(
+                    w,
+                    step,
+                    intent_seq,
+                    reply,
+                    shown,
+                    notice,
+                    tool,
+                    "error",
+                    Some(DELEGATE_REFUSED),
+                    text,
+                    false,
+                    None,
+                );
+            }
+            let Ok(carve) = carve else {
+                return Err(StopCause::PolicyAbort);
+            };
+            let brief = brief.unwrap_or_default();
+
+            // §5.2: the child's wall time is its own — the parent's meter
+            // is paused for the whole child, asks included, and the child
+            // pauses its own during its asks. The run so far is what the
+            // `ChildRun` record cites.
+            let wall_used_ms = u64::try_from(self.meter.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let facts = WorkspaceFacts {
+                tree: self.tree,
+                files: ctx.facts.files,
+                oversize: ctx.facts.oversize,
+            };
+            let link = ParentLink {
+                run: ctx.parent_run.clone(),
+                attempt: ctx.parent_attempt,
+                step,
+                intent_hash,
+            };
+            let pause = self.meter.pause_wall()?;
+            let outcome = run_child(&ctx, brief, &carve, &link, &facts, self.workspace.clone());
+            drop(pause);
+
+            // §10 stop table: a child that started but whose journal
+            // cannot be read back (or whose committed head is missing) is
+            // a harness-visible failure — record the tool-level "could not
+            // run" with nothing of the child's work in it, then stop. Any
+            // other refusal means the child never started: a `provider_error`
+            // observation, and the run goes on.
+            let done = match outcome {
+                Ok(done) => done,
+                Err(e @ ChildRefused::ReadBack(_)) => {
+                    return self.delegate_journal_lost(w, step, intent_seq, e.to_string());
+                }
+                Err(e @ ChildRefused::Note(_)) => {
+                    return self.delegate_journal_lost(w, step, intent_seq, e.to_string());
+                }
+                Err(_) => {
+                    return self.delegate_finish(
+                        w,
+                        step,
+                        intent_seq,
+                        reply,
+                        shown,
+                        notice,
+                        tool,
+                        "provider_error",
+                        Some(DELEGATE_NOT_STARTED),
+                        NOT_STARTED_TEXT.to_owned(),
+                        false,
+                        None,
+                    );
+                }
+            };
+            let Some(_) = done.chain_head else {
+                return self.delegate_journal_lost(
+                    w,
+                    step,
+                    intent_seq,
+                    format!(
+                        "the child run stopped ({}) but its journal has no committed head",
+                        stop_cause_name(&done.stop)
+                    ),
+                );
+            };
+
+            // §6.2: the child's record, recomputable from the parent
+            // journal alone (the brief and note are cited by digest; their
+            // bytes travel as the tool's untrusted payloads).
+            let Some(child_id) = Ident::from_trusted(&done.run) else {
+                return Err(StopCause::PolicyAbort);
+            };
+            let spend = done.spend;
+            let (text, truncated) = match &done.note {
+                Some(note) => frame_report(&done.run, done.steps, carve.steps, note, self.profile),
+                None => (
+                    format!(
+                        "The helper (run {}) stopped without a report: {}, after {} of {} steps. \
+                         Its work is not available; do it yourself or ask a narrower question.",
+                        done.run,
+                        stop_cause_name(&done.stop),
+                        done.steps,
+                        carve.steps
+                    ),
+                    false,
+                ),
+            };
+            let submitted = done.note.is_some();
+            let Some(spec_grants) =
+                crate::delegate::child_spec(&ctx.parent_spec.grants, self.profile)
+            else {
+                return Err(StopCause::PolicyAbort);
+            };
+            let mut grants = Vec::with_capacity(spec_grants.len());
+            for g in &spec_grants {
+                // The id comes from the resolved capability, like the
+                // header's `grants` field — a grant that does not resolve
+                // cannot be vouched for.
+                let harness_manifest::admission::Resolved::One { capability, .. } =
+                    ctx.registry.resolve(g)
+                else {
+                    return Err(StopCause::PolicyAbort);
+                };
+                let Some(id) = Ident::from_capability(capability) else {
+                    return Err(StopCause::PolicyAbort);
+                };
+                grants.push(Trusted::Id(id));
+            }
+            let mut child_ev = Event::new(EventKind::ChildRun)
+                .field("intent_seq", Trusted::U64(intent_seq))
+                .field("child", Trusted::Id(child_id))
+                .field("stop", Trusted::Text(stop_cause_name(&done.stop)))
+                .field("brief", Trusted::Digest(sha256(brief.as_bytes())))
+                .field(
+                    "template",
+                    Trusted::Digest(crate::delegate::child_template_digest()),
+                )
+                .field("grants", Trusted::List(grants))
+                .field(
+                    "limits",
+                    Trusted::Obj(vec![
+                        ("steps", Trusted::U64(u64::from(carve.steps))),
+                        ("tokens", Trusted::U64(carve.tokens)),
+                        (
+                            "wall_ms",
+                            Trusted::U64(u64::try_from(carve.wall.as_millis()).unwrap_or(u64::MAX)),
+                        ),
+                    ]),
+                )
+                .field("wall_used_ms", Trusted::U64(wall_used_ms))
+                .field(
+                    "spent",
+                    Trusted::Obj(vec![
+                        ("steps", Trusted::U64(u64::from(spend.steps()))),
+                        ("tokens_in", Trusted::U64(spend.tokens().0)),
+                        ("tokens_out", Trusted::U64(spend.tokens().1)),
+                        ("estimated", Trusted::Bool(spend.estimated())),
+                        (
+                            "wall_ms",
+                            Trusted::U64(
+                                u64::try_from(spend.wall().as_millis()).unwrap_or(u64::MAX),
+                            ),
+                        ),
+                    ]),
+                );
+            if let Some(head) = done.chain_head {
+                child_ev = child_ev.field("chain_head", Trusted::Digest(head));
+            }
+            if let Some(note) = &done.note {
+                child_ev = child_ev.field("result", Trusted::Digest(sha256(note.as_bytes())));
+            }
+            w.append(step, child_ev).map_err(journal)?;
+
+            // §6.3: the report (framed, §7) or the no-report error, as the
+            // step's ToolFinished; the child's spend joins the parent's
+            // meter only once that record is durable (§5.2, in
+            // `delegate_finish`). The observation is untrusted like any
+            // tool's: nonce delimiting, withholding and no parsing come
+            // from the ordinary turn path (§7, INV-29).
+            let status = if submitted { "ok" } else { "error" };
+            let code = (!submitted).then_some(DELEGATE_NO_REPORT);
+            if let Some(c) = self.delegate.as_mut() {
+                c.admitted += 1;
+            }
+            return self.delegate_finish(
+                w,
+                step,
+                intent_seq,
+                reply,
+                shown,
+                notice,
+                tool,
+                status,
+                code,
+                text,
+                truncated,
+                Some(&spend),
+            );
         }
 
         // The plan sentinel (P-28): like the checklist, recorded and never
@@ -1505,6 +1933,16 @@ impl<'a> Loop<'a> {
                 // file tools' race); a tree the harness could not measure
                 // stops it too (a fact it cannot state).
                 if let (Some(x), true) = (&res.exec, is_exec(&tool)) {
+                    // P-33: the ledger's commands-run entry. The argv comes
+                    // from the parsed call (re-derived identically in a
+                    // replay), the one-line end from the exec record the
+                    // result carries (live or re-fed).
+                    if let Some(argv) = &ledger_argv {
+                        self.ledger_commands.push(context::LedgerCommand {
+                            argv: argv.clone(),
+                            result: exec_end_text(x),
+                        });
+                    }
                     let tree = match fed_exec_tree {
                         Some(t) => t,
                         None => x.workspace.as_ref().map(WorkspaceTree::digest),
@@ -1660,6 +2098,101 @@ impl<'a> Loop<'a> {
         self.meter.tick_wall()?;
         self.observe_budgets(w, step)?;
         Ok(Flow::Continue)
+    }
+
+    /// The delegate step's `ToolFinished` and the turn closed around it
+    /// (P-38e): the observation lands like any tool's, and when a child
+    /// actually ran, its spend joins the parent's meter after the record
+    /// is durable (§5.2), then the wall tick and the budget checks. Every
+    /// delegate outcome but an unreadable child journal comes through here.
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_finish<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+        step: u64,
+        intent_seq: u64,
+        reply: Untrusted<String>,
+        shown: ShownCall,
+        notice: Option<HarnessText>,
+        tool: String,
+        status: &'static str,
+        code: Option<u16>,
+        text: String,
+        truncated: bool,
+        spend: Option<&ChildSpend>,
+    ) -> Result<Flow, StopCause> {
+        let digest = sha256(text.as_bytes());
+        let body = Untrusted::new(text, Source::Tool(DELEGATE_ID.to_owned()));
+        let out = w
+            .untrusted(&body)
+            .map_err(|e: JournalError| e.stop_cause())?;
+        let mut ev = Event::new(EventKind::ToolFinished)
+            .field("intent_seq", Trusted::U64(intent_seq))
+            .field("status", Trusted::Text(status))
+            .field("truncated", Trusted::Bool(truncated))
+            .field("digest", Trusted::Digest(digest))
+            .field("output", Trusted::Untrusted(out));
+        if let Some(code) = code {
+            ev = ev.field("code", Trusted::U64(u64::from(code)));
+        }
+        w.append(step, ev)
+            .map_err(|e: JournalError| e.stop_cause())?;
+        self.detector.observe(LoopEvent::Observation { digest });
+        self.turns.push(Turn {
+            step,
+            reply,
+            action: Some(shown),
+            feedback: Feedback::Observation {
+                call: tool,
+                body,
+                digest,
+            },
+            notice,
+        });
+        if let Some(spend) = spend {
+            self.meter.absorb_child(spend)?;
+        }
+        self.meter.tick_wall()?;
+        self.observe_budgets(w, step)?;
+        Ok(Flow::Continue)
+    }
+
+    /// §10: the child started but its journal cannot be read back (or its
+    /// committed head is missing). The step's result is the tool-level
+    /// "could not run" carrying nothing of the child's work, and the run
+    /// stops: its own journal may share the child's failure.
+    fn delegate_journal_lost<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+        step: u64,
+        intent_seq: u64,
+        error: String,
+    ) -> Result<Flow, StopCause> {
+        let body = Untrusted::new(
+            NOT_STARTED_TEXT.to_owned(),
+            Source::Tool(DELEGATE_ID.to_owned()),
+        );
+        let out = w
+            .untrusted(&body)
+            .map_err(|e: JournalError| e.stop_cause())?;
+        w.append(
+            step,
+            Event::new(EventKind::ToolFinished)
+                .field("intent_seq", Trusted::U64(intent_seq))
+                .field("status", Trusted::Text("provider_error"))
+                .field("truncated", Trusted::Bool(false))
+                .field(
+                    "digest",
+                    Trusted::Digest(sha256(NOT_STARTED_TEXT.as_bytes())),
+                )
+                .field("output", Trusted::Untrusted(out))
+                .field("code", Trusted::U64(u64::from(DELEGATE_NOT_STARTED))),
+        )
+        .map_err(|e: JournalError| e.stop_cause())?;
+        Err(StopCause::JournalUnavailable {
+            op: "child journal".to_owned(),
+            error,
+        })
     }
 
     /// Decide how the turn this step's request shows for the first time

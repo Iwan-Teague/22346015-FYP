@@ -485,3 +485,27 @@ fn outline_file(
     let text = String::from_utf8(raw).ok()?;
     Some(ex.extract(lang, &text))
 }
+
+/// One file's outline as a repo map shows it (P-33): the path, then one
+/// `  {line}: {sig}` line per symbol, at most [`OUTLINE_MAX_ENTRIES`] of
+/// them. `None` when the file kind has no outline language or the text
+/// shows no symbols. Pure — text in, text out, no I/O — so the harness's
+/// repo map is a pure function of the file bytes, and a live run and a
+/// replay that reads the same bytes render the same lines.
+pub fn file_outline_text(rel: &str, text: &str) -> Option<String> {
+    let lang = lang_of(rel)?;
+    let ex = Extractor::new()?;
+    let syms = ex.extract(lang, text);
+    if syms.is_empty() {
+        return None;
+    }
+    let mut rows = String::new();
+    for sym in syms.iter().take(OUTLINE_MAX_ENTRIES) {
+        rows.push_str(&format!("  {}: {}\n", sym.line, sym.sig));
+    }
+    let mut s = String::with_capacity(rel.len() + 1 + rows.len());
+    s.push_str(rel);
+    s.push('\n');
+    s.push_str(&rows);
+    Some(s)
+}

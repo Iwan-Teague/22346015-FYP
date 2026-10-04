@@ -25,7 +25,7 @@ use crate::driver::step::UserState;
 use crate::driver::{
     attempt_check, commit, exec_tools, header, loop_facts, new_meter_resumed, prepare, todo_for,
     Approvals, BudgetNotices, ExecHeader, HeaderInputs, Loop, LoopInit, NonceSource, PortsHeader,
-    Prepared, ReadLog, WorkspaceModeRecord,
+    Prepared, ReadLog, RepoMapFeed, WorkspaceModeRecord,
 };
 use crate::postedit::PostEditState;
 use crate::presubmit::PresubmitState;
@@ -408,8 +408,13 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         post_edit: PostEditState::of(&r.spec.post_edit),
         workspace_root: r.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
+        // The kept steps' repo maps are re-fed (P-33); the live steps after
+        // them compute from the touched files, like any live run.
+        repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
         instructions: None,
         user: None,
+        // A resumed run cannot delegate yet (P-38f rebuilds the context).
+        delegate: None,
     });
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);
@@ -806,6 +811,9 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         post_edit: PostEditState::of(&r.spec.post_edit),
         workspace_root: r.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
+        // The kept steps' repo maps are re-fed (P-33); the live steps after
+        // them compute from the touched files, like any live run.
+        repo_feed: RepoMapFeed::re_feed(rec.repo_maps, kept_through),
         // The resumed session re-derives the instructions from the journal
         // (P-30) and rewrites the identical `InstructionsLoaded` record in
         // its catch-up, before any recorded input.
@@ -826,6 +834,8 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             blobs: layout::attempt_dir(&run_dir, attempt).join(layout::BLOBS_DIR),
             sink: r.sink,
         }),
+        // A resumed session cannot delegate yet (P-38f rebuilds it).
+        delegate: None,
     });
     let end = lp.drive_session(
         &mut w,

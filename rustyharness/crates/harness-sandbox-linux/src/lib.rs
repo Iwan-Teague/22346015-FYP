@@ -57,6 +57,12 @@
 pub mod seccomp;
 pub mod supervisor;
 
+/// The live self-probe (S-Le): canary children through the real
+/// supervisor path, refusing unless every canary is refused. Linux-only:
+/// the supervisor's spawn half is.
+#[cfg(target_os = "linux")]
+pub mod probe;
+
 /// What the host MEASURED about the confinement primitives of the default
 /// tier (read-only probes of `/proc` and `/sys`; a missing file is recorded
 /// as [`Option::None`], never guessed).

@@ -236,6 +236,7 @@ fn run(
         approver,
         confinement: None,
         input,
+        instructions: None,
         sink: None,
     })
     .unwrap()
@@ -517,6 +518,7 @@ fn restored_notice_reaches_context() {
         approver: None,
         confinement: None,
         input: &input,
+        instructions: None,
         sink: None,
     })
     .unwrap();

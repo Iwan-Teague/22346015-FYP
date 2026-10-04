@@ -9,7 +9,18 @@ all-features = true
 version = 2
 # The workspace's own crates are PolyForm-Noncommercial-1.0.0 (docs/adr/0003-licence.md);
 # third-party dependencies must stay on permissive licences.
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "PolyForm-Noncommercial-1.0.0"]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "PolyForm-Noncommercial-1.0.0",
+    # The TLS stack's tree (P-39n, harness-fetch/net only — INV-52 keeps it
+    # out of every other build), measured with `cargo deny check licenses`
+    # before admission: nothing else in the graph needed these.
+    "ISC",                   # ring, rustls-webpki, untrusted
+    "BSD-3-Clause",          # subtle (via ring)
+    "CDLA-Permissive-2.0",   # webpki-roots (the compiled-in root store data)
+]
 confidence-threshold = 1.0
 
 [bans]
@@ -24,6 +35,16 @@ confidence-threshold = 1.0
 #   scripts/ci/purity.sh §5b). Target-gated with it, so no other platform
 #   pulls them; `rustix` is pinned to its libc backend (no build codegen —
 #   L-Q2 open question, re-review at admission). No process APIs.
+#   rustls, rustls-webpki, ring, untrusted, subtle, zeroize (P-39n, design
+#   note `P-39-web-airlock` §5.4): the reviewed TLS stack, admitted for the
+#   `harness-fetch/net` feature ONLY (INV-52: no other crate may link any
+#   of them — scripts/ci/purity.sh allowlists that exact tree and checks
+#   harness-cli stays TLS-free). rustls = the client, ring = the crypto
+#   provider installed per-config (never a process default), rustls-webpki
+#   = certificate verification against compiled-in Mozilla roots
+#   (webpki-roots; CDLA-Permissive-2.0 data, never the system trust store),
+#   untrusted/subtle/zeroize = ring's parsing and crypto primitives. Pure
+#   Rust, no FFI, no default features (no aws-lc-rs, no logging).
 multiple-versions = "warn"
 wildcards = "deny"
 # Intra-workspace path dependencies carry no version; they are not registry

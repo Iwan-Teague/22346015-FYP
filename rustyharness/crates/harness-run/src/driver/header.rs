@@ -4,7 +4,7 @@
 
 use gate_outcome::Digest;
 use harness_core::environment::EnvSample;
-use harness_core::{sha256, MeterLimits, Source, Untrusted};
+use harness_core::{sha256, MeterLimits, Nonce, RunId, Source, Untrusted};
 use harness_journal::{Header, Ident, StartError, Trusted};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::builtin;
@@ -71,8 +71,19 @@ pub(crate) struct HeaderInputs<'a> {
     /// The task's port grant, with the probed witness (P-36g §6.1); `None`
     /// without ports, so older journals read as before.
     pub(crate) ports: Option<PortsHeader>,
+    /// The project instructions the user trusted at the session's start
+    /// (P-30); `None` loads none, so older journals read as before.
+    pub(crate) instructions: Option<&'a crate::session::Instructions>,
     /// The workspace-mode record (P-52); `None` in-place (no field).
     pub(crate) workspace_mode: Option<&'a WorkspaceModeRecord>,
+    /// The child link (P-38): present only in a child run's header, whose
+    /// `mode` is `child`. A batch or session header carries neither this
+    /// nor `child`.
+    pub(crate) parent: Option<ParentLink>,
+    /// The child record (P-38): the brief's nonce, the pinned template,
+    /// the brief's digest and the carved wall budget; present only in a
+    /// child run's header.
+    pub(crate) child: Option<ChildHeader>,
 }
 
 /// The sandbox a run's commands ran under, as its witness names it (H2d):
@@ -200,6 +211,75 @@ impl WorkspaceModeRecord {
             manifest,
             files,
         })
+    }
+}
+
+/// A child run's parent link (P-38): which run delegated, at which attempt
+/// and step, and the digest of the delegating call's intent record. Header
+/// inputs an audit or a resume compares; only a child header carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParentLink {
+    /// The delegating run.
+    pub(crate) run: RunId,
+    /// The delegating attempt.
+    pub(crate) attempt: u32,
+    /// The delegating loop step.
+    pub(crate) step: u64,
+    /// The delegating `ToolStarted` record's intent digest
+    /// ([`harness_journal::Journaled::intent_hash`]).
+    pub(crate) intent_hash: Digest,
+}
+
+impl ParentLink {
+    fn trusted(&self) -> Result<Trusted, StartError> {
+        Ok(Trusted::Obj(vec![
+            (
+                "run",
+                Trusted::Id(Ident::from_trusted(&self.run).ok_or(StartError {
+                    op: "header",
+                    error: "the parent run id is not an identifier".into(),
+                })?),
+            ),
+            ("attempt", Trusted::U64(u64::from(self.attempt))),
+            ("step", Trusted::U64(self.step)),
+            ("intent_hash", Trusted::Digest(self.intent_hash)),
+        ]))
+    }
+}
+
+/// What the header records about a child run itself (P-38): the brief's
+/// delimiter nonce, the pinned template it was rendered into, the brief's
+/// content digest, and the wall budget it was carved. The brief text
+/// itself travels beside the header as the untrusted `child_brief` claim
+/// (sourced from `harness.task.delegate`), like the `claimed_*` fields:
+/// a header field is trusted, so model text cannot be one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildHeader {
+    /// The SHA-256 of the compiled-in brief template, placeholders included.
+    pub(crate) template: Digest,
+    /// The SHA-256 of the brief's exact bytes (invisible characters
+    /// stripped, as [`crate::delegate::child_task_text`] embeds it).
+    pub(crate) brief: Digest,
+    /// The delimiter nonce drawn for the brief.
+    pub(crate) brief_nonce: Nonce,
+    /// The wall budget carved for this child, in milliseconds.
+    pub(crate) limits_wall_ms: u64,
+}
+
+impl ChildHeader {
+    fn trusted(&self) -> Result<Trusted, StartError> {
+        Ok(Trusted::Obj(vec![
+            ("template", Trusted::Digest(self.template)),
+            ("brief", Trusted::Digest(self.brief)),
+            (
+                "brief_nonce",
+                Trusted::Id(Ident::from_trusted(&self.brief_nonce).ok_or(StartError {
+                    op: "header",
+                    error: "the brief nonce is not an identifier".into(),
+                })?),
+            ),
+            ("limits_wall_ms", Trusted::U64(self.limits_wall_ms)),
+        ]))
     }
 }
 
@@ -346,8 +426,16 @@ impl PortsHeader {
 /// as before. `session_kind` and `web` (P-39i) are a research session's:
 /// absent for a coding session, so coding journals read exactly as before.
 /// `post_edit` (P-27) is the task's post-edit checks: absent without one,
-/// so a journal without one reads as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 21] = [
+/// so a journal without one reads as before. `parent` and `child` (P-38)
+/// are a child run's: a batch or session journal has neither, and an audit
+/// or a resume recomputes a batch or session header, so a child journal is
+/// refused at `mode` (its expected `mode` input is absent, the recorded
+/// one says `child`). `instructions` (P-30) is the trusted project
+/// instructions' digest: absent when none were loaded, so journals
+/// without any read as before. `endpoint_class` (P-31) is a
+/// hosted profile's declaration (Q-3): absent for a local model, so every
+/// journal written before P-31 reads as before.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 25] = [
     "task",
     "grants",
     "workspace_public",
@@ -369,6 +457,10 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 21] = [
     "turn_limits",
     "session_kind",
     "web",
+    "parent",
+    "child",
+    "instructions",
+    "endpoint_class",
 ];
 
 /// The header's `limits` object, field by field: the one encoding the
@@ -512,7 +604,7 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
         // What this build's contexts and requests are (H1h): a replay
         // recomputes them, so it needs the same format. A session run's
         // contexts differ (the users' share, P-05 §2.3), so it has its own;
-        // a research session's differ again (P-39i, rh-research/1).
+        // a research session's differ again (P-39i, rh-research/2).
         .field(
             "context_format",
             Trusted::Text(match &spec.kind {
@@ -549,6 +641,12 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
     // profile, so every older journal reads as before.
     if h.profile.tool_docs() == harness_model::profile::ToolDocs::Terse {
         hd = hd.field("tool_docs", Trusted::Digest(terse_table_sha256()));
+    }
+    // P-31, Q-3: the hosted declaration, so a journal says in its header
+    // that its context went to a hosted provider. No key for a local
+    // model, so every journal written before P-31 reads as before.
+    if h.profile.hosted() {
+        hd = hd.field("endpoint_class", Trusted::Text("loopback-proxy-hosted"));
     }
     if let Some(e) = &h.exec {
         hd = hd
@@ -600,6 +698,21 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
                 ("format_errors", Trusted::U64(u64::from(t.format_errors))),
             ]),
         );
+    } else if let (Some(p), Some(c)) = (&h.parent, &h.child) {
+        // P-38: a child run's header. Both links must be present (a child
+        // is constructed with both); the keys are header inputs, so an
+        // audit or a resume of the journal as a batch or session run is
+        // refused at `mode` before them.
+        hd = hd
+            .field("mode", Trusted::Text("child"))
+            .field("parent", p.trusted()?)
+            .field("child", c.trusted()?);
+    } else if h.parent.is_some() || h.child.is_some() {
+        // Half a child header is an internal caller's bug; refuse rather
+        // than write a journal that names one link and not the other.
+        return Err(super::RunRefused::Delegate(
+            "a child run's header takes both the parent link and the child record",
+        ));
     }
     // P-39i: a research session's kind and web grant, header inputs an
     // audit or a resume compares (INV-42: the session's own authority,
@@ -609,6 +722,13 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
         hd = hd
             .field("session_kind", Trusted::Text("research"))
             .field("web", Trusted::Digest(web_grant_digest(g)));
+    }
+    // P-30: the trusted project instructions' digest, a header input an
+    // audit or a resume compares (what entered the context must be what
+    // the user approved). No key when none were loaded, so older journals
+    // read as before.
+    if let Some(n) = &h.instructions {
+        hd = hd.field("instructions", Trusted::Digest(n.digest));
     }
     if let Some((attempt, head, carried_ms, skipped)) = &h.resumed_from {
         let mut from = vec![

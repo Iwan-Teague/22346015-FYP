@@ -119,6 +119,11 @@ pub(crate) struct Loop<'a> {
     /// research text). Never `true` with `user: None` — a research session
     /// is always a driven session.
     pub(crate) research: bool,
+    /// Trusted project instructions (P-30), `None` when the host loaded
+    /// none: a batch run and a research session never load any. They reach
+    /// the context as the fixed project-notes block and the nonce draw
+    /// refuses a nonce the notes carry.
+    pub(crate) instructions: Option<&'a crate::session::Instructions>,
     /// The plan awaiting `/build` (P-28): set by an accepted
     /// `harness.plan.submit`, taken by an approval. Not in `LoopInit`: it
     /// always starts empty, in a live run, an audit and a resume alike — a
@@ -295,6 +300,7 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) restore: crate::restore::RestoreLog,
     pub(crate) user: Option<UserState<'a>>,
     pub(crate) research: bool,
+    pub(crate) instructions: Option<&'a crate::session::Instructions>,
 }
 
 impl<'a> Loop<'a> {
@@ -330,6 +336,7 @@ impl<'a> Loop<'a> {
             restore,
             user,
             research,
+            instructions,
         } = init;
         Loop {
             session,
@@ -362,6 +369,7 @@ impl<'a> Loop<'a> {
             restore,
             user,
             research,
+            instructions,
             plan_pending: None,
             plan_approved: None,
         }
@@ -559,6 +567,21 @@ impl<'a> Loop<'a> {
             plan_mode: self.plan_mode(),
             approved_plan: self.plan_approved.clone(),
         }
+    }
+
+    /// The trusted project instructions as the context's fixed
+    /// project-notes block (P-30): `None` when none were loaded. The
+    /// digest is the one the user approved; the text keeps its untrusted
+    /// source (the workspace file it came from).
+    fn session_notes(&self) -> Option<context::ProjectNotes> {
+        self.instructions.map(|n| context::ProjectNotes {
+            name: n.name.to_owned(),
+            digest: n.digest.to_string(),
+            text: Untrusted::new(
+                n.text.inspect("context: project notes").clone(),
+                Source::Workspace(n.name.to_owned()),
+            ),
+        })
     }
 
     /// `/plan` (P-28): narrow the session to the plan set. A research
@@ -793,6 +816,7 @@ impl<'a> Loop<'a> {
                 &tools,
                 self.task,
                 &self.facts,
+                self.session_notes().as_ref(),
                 &self.turns,
                 &u.users,
                 &self.nonces.assigned,
@@ -1697,6 +1721,13 @@ impl<'a> Loop<'a> {
                 .collect(),
             None => Vec::new(),
         };
+        // The project notes are untrusted text too (P-30): a nonce inside
+        // them is never drawn. (A recorded nonce that already collides with
+        // the notes — possible only in a resumed attempt — fails later at
+        // the render, which refuses a delimiter collision.)
+        let notes_text: Option<&str> = self
+            .instructions
+            .map(|n| n.text.inspect("context: project notes").as_str());
         for _ in 0..3 {
             let n = self.nonces.next(step).ok_or(StopCause::PolicyAbort)?;
             let taken = self.nonces.drawn().any(|m| *m == n);
@@ -1710,7 +1741,8 @@ impl<'a> Loop<'a> {
                 body || context::model_texts(protocol, t)
                     .into_iter()
                     .any(|s| contains_nonce(s, &n))
-            }) || user_texts.iter().any(|s| contains_nonce(s, &n));
+            }) || user_texts.iter().any(|s| contains_nonce(s, &n))
+                || notes_text.is_some_and(|s| contains_nonce(s, &n));
             if !taken && !inside {
                 return Ok(n);
             }

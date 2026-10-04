@@ -18,6 +18,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -25,11 +26,13 @@ use gate_outcome::{Finding, FindingCode, GateId};
 use harness_core::RunId;
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_run::session::{run_session, SessionConfig, SessionRun};
-use harness_run::{Approver, RunRefused};
+use harness_run::{fork_session, Approver, ForkSession, RunRefused};
 
 use crate::approver::ApproverSource;
 use crate::render::SinkRenderer;
-use crate::repl::{BackendSource, ChatApprover, ChatInput, ChatState, InputSource, LineFeed};
+use crate::repl::{
+    BackendSource, ChatApprover, ChatInput, ChatState, CommandSources, InputSource, LineFeed,
+};
 use crate::report::{emit, exit, info, refused, Outcome};
 use crate::Cx;
 
@@ -37,8 +40,8 @@ use crate::Cx;
 const DEFAULT_GATE: &str = "rustyharness.run";
 
 /// The chat verb's options (a subset of `run`'s; `--gate` as in every
-/// gate child).
-const ALLOWED: &[&str] = &[
+/// gate child; `pub` for the usage-completeness tests, P-58).
+pub(crate) const ALLOWED: &[&str] = &[
     "task",
     "workspace",
     "state-root",
@@ -56,18 +59,33 @@ const ALLOWED: &[&str] = &[
 ];
 
 /// The chat verb's valueless flags (`--scratch-with-git` goes with
-/// `--workspace-mode scratch`, P-52).
-const FLAGS: &[&str] = &["shell", "no-default-denies", "scratch-with-git"];
+/// `--workspace-mode scratch`, P-52; the session-grant flags as on the
+/// gate children, P-23/P-58).
+pub(crate) const FLAGS: &[&str] = &[
+    "shell",
+    "no-default-denies",
+    "allow-session-grants",
+    "accept-edits",
+    "scratch-with-git",
+];
 
 /// The token budget every CLI run is given (`inputs.rs`; the profile
 /// derived default; the task's `budget` section does not set tokens).
 const TOKEN_BUDGET: u64 = 1_000_000;
 
 pub(crate) fn chat(cx: &Cx<'_>, rest: &[&str]) -> u8 {
-    // `--resume [<run-id>]` and `--continue` are pre-passed: the picker
-    // form takes no value, the other consumes one. A duplicate of either
-    // is a usage error, as anywhere.
+    // `--resume [<run-id>]`, `--continue` and `--fork RUN@STEP` are
+    // pre-passed: the picker form takes no value, the others consume one.
+    // A duplicate of any is a usage error, as anywhere.
+    let usage = |cx: &Cx<'_>, why: &str| {
+        note!(cx, "{why}\n{}", crate::args::USAGE);
+        match GateId::new(DEFAULT_GATE) {
+            Ok(g) => emit(cx, &g, refused(exit::USAGE, why.to_owned())),
+            Err(_) => exit::USAGE,
+        }
+    };
     let mut resume: Option<Option<String>> = None;
+    let mut fork: Option<(RunId, u64)> = None;
     let mut filtered: Vec<&str> = Vec::with_capacity(rest.len());
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
@@ -75,12 +93,7 @@ pub(crate) fn chat(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         match *tok {
             "--resume" | "--continue" => {
                 if resume.is_some() {
-                    note!(cx, "--resume given twice\n{}", crate::args::USAGE);
-                    let outcome = refused(exit::USAGE, "--resume given twice".into());
-                    return match GateId::new(DEFAULT_GATE) {
-                        Ok(g) => emit(cx, &g, outcome),
-                        Err(_) => exit::USAGE,
-                    };
+                    return usage(cx, "--resume given twice");
                 }
                 resume = Some(None);
                 if was_resume {
@@ -91,8 +104,23 @@ pub(crate) fn chat(cx: &Cx<'_>, rest: &[&str]) -> u8 {
                     }
                 }
             }
+            "--fork" => match it.next() {
+                Some(v) if !v.starts_with("--") => match parse_fork(v) {
+                    Some(f) => {
+                        if fork.is_some() {
+                            return usage(cx, "--fork given twice");
+                        }
+                        fork = Some(f);
+                    }
+                    None => return usage(cx, "--fork is RUN@STEP (a run id and a step)"),
+                },
+                _ => return usage(cx, "--fork needs a RUN@STEP value"),
+            },
             other => filtered.push(other),
         }
+    }
+    if resume.is_some() && fork.is_some() {
+        return usage(cx, "--resume and --fork cannot be combined");
     }
     let parsed = crate::args::options_with_flags(&filtered, ALLOWED, FLAGS);
     let gate_text = parsed
@@ -129,9 +157,17 @@ pub(crate) fn chat(cx: &Cx<'_>, rest: &[&str]) -> u8 {
             if let Some(pick) = &resume {
                 return emit(cx, &gate, resume_refusal(cx, pick, &filled, &cfg));
             }
-            emit(cx, &gate, try_chat(cx, &filled, &cfg))
+            emit(cx, &gate, try_chat(cx, &filled, &cfg, fork))
         }
     }
+}
+
+/// A `--fork`/`/fork` argument, `RUN@STEP`: the parent run id and the
+/// step to fork at. Anything else is not one.
+pub(crate) fn parse_fork(s: &str) -> Option<(RunId, u64)> {
+    let (run, step) = s.split_once('@')?;
+    let step = step.parse::<u64>().ok()?;
+    RunId::parse(run).map(|r| (r, step))
 }
 
 /// The `--resume` refusal: fail closed (P-17 is not in this build), but
@@ -205,6 +241,7 @@ fn try_chat(
     cx: &Cx<'_>,
     o: &BTreeMap<&str, &str>,
     cfg: &Option<crate::config::UserConfig>,
+    fork: Option<(RunId, u64)>,
 ) -> Outcome {
     let inp = match crate::inputs::inputs(cx, o, cfg) {
         Ok(i) => i,
@@ -319,6 +356,7 @@ fn try_chat(
         backend,
         o,
         cfg,
+        fork,
     )
 }
 
@@ -345,6 +383,11 @@ fn banner(
         inp.profile.id(),
         endpoint.unwrap_or("(a backend given to the library)")
     );
+    // The hosted disclosure (P-31): said in the banner and in `/status`,
+    // every session, while the profile declares a hosted upstream.
+    if inp.profile.hosted() {
+        note!(cx, "context is sent to a hosted provider");
+    }
     if inp.spec.exec.is_some() {
         match harness_sandbox::available() {
             harness_sandbox::Containment::Available(b) => {
@@ -363,8 +406,114 @@ fn banner(
     note!(cx, "policy digest: {}", inp.policy.digest());
 }
 
+/// The command template sources (P-30): the user's config dir (trusted by
+/// location) and the workspace's `.rustyharness/commands` (trusted per
+/// template digest through the same trust store as the project notes).
+fn commands_for(workspace: &str, trust: &Rc<RefCell<crate::trust::Trust>>) -> Rc<CommandSources> {
+    Rc::new(CommandSources {
+        config_dir: crate::config::config_dir().ok().flatten(),
+        workspace: PathBuf::from(workspace),
+        trust: trust.clone(),
+    })
+}
+
+/// The project notes (P-30): find the workspace's `AGENTS.md` (preferred)
+/// or `CLAUDE.md`, show its size and digest, and load it only when its
+/// digest is already trusted — or the person at a real terminal answers
+/// `y` once, which remembers the digest for later chats. A file that
+/// exists but cannot be read, is over the cap, or is not UTF-8 refuses
+/// loading entirely (fail closed; no fall-through to the other name).
+/// Without a terminal nothing is loaded and nothing is asked.
+fn load_notes(
+    cx: &Cx<'_>,
+    workspace: &str,
+    trust: &Rc<RefCell<crate::trust::Trust>>,
+    feed_slot: &Option<Rc<LineFeed>>,
+) -> Option<harness_run::Instructions> {
+    let root = Path::new(workspace);
+    let mut file = None;
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = root.join(name);
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                note!(
+                    cx,
+                    "cannot read {}: {e}; loading no project notes",
+                    path.display()
+                );
+                return None;
+            }
+            Ok(bytes) => {
+                file = Some((name, bytes));
+                break;
+            }
+        }
+    }
+    let (name, bytes) = file?;
+    if bytes.len() > harness_run::Instructions::MAX_BYTES {
+        note!(
+            cx,
+            "{name} is {} bytes, over the {}-byte cap; loading no project notes",
+            bytes.len(),
+            harness_run::Instructions::MAX_BYTES
+        );
+        return None;
+    }
+    let notes = match harness_run::Instructions::new(name, &bytes) {
+        Ok(n) => n,
+        Err(e) => {
+            note!(cx, "{name} refused ({e}); loading no project notes");
+            return None;
+        }
+    };
+    note!(
+        cx,
+        "project notes: {name}, {} bytes, sha256 {}",
+        bytes.len(),
+        notes.digest()
+    );
+    let digest = notes.digest().to_string();
+    if trust.borrow().has_instruction(&digest) {
+        note!(
+            cx,
+            "{name} is trusted; it enters the context as untrusted project notes"
+        );
+        return Some(notes);
+    }
+    let Some(feed) = feed_slot else {
+        note!(cx, "{name} is not trusted yet; loading no project notes");
+        return None;
+    };
+    feed.drain();
+    cx.note("trust these project notes for this and later chats? [y/N]: ");
+    let trusted = match feed.next_line(Instant::now() + std::time::Duration::from_secs(300)) {
+        Some(line) => {
+            let a = line.trim().to_ascii_lowercase();
+            a == "y" || a == "yes"
+        }
+        None => false,
+    };
+    if !trusted {
+        note!(cx, "not trusted: loading no project notes");
+        return None;
+    }
+    trust.borrow_mut().trust_instruction(&digest);
+    if let Err(e) = trust.borrow().save() {
+        note!(cx, "cannot remember the trust decision: {e}");
+    }
+    note!(cx, "{name} is trusted for this and later chats");
+    Some(notes)
+}
+
 /// The outer session loop: one `run_session` per session; `/clear` ends
-/// the current one and starts a fresh session in the same chat.
+/// the current one and starts a fresh session in the same chat. A fork —
+/// `--fork RUN@STEP`, or `/fork RUN@STEP` mid-chat — replaces the NEXT
+/// session with `fork_session`: a new run that catches up on the parent's
+/// recorded conversation to the fork step, then continues live.
+// The chat's inputs are one flat list (as `cmd_compare`'s replay is);
+// the count, not the shape, trips the lint.
+#[allow(clippy::too_many_arguments)]
 fn run_sessions(
     cx: &Cx<'_>,
     inp: &crate::inputs::Inputs,
@@ -373,6 +522,7 @@ fn run_sessions(
     backend: &dyn harness_model::ModelBackend,
     o: &BTreeMap<&str, &str>,
     cfg: &Option<crate::config::UserConfig>,
+    fork: Option<(RunId, u64)>,
 ) -> Outcome {
     let state = Rc::new(RefCell::new(ChatState {
         workspace: workspace.to_owned(),
@@ -391,21 +541,36 @@ fn run_sessions(
         last_todo: None,
         clear: false,
         exit: false,
+        fork,
+        hosted: inp.profile.hosted(),
+        pricing: inp.profile.pricing(),
     }));
     let sink = SinkRenderer::new(cx, state.clone());
+    // P-30: the trust store (in the user's config dir). Unreadable or
+    // malformed: refuse rather than silently forgetting prior decisions.
+    let trust = match crate::trust::Trust::load() {
+        Ok(t) => Rc::new(RefCell::new(t)),
+        Err(e) => return refused(crate::report::exit::UNREADABLE_INPUT, e),
+    };
     // One stdin reader for the whole chat (input and approver share it);
     // injected lines end after their last line.
     let (feed_slot, chat_input): (Option<Rc<LineFeed>>, ChatInput) = match &cx.input {
         InputSource::Stdin => {
             let feed = Rc::new(LineFeed::spawn());
-            let input = ChatInput::from_feed(cx, state.clone(), feed.clone());
+            let commands = commands_for(workspace, &trust);
+            let input = ChatInput::from_feed(cx, state.clone(), feed.clone(), Some(commands));
             (Some(feed), input)
         }
-        InputSource::Given(lines) => (
-            None,
-            ChatInput::from_lines(cx, state.clone(), lines.to_vec()),
-        ),
+        InputSource::Given(lines) => {
+            let commands = commands_for(workspace, &trust);
+            (
+                None,
+                ChatInput::from_lines(cx, state.clone(), lines.to_vec(), Some(commands)),
+            )
+        }
     };
+    // The project notes (P-30): found once per chat, before any session.
+    let instructions_slot = load_notes(cx, workspace, &trust, &feed_slot);
     // Who answers an ask (§5.3): at a real terminal the chat's own prompt
     // over the shared feed; an approver given to the library wins; with
     // nobody, every ask is a deny (§5.2). A config `approver: "none"`
@@ -434,9 +599,73 @@ fn run_sessions(
     // person answer `a`/`d` at an approval prompt.
     session_config.run.allow_session_grants = o.contains_key("allow-session-grants");
     let report = loop {
-        match run_session(SessionRun {
+        // The fork pending for this session, if any: the first one from
+        // `--fork`, later ones from `/fork` (at most one per session).
+        // (The borrow must end before the session runs: the renderer
+        // reads the same state as events stream.)
+        let pending_fork = state.borrow_mut().fork.take();
+        let (parent, parent_step) = match pending_fork {
+            Some((p, s)) => (p, s),
+            None => {
+                match run_session(SessionRun {
+                    state_root,
+                    workspace: std::path::Path::new(workspace),
+                    spec: &inp.spec,
+                    registry: &inp.registry,
+                    policy: &inp.policy,
+                    profile: &inp.profile,
+                    backend,
+                    probe: cx.probe,
+                    env: &harness_sandbox::environment::SystemEnv,
+                    config: &session_config,
+                    approver,
+                    confinement: Some(cx.confinement),
+                    input: &chat_input,
+                    sink: Some(&sink),
+                    instructions: instructions_slot.as_ref(),
+                }) {
+                    Ok(r) => {
+                        note!(
+                            cx,
+                            "session {} attempt {}: {} turn(s), {} step(s), stopped ({})",
+                            r.run.run,
+                            r.run.attempt,
+                            r.turns,
+                            r.run.steps,
+                            harness_journal::writer::stop_cause_name(&r.run.cause)
+                        );
+                        note!(
+                            cx,
+                            "outcome: indeterminate (NothingChecked): nothing has verified the result"
+                        );
+                        let (clear, exit_chat) = {
+                            let st = state.borrow_mut();
+                            (st.clear, st.exit)
+                        };
+                        if clear && !exit_chat {
+                            {
+                                let mut st = state.borrow_mut();
+                                st.clear = false;
+                                st.turns = 0;
+                                st.steps = 0;
+                                st.last_calls.clear();
+                                st.pending.clear();
+                            }
+                            note!(cx, "new session:");
+                            continue;
+                        }
+                        break r;
+                    }
+                    Err(e) => return from_refusal(cx, &e),
+                }
+            }
+        };
+        note!(cx, "forking {}@{}:", parent, parent_step);
+        match fork_session(ForkSession {
             state_root,
-            workspace: std::path::Path::new(workspace),
+            parent: &parent,
+            parent_step,
+            workspace: Some(std::path::Path::new(workspace)),
             spec: &inp.spec,
             registry: &inp.registry,
             policy: &inp.policy,
@@ -464,23 +693,12 @@ fn run_sessions(
                     cx,
                     "outcome: indeterminate (NothingChecked): nothing has verified the result"
                 );
-                let (clear, exit_chat) = {
-                    let st = state.borrow();
-                    (st.clear, st.exit)
-                };
-                if clear && !exit_chat {
-                    {
-                        let mut st = state.borrow_mut();
-                        st.clear = false;
-                        st.turns = 0;
-                        st.steps = 0;
-                        st.last_calls.clear();
-                        st.pending.clear();
-                    }
-                    note!(cx, "new session:");
-                    continue;
+                let exit_chat = state.borrow().exit;
+                if exit_chat {
+                    break r;
                 }
-                break r;
+                note!(cx, "new session:");
+                continue;
             }
             Err(e) => return from_refusal(cx, &e),
         }

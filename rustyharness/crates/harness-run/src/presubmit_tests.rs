@@ -391,6 +391,7 @@ fn drive(s: Setup<'_>) -> Done {
         providers,
         meter: new_meter(
             cfg.limits.clone(),
+            None,
             Box::new(Advancing {
                 now: Cell::new(Duration::ZERO),
                 step: s.clock_step,
@@ -406,6 +407,7 @@ fn drive(s: Setup<'_>) -> Done {
         tree: sha256(b"tree"),
         workspace: None,
         research: false,
+        instructions: None,
         approvals: Approvals::new(&run_id, 1, s.approver, Default::default()),
         env: &env,
         pressure: Vec::new(),
@@ -1020,6 +1022,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         })],
         meter: new_meter(
             cfg.limits.clone(),
+            None,
             Box::new(Advancing {
                 now: Cell::new(Duration::ZERO),
                 step: Duration::ZERO,
@@ -1035,6 +1038,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
         tree: sha256(b"tree"),
         workspace: None,
         research: false,
+        instructions: None,
         approvals: Approvals::new(&run_id, 1, None, Default::default()),
         env: &env,
         pressure: Vec::new(),

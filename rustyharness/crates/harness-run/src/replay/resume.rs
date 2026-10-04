@@ -37,7 +37,7 @@ use crate::{RunConfig, RunRefused, RunReport, TaskSpec};
 
 use super::audit::{attempts_desc, has_header, UNREADABLE};
 use super::compare::{check_header, expected_inputs};
-use super::feed::{digest_at, recorded, recorded_facts};
+use super::feed::{digest_at, instructions_of, recorded, recorded_facts};
 
 /// A backend that replays the recorded exchanges first, then goes live. A
 /// replayed request that differs from the recorded one (a divergence) is
@@ -186,6 +186,9 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
     // reserved list must match the recorded ones, and so must what the
     // probe observes now.
     let ports_header = PortsHeader::of(r.spec, r.config, pre.ports.as_ref());
+    // A batch run loads no project instructions (P-30): `None` recomputes
+    // a header without the key, and a journal that carries one (or the
+    // record) is refused.
     check_header(
         head,
         &expected_inputs(
@@ -196,6 +199,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             &r.config.limits,
             None,
             ports_header.as_ref(),
+            None,
         ),
     )
     .map_err(|d| not_resumable(d.why))?;
@@ -327,7 +331,10 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
             .as_ref()
             .map(|(p, w)| ExecHeader::live(p, w, r.config)),
         ports: ports_header,
+        instructions: None,
         workspace_mode: workspace_mode.as_ref(),
+        parent: None,
+        child: None,
     })?;
     let exec = exec_tools(&pre, &run_dir, r.confinement, r.config)?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
@@ -363,6 +370,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         providers: Prepared::providers(pre.read_tools, pre.edit_tools, pre.patch_tools, exec),
         meter: new_meter_resumed(
             r.config.limits.clone(),
+            r.profile.pricing(),
             Box::new(SystemClock::default()),
             Duration::from_millis(carried_ms),
         ),
@@ -400,6 +408,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         post_edit: PostEditState::of(&r.spec.post_edit),
         workspace_root: r.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
+        instructions: None,
         user: None,
     });
     let end = lp.drive(&mut w);
@@ -495,6 +504,12 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         _ => return Err(not_resumable("no such run directory")),
     }
     let (n, v, skipped) = resumable_attempt(&run_dir, r.run)?;
+    // The project instructions (P-30): parsed from the journal before any
+    // record moves out of `v` and before the header check, so the header's
+    // `instructions` digest can be recomputed from exactly what the
+    // journal carries.
+    let blobs = DirBlobSource::new(layout::attempt_dir(&run_dir, n).join(layout::BLOBS_DIR));
+    let recorded_instructions = instructions_of(&v, &blobs).map_err(|d| not_resumable(d.why))?;
     // ---- Reopen (P-17 §7). A committed session attempt is reopened by
     // dropping its last two records — the `InputEnded`, then the
     // `RunStopped` (`session_ended`), the only stop a session may commit.
@@ -553,6 +568,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             &limits,
             Some(&r.config.turn),
             ports_header.as_ref(),
+            recorded_instructions.as_ref(),
         ),
     )
     .map_err(|d| not_resumable(d.why))?;
@@ -637,8 +653,6 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             ));
         }
     }
-    let attempt_dir = layout::attempt_dir(&run_dir, n);
-    let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
     let rec = recorded(&kept, &blobs, r.profile)
         .map_err(|_| not_resumable("the last attempt's records cannot be replayed"))?;
     // The last step the catch-up re-feeds (H2e: its wall notices too).
@@ -710,7 +724,10 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
             .as_ref()
             .map(|(p, w)| ExecHeader::live(p, w, &r.config.run)),
         ports: ports_header,
+        instructions: recorded_instructions.as_ref(),
         workspace_mode: workspace_mode.as_ref(),
+        parent: None,
+        child: None,
     })?;
     let exec = exec_tools(&pre, &run_dir, r.confinement, &r.config.run)?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
@@ -750,6 +767,7 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         providers: Prepared::providers(pre.read_tools, pre.edit_tools, pre.patch_tools, exec),
         meter: new_meter_resumed(
             limits.clone(),
+            r.profile.pricing(),
             Box::new(SystemClock::default()),
             Duration::from_millis(carried_ms),
         ),
@@ -788,6 +806,10 @@ pub fn resume_session(r: ResumeSession<'_>) -> Result<SessionReport, RunRefused>
         post_edit: PostEditState::of(&r.spec.post_edit),
         workspace_root: r.workspace.map(std::path::Path::to_path_buf),
         restore: Default::default(),
+        // The resumed session re-derives the instructions from the journal
+        // (P-30) and rewrites the identical `InstructionsLoaded` record in
+        // its catch-up, before any recorded input.
+        instructions: recorded_instructions.as_ref(),
         // The resumed session opens turns: the catch-up re-feeds the kept
         // turns' inputs, then the live source is asked (a boundary) or the
         // interrupted turn keeps running (mid-turn).

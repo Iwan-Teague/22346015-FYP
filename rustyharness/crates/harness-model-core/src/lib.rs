@@ -212,6 +212,21 @@ pub enum Message {
         /// The harness text.
         text: HarnessText,
     },
+    /// The workspace's project instructions (P-30, session only): the text
+    /// of AGENTS.md or CLAUDE.md as the user approved it at session start.
+    /// Project notes, not harness rules: shown once, inside untrusted
+    /// delimiters named by the file's own sha256 (a file cannot contain its
+    /// own digest), cut to the notes cap with a notice ([`crate::context`]).
+    /// The same [`Untrusted`] mechanics apply as for tool output: invisibles
+    /// stripped, a delimiter collision refused when rendered.
+    Notes {
+        /// The file it was loaded from (`AGENTS.md` or `CLAUDE.md`).
+        name: String,
+        /// sha256 of the file text, naming the delimiters.
+        digest: String,
+        /// The file text (cut to the notes cap by the context builder).
+        body: Untrusted<String>,
+    },
 }
 
 /// The id of a past tool call in the native protocol's history (design row

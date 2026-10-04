@@ -56,7 +56,9 @@
 )]
 
 pub mod approve;
+mod delegate;
 pub mod driver;
+mod egress;
 pub mod postedit;
 pub mod presubmit;
 pub mod replay;
@@ -66,6 +68,7 @@ pub mod scratch;
 pub mod session;
 
 pub use approve::{ApprovalAnswer, Approver, ApproverKind};
+pub use delegate::{child_task_text, child_template_digest, CHILD_TEMPLATE};
 pub use driver::{
     run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec, WorkspaceModeRecord,
     PORTS_PER_TASK,
@@ -77,13 +80,14 @@ pub use harness_tools::{plain_name, ExecLimits, ExecProgram, ExecSpec, MAX_PROGR
 pub use postedit::{PostEditCheck, PostEditRefused, PostEditReport, PostEditResult, PostEditSpec};
 pub use presubmit::{PresubmitRefused, PresubmitReport, PresubmitResult, PresubmitSpec};
 pub use replay::{
-    audit, audit_session, resume, resume_session, Audit, AuditRefused, AuditReport, Divergence,
-    Resume, ResumeSession,
+    audit, audit_session, fork_session, resume, resume_session, Audit, AuditRefused, AuditReport,
+    Divergence, ForkSession, Resume, ResumeSession,
 };
 pub use restore::{external_differ, marks_from_records, plan, RestoreCommand, RestoreMark};
 pub use session::{
-    run_research, run_session, EventSink, InputEnd, ResearchRun, SessionConfig, SessionReport,
-    SessionRun, TurnLimits, UiEvent, UserInput, UserInputEvent, UserMessage, UserMessageRefused,
+    run_research, run_session, EventSink, InputEnd, Instructions, InstructionsRefused, ResearchRun,
+    SessionConfig, SessionReport, SessionRun, TurnLimits, UiEvent, UserInput, UserInputEvent,
+    UserMessage, UserMessageRefused,
 };
 
 #[cfg(test)]

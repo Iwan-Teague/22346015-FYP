@@ -20,6 +20,12 @@ harness-model = { path = "../harness-model" }
 harness-policy = { path = "../harness-policy" }
 harness-run = { path = "../harness-run" }
 harness-sandbox = { path = "../harness-sandbox" }
+# The hostile web fixtures (P-39k) run the fetcher library in process and
+# report hop results through the provider's runner seam. Both crates are
+# pure (no TLS, INV-52); the `remap`-gated test connector stays in the
+# test crates, which enable that feature in their own dev-dependencies.
+harness-fetch = { path = "../harness-fetch" }
+harness-tools = { path = "../harness-tools" }
 thiserror.workspace = true
 
 [dev-dependencies]

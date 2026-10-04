@@ -485,6 +485,7 @@ Card fields: **Why** | **Crates** | **Tests** (named, `cargo test`) | **Deps** |
 | E9 | **Sandbox conformance** extended: `.git` write (P-29), ports (P-36), background kill (P-36) | `harness-sandbox/tests/conformance_macos.rs` | yes on macOS CI | confinement claims for new features |
 | E10 | **Gates**: `sh scripts/ci/gates.sh` unchanged semantics; purity selftest extended when a slice adds a new reviewed dependency or spawn file | scripts/ci | yes | no heavy deps; spawn sites reviewed |
 | E11 | **Per-slice acceptance**: the card's named tests; reviewer (fresh context, different model where possible) checks the diff against the card before merge | process | yes | cheap-model output is verified |
+| E12 | **Web airlock hostile suite** (P-39k): prompt injection and forged nonces in fetched pages, redirect/DNS attacks (metadata IP, private-via-DNS, rebinding, mixed answers, IPv4-mapped IPv6), budget bombs (giant bodies, endless chunked, slowloris, header floods, gzip bombs), zip-as-HTML, content-type games, request smuggling, terminal escapes, search-snippet injection, lying fetcher frames, offline audit replay with zero sockets | `harness-run/tests/hostile_web.rs` | yes | the web airlock refuses each hostile class with a typed refusal, keeps every egress journaled before it happens, and replays offline identically |
 
 Suggested definition of done for any slice: card tests green + `sh scripts/ci/gates.sh` + `assert_audit_clean` in at least one test + `docs/slices/P-xx.md` written + no changes outside the card's crates (checked by `git diff --stat`).
 

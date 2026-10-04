@@ -12,7 +12,9 @@ use harness_core::{LoopDetector, MeterLimits, RunId};
 use harness_journal::reader::DirBlobSource;
 use harness_journal::writer::SystemClock;
 use harness_journal::{
-    layout, verify, EventKind, JournalReader, JournalWriter, StartError, Verified,
+    canon::{EventKind, Ident},
+    event::{Event, Trusted},
+    layout, verify, JournalReader, JournalWriter, StartError, Verified,
 };
 use harness_manifest::admission::Registry;
 use harness_model::context::Renderings;
@@ -35,7 +37,7 @@ use crate::session::{SessionInputs, TurnLimits};
 use crate::{RunConfig, RunRefused, TaskSpec};
 
 use super::compare::{check_header, compare, diverge, expected_inputs, Divergence};
-use super::feed::{digest_at, recorded, recorded_facts};
+use super::feed::{digest_at, instructions_of, recorded, recorded_facts};
 
 /// The audit's probe: a replay never measures a host.
 const NOT_SAMPLED: EnvSample = EnvSample::unmeasured(Unmeasured::NotSampled);
@@ -275,6 +277,15 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             }
         }
     };
+    // The project instructions (P-30): parsed from the journal before the
+    // header check, so the header's `instructions` digest can be
+    // recomputed from exactly what the journal carries. A shape this loop
+    // does not write refuses here, like any bad record.
+    let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
+    let recorded_instructions = match instructions_of(&v, &blobs) {
+        Ok(n) => n,
+        Err(d) => return Ok(failed(d, None)),
+    };
     if let Err(d) = check_header(
         head,
         &expected_inputs(
@@ -285,6 +296,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             a.limits,
             turn,
             recorded_ports.as_ref(),
+            recorded_instructions.as_ref(),
         ),
     ) {
         return Ok(failed(d, None));
@@ -302,8 +314,7 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
             None,
         ));
     };
-    let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
-    let rec = match recorded(&v, &blobs, a.profile) {
+    let mut rec = match recorded(&v, &blobs, a.profile) {
         Ok(r) => r,
         Err(d) => return Ok(failed(d, None)),
     };
@@ -404,11 +415,64 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         session: turn.copied(),
         exec: exec_header,
         ports: recorded_ports,
+        instructions: recorded_instructions.as_ref(),
         workspace_mode: workspace_mode.as_ref(),
+        parent: None,
+        child: None,
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)
         .map_err(AuditRefused::Start)?;
+    // A fork's journal (P-32): the recorded `ForkedFrom` head is held
+    // against the parent's own records in this state root — the parent's
+    // kept prefix is re-derived the way `fork_session` did, and a head
+    // that no longer matches (a changed or tampered parent, a parent
+    // resumed into a later attempt) is a divergence. The record is then
+    // re-written into the replay journal, so the comparison carries it.
+    if let Some(fork) = rec.fork.take() {
+        let seq = v
+            .records
+            .iter()
+            .find(|r| r.kind == EventKind::ForkedFrom)
+            .map_or(0, |r| r.seq);
+        let head =
+            match super::fork::parent_prefix_head(a.state_root, &fork.parent_run, fork.parent_step)
+            {
+                Ok(h) => h,
+                Err(_) => {
+                    return Ok(failed(
+                        diverge(seq, 0, "the forked parent's prefix does not verify"),
+                        Some(replay_dir),
+                    ))
+                }
+            };
+        if head != fork.parent_chain_head {
+            return Ok(failed(
+                diverge(
+                    seq,
+                    0,
+                    "the forked parent's prefix does not match the recorded chain head",
+                ),
+                Some(replay_dir),
+            ));
+        }
+        let Some(parent_id) = Ident::from_trusted(&fork.parent_run) else {
+            return Ok(failed(
+                diverge(seq, 0, "the forked parent's prefix does not verify"),
+                Some(replay_dir),
+            ));
+        };
+        let ev = Event::new(EventKind::ForkedFrom)
+            .field("parent_run", Trusted::Id(parent_id))
+            .field("parent_step", Trusted::U64(fork.parent_step))
+            .field("parent_chain_head", Trusted::Digest(fork.parent_chain_head));
+        if w.append(0, ev).is_err() {
+            return Ok(failed(
+                diverge(0, 0, "the replay journal could not be written"),
+                Some(replay_dir),
+            ));
+        }
+    }
     // The replay does not re-measure wall time (it cannot recompute it):
     // its meter has no wall limit, so a replay never stops on the clock.
     let limits = MeterLimits {
@@ -436,7 +500,13 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         profile: a.profile,
         backend: &rec.backend,
         providers: Vec::new(),
-        meter: new_meter(limits, Box::new(SystemClock::default())),
+        // The profile's price table (P-31): the audit recomputes the cost
+        // charges, so a budget stop in the `Cost` dimension replays too.
+        meter: new_meter(
+            limits,
+            a.profile.pricing(),
+            Box::new(SystemClock::default()),
+        ),
         detector: LoopDetector::new(),
         turns: Vec::new(),
         config: &config,
@@ -473,6 +543,9 @@ fn audit_inner(a: Audit<'_>, turn: Option<&TurnLimits>) -> Result<AuditReport, A
         post_edit: PostEditState::of(&a.spec.post_edit),
         workspace_root: None,
         restore: Default::default(),
+        // The replay re-derives the instructions from the journal (P-30)
+        // and rewrites the identical `InstructionsLoaded` record.
+        instructions: recorded_instructions.as_ref(),
         // A session replay opens turns (P-17 §6): the re-fed texts build
         // the users' share of the context, and each turn's budgets are
         // recomputed from the recorded turn limits. It measures nothing

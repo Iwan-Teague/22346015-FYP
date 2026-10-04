@@ -11,7 +11,9 @@
 //! the real `harness_cli` verbs in process. The kit adds convenience only.
 //!
 //! [`mutator`] (P-54) adds the deterministic fuzz-style generator the
-//! parsers' robustness tests share.
+//! parsers' robustness tests share. [`hostile`] (P-39k) adds the web
+//! airlock's hostile-test fixtures: the scripted loopback server, the fake
+//! resolver, the recording egress log and the in-process hop runner.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code, and this crate is a
@@ -28,6 +30,7 @@
     )
 )]
 
+pub mod hostile;
 pub mod mutator;
 
 use std::cell::RefCell;

@@ -45,7 +45,9 @@ pub const INLINE_MAX: usize = 4096;
 /// - [`Ident::of`]: a `&'static str` (compile-time harness text), or
 /// - [`Ident::from_trusted`]: a value implementing the sealed
 ///   `harness_core::TrustedName` (a `RunId` or a `Nonce`), or
-/// - [`Ident::from_capability`]: an admitted manifest's `Capability`.
+/// - [`Ident::from_capability`]: an admitted manifest's `Capability`, or
+/// - [`Ident::from_dns_host`]: a host the web airlock's URL parser
+///   validated (P-39j; grammar re-checked as a backstop).
 ///
 /// The grammar also refuses a leading `.` or `-` (so never `.`, `..`,
 /// `.hidden` or `-rf`; H1c confirming review NF-3).
@@ -95,6 +97,23 @@ impl Ident {
     /// grammatical `CapId`).
     pub fn from_capability(c: &harness_manifest::Capability) -> Option<Self> {
         Self::new(c.id().as_str())
+    }
+
+    /// A host from the web airlock's `Egress` records (P-39j). The caller
+    /// vouches the name came from the airlock's URL parser
+    /// (`harness_policy::web::parse_url`), which lowercases and validates
+    /// it before any hop may use it — the design (P-39-web-airlock §4.5)
+    /// calls such a host harness text for exactly that reason. This
+    /// constructor re-checks the same grammar as a backstop (`is_egress_host`:
+    /// an IP literal, or lowercase dot-separated labels of `[a-z0-9-]`),
+    /// and the identifier grammar above still applies on top, so an
+    /// over-long host is refused here and the hop is refused with it
+    /// (fail closed, not truncated).
+    pub fn from_dns_host(host: &str) -> Option<Self> {
+        if !is_egress_host(host) {
+            return None;
+        }
+        Self::new(host)
     }
 
     /// The text.
@@ -191,9 +210,21 @@ impl fmt::Display for Ident {
 ///   the note's 64-hex id), `path` (UntrustedBlob, the note's path),
 ///   `sha256` (Text, the payload's digest).
 ///
+/// **Fork (P-32).** `ForkedFrom` is fsynced (a resume keys on it): the
+/// first record of a forked run's journal, and nothing else writes it.
+/// Its canonical body (`check_canonical_body` enforces exactly these keys
+/// and shapes):
+///
+/// - `ForkedFrom` (fsynced; step 0, directly after the header):
+///   `parent_chain_head` (Digest, the parent's kept prefix's chain head
+///   at the fork point), `parent_run` (Id, the parent run), `parent_step`
+///   (U64, the last kept parent step the child caught up through — a
+///   turn boundary). The audit re-derives that head from the parent's
+///   own records and holds the recorded one against it (P-32).
+///
 /// - Reserved: `ModeChanged` (P-28), `RuleGranted` (P-23), `Restored`
-///   (P-22/P-26), `InstructionsLoaded` (P-30), `ForkedFrom` (P-32),
-///   `ChildRun` (P-38). No code writes them in this wave.
+///   (P-22/P-26), `InstructionsLoaded` (P-30), `ChildRun` (P-38). No code
+///   writes them in this wave.
 ///
 /// **Background-process kinds (P-36h; H-E's last additions, design P-36
 /// §10.1).** Both fsynced: they are measurements the audit re-feeds, and
@@ -379,6 +410,7 @@ pub fn canonical_body_keys(kind: EventKind) -> Option<&'static [&'static str]> {
         ]),
         EventKind::NoteSaved => Some(&["bytes", "note", "sources", "turn"]),
         EventKind::NoteImported => Some(&["bytes", "confirm", "note", "path", "sha256"]),
+        EventKind::ForkedFrom => Some(&["parent_chain_head", "parent_run", "parent_step"]),
         _ => None,
     }
 }

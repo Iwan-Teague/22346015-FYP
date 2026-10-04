@@ -194,10 +194,16 @@ expect_refusal "harness-run enables the provider's testing seam" \
     "a normal dependency edge enables harness-mcp/testing"
 
 # ... and a workspace feature that FORWARDS to harness-mcp/testing (cargo
-# tree shows only active features).
+# tree shows only active features). harness-cli already has a [features]
+# table (net), so the plant adds a line to it — a second table would not
+# even parse.
 fresh
-printf '\n[features]\nmcp-chaos = ["harness-mcp/testing"]\n' >>"$copy/crates/harness-cli/Cargo.toml" ||
-    fail "could not plant the mcp-chaos feature"
+awk '{ print } /^net[ \t]*=/ { print "mcp-chaos = [\"harness-mcp/testing\"]" }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting the mcp-chaos feature"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+grep -qF 'mcp-chaos = ["harness-mcp/testing"]' "$copy/crates/harness-cli/Cargo.toml" ||
+    fail "mcp-chaos plant did not land"
 expect_refusal "a chaos feature forwards to harness-mcp/testing" \
     "a workspace feature forwards to harness-mcp/testing"
 
@@ -223,6 +229,33 @@ awk '{ print } /^\[dependencies\]/ { print "rustls = { path = \"../zz-rustls\" }
     fail "awk failed planting a dependency"
 mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-model/Cargo.toml" || fail "mv failed"
 expect_refusal "harness-model depends on a TLS crate" "INV-24: TLS/HTTP-client crates in the default build"
+
+# INV-52 (P-39n): a TLS crate must be refused from harness-cli in ANY feature
+# combination. The plant is an OPTIONAL `rustls` path dependency enabled by a
+# feature, so the default build (INV-24's tree) stays clean and the check
+# that fires is the cli one (--all-features). The crate is planted OUTSIDE
+# the copy (so outside the workspace directory): cargo makes every path
+# dependency INSIDE the workspace directory an automatic member, and a member
+# rooted at `rustls` would put the name in INV-24's tree with the edge off —
+# refusing for the wrong reason.
+fresh
+mkdir -p "$tmpdir/zz-rustls-outside/src" || fail "mkdir failed"
+printf '[package]\nname = "rustls"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n' \
+    >"$tmpdir/zz-rustls-outside/Cargo.toml" || fail "could not plant rustls"
+printf '' >"$tmpdir/zz-rustls-outside/src/lib.rs" || fail "could not plant rustls lib"
+awk '{ print } /^\[dependencies\]/ { print "rustls = { path = \"../../../zz-rustls-outside\", optional = true }" }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+# harness-cli already has a [features] table (net); the plant adds to it.
+awk '{ print } /^net[ \t]*=/ { print "zz-tls = [\"dep:rustls\"]" }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting the zz-tls feature"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+grep -qF 'zz-tls = ["dep:rustls"]' "$copy/crates/harness-cli/Cargo.toml" ||
+    fail "INV-52 plant did not land"
+expect_refusal "harness-cli links a TLS crate behind a feature" \
+    "INV-52: TLS/HTTP-client crates linked into harness-cli"
 
 # The pure model crate naming an I/O facility is refused like any pure crate.
 fresh
@@ -270,9 +303,14 @@ expect_refusal "harness-model depends on a crate outside its allowlist" "harness
 
 # H1c confirming review NF-1: a workspace feature that forwards to fault-injection.
 fresh
-# (harness-cli already depends on harness-journal since H1e-2b.)
-printf '\n[features]\nchaos = ["harness-journal/fault-injection"]\n' >>"$copy/crates/harness-cli/Cargo.toml" ||
-    fail "could not plant the chaos feature"
+# (harness-cli already depends on harness-journal since H1e-2b, and already
+# has a [features] table — the plant adds a line to it.)
+awk '{ print } /^net[ \t]*=/ { print "chaos = [\"harness-journal/fault-injection\"]" }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting the chaos feature"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+grep -qF 'chaos = ["harness-journal/fault-injection"]' "$copy/crates/harness-cli/Cargo.toml" ||
+    fail "chaos plant did not land"
 expect_refusal "a chaos feature forwards to fault-injection" "a workspace feature forwards to harness-journal/fault-injection"
 # ... and the compile_error! that keeps it out of optimised builds.
 fresh
@@ -443,6 +481,59 @@ fresh
 expect_refusal "a crates.io crate not on the reviewed list" \
     "INV-23: crates.io crates in the build that are not on this gate's reviewed list" \
     PATH="$tmpdir/treeshim:$PATH"
+
+# --- tool failures must fail closed -------------------------------------------
+# Created here, before its first use (the net-tree case below); the later
+# cases reuse it.
+mkdir "$tmpdir/shim" || fail "mkdir shim failed"
+cat >"$tmpdir/shim/cargo" <<EOF
+#!/bin/sh
+# Fails 'cargo tree' when an argument equals \$SHIM_FAIL_ARG; with
+# SHIM_EMPTY=1 it prints nothing and succeeds. Everything else is real cargo.
+if [ "\$1" = tree ]; then
+    for a in "\$@"; do
+        if [ "\$a" = "\${SHIM_FAIL_ARG:-}" ]; then
+            echo "error: simulated cargo tree failure" >&2
+            exit 101
+        fi
+    done
+    [ "\${SHIM_EMPTY:-0}" = 1 ] && exit 0
+fi
+exec "$real_cargo" "\$@"
+EOF
+chmod +x "$tmpdir/shim/cargo" || fail "chmod shim failed"
+shim_path="$tmpdir/shim:$PATH"
+
+# P-39n: the net tree of harness-fetch is allowlisted exactly like the
+# default tree. A crates.io crate appearing only there (shim: appended after
+# the fetch-net invocation) is refused under the net tree's own name.
+mkdir "$tmpdir/nettreeshim" || fail "mkdir nettreeshim failed"
+cat >"$tmpdir/nettreeshim/cargo" <<EOF
+#!/bin/sh
+# With SHIM_NET_FAIL=1, fails exactly the harness-fetch net-feature tree
+# read; with SHIM_NET_FAIL unset, adds a crates.io crate to it. Everything
+# else is real cargo.
+if [ "\$*" = "tree --target all -e normal,build --prefix none -p harness-fetch --features net" ]; then
+    if [ "\${SHIM_NET_FAIL:-0}" = 1 ]; then
+        echo "error: simulated cargo tree failure" >&2
+        exit 101
+    fi
+    "$real_cargo" "\$@" || exit \$?
+    echo "duct v0.13.7"
+    exit 0
+fi
+exec "$real_cargo" "\$@"
+EOF
+chmod +x "$tmpdir/nettreeshim/cargo" || fail "chmod nettreeshim failed"
+fresh
+expect_refusal "a crates.io crate in the net tree alone" \
+    "harness-fetch (net) pulled in non-allowlisted crates" \
+    PATH="$tmpdir/nettreeshim:$PATH"
+# ... and the net tree read failing must fail the gate, not skip the check.
+fresh
+expect_refusal "cargo tree fails (net tree only)" \
+    "cargo tree failed: -p harness-fetch --features net" \
+    PATH="$tmpdir/nettreeshim:$PATH" SHIM_NET_FAIL=1
 # Targets whose code the scan does not read (NF-3).
 fresh
 mkdir -p "$copy/crates/harness-cli/hidden" || fail "mkdir failed"
@@ -658,25 +749,6 @@ expect_refusal "purity_allows_the_named_linux_unsafe_crate_only" \
     "does not open with #![forbid(unsafe_code)]"
 
 # --- tool failures must fail closed -------------------------------------------
-mkdir "$tmpdir/shim" || fail "mkdir shim failed"
-cat >"$tmpdir/shim/cargo" <<EOF
-#!/bin/sh
-# Fails 'cargo tree' when an argument equals \$SHIM_FAIL_ARG; with
-# SHIM_EMPTY=1 it prints nothing and succeeds. Everything else is real cargo.
-if [ "\$1" = tree ]; then
-    for a in "\$@"; do
-        if [ "\$a" = "\${SHIM_FAIL_ARG:-}" ]; then
-            echo "error: simulated cargo tree failure" >&2
-            exit 101
-        fi
-    done
-    [ "\${SHIM_EMPTY:-0}" = 1 ] && exit 0
-fi
-exec "$real_cargo" "\$@"
-EOF
-chmod +x "$tmpdir/shim/cargo" || fail "chmod shim failed"
-shim_path="$tmpdir/shim:$PATH"
-
 fresh
 expect_refusal "cargo tree fails (default tree)" "cargo tree failed: -p gate-outcome" \
     PATH="$shim_path" SHIM_FAIL_ARG=gate-outcome

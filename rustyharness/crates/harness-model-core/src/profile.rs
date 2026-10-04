@@ -5,9 +5,11 @@
 //! grammar, no field that this build cannot honour:
 //! - `grammar` other than `none` is refused (constrained decoding through
 //!   the OpenAI-compatible API is spike S-P1; safety never depends on it);
-//! - `price` is refused: prices exist for hosted endpoints only, and this
-//!   build has none (N-7: "a hosted run without a price table refuses to
-//!   start" belongs with the `hosted` feature);
+//! - `price` is refused: prices for hosted endpoints are declared with
+//!   P-31's `price_table` next to `upstream: "hosted"` instead (N-7: "a
+//!   hosted run without a price table refuses to start" is enforced where
+//!   runs are planned, not here — a hosted profile without a price table
+//!   parses, and every run of it is refused);
 //! - `tool_choice_required_ok: true` with the text protocol is refused as
 //!   meaningless, and so is `parallel_tool_calls_false_ok: true`;
 //! - `parallel_tool_calls: true` (P-53) is refused with the text protocol
@@ -26,7 +28,11 @@
 //! older harness refuses a profile that sets one (unknown fields are
 //! refused), so no build silently ignores it. The same is true of P-53's
 //! `tool_docs` (`full` by default; `terse` joins the digest) and
-//! `parallel_tool_calls` (`false` by default; `true` joins the digest).
+//! `parallel_tool_calls` (`false` by default; `true` joins the digest), and
+//! of P-31's hosted declaration (`upstream` and `price_table` are absent
+//! for a local model, which keeps the digest of every profile written
+//! before P-31; both join the digest when the profile says
+//! `upstream: "hosted"`).
 //!
 //! An unknown model gets [`Profile::conservative_default`]. A profile runs
 //! whether or not `profile check` stamped it; `profile_validated` is
@@ -81,6 +87,30 @@ pub enum ToolDocs {
     /// one sentence per tool plus its argument names, for small local
     /// models that read shorter declarations better.
     Terse,
+}
+
+/// Where a model's inference runs (P-31). Only the hosted case is
+/// representable: the endpoint is the user's loopback proxy in front of a
+/// hosted provider (docs/hosted-proxy.md), so the context leaves the
+/// machine and the hosted disclosure rules apply (Q-2, Q-3). Any other
+/// value is an unknown variant and refused as a shape error, fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Upstream {
+    /// The endpoint proxies a hosted provider.
+    Hosted,
+}
+
+/// A price table (P-31, §2.4): the hosted provider's price in micro-USD
+/// per kilo-token. It feeds the meter's `Cost` budget; a hosted run whose
+/// profile has none refuses to start (enforced where runs are planned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceTable {
+    /// Input price, micro-USD per kilo-token.
+    pub in_micro_per_ktok: u64,
+    /// Output price, micro-USD per kilo-token.
+    pub out_micro_per_ktok: u64,
 }
 
 /// Sampling defaults.
@@ -151,6 +181,10 @@ struct ProfileWire {
     #[serde(default)]
     kv_quant_note: Option<String>,
     #[serde(default)]
+    upstream: Option<Upstream>,
+    #[serde(default)]
+    price_table: Option<PriceTable>,
+    #[serde(default)]
     price: Option<serde_json::Value>,
     #[serde(default)]
     validated: Option<Stamp>,
@@ -177,6 +211,8 @@ pub struct Profile {
     recent_turns: u32,
     sampling: Sampling,
     kv_quant_note: Option<String>,
+    upstream: Option<Upstream>,
+    price_table: Option<PriceTable>,
     validated: Option<Stamp>,
     sha256: Option<Digest>,
 }
@@ -290,6 +326,16 @@ impl Profile {
                 "read_timeout_secs is null; leave it out for the default timeout".into(),
             ));
         }
+        if v.get("upstream").is_some_and(serde_json::Value::is_null) {
+            return Err(ProfileError::Shape(
+                "upstream is null; leave it out for a local model".into(),
+            ));
+        }
+        if v.get("price_table").is_some_and(serde_json::Value::is_null) {
+            return Err(ProfileError::Shape(
+                "price_table is null; leave it out (or declare `upstream` with it)".into(),
+            ));
+        }
         let w: ProfileWire =
             serde_json::from_value(v).map_err(|e| ProfileError::Shape(e.to_string()))?;
         let f = ProfileError::Field;
@@ -347,6 +393,16 @@ impl Profile {
             return Err(ProfileError::NotInThisBuild {
                 field: "price",
                 why: "prices apply to hosted endpoints, which this build does not have",
+            });
+        }
+        // P-31, fail closed: a price table prices a hosted provider, so it
+        // only means something next to `upstream: "hosted"` (and a hosted
+        // run without one is refused at planning, per §2.4 — parsing stays
+        // permissive so the profile file can be checked on its own).
+        if w.price_table.is_some() && w.upstream != Some(Upstream::Hosted) {
+            return Err(ProfileError::NotInThisBuild {
+                field: "price_table",
+                why: "a price table needs `upstream: \"hosted\"`",
             });
         }
         if w.tool_choice_required_ok && w.protocol == Protocol::Text {
@@ -408,6 +464,8 @@ impl Profile {
             recent_turns: w.recent_turns,
             sampling: s,
             kv_quant_note: w.kv_quant_note,
+            upstream: w.upstream,
+            price_table: w.price_table,
             validated: w.validated,
             sha256: Some(sha256(bytes)),
         })
@@ -439,6 +497,8 @@ impl Profile {
                 max_tokens: 1024,
             },
             kv_quant_note: None,
+            upstream: None,
+            price_table: None,
             validated: None,
             sha256: None,
         }
@@ -532,6 +592,27 @@ impl Profile {
     pub fn kv_quant_note(&self) -> Option<&str> {
         self.kv_quant_note.as_deref()
     }
+    /// Whether the profile declares a hosted upstream (P-31): the endpoint
+    /// is the user's loopback proxy in front of a hosted provider, so the
+    /// context leaves the machine. Hosted runs get the disclosure banner,
+    /// refuse grants at personal sensitivity or above (Q-2), need a price
+    /// table (§2.4), and record `endpoint_class: loopback-proxy-hosted` in
+    /// the journal header (Q-3).
+    pub fn hosted(&self) -> bool {
+        self.upstream == Some(Upstream::Hosted)
+    }
+    /// The price table as per-token pricing (P-31) for the meter's `Cost`
+    /// budget. Per kilo-token prices divide by 1000 with integer division:
+    /// a price that is not a whole number of micro-USD per token floors
+    /// (the budget is a ceiling, never a discount, and the audit recomputes
+    /// the same way). `None` unless the profile is hosted and sets a table.
+    pub fn pricing(&self) -> Option<harness_core::Pricing> {
+        let t = self.price_table?;
+        Some(harness_core::Pricing {
+            input_micros_per_token: t.in_micro_per_ktok / 1000,
+            output_micros_per_token: t.out_micro_per_ktok / 1000,
+        })
+    }
     /// Whether `profile check` stamped this profile. Recorded as
     /// `profile_validated` in every journal header (§3.4).
     pub fn validated(&self) -> bool {
@@ -611,6 +692,25 @@ impl Profile {
         // And for P-53's parallel calls: only when opted in.
         if let (true, Some(o)) = (self.parallel_tool_calls, v.as_object_mut()) {
             o.insert("parallel_tool_calls".into(), serde_json::Value::Bool(true));
+        }
+        // And for P-31's hosted declaration: only when hosted, so every
+        // local profile (each profile written before P-31) keeps its
+        // digest and its stamp. A hosted profile without a price table is
+        // representable here (every run of it refuses) and digests as
+        // `upstream` alone.
+        if self.hosted() {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("upstream".into(), serde_json::Value::from("hosted"));
+                if let Some(t) = self.price_table {
+                    o.insert(
+                        "price_table".into(),
+                        serde_json::json!({
+                            "in_micro_per_ktok": t.in_micro_per_ktok,
+                            "out_micro_per_ktok": t.out_micro_per_ktok,
+                        }),
+                    );
+                }
+            }
         }
         sha256(v.to_string().as_bytes())
     }
@@ -756,6 +856,108 @@ mod tests {
         let w = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
         assert_eq!(w.edit_format(), EditFormat::Whole);
         assert_eq!(w.content_sha256().to_string(), WHOLE_CONTENT);
+    }
+
+    // P-31: a local profile — every profile written before P-31 — keeps its
+    // digest and its stamp. `upstream` and `price_table` are content only
+    // when the profile is hosted.
+    #[test]
+    fn local_profile_digest_unchanged() {
+        const GOOD_CONTENT: &str =
+            "b8bf6a5e7b6c3f107548dc8cb096d84b2900f8e0846e474845521be5f8fcfb6f";
+        const DEFAULT_CONTENT: &str =
+            "d6b9b8ef0476910c516913f9edd2adfb5c8d91798e629f2403906c69141ba6cb";
+        let p = Profile::parse(GOOD.as_bytes()).unwrap();
+        assert!(!p.hosted());
+        assert_eq!(p.pricing(), None);
+        assert_eq!(p.content_sha256().to_string(), GOOD_CONTENT);
+        let d = Profile::conservative_default("m");
+        assert!(!d.hosted());
+        assert_eq!(d.pricing(), None);
+        assert_eq!(d.content_sha256().to_string(), DEFAULT_CONTENT);
+    }
+
+    // P-31: a hosted profile parses with the price table, converts it to
+    // per-token pricing for the meter's Cost budget, and is content (its
+    // digest differs from the local one). Hosted without a table parses
+    // too — every run of it refuses, at planning (§2.4).
+    #[test]
+    fn hosted_profile_declares_upstream_and_price_table() {
+        let hosted = with("upstream", r#""hosted""#);
+        let p = Profile::parse(hosted.as_bytes()).unwrap();
+        assert!(p.hosted());
+        assert_eq!(p.pricing(), None);
+        let local = Profile::parse(GOOD.as_bytes()).unwrap();
+        assert_ne!(p.content_sha256(), local.content_sha256());
+
+        let mut o: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&hosted).unwrap();
+        o.insert(
+            "price_table".into(),
+            serde_json::json!({"in_micro_per_ktok": 3000, "out_micro_per_ktok": 15000}),
+        );
+        let priced = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
+        assert!(priced.hosted());
+        assert_eq!(
+            priced.pricing(),
+            Some(harness_core::Pricing {
+                input_micros_per_token: 3,
+                output_micros_per_token: 15,
+            })
+        );
+        assert_ne!(priced.content_sha256(), p.content_sha256());
+    }
+
+    // P-31, fail closed: the declaration only means one thing.
+    #[test]
+    fn hosted_declarations_fail_closed() {
+        // A price table prices a hosted provider; without the declaration
+        // it is refused.
+        let table = r#"{"in_micro_per_ktok":1,"out_micro_per_ktok":1}"#;
+        assert!(matches!(
+            Profile::parse(with("price_table", table).as_bytes()),
+            Err(ProfileError::NotInThisBuild {
+                field: "price_table",
+                ..
+            })
+        ));
+        // Explicit nulls are not absence.
+        for k in ["upstream", "price_table"] {
+            assert!(
+                matches!(
+                    Profile::parse(with(k, "null").as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{k}"
+            );
+        }
+        // Only `hosted` is an upstream; anything else is a shape error
+        // (an unknown variant), never silently local.
+        for v in ["\"regional\"", "\"\"", "1"] {
+            assert!(
+                matches!(
+                    Profile::parse(with("upstream", v).as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{v}"
+            );
+        }
+        // The table itself is strict.
+        for t in [
+            r#"{"in_micro_per_ktok":1}"#,
+            r#"{"in_micro_per_ktok":1,"out_micro_per_ktok":1,"surprise":0}"#,
+        ] {
+            let mut o: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&with("upstream", r#""hosted""#)).unwrap();
+            o.insert("price_table".into(), serde_json::from_str(t).unwrap());
+            assert!(
+                matches!(
+                    Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()),
+                    Err(ProfileError::Shape(_))
+                ),
+                "{t}"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,12 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Forwarded to harness-tools/net (P-39n): the CLI itself never links TLS —
+# it depends on neither harness-fetch nor any TLS crate in ANY feature
+# combination (INV-52, checked by purity.sh's cli_never_links_tls).
+net = ["harness-tools/net"]
+
 [dependencies]
 # The CLI is a gate child (design §7.7): its last stdout line is a
 # GateReport, so it needs gate-outcome's wire form.

@@ -159,6 +159,7 @@ fn drive(
         approver,
         confinement,
         input,
+        instructions: None,
         sink: None,
     })
 }

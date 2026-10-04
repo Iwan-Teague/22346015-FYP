@@ -79,3 +79,6 @@ pub use writer::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tamper_tests;

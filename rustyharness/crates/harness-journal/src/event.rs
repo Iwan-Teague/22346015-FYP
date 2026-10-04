@@ -31,6 +31,14 @@ pub enum Trusted {
     Text(&'static str),
     /// A validated identifier.
     Id(Ident),
+    /// An IP address in its canonical text form (P-39j): `IpAddr` parses
+    /// and displays canonically, so the address — a value the airlock
+    /// classified, not free text — is harness-typed without a runtime
+    /// string constructor. On the wire: the `Display` string.
+    Ip(core::net::IpAddr),
+    /// Absent (JSON `null`), for typed optional fields such as the
+    /// `Egress` record's chosen address (P-39j).
+    Null,
     /// A digest (hex on the wire).
     Digest(Digest),
     /// A list.
@@ -52,6 +60,8 @@ impl Trusted {
             Trusted::I64(n) => Value::from(*n),
             Trusted::Text(s) => Value::from(*s),
             Trusted::Id(i) => Value::from(i.as_str()),
+            Trusted::Ip(ip) => Value::from(ip.to_string()),
+            Trusted::Null => Value::Null,
             Trusted::Digest(d) => Value::from(d.to_string()),
             Trusted::List(l) => {
                 Value::Array(l.iter().map(Trusted::to_value).collect::<Result<_, _>>()?)

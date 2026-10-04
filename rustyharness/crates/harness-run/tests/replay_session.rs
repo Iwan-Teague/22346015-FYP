@@ -144,6 +144,7 @@ fn drive_session(
         approver,
         confinement: None,
         input,
+        instructions: None,
         sink: None,
     })
 }

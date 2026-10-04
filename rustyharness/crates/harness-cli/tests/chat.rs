@@ -328,3 +328,26 @@ fn chat_session_journal_audits_clean() {
         Some("indeterminate:nothing_checked")
     );
 }
+
+// P-31: a hosted profile's chat says so in the banner (and `/status`).
+#[test]
+fn hosted_chat_discloses_the_upstream() {
+    let fx = Fixture::new("chat-hosted").unwrap();
+    let base = setup(&fx, &["harness.fs.read"]);
+    let mut p: serde_json::Map<String, serde_json::Value> = serde_json::from_str(PROFILE).unwrap();
+    p.insert("upstream".into(), serde_json::json!("hosted"));
+    p.insert(
+        "price_table".into(),
+        serde_json::json!({"in_micro_per_ktok": 3000, "out_micro_per_ktok": 15000}),
+    );
+    std::fs::write(
+        fx.base().join("profile.json"),
+        serde_json::Value::Object(p).to_string(),
+    )
+    .unwrap();
+    let (_code, _out, err) = chat_cli(&fx, &argv(&base), &["hello"], vec![say("hi")], &[]);
+    assert!(
+        err.contains("context is sent to a hosted provider"),
+        "{err}"
+    );
+}

@@ -25,7 +25,7 @@ use harness_tools::builtin::WorkspaceFacts;
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 
 use crate::driver::approvals::Approvals;
-use crate::driver::plan::{plan, prepare};
+use crate::driver::plan::{hosted_takes_no_personal, plan, prepare};
 use crate::driver::step::{BudgetNotices, Loop, LoopInit, NonceSource};
 use crate::driver::stop::{commit, End};
 use crate::driver::tools::{bg_fields, exec_fields, parse_bg, parse_exec};
@@ -159,8 +159,29 @@ fn drive_full(
     status: Option<ToolStatus>,
     env: &EnvSample,
 ) -> Outcome {
+    drive_full_profile(
+        Profile::conservative_default("m"),
+        replies,
+        plan_faults,
+        limits,
+        clock_step,
+        status,
+        env,
+    )
+}
+
+/// [`drive_full`] with a given profile (P-31: a hosted one, whose price
+/// table the meter needs).
+fn drive_full_profile(
+    profile: Profile,
+    replies: Vec<Result<Completion, ModelError>>,
+    plan_faults: FaultPlan,
+    limits: impl FnOnce(&mut RunConfig),
+    clock_step: Duration,
+    status: Option<ToolStatus>,
+    env: &EnvSample,
+) -> Outcome {
     let reg = registry();
-    let profile = Profile::conservative_default("m");
     let spec = TaskSpec {
         task: TaskText::new("What is in a.txt?".into()),
         grants: vec!["harness.fs.read".into(), "harness.fs.list".into()],
@@ -206,6 +227,7 @@ fn drive_full(
         })],
         meter: new_meter(
             cfg.limits.clone(),
+            profile.pricing(),
             Box::new(Advancing {
                 now: Cell::new(Duration::ZERO),
                 step: clock_step,
@@ -221,6 +243,7 @@ fn drive_full(
         tree: harness_core::sha256(b"tree"),
         workspace: None,
         research: false,
+        instructions: None,
         approvals: Approvals::new(&RunId::new(9, [1; 10]), 1, None, Default::default()),
         env,
         pressure: Vec::new(),
@@ -938,6 +961,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         })],
         meter: new_meter(
             cfg.limits.clone(),
+            profile.pricing(),
             Box::new(Advancing {
                 now: Cell::new(Duration::ZERO),
                 step: Duration::ZERO,
@@ -953,6 +977,7 @@ fn h2b_an_unverified_edit_stops_the_run_after_its_result_is_durable() {
         tree: harness_core::sha256(b"tree"),
         workspace: None,
         research: false,
+        instructions: None,
         approvals: Approvals::new(&RunId::new(9, [1; 10]), 1, None, Default::default()),
         env: &env,
         pressure: Vec::new(),
@@ -1635,7 +1660,10 @@ fn header_records_the_port_grant_only_when_ports_are_granted() {
         session: None,
         exec: None,
         ports,
+        instructions: None,
         workspace_mode: None,
+        parent: None,
+        child: None,
     };
 
     let body = header_body(header(&inputs(None)).unwrap());
@@ -1695,4 +1723,29 @@ fn ports_header_parses_back() {
     ] {
         assert!(PortsHeader::parse(&bad).is_none(), "{bad}");
     }
+}
+
+// ---- P-31: hosted profiles ---------------------------------------------------
+
+// Q-2, at the rule's seam: the grants a hosted run was given are refused at
+// personal sensitivity or above. No admitted registry can carry such a
+// capability in this build (a Signed tier waits for H4's signature
+// verification; a Pinned tier refuses the sensitivity), so the end-to-end
+// refusal is tested through `plan`'s pure rule and the price-table refusal
+// covers the hosted flow (`tests/hosted.rs`).
+#[test]
+fn hosted_profile_refuses_personal_sensitivity() {
+    use harness_manifest::Sensitivity;
+    assert!(hosted_takes_no_personal([Sensitivity::Personal]));
+    assert!(hosted_takes_no_personal([Sensitivity::Restricted]));
+    assert!(hosted_takes_no_personal([
+        Sensitivity::Public,
+        Sensitivity::Operational,
+        Sensitivity::Personal,
+    ]));
+    assert!(!hosted_takes_no_personal([
+        Sensitivity::Public,
+        Sensitivity::Operational,
+    ]));
+    assert!(!hosted_takes_no_personal([] as [Sensitivity; 0]));
 }

@@ -106,6 +106,91 @@ impl UserMessage {
     }
 }
 
+/// Project instructions loaded at a session's start (P-30): the
+/// workspace root's `AGENTS.md` or `CLAUDE.md`, after the user chose to
+/// trust this exact text. Untrusted by definition — anyone who can write
+/// the workspace could have written them — so they reach the context only
+/// as an untrusted project-notes block and never a policy decision.
+/// Constructed only by the host (the CLI, after its trust prompt); a
+/// library caller passes `None` and nothing is loaded.
+#[derive(Debug)]
+pub struct Instructions {
+    /// The file's name: `AGENTS.md` or `CLAUDE.md`.
+    pub(crate) name: &'static str,
+    /// SHA-256 over the full text (the digest the user approved).
+    pub(crate) digest: Digest,
+    /// The full text, untrusted.
+    pub(crate) text: Untrusted<String>,
+}
+
+/// Why [`Instructions`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InstructionsRefused {
+    /// The file is not one the loop loads.
+    #[error("instructions must be AGENTS.md or CLAUDE.md (got {name})")]
+    UnknownName {
+        /// The name that was given.
+        name: String,
+    },
+    /// The text is over the byte cap.
+    #[error("project instructions are limited to {max} bytes (got {len})")]
+    TooLong {
+        /// The text's length in bytes.
+        len: usize,
+        /// The cap.
+        max: usize,
+    },
+    /// The bytes are not UTF-8 text.
+    #[error("project instructions must be UTF-8 text")]
+    NotText,
+}
+
+impl Instructions {
+    /// The cap on the instructions' size, in bytes: beyond this the CLI
+    /// refuses to load the file at all (fail closed; the 8% context cap
+    /// would cut nearly all of it anyway).
+    pub const MAX_BYTES: usize = 1024 * 1024;
+
+    /// Instructions from a file's name and bytes. The name must be one of
+    /// the two files the loop loads; the bytes must be UTF-8 text of at
+    /// most [`Instructions::MAX_BYTES`]. The digest is computed over the
+    /// full text.
+    pub fn new(name: &str, bytes: &[u8]) -> Result<Self, InstructionsRefused> {
+        let name = match name {
+            "AGENTS.md" => "AGENTS.md",
+            "CLAUDE.md" => "CLAUDE.md",
+            other => {
+                return Err(InstructionsRefused::UnknownName {
+                    name: other.to_owned(),
+                })
+            }
+        };
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(InstructionsRefused::TooLong {
+                len: bytes.len(),
+                max: Self::MAX_BYTES,
+            });
+        }
+        let text = String::from_utf8(bytes.to_vec()).map_err(|_| InstructionsRefused::NotText)?;
+        let digest = harness_core::sha256(text.as_bytes());
+        Ok(Self {
+            name,
+            digest,
+            text: Untrusted::new(text, Source::Workspace(name.to_owned())),
+        })
+    }
+
+    /// The instructions' file name.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The digest of the full text.
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+}
+
 /// Why the input ended (P-05 §1.1): the names the `InputEnded` record
 /// carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +448,10 @@ pub struct SessionRun<'a> {
     pub confinement: Option<&'a dyn Confinement>,
     /// Where the session's messages come from.
     pub input: &'a dyn UserInput,
+    /// Project instructions loaded at the session's start (P-30), if the
+    /// host chose to trust some. `None` loads nothing (the library
+    /// default).
+    pub instructions: Option<&'a Instructions>,
     /// Where journaled records are shown as they are written; `None`
     /// buffers nothing and shows nothing.
     pub sink: Option<&'a dyn EventSink>,
@@ -435,7 +524,10 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         session: Some(s.config.turn),
         exec: exec_header,
         ports: ports_header,
+        instructions: s.instructions,
         workspace_mode: s.config.run.workspace_mode.as_ref(),
+        parent: None,
+        child: None,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -452,7 +544,11 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
     let blobs = layout::attempt_dir(&run_dir, attempt).join(layout::BLOBS_DIR);
 
     // ---- The loop. ----
-    let meter = new_meter(limits, Box::new(SystemClock::default()));
+    let meter = new_meter(
+        limits,
+        s.profile.pricing(),
+        Box::new(SystemClock::default()),
+    );
     let edit_tools = pre.edit_tools.clone();
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
@@ -491,6 +587,7 @@ pub fn run_session(s: SessionRun<'_>) -> Result<SessionReport, RunRefused> {
         post_edit: crate::postedit::PostEditState::of(&s.spec.post_edit),
         workspace_root: Some(s.workspace.to_path_buf()),
         restore: Default::default(),
+        instructions: s.instructions,
         user: Some(UserState {
             limits: s.config.turn,
             turn: 1,
@@ -569,7 +666,7 @@ pub struct ResearchRun<'a> {
 /// Run a research session (P-39i, §2.2-§2.4): the session loop with no
 /// workspace — the same turn budget, input handling and journal records as
 /// [`run_session`], but no tree walk at a turn's start (the facts stay the
-/// no-workspace facts), the research context (`rh-research/1`), and the
+/// no-workspace facts), the research context (`rh-research/2`), and the
 /// header's `session_kind`/`web` keys. `Err` means the session did not
 /// start.
 pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
@@ -622,7 +719,10 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         session: Some(s.config.turn),
         exec: None,
         ports: None,
+        instructions: None,
         workspace_mode: s.config.run.workspace_mode.as_ref(),
+        parent: None,
+        child: None,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -640,7 +740,11 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
     // ---- The loop: the session loop, workspace-less (P-39i). The facts
     // are the research facts; the tree is the digest of nothing and no
     // provider serves tools (the task tools are the loop's own). ----
-    let meter = new_meter(limits, Box::new(SystemClock::default()));
+    let meter = new_meter(
+        limits,
+        s.profile.pricing(),
+        Box::new(SystemClock::default()),
+    );
     let mut lp = Loop::new(LoopInit {
         session: pre.session,
         registry: s.registry,
@@ -678,6 +782,7 @@ pub fn run_research(s: ResearchRun<'_>) -> Result<SessionReport, RunRefused> {
         post_edit: PostEditState::of(&s.spec.post_edit),
         workspace_root: None,
         restore: Default::default(),
+        instructions: None,
         user: Some(UserState {
             limits: s.config.turn,
             turn: 1,
@@ -746,6 +851,27 @@ impl<'a> Loop<'a> {
             SessionInputs::Replay(recorded) => (recorded, None),
             SessionInputs::Resume { recorded, live } => (recorded, Some(live)),
         };
+        // P-30: trusted project instructions are journaled once, at the
+        // attempt's start, in every mode (live, replay, a resume's
+        // catch-up) — the audit re-derives them from the journal and
+        // rewrites this identical record before comparing. The full text
+        // rides as an untrusted blob (the journal decides inline or
+        // blob-by-digest); the digest is over the text the user approved.
+        if let Some(n) = &self.instructions {
+            let ev = w
+                .untrusted(&n.text)
+                .map_err(journal)
+                .map(|blob| {
+                    Event::new(EventKind::InstructionsLoaded)
+                        .field("path", Trusted::Text(n.name))
+                        .field("digest", Trusted::Digest(n.digest))
+                        .field("text", Trusted::Untrusted(blob))
+                })
+                .and_then(|ev| w.append(self.step, ev).map_err(journal));
+            if let Err(cause) = ev {
+                return self.session_end(cause);
+            }
+        }
         // What the next input is: a live event, or one recorded input. A
         // replay whose recorded inputs are gone stops as cancelled (P-17
         // §6): nothing was journaled for a next turn, so there is no

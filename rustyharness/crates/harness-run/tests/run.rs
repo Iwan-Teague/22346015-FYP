@@ -385,3 +385,17 @@ fn the_header_records_the_host_the_manifest_and_the_environment() {
     }
     assert!(r.possibly_environmental.is_empty());
 }
+
+/// P-38: a batch header carries neither the child mode nor the child
+/// links, so child keys never change what a batch header (and its audit)
+/// compares.
+#[test]
+fn batch_header_unchanged_without_delegate() {
+    let fx = Fixture::new("run-batch-header").unwrap();
+    let r = run_scripted(&fx, vec![submit()]).unwrap();
+    let head = &records(&r)[0].body;
+    assert!(!head.contains_key("parent"), "{head:?}");
+    assert!(!head.contains_key("child"), "{head:?}");
+    assert!(!head.contains_key("mode"), "{head:?}");
+    assert_eq!(head.get("checks").unwrap(), 0);
+}

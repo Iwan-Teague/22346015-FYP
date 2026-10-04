@@ -123,11 +123,14 @@ pub const CONTEXT_FORMAT: &str = "rh-context/5";
 /// conversation block (user messages verbatim, bounded by their share of
 /// the window) and the session rules and protocol sentences. Since P-28 it
 /// also carries the plan-mode line and, after `/build`, the approved plan
-/// block. A batch context stays [`CONTEXT_FORMAT`] (`rh-context/5`): batch
-/// headers, journals, context digests and request bytes are unchanged, and
-/// old journals still audit. Bump both with any change to what this module
-/// or `wire::render_request` produces.
-pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/7";
+/// block. Since P-30 it also carries the project-notes block when the
+/// session loaded AGENTS.md or CLAUDE.md (its absence changes nothing, so
+/// journals without it still audit). A batch context stays
+/// [`CONTEXT_FORMAT`] (`rh-context/5`): batch headers, journals, context
+/// digests and request bytes are unchanged, and old journals still audit.
+/// Bump both with any change to what this module or `wire::render_request`
+/// produces.
+pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/8";
 
 /// The context format of a RESEARCH session (P-39i, §2.2-§2.4): the
 /// session request shape (the conversation block, the users' share) with
@@ -136,12 +139,19 @@ pub const SESSION_CONTEXT_FORMAT: &str = "rh-context/7";
 /// exactly what it was and old journals still audit. Bump it with any
 /// change to what the research path of this module or `wire::render_request`
 /// produces.
-pub const RESEARCH_CONTEXT_FORMAT: &str = "rh-research/1";
+pub const RESEARCH_CONTEXT_FORMAT: &str = "rh-research/2";
 
 /// The share of the context window (in estimate bytes) user messages live
 /// in (P-05 §2.4): `budget_tokens × 3 × USER_SHARE_PERCENT / 100`. The
 /// estimate is `bytes / 3`, so `3 × budget_tokens` is the byte limit.
 pub const USER_SHARE_PERCENT: u64 = 20;
+
+/// The share of the context window (in estimate bytes) the project notes
+/// (P-30) live in: `budget_tokens × 3 × NOTES_SHARE_PERCENT / 100`. The
+/// notes are cut to this many bytes (on a character boundary) and a notice
+/// names the cut, so a large AGENTS.md cannot crowd out the task or the
+/// window.
+pub const NOTES_SHARE_PERCENT: u64 = 8;
 
 /// Estimate bytes held back from the user share, so the kept user messages
 /// plus the index group one of them may split always leave room (P-05
@@ -694,6 +704,17 @@ pub fn research_facts(hosts: &[String], search: bool) -> Vec<Fact> {
             value: FactValue::Text(String::from("saved as quarantined notes")),
             method: "the harness keeps every accepted submit note for human review",
         },
+        // P-46: the citation convention the report must follow. The digests
+        // a fetch's observation header shows are the only currency a cited
+        // passage has: the post-submit check matches them against what the
+        // journal recorded, and flags anything else as a phantom citation.
+        Fact {
+            name: "citations",
+            value: FactValue::Text(String::from(
+                "cite every passage as sha256:<64-hex digest>, using the text digest shown in the fetch observation header",
+            )),
+            method: "the report's citations are checked against the digests the journal recorded",
+        },
     ]
 }
 
@@ -950,6 +971,7 @@ pub fn build(
         tools,
         task,
         facts,
+        None,
         turns,
         &[],
         shown,
@@ -989,20 +1011,62 @@ impl Default for SessionModeView {
     }
 }
 
+/// The project instructions a session loaded (P-30): the workspace's
+/// AGENTS.md or CLAUDE.md, approved by the user at session start. Plain
+/// data, so `build_session` stays pure in its inputs and audit replay
+/// recomputes the request bytes. The digest is computed here from the text
+/// (not taken from the caller), so the wire delimiters always name the text
+/// they wrap — and a file cannot contain its own sha256, so its text can
+/// never carry its own closing delimiter.
+#[derive(Debug)]
+pub struct ProjectNotes {
+    /// The file it was loaded from (`AGENTS.md` or `CLAUDE.md`).
+    pub name: String,
+    /// sha256 of `text`, hex.
+    pub digest: String,
+    /// The file text.
+    pub text: Untrusted<String>,
+}
+
+impl ProjectNotes {
+    /// Wrap the approved text of `name`; the digest is taken over the whole
+    /// text, before any cut.
+    pub fn new(name: &str, text: Untrusted<String>) -> Self {
+        let digest =
+            harness_core::sha256(text.inspect("project notes: digest").as_bytes()).to_string();
+        Self {
+            name: name.to_owned(),
+            digest,
+            text,
+        }
+    }
+}
+
+/// The notes cap in estimate bytes: 8% of the window (P-30).
+pub fn notes_cap_bytes(profile: &Profile) -> u64 {
+    budget_tokens(profile)
+        .saturating_mul(3)
+        .saturating_mul(NOTES_SHARE_PERCENT)
+        .saturating_div(100)
+}
+
 /// Build a session turn's context (P-05 §2): the batch blocks and step
 /// turns, plus the conversation block — every user message (`Source::User`)
 /// interleaved at its `before` position, shown verbatim, never compacted,
 /// bounded by its share of the window; an oldest prefix beyond the share is
 /// dropped and rendered as one counted notice ([`Built::users_dropped`]).
-/// `mode_view` is the plan-mode state (P-28). Pure in
-/// `(profile, tools, task, facts, turns, users, shown, mode_view)`, so audit
-/// replay recomputes it.
+/// `mode_view` is the plan-mode state (P-28). `notes` is the project
+/// instructions the session loaded (P-30), shown once as a fixed block
+/// after the facts, cut to [`notes_cap_bytes`] with a notice. Pure in
+/// `(profile, tools, task, facts, notes, turns, users, shown, mode_view)`,
+/// so audit replay recomputes it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_session(
     profile: &Profile,
     tools: &[ToolSpec],
     task: &TaskText,
     facts: &[Fact],
+    notes: Option<&ProjectNotes>,
     turns: &[Turn],
     users: &[UserEntry],
     shown: &Renderings,
@@ -1013,6 +1077,7 @@ pub fn build_session(
         tools,
         task,
         facts,
+        notes,
         turns,
         users,
         shown,
@@ -1044,6 +1109,7 @@ pub fn build_research(
         tools,
         task,
         facts,
+        None,
         turns,
         users,
         shown,
@@ -1103,6 +1169,7 @@ fn build_inner(
     tools: &[ToolSpec],
     task: &TaskText,
     facts: &[Fact],
+    notes: Option<&ProjectNotes>,
     turns: &[Turn],
     users: &[UserEntry],
     shown: &Renderings,
@@ -1127,6 +1194,7 @@ fn build_inner(
             tools,
             task,
             facts,
+            notes,
             mode_view.unwrap_or(&SessionModeView::build()),
         ),
         Mode::Research => research_fixed_messages(profile, tools, task, facts),
@@ -1365,12 +1433,15 @@ fn fixed_messages(
 /// profile's protocol, so it is fixed for a session. Since P-28 the rules
 /// block ends with the mode line (plan mode narrows the session to
 /// read-only tools; the caller passes that narrowed list), and an approved
-/// plan renders as one extra user-approved block after the facts.
+/// plan renders as one extra user-approved block after the facts. Since
+/// P-30 the project notes render as one extra block after the facts (before
+/// the approved plan), cut to [`notes_cap_bytes`] with a notice when cut.
 fn session_fixed_messages(
     profile: &Profile,
     tools: &[ToolSpec],
     task: &TaskText,
     facts: &[Fact],
+    notes: Option<&ProjectNotes>,
     mode_view: &SessionModeView,
 ) -> Vec<Message> {
     let protocol = profile.protocol();
@@ -1415,6 +1486,26 @@ fn session_fixed_messages(
             s.push_str(&format!("- {}: {v} (method: {})\n", f.name, f.method));
         }
         out.push(Message::System(HarnessText::rendered(s)));
+    }
+    // The project notes (P-30): the user read the file and approved loading
+    // it, but its text is workspace data, not harness rules — shown inside
+    // its own digest-named delimiters, cut to the notes cap with a notice.
+    if let Some(n) = notes {
+        let text = n.text.inspect("context: project notes");
+        let cap = notes_cap_bytes(profile);
+        let (shown_text, cut) = cut_notes(text, cap);
+        out.push(Message::Notes {
+            name: n.name.clone(),
+            digest: n.digest.clone(),
+            body: Untrusted::new(shown_text, n.text.source().clone()),
+        });
+        if let Some((kept, full)) = cut {
+            out.push(Message::System(HarnessText::rendered(format!(
+                "Project notes ({}) were cut to {} of {} bytes to fit the context window; \
+                 the full text stays in the journal.",
+                n.name, kept, full
+            ))));
+        }
     }
     // The approved plan (P-28): the user read the plan and approved it with
     // /build, so the block is the user's own intent, not model text.
@@ -1716,6 +1807,22 @@ fn cap_text(text: &str, cap: ObsCap) -> (String, Option<(usize, usize)>) {
     (shown, Some((total_lines, text.len())))
 }
 
+/// Cut the notes text to `cap` bytes (on a character boundary). Returns
+/// what is shown and, when anything was cut, `(kept, full)` bytes.
+fn cut_notes(text: &str, cap: u64) -> (String, Option<(u64, u64)>) {
+    let full = len64(text.len());
+    if full <= cap {
+        return (text.to_owned(), None);
+    }
+    let mut end = usize::try_from(cap).unwrap_or(usize::MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let shown = text.get(..end).unwrap_or("").to_owned();
+    let kept = len64(shown.len());
+    (shown, Some((kept, full)))
+}
+
 /// A message's digest tag and its fields, in order. The tag names the kind,
 /// and with the message's place it fixes the wire role (the first `s` is
 /// the system message, a later one a user message; `t`, `o`, `u` user; `a`,
@@ -1725,7 +1832,8 @@ fn cap_text(text: &str, cap: ObsCap) -> (String, Option<(usize, usize)>) {
 /// - `c`: the tool-call id (its wire form), the tool's capability id, the
 ///   arguments, then the reply text beside the call;
 /// - `r`: the id of the call it answers, the call label, then the output;
-/// - `n`: the id of the call it answers, then the harness text.
+/// - `n`: the id of the call it answers, then the harness text;
+/// - `p`: the notes file's name, its digest, then the text.
 fn fields(m: &Message) -> (u8, Vec<Cow<'_, str>>) {
     let t = |u: &'static str| Cow::Borrowed(u);
     match m {
@@ -1772,6 +1880,14 @@ fn fields(m: &Message) -> (u8, Vec<Cow<'_, str>>) {
         Message::ToolNotice { id, text } => (
             b'n',
             vec![Cow::Owned(id.wire()), Cow::Borrowed(text.as_str())],
+        ),
+        Message::Notes { name, digest, body } => (
+            b'p',
+            vec![
+                Cow::Borrowed(name.as_str()),
+                Cow::Borrowed(digest.as_str()),
+                Cow::Borrowed(body.inspect("context: digest").as_str()),
+            ],
         ),
     }
 }
@@ -3060,6 +3176,7 @@ mod tests {
             &tools(2),
             &task(),
             &[],
+            None,
             turns,
             users,
             &shown_for(turns),
@@ -3068,12 +3185,124 @@ mod tests {
     }
 
     /// The context format constants: batch stays rh-context/5 (old journals
-    /// still audit), sessions are rh-context/7 (P-28 added the mode line
-    /// and the approved-plan block).
+    /// still audit), sessions are rh-context/8 (P-28 added the mode line
+    /// and the approved-plan block; P-30 added the project-notes block).
     #[test]
     fn context_format_constants() {
         assert_eq!(CONTEXT_FORMAT, "rh-context/5");
-        assert_eq!(SESSION_CONTEXT_FORMAT, "rh-context/7");
+        assert_eq!(SESSION_CONTEXT_FORMAT, "rh-context/8");
+    }
+
+    /// P-30: the project notes render as one fixed block after the facts,
+    /// tagged `p`, carrying the file name and the digest of the whole text.
+    #[test]
+    fn project_notes_block_after_facts() {
+        let notes = ProjectNotes::new(
+            "AGENTS.md",
+            Untrusted::new("be terse".into(), Source::Workspace("AGENTS.md".into())),
+        );
+        let built = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            Some(&notes),
+            &[],
+            &[],
+            &shown_for(&[]),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        let m = built
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::Notes { .. }))
+            .unwrap();
+        let (tag, f) = fields(m);
+        assert_eq!(tag, b'p');
+        assert_eq!(f[0], "AGENTS.md");
+        assert_eq!(f[1], harness_core::sha256(b"be terse").to_string());
+        assert_eq!(f[2], "be terse");
+        // After the facts, before any turn (none here): the last fixed block.
+        let ts = texts(&built);
+        let pos = ts.iter().position(|(t, _)| *t == b'p').unwrap();
+        assert!(ts[..pos].iter().all(|(t, _)| matches!(t, b's' | b't')));
+        assert!(ts[pos + 1..].is_empty());
+        // No notes: no `p` block at all.
+        let plain = build_session(
+            &profile(),
+            &tools(2),
+            &task(),
+            &[],
+            None,
+            &[],
+            &[],
+            &shown_for(&[]),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        assert!(!texts(&plain).iter().any(|(t, _)| *t == b'p'));
+    }
+
+    /// P-30: notes larger than the cap are cut to it (on a character
+    /// boundary) and a notice names the cut; the digest still covers the
+    /// whole text.
+    #[test]
+    fn instructions_cap_with_notice() {
+        let full = "x".repeat(4000);
+        let notes = ProjectNotes::new(
+            "AGENTS.md",
+            Untrusted::new(full.clone(), Source::Workspace("AGENTS.md".into())),
+        );
+        let p = profile();
+        let built = build_session(
+            &p,
+            &tools(2),
+            &task(),
+            &[],
+            Some(&notes),
+            &[],
+            &[],
+            &shown_for(&[]),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        let cap = notes_cap_bytes(&p);
+        let ts = texts(&built);
+        let body = ts.iter().find(|(t, _)| *t == b'p').unwrap();
+        assert_eq!(u64::try_from(body.1.len()).unwrap_or(u64::MAX), cap);
+        assert!(ts.iter().any(|(t, s)| *t == b's'
+            && s.contains("Project notes (AGENTS.md) were cut to")
+            && s.contains(&format!("{cap} of {} bytes", full.len()))));
+        let m = built
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::Notes { .. }))
+            .unwrap();
+        let (_, f) = fields(m);
+        assert_eq!(f[1], harness_core::sha256(full.as_bytes()).to_string());
+        // A cut on a character boundary: a multi-byte character at the edge
+        // is not split.
+        let wide = "é".repeat(2000);
+        let notes = ProjectNotes::new(
+            "CLAUDE.md",
+            Untrusted::new(wide, Source::Workspace("CLAUDE.md".into())),
+        );
+        let built = build_session(
+            &p,
+            &tools(2),
+            &task(),
+            &[],
+            Some(&notes),
+            &[],
+            &[],
+            &shown_for(&[]),
+            &SessionModeView::build(),
+        )
+        .unwrap();
+        let body = texts(&built).into_iter().find(|(t, _)| *t == b'p').unwrap();
+        assert!(body.1.is_char_boundary(body.1.len()));
+        assert!(u64::try_from(body.1.len()).unwrap_or(u64::MAX) <= cap);
     }
 
     /// Batch contexts are byte for byte what they were: these digests were
@@ -3429,6 +3658,7 @@ by the user. Your edits after that step no longer stand; read a file before you 
             &tools(2),
             &task(),
             &[],
+            None,
             &turns,
             &[],
             &shown_for(&turns),
@@ -3447,6 +3677,7 @@ by the user. Your edits after that step no longer stand; read a file before you 
             &tools(2),
             &task(),
             &[],
+            None,
             &turns,
             &[],
             &shown_for(&turns),
@@ -3466,6 +3697,7 @@ by the user. Your edits after that step no longer stand; read a file before you 
                 &tools(2),
                 &task(),
                 &[],
+                None,
                 &turns,
                 &[],
                 &shown_for(&turns),

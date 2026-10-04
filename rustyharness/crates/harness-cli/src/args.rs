@@ -15,17 +15,23 @@ pub(crate) const USAGE: &str = "usage:
                        --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
                        [--policy <policy.json>] [--gate <gate-id>] [--output stream-json]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
-                       [--no-default-denies]
+                       [--no-default-denies] [--workspace-mode in-place|scratch]
+                       [--scratch-with-git] [--allow-session-grants] [--accept-edits]
                        [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>] [--bg-persist]
-   rustyharness resume --run <run-id> + the run options
+   rustyharness resume --run <run-id> + the run options except
+                       --workspace-mode and --scratch-with-git
   rustyharness replay --run <run-id> --task <task.json> --state-root <dir>
                        --profile <profile.json> [--attempt <n>] [--anchor <sha256>]
                        [--policy <policy.json>] [--gate <gate-id>]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
-                       [--no-default-denies]
+                       [--no-default-denies] [--accept-edits]
                        [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>]
    rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
   rustyharness review --run <run-id> --workspace <dir> [--state-root <dir>]
+  rustyharness apply  --session <run-id> [--state-root <dir>] [--dry-run]
+                       copy a scratch session's edits back onto the original
+                       workspace after showing the diff; a typed `apply`
+                       confirms, conflicts are reported and skipped
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
   rustyharness sessions [--state-root <dir>] [--run <run-id>]
@@ -33,7 +39,9 @@ pub(crate) const USAGE: &str = "usage:
   rustyharness chat   --task <task.json> --profile <profile.json> [--endpoint <url>]
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
                         [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
-                        [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
+                        [--shell] [--no-default-denies] [--workspace-mode in-place|scratch]
+                        [--scratch-with-git] [--allow-session-grants] [--accept-edits]
+                        [--resume [<run-id>] | --continue | --fork RUN@STEP]
   rustyharness acp    --task <task.json> --profile <profile.json> [--endpoint <url>]
                         --state-root <dir> [--policy <policy.json>] [--gate <gate-id>]
                         [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
@@ -113,6 +121,64 @@ ports (P-36g): a task file's exec section may hold ports (loopback ports
   that binds a LAN port is a protected action: it asks every time and a
   session grant never covers it.";
 
+/// The help text `rustyharness <verb path> --help` prints (P-58): the
+/// USAGE synopsis entries whose command path extends `path` (`schedule
+/// --help` shows every schedule subverb), plus a pointer to the whole
+/// usage for the shared notes. `None` when USAGE names no such path: the
+/// caller's ordinary dispatch answers instead, so an unknown verb keeps
+/// its usage error (fail closed).
+pub(crate) fn help_for(path: &[&str]) -> Option<String> {
+    // One entry per `rustyharness ...` synopsis line: its command path
+    // (the leading plain words, so `manifest check` and `schedule
+    // run-now` are two tokens) and its lines (continuations belong to
+    // the entry above them, until the blank line before the notes).
+    let mut entries: Vec<(Vec<&str>, String)> = Vec::new();
+    let mut open = true;
+    for line in USAGE.lines() {
+        if line.trim().is_empty() {
+            open = false;
+        }
+        match line.trim_start().strip_prefix("rustyharness ") {
+            Some(rest) => {
+                let cmd: Vec<&str> = rest
+                    .split_whitespace()
+                    .take(2)
+                    .take_while(|t| {
+                        !t.starts_with('-')
+                            && t.chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    })
+                    .collect();
+                entries.push((cmd, line.to_owned()));
+            }
+            None => {
+                if let Some((_, text)) = entries.last_mut() {
+                    if open {
+                        text.push('\n');
+                        text.push_str(line);
+                    }
+                }
+            }
+        }
+    }
+    let matched: Vec<&str> = entries
+        .iter()
+        .filter(|(cmd, _)| {
+            cmd.len() >= path.len() && path.iter().enumerate().all(|(i, p)| cmd.get(i) == Some(p))
+        })
+        .map(|(_, text)| text.as_str())
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    let mut out = matched.join("\n");
+    out.push_str(
+        "\n\nrun `rustyharness --help` for every verb and the shared notes\n\
+         (defaults, sensitive paths, exec by name, ports, schedules).\n",
+    );
+    Some(out)
+}
+
 /// Parse `--key value` pairs; a repeated or unknown key is a usage error.
 /// A key in `valueless` is a flag: it takes no value (`--shell`), and a
 /// value-shaped token after it is refused as an unknown option.
@@ -190,17 +256,23 @@ mod tests {
                        --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
                        [--policy <policy.json>] [--gate <gate-id>] [--output stream-json]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
-                       [--no-default-denies]
+                       [--no-default-denies] [--workspace-mode in-place|scratch]
+                       [--scratch-with-git] [--allow-session-grants] [--accept-edits]
                        [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>] [--bg-persist]
-   rustyharness resume --run <run-id> + the run options
+   rustyharness resume --run <run-id> + the run options except
+                       --workspace-mode and --scratch-with-git
   rustyharness replay --run <run-id> --task <task.json> --state-root <dir>
                        --profile <profile.json> [--attempt <n>] [--anchor <sha256>]
                        [--policy <policy.json>] [--gate <gate-id>]
                        [--allow-exec <name[,name]>] [--preset <rust|node|python|go>] [--shell]
-                       [--no-default-denies]
+                       [--no-default-denies] [--accept-edits]
                        [--allow-port <p[,p]>] [--allow-lan-port <p[,p]>]
    rustyharness events --run <run-id> [--state-root <dir>] [--format ndjson] [--follow]
   rustyharness review --run <run-id> --workspace <dir> [--state-root <dir>]
+  rustyharness apply  --session <run-id> [--state-root <dir>] [--dry-run]
+                       copy a scratch session's edits back onto the original
+                       workspace after showing the diff; a typed `apply`
+                       confirms, conflicts are reported and skipped
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
   rustyharness sessions [--state-root <dir>] [--run <run-id>]
@@ -208,7 +280,9 @@ mod tests {
   rustyharness chat   --task <task.json> --profile <profile.json> [--endpoint <url>]
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
                         [--gate <gate-id>] [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]
-                        [--shell] [--no-default-denies] [--resume [<run-id>] | --continue]
+                        [--shell] [--no-default-denies] [--workspace-mode in-place|scratch]
+                        [--scratch-with-git] [--allow-session-grants] [--accept-edits]
+                        [--resume [<run-id>] | --continue | --fork RUN@STEP]
   rustyharness acp    --task <task.json> --profile <profile.json> [--endpoint <url>]
                         --state-root <dir> [--policy <policy.json>] [--gate <gate-id>]
                         [--allow-exec <name[,name]>] [--preset <rust|node|python|go>]

@@ -60,6 +60,6 @@ pub use provider::{
 pub use restore::{recreate_file, restore_file, uncreate_file, RestoreError};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};
 pub use web::{
-    BoxConnector, ConfinedHopRunner, Egress, FetcherPin, HopRun, HopRunner, RunnerError,
-    WebBudgets, WebHop, WebRecord, WebSetupError, WebTools,
+    BoxConnector, ConfinedHopRunner, Egress, FetcherPin, HopRun, HopRunner, RecordedHops,
+    RecordedResolver, RunnerError, WebBudgets, WebHop, WebRecord, WebSetupError, WebTools,
 };

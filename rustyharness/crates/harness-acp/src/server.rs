@@ -405,6 +405,9 @@ fn run_one<W: Write>(
         approver: Some(&approver),
         confinement: inp.confinement,
         input: &input,
+        // P-30: the ACP server loads no project instructions (only the
+        // CLI asks the user to trust a workspace file).
+        instructions: None,
         sink: Some(&sink),
     }) {
         Ok(report) => {

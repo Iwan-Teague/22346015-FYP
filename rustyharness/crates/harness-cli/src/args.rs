@@ -34,7 +34,7 @@ pub(crate) const USAGE: &str = "usage:
                        confirms, conflicts are reported and skipped
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
-  rustyharness sessions [--state-root <dir>] [--run <run-id>]
+  rustyharness sessions [--state-root <dir>] [--run <run-id>] [--all]
   rustyharness gc --run <run-id> | --older-than <N>d   [--state-root <dir>]
   rustyharness chat   --task <task.json> --profile <profile.json> [--endpoint <url>]
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]
@@ -275,7 +275,7 @@ mod tests {
                        confirms, conflicts are reported and skipped
   rustyharness profile check --profile <profile.json> --endpoint <url>
   rustyharness profile init  --endpoint <url> [--out <profile.json>]
-  rustyharness sessions [--state-root <dir>] [--run <run-id>]
+  rustyharness sessions [--state-root <dir>] [--run <run-id>] [--all]
   rustyharness gc --run <run-id> | --older-than <N>d   [--state-root <dir>]
   rustyharness chat   --task <task.json> --profile <profile.json> [--endpoint <url>]
                         [--workspace <dir>] [--state-root <dir>] [--policy <policy.json>]

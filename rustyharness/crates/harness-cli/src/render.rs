@@ -71,6 +71,7 @@ impl EventSink for SinkRenderer<'_, '_> {
                 note!(self.cx, "[loop] {}", text(ev.body.get("kind")));
             }
             EventKind::BudgetNotice => note!(self.cx, "[budget] {}", self.budget(ev)),
+            EventKind::ChildRun => self.child_run(ev),
             EventKind::PolicyDecided => self.policy_decided(ev),
             EventKind::UserTurn => self.user_turn(ev),
             EventKind::TurnEnded => {
@@ -154,7 +155,12 @@ impl<'c, 'a> SinkRenderer<'c, 'a> {
         // `ToolStarted` and this `ToolFinished` reaching the sink.
         let ms = started.map(|t| t.elapsed().as_millis());
         let status = text(ev.body.get("status"));
-        let mut line = if args.is_empty() {
+        let mut line = if capability == harness_policy::DELEGATE_ID {
+            // The delegate's finished record is the helper's framed
+            // report; the preview shows it (still untrusted, still
+            // sanitized).
+            format!("[helper] report -> {status}")
+        } else if args.is_empty() {
             format!("[tool] {capability} -> {status}")
         } else {
             let shown = sanitize_for_terminal_bounded(&args, DisplayMode::Line, ARGS_BYTES);
@@ -184,6 +190,19 @@ impl<'c, 'a> SinkRenderer<'c, 'a> {
             }
         }
         note!(self.cx, "{line}");
+    }
+
+    /// A delegate's one line (P-38g): the helper's run id and its step
+    /// budget, from the parent journal's `ChildRun` record. Display only.
+    fn child_run(&self, ev: &UiEvent<'_>) {
+        let child = text(ev.body.get("child"));
+        let steps = ev
+            .body
+            .get("limits")
+            .and_then(|l| l.get("steps"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        note!(self.cx, "[helper] started (run {child}, {steps} steps)");
     }
 
     fn edit_applied(&self, ev: &UiEvent<'_>) {

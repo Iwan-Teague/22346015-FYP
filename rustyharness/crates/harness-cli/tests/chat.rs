@@ -351,3 +351,50 @@ fn hosted_chat_discloses_the_upstream() {
         "{err}"
     );
 }
+
+// P-38g: the chat sink shows a delegate as a helper — a `[helper]
+// started` line from the parent's `ChildRun` record and the framed
+// report line from the delegate's `ToolFinished`.
+#[test]
+fn chat_shows_helper_start_and_report_lines() {
+    let fx = Fixture::new("chat-helper-lines").unwrap();
+    let base = setup(&fx, &["harness.fs.read", "harness.task.delegate"]);
+    let (code, _out, err) = chat_cli(
+        &fx,
+        &argv(&base),
+        &["ask a helper what a.txt says"],
+        vec![
+            act("harness.task.delegate", r#"{"task":"what is in a.txt?"}"#),
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act(
+                "harness.task.submit",
+                r#"{"note":"a.txt says the answer is in here"}"#,
+            ),
+            say("the helper read it for me"),
+        ],
+        &[],
+    );
+    assert_eq!(code, 5, "stderr: {err}");
+    assert!(err.contains("[helper] started (run "), "stderr: {err}");
+    let started = err
+        .lines()
+        .find(|l| l.starts_with("[helper] started"))
+        .unwrap_or_else(|| panic!("no helper start line in: {err}"));
+    assert!(
+        started.ends_with(" steps)"),
+        "the helper's step budget is shown: {started}"
+    );
+    assert!(err.contains("[helper] report -> ok"), "stderr: {err}");
+    let report = err
+        .lines()
+        .find(|l| l.starts_with("[helper] report"))
+        .unwrap_or_else(|| panic!("no helper report line in: {err}"));
+    assert!(
+        report.contains("Report from a read-only helper"),
+        "the framed report is previewed: {report}"
+    );
+    assert!(
+        !err.contains("[tool] harness.task.delegate"),
+        "the delegate is not rendered as a plain tool: {err}"
+    );
+}

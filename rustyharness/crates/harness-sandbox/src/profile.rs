@@ -204,6 +204,76 @@ pub fn render(
     Ok(p)
 }
 
+/// The profile text for the file-op helper instance (P-36d, §7.1): one
+/// fork-less perl serving `rh-fileop/1` requests against the workspace.
+/// Differences from [`render`], each load-bearing:
+///
+/// - **No `process-fork`.** The helper forks nothing, so a fork is
+///   impossible twice over (the stub never calls it, the kernel refuses
+///   it); the instance holds exactly one process by construction.
+/// - **`process-exec` of the stub interpreter ONLY.** The helper never
+///   launches another program, so no system or root subpath is executable.
+/// - **No `signal` allow.** The start canary needs `signal 0` to the
+///   parent to fail with `EPERM`, and the helper never signals anything.
+/// - Reads are as broad as a confined call's (the kernel view is a write
+///   view); writes land only on the read-write roots (none at all for a
+///   read-only session) and `/dev/null`.
+/// - Protected overlays, FIFOs and the network are denied last, as in
+///   [`render`]. No port grant ever renders here: the helper asks for
+///   `Network::None`.
+pub fn render_fileop(v: &Validated) -> Result<String, UnsafePath> {
+    let mut p = String::new();
+    p.push_str(&format!(
+        "(version 1)\n; {PROFILE_VERSION}\n(deny default)\n"
+    ));
+    p.push_str(&format!(
+        "(allow process-exec (literal {}))\n",
+        q(STUB_INTERPRETER)?
+    ));
+    p.push_str("(allow process-info* (target self))\n");
+    p.push_str("(allow sysctl-read)\n");
+    p.push_str("(allow file-read* (literal \"/\")");
+    for d in SYSTEM_READ {
+        p.push_str(&format!(" (subpath {})", q(d)?));
+    }
+    for d in DEVICES_READ {
+        p.push_str(&format!(" (literal {})", q(d)?));
+    }
+    for r in v.read_only.iter().chain(v.read_write.iter()) {
+        p.push_str(&format!(" (subpath {})", q(r)?));
+    }
+    p.push_str(")\n");
+    let mut anc: Vec<String> = v
+        .read_only
+        .iter()
+        .chain(v.read_write.iter())
+        .flat_map(|r| ancestors(r))
+        .collect();
+    anc.sort();
+    anc.dedup();
+    if !anc.is_empty() {
+        p.push_str("(allow file-read-metadata");
+        for a in &anc {
+            p.push_str(&format!(" (literal {})", q(a)?));
+        }
+        p.push_str(")\n");
+    }
+    p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
+    if !v.read_write.is_empty() {
+        p.push_str("(allow file-write*");
+        for r in &v.read_write {
+            p.push_str(&format!(" (subpath {})", q(r)?));
+        }
+        p.push_str(")\n");
+    }
+    for pr in &v.protected {
+        p.push_str(&format!("(deny file-write* (subpath {}))\n", q(pr)?));
+    }
+    p.push_str("(deny file-read* file-write* (vnode-type FIFO))\n");
+    p.push_str("(deny network*)\n");
+    Ok(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +443,69 @@ mod tests {
             .find("(allow network-outbound (remote ip \"localhost:8123\"))")
             .unwrap();
         assert!(deny < allow);
+    }
+
+    // --- render_fileop (P-36d, §7.1) -------------------------------------
+
+    #[test]
+    fn fileop_profile_is_deny_default_with_one_exec_and_no_fork() {
+        let p = render_fileop(&v()).unwrap();
+        assert!(p.starts_with("(version 1)\n; rh-seatbelt/1\n(deny default)\n"));
+        // Fork-less twice over: the stub never calls it and the kernel
+        // refuses it, so the instance is exactly one process.
+        assert!(!p.contains("process-fork"));
+        // The helper never signals: the start canary needs the refusal.
+        assert!(!p.contains("(allow signal"));
+        let exec = p
+            .find("(allow process-exec")
+            .map(|at| p[at..].lines().next().unwrap().to_string());
+        assert_eq!(
+            exec.as_deref(),
+            Some("(allow process-exec (literal \"/usr/bin/perl\"))"),
+            "only the stub interpreter is executable: no system or root subpath"
+        );
+        assert!(p.contains("(allow process-info* (target self))\n"));
+        assert!(p.contains("(allow sysctl-read)\n"));
+        assert!(p.contains("(allow file-read* (literal \"/\")"));
+        assert!(p.contains("(allow file-write* (subpath \"/w/ws\"))\n"));
+        assert!(p.contains("(allow file-write-data (literal \"/dev/null\"))\n"));
+        assert!(p.contains("(allow file-read-metadata (literal \"/opt\") (literal \"/w\"))\n"));
+    }
+
+    #[test]
+    fn fileop_profile_puts_the_write_denies_after_the_write_allow() {
+        let p = render_fileop(&v()).unwrap();
+        let w = p.find("(allow file-write* (subpath \"/w/ws\"))").unwrap();
+        let pr = p
+            .find("(deny file-write* (subpath \"/w/ws/.git\"))")
+            .unwrap();
+        let fifo = p.find("(vnode-type FIFO)").unwrap();
+        let net = p.find("(deny network*)").unwrap();
+        assert!(w < pr && pr < fifo && fifo < net);
+        assert!(p.ends_with("(deny network*)\n"));
+        assert!(!p.contains("network-bind"));
+        assert!(!p.contains("network-outbound"));
+        assert!(!p.contains("mach-lookup"));
+    }
+
+    #[test]
+    fn fileop_readonly_profile_grants_no_write_root_at_all() {
+        let mut ro = v();
+        ro.read_write.clear();
+        ro.read_only.push("/w/ws".into());
+        ro.protected.clear();
+        let p = render_fileop(&ro).unwrap();
+        assert!(!p.contains("(allow file-write*"));
+        assert!(p.contains("(allow file-read* (literal \"/\") (subpath \"/usr\")"));
+        assert!(p.contains("(subpath \"/w/ws\"))"));
+        // Read roots still get their ancestors as metadata-only.
+        assert!(p.contains("(literal \"/w\"))"));
+    }
+
+    #[test]
+    fn fileop_profile_refuses_an_unsafe_path_like_the_exec_one() {
+        let mut bad = v();
+        bad.read_write.push("/w/ws/a\"b".to_string());
+        assert!(matches!(render_fileop(&bad), Err(UnsafePath(_))));
     }
 }

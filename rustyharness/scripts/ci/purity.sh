@@ -638,6 +638,7 @@ fi
 spawn_file=crates/harness-sandbox/src/capture.rs
 spawn_tests=crates/harness-sandbox/src/capture/tests.rs
 confine_file=crates/harness-sandbox/src/confine_spawn.rs
+fileop_stub_file=crates/harness-sandbox/src/fileop_stub.rs
 find crates -type l >"$tmpdir/links" || fail "find failed (INV-23 symlinks)"
 if [ -s "$tmpdir/links" ]; then
     fail "INV-23: symlinks under crates/ (a source could hide behind one):
@@ -645,7 +646,8 @@ $(cat "$tmpdir/links")"
 fi
 find crates -path '*/src/*' -type f -name '*.rs' >"$tmpdir/argv-found" || fail "find failed (INV-23)"
 sort "$tmpdir/argv-found" >"$tmpdir/argv-files" || fail "sort failed (INV-23)"
-for must in "$spawn_file" "$spawn_tests" "$confine_file" crates/harness-sandbox/src/locality.rs; do
+for must in "$spawn_file" "$spawn_tests" "$confine_file" "$fileop_stub_file" \
+    crates/harness-sandbox/src/locality.rs; do
     grep -qxF "$must" "$tmpdir/argv-files" || fail "INV-23 scan would miss $must"
 done
 : >"$tmpdir/hits"
@@ -706,6 +708,27 @@ while IFS= read -r prog; do
         *) printf '%s: INV-23: program %s is not one the confined spawn may run\n' "$confine_file" "$prog" >>"$tmpdir/hits" ;;
     esac
 done <"$tmpdir/confine-programs"
+# The file-op stub's Rust file (P-36d, design §7.1): it holds the pinned
+# FILEOP_STUB perl text and spawns nothing — the confined spawn runs it.
+# So its code names no Command/CommandExt/raw_arg, and it holds no
+# absolute-path literal AT ALL (raw view: the stub is a raw string whose
+# contents the code view hides, and it holds no double quote, so a literal
+# cannot hide from this scan either).
+strip_comments "$fileop_stub_file" "$tmpdir/fileop-stripped"
+normalise "$tmpdir/fileop-stripped" "$tmpdir/fileop-code"
+scan "INV-23: a spawn named in $fileop_stub_file (it spawns nothing)" \
+    "(^|$nb)(Command|CommandExt|raw_arg)($nb|\$)" "$tmpdir/fileop-code" "$fileop_stub_file"
+normalise "$fileop_stub_file" "$tmpdir/fileop-raw"
+rc=0
+grep -aoE '"/[^"]*"' "$tmpdir/fileop-raw" >"$tmpdir/fileop-paths" || rc=$?
+case $rc in
+    0) while IFS= read -r lit; do
+           printf '%s: INV-23: absolute-path literal %s in a file that spawns nothing and names no path\n' \
+               "$fileop_stub_file" "$lit" >>"$tmpdir/hits"
+       done <"$tmpdir/fileop-paths" ;;
+    1) ;;
+    *) fail "grep error (rc=$rc) listing absolute-path literals in $fileop_stub_file" ;;
+esac
 if [ -s "$tmpdir/hits" ]; then
     fail "INV-23: spawns are confined to the closed query set in $spawn_file and the confined spawn in $confine_file:
 $(cat "$tmpdir/hits")"
@@ -730,7 +753,17 @@ read -r capture_got _ <"$tmpdir/capture-sha" || fail "could not read the digest 
 # while the call runs (try_status/read/totals/stop), the control pipe closed
 # by a deadline closer; the three admitted programs, the stub and the frame
 # format are unchanged, and live bounds fail closed before the spawn.
-confine_spawn_sha256=86c6709181a650304261739210858d4a11fbcd503eaaeafef84b33bfd2807be5
+# P-36d (2026-10-03): the stub text is selected by the closed enum
+# Stub::{Domain, FileOp} — the file-op stub's text lives in fileop_stub.rs
+# (pinned below) and travels as the perl -e argument; the three admitted
+# programs, the domain stub and the frame format are unchanged.
+# P-36d fix-up 2 (2026-10-03): the domain stub's per-pass canary now checks
+# getppid() when kill(0) succeeds: macOS answers signal 0 to an unreaped
+# zombie harness even under the profile, which forfeited the crash sweep to
+# the reaper race; a reparented stub's parent cannot come back, so the
+# accepted signal cannot have reached it. Start canary, frame format and
+# programs unchanged.
+confine_spawn_sha256=22adde9b99ffb241c769fe6fcd03cc0818c1028789db848c2dd4c9926c92148f
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum <"$confine_file" >"$tmpdir/confine-sha" || fail "sha256sum failed on $confine_file"
 else
@@ -739,6 +772,21 @@ fi
 read -r confine_got _ <"$tmpdir/confine-sha" || fail "could not read the digest of $confine_file"
 [ "$confine_got" = "$confine_spawn_sha256" ] ||
     fail "INV-23: $confine_file is not the reviewed version (sha256 $confine_got, pinned $confine_spawn_sha256): the confined spawn changes only with this gate; review the change, then update confine_spawn_sha256 in scripts/ci/purity.sh"
+
+# The file-op stub, pinned (P-36d). Update only with a review of the change.
+# P-36d (2026-10-03): first pin: the fork-less FILEOP_STUB (design §7.1) —
+# start canary byte-identical to the domain stub's, no fork, no double
+# quote, no absolute path, the rh-fileop/1 ops with O_NOFOLLOW and core
+# Digest::SHA, link+unlink move, directory fsync after every write.
+fileop_stub_sha256=435800cb3e3b89229eafcf7dc4e2c62cab3bdb9cb71555f9036d72f692ea0f36
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum <"$fileop_stub_file" >"$tmpdir/fileop-sha" || fail "sha256sum failed on $fileop_stub_file"
+else
+    shasum -a 256 <"$fileop_stub_file" >"$tmpdir/fileop-sha" || fail "shasum failed on $fileop_stub_file"
+fi
+read -r fileop_got _ <"$tmpdir/fileop-sha" || fail "could not read the digest of $fileop_stub_file"
+[ "$fileop_got" = "$fileop_stub_sha256" ] ||
+    fail "INV-23: $fileop_stub_file is not the reviewed version (sha256 $fileop_got, pinned $fileop_stub_sha256): the file-op stub changes only with this gate; review the change, then update fileop_stub_sha256 in scripts/ci/purity.sh"
 
 # --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------
 # Every compile_fail doctest names its expected error code; gates.sh runs the

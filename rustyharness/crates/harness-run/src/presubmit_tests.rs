@@ -335,8 +335,16 @@ impl Setup<'_> {
 fn drive(s: Setup<'_>) -> Done {
     let reg = registry();
     let profile = s.profile.clone();
-    let (session, tools) =
-        plan(&s.spec, &reg, &s.policy, &profile, s.approver_present, true).unwrap();
+    let (session, tools) = plan(
+        &s.spec,
+        &reg,
+        &s.policy,
+        &profile,
+        s.approver_present,
+        true,
+        true,
+    )
+    .unwrap();
     let backend = Recording {
         inner: ScriptedBackend::new(profile.clone(), s.replies),
         profile: profile.clone(),
@@ -998,7 +1006,7 @@ fn a_timed_out_check_is_a_failed_check_with_the_host_sampled() {
     let profile = Profile::conservative_default("m");
     let spec = spec_of(&[&["cargo", "test"]], 1);
     let policy = UserPolicy::new(&[], &[], &[EXEC_ID]).unwrap();
-    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, true).unwrap();
+    let (session, tools) = plan(&spec, &reg, &policy, &profile, false, true, true).unwrap();
     let backend = ScriptedBackend::new(profile.clone(), vec![submit("a"), submit("b")]);
     let cfg = RunConfig::defaults(1_000_000);
     let file = FaultFile::new(FaultPlan::default());

@@ -70,7 +70,7 @@ pub use canon::{rfc3339_utc, EventKind, Ident};
 pub use conditions::{Condition, ConditionKind};
 pub use event::{Event, Trusted, UntrustedBlob};
 pub use reader::{verify, BlobSource, BreakKind, Broken, JournalReader, Record, Verified};
-pub use scan::{scan_runs, ScanError, ScannedRun};
+pub use scan::{scan_runs, ChildLink, ScanError, ScannedRun};
 pub use tail::{JournalTail, Poll};
 pub use writer::{
     stop_cause_name, stop_cause_named, BlobSink, Clock, Header, JournalError, JournalFile,

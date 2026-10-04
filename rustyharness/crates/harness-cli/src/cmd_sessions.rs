@@ -29,13 +29,14 @@ pub(crate) fn sessions(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         ["show", rest @ ..] => (Mode::Show, rest),
         _ => (Mode::List, rest),
     };
-    let o = match options(rest, &["state-root", "run"], &[]) {
+    let o = match options(rest, &["state-root", "run"], &["all"]) {
         Ok(o) => o,
         Err(e) => {
             note!(cx, "{e}\n{USAGE}");
             return exit::USAGE;
         }
     };
+    let all = o.contains_key("all");
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -93,6 +94,17 @@ pub(crate) fn sessions(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         },
     };
     let mut rows: Vec<SessionRow> = scanned.iter().map(row_of).collect();
+    // Delegate children are plumbing, not sessions: hidden from the list
+    // unless asked for. A run whose journal is unreadable stays listed —
+    // nothing can be claimed about it, so it is not assumed to be a child
+    // (fail-closed). `show` is an explicit ask for one run: no hiding.
+    let hidden = if all || show.is_some() {
+        0
+    } else {
+        let before = rows.len();
+        rows.retain(|r| r.child_of.is_none());
+        before - rows.len()
+    };
     // Newest first; the unreadable (no start time known) go last.
     rows.sort_by(|a, b| {
         b.start
@@ -115,6 +127,13 @@ pub(crate) fn sessions(cx: &Cx<'_>, rest: &[&str]) -> u8 {
         },
         None => {
             note!(cx, "{} run(s) in {}", rows.len(), state_root);
+            if hidden > 0 {
+                note!(
+                    cx,
+                    "{} helper run(s) hidden; pass --all to list them",
+                    hidden
+                );
+            }
             for r in &rows {
                 say!(cx, "{}", line_of(&state_root, r));
             }
@@ -134,6 +153,8 @@ pub(crate) struct SessionRow {
     pub(crate) head: Option<String>,
     /// Why the journal could not be read, when it could not.
     pub(crate) unreadable: Option<String>,
+    /// The run's parent, when the header says it is a delegate child.
+    pub(crate) child_of: Option<harness_journal::ChildLink>,
 }
 
 pub(crate) fn row_of(s: &ScannedRun) -> SessionRow {
@@ -146,6 +167,7 @@ pub(crate) fn row_of(s: &ScannedRun) -> SessionRow {
             stop: None,
             head: None,
             unreadable: Some(e.to_string()),
+            child_of: None,
         },
         Ok(v) => SessionRow {
             run,
@@ -154,6 +176,7 @@ pub(crate) fn row_of(s: &ScannedRun) -> SessionRow {
             stop: committed_of(v),
             head: Some(v.head.to_string()),
             unreadable: None,
+            child_of: s.child_of.clone(),
         },
     }
 }
@@ -190,7 +213,7 @@ fn line_of(state_root: &str, r: &SessionRow) -> String {
         Some((c, o)) => (c.clone(), o.clone()),
         None => ("-".to_owned(), "-".to_owned()),
     };
-    format!(
+    let mut line = format!(
         "{} {} steps={} stop={} outcome={} head={} workspace={} task=\"{task}\"",
         r.run,
         r.start.as_deref().unwrap_or("-"),
@@ -199,7 +222,11 @@ fn line_of(state_root: &str, r: &SessionRow) -> String {
         outcome,
         r.head.as_deref().unwrap_or("-"),
         workspace,
-    )
+    );
+    if let Some(parent) = &r.child_of {
+        line.push_str(&format!(" child of {}@{}", parent.run, parent.step));
+    }
+    line
 }
 
 /// `sessions show`'s extra words, on stderr.

@@ -62,6 +62,13 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 #[doc(hidden)]
 pub const DOMAIN_STUB: &str = confine_spawn::STUB;
 
+/// The file-op stub's text (P-36d, §7.1, see `fileop_stub`), exposed for
+/// the conformance test that runs it unconfined to exercise its start
+/// check: with no sandbox around it, the canary sees a signallable parent
+/// and refuses before doing anything.
+#[doc(hidden)]
+pub const FILEOP_STUB: &str = crate::fileop_stub::FILEOP_STUB;
+
 /// What this backend can enforce (H2c). Memory: per-process `RLIMIT_AS`
 /// (measured enforced on this host). Processes: the stub's member-count
 /// watchdog (`RLIMIT_NPROC` is per user, so it cannot bound one sandbox; the

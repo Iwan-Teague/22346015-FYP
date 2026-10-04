@@ -93,6 +93,31 @@ fn try_replay(
             format!("the replay did not start: {e}"),
         )
     })?;
+    // One line per helper run audited with the parent (P-38g): id,
+    // anchored, divergence.
+    for c in &rep.children {
+        let anchored = if c.anchored { "anchored" } else { "unanchored" };
+        match &c.divergence {
+            None => note!(cx, "child run {}: {}, no divergence", c.run, anchored),
+            Some(d) => note!(
+                cx,
+                "child run {}: {}, DIVERGED at record {} (step {}): {}",
+                c.run,
+                anchored,
+                d.seq,
+                d.step,
+                d.why
+            ),
+        }
+    }
+    // A helper the audit could not vouch for fails the whole replay
+    // (P-38g): the parent's own records matched, but the evidence they
+    // point at does not hold up, so nothing here is vouched for either.
+    let bad_child = rep.children.iter().find_map(|c| {
+        c.divergence
+            .as_ref()
+            .map(|d| (c.run.clone(), d.seq, d.step, d.why))
+    });
     // Wall-budget records are left out of the comparison (their timing is
     // the clock's) after a shape check; say how many (review F-1).
     let (walls, walls_short) = if rep.wall_skipped == 0 {
@@ -109,11 +134,28 @@ fn try_replay(
             ),
         )
     };
-    let findings = match &rep.divergence {
-        None if rep.stop_recomputed => {
-            // H1 phase-exit review, named item 2: what was re-fed and what
-            // recomputed, never "every record recomputed".
+    let findings = match bad_child {
+        Some((child, seq, step, why)) => {
             note!(
+                cx,
+                "replay of run {run} attempt {}: DIVERGED at helper run {child} (record {} step {}): {}",
+                rep.attempt,
+                seq,
+                step,
+                why
+            );
+            info(
+                "harness.replay.divergence",
+                &format!("run {run} attempt {} helper run {child}", rep.attempt),
+                "the recorded journal",
+                why.to_owned(),
+            )
+        }
+        None => match &rep.divergence {
+            None if rep.stop_recomputed => {
+                // H1 phase-exit review, named item 2: what was re-fed and what
+                // recomputed, never "every record recomputed".
+                note!(
                 cx,
                 "replay of run {run} attempt {}: {} records matched. {REPLAY_SCOPE}, and the stop.{walls} {}",
                 rep.attempt,
@@ -124,45 +166,45 @@ fn try_replay(
                     "Without --anchor, a journal rewritten consistently is not detected (the chain is unkeyed)."
                 }
             );
-            info(
-                "harness.replay",
-                &format!("run {run} attempt {}", rep.attempt),
-                "the recorded journal",
-                format!(
-                    "{} records matched ({REPLAY_SCOPE_SHORT}){walls_short}{}",
-                    rep.matched,
-                    if rep.anchored { "; anchor matched" } else { "" }
-                ),
-            )
-        }
-        None if matches!(
-            rep.outcome,
-            GateOutcome::Indeterminate {
-                why: IndeterminateKind::CouldNotRun
+                info(
+                    "harness.replay",
+                    &format!("run {run} attempt {}", rep.attempt),
+                    "the recorded journal",
+                    format!(
+                        "{} records matched ({REPLAY_SCOPE_SHORT}){walls_short}{}",
+                        rep.matched,
+                        if rep.anchored { "; anchor matched" } else { "" }
+                    ),
+                )
             }
-        ) =>
-        {
-            note!(
+            None if matches!(
+                rep.outcome,
+                GateOutcome::Indeterminate {
+                    why: IndeterminateKind::CouldNotRun
+                }
+            ) =>
+            {
+                note!(
                 cx,
                 "replay of run {run} attempt {}: the attempt never committed (no RunStopped); its {} records matched",
                 rep.attempt,
                 rep.matched
             );
-            info(
-                "harness.replay.incomplete",
-                &format!("run {run} attempt {}", rep.attempt),
-                "a committed attempt",
-                format!("no RunStopped; {} records matched", rep.matched),
-            )
-        }
-        None if rep.anchored => {
-            note!(
+                info(
+                    "harness.replay.incomplete",
+                    &format!("run {run} attempt {}", rep.attempt),
+                    "a committed attempt",
+                    format!("no RunStopped; {} records matched", rep.matched),
+                )
+            }
+            None if rep.anchored => {
+                note!(
                     cx,
                     "replay of run {run} attempt {}: {} records matched. {REPLAY_SCOPE}; the stop, a wall-budget stop, is not recomputable.{walls} The anchor matched the journal's chain head, so no record was cut from it.",
                     rep.attempt,
                     rep.matched
                 );
-            info(
+                info(
                 "harness.replay.anchored",
                 &format!("run {run} attempt {}", rep.attempt),
                 "the recorded journal",
@@ -171,45 +213,56 @@ fn try_replay(
                     rep.matched
                 ),
             )
-        }
-        None => {
-            // H1e-2b review F-1: never "every record matched" for a
-            // stop the replay could not recompute.
-            note!(
+            }
+            None => {
+                // H1e-2b review F-1: never "every record matched" for a
+                // stop the replay could not recompute.
+                note!(
                     cx,
                     "replay of run {run} attempt {}: {} records matched, but the stop was NOT recomputed: wall stop not recomputable; only --anchor proves no truncation",
                     rep.attempt,
                     rep.matched
                 );
-            info(
-                "harness.replay.stop-unverified",
-                &format!("run {run} attempt {}", rep.attempt),
-                "a stop the replay recomputes, or a matching --anchor",
-                "wall stop not recomputable; only --anchor proves no truncation".to_owned(),
-            )
+                info(
+                    "harness.replay.stop-unverified",
+                    &format!("run {run} attempt {}", rep.attempt),
+                    "a stop the replay recomputes, or a matching --anchor",
+                    "wall stop not recomputable; only --anchor proves no truncation".to_owned(),
+                )
+            }
+            Some(d) => {
+                note!(
+                    cx,
+                    "replay of run {run} attempt {}: DIVERGED at record {} (step {}): {}",
+                    rep.attempt,
+                    d.seq,
+                    d.step,
+                    d.why
+                );
+                info(
+                    "harness.replay.divergence",
+                    &format!(
+                        "run {run} attempt {} record {} step {}",
+                        rep.attempt, d.seq, d.step
+                    ),
+                    "the recorded journal",
+                    d.why.to_owned(),
+                )
+            }
+        },
+    };
+    // The failing helper, not the parent, is what failed; the outcome says
+    // the evidence is unreadable all the same.
+    let outcome = if rep.divergence.is_none() && rep.children.iter().any(|c| c.divergence.is_some())
+    {
+        GateOutcome::Indeterminate {
+            why: IndeterminateKind::UnreadableEvidence,
         }
-        Some(d) => {
-            note!(
-                cx,
-                "replay of run {run} attempt {}: DIVERGED at record {} (step {}): {}",
-                rep.attempt,
-                d.seq,
-                d.step,
-                d.why
-            );
-            info(
-                "harness.replay.divergence",
-                &format!(
-                    "run {run} attempt {} record {} step {}",
-                    rep.attempt, d.seq, d.step
-                ),
-                "the recorded journal",
-                d.why.to_owned(),
-            )
-        }
+    } else {
+        rep.outcome
     };
     Ok(Outcome {
-        outcome: rep.outcome,
+        outcome,
         findings: findings.into_iter().collect(),
         chain_head: None,
         exit_override: None,

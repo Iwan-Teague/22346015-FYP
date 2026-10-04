@@ -68,20 +68,23 @@
 //! refuse, so no witness is minted.
 //!
 //! **Per-pass check.** Before each sweep pass the stub signals 0 to the
-//! same parent again and accepts only `EPERM` (the parent is alive and
-//! still refused) or `ESRCH` (3: the harness has gone, e.g. crashed).
-//! Accepting `ESRCH` is deliberate: after a verified start the filter
-//! cannot have changed, and refusing to sweep when the harness has died
-//! would give up the one cleanup a crash still gets. Success, or any
-//! other error, reports `canary` and stops sweeping — but a bare success
-//! is not believed at first sight: a parent SIGKILLed moments ago is a
-//! zombie until its own parent reaps it, and on Darwin `kill(0, zombie)`
-//! still succeeds. The stub re-checks a success every 50 ms for up to a
-//! second (the reap window) before canarying; a success that persists,
-//! or any other error, reports `canary` and stops sweeping. The delay
-//! cannot broaden the sweep: the filter was verified at start and a
-//! Seatbelt profile is fixed for life, so the check remains what stops
-//! a sweep, not what starts one.
+//! same parent again and accepts `EPERM` (the parent is alive and
+//! still refused), `ESRCH` (3: the harness has gone, e.g. crashed), or —
+//! measured on this host — a signal 0 that the kernel *accepted* while the
+//! stub is already reparented to `launchd`: on macOS `kill(0, zombie)`
+//! succeeds even under the profile, and a SIGKILLed harness sits in its
+//! own parent as an unreaped zombie for at least one scheduler wakeup
+//! (2-3 ms measured), while the stub, woken by the same death's
+//! control-pipe EOF, reaches its first check within microseconds and used
+//! to forfeit the crash sweep to that race every time (the conformance
+//! suite's reaper thread loses it routinely). The stub can tell the two
+//! cases apart without guessing: a live harness is always still its
+//! parent, so `getppid() == $pp`; a reparented stub's parent cannot come
+//! back, so the accepted signal cannot have reached the harness (and
+//! after a verified start the filter cannot have changed). Success
+//! against a parent `getppid()` still reports, or any other error, means
+//! the filter cannot be shown to hold: the stub reports `canary` and
+//! stops sweeping.
 //!
 //! **Report.** The stub's last act is one line on stderr, `rh-stub/1
 //! <confirmed|unconverged|canary> status=<wait status>
@@ -110,9 +113,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::fileop_stub::FILEOP_STUB;
 use crate::ring::{Chunk, Mode, Ring, Stream, StreamTotals};
 use crate::spec::{ChildStatus, ConfinedExit, DomainCleanup, Validated};
 use crate::LiveOpts;
+
+/// Which stub a confined instance runs (P-36d, §7.1): the domain stub
+/// (fork a program, sweep the instance when the call ends) or the file-op
+/// stub (serve `rh-fileop/1` requests; forks nothing, so the instance is
+/// exactly one process). The closed enum keeps the spawn free of free
+/// text: both stub texts are pinned constants.
+pub(crate) enum Stub {
+    Domain,
+    FileOp,
+}
 
 /// The sweep deadline a call asks for unless it says otherwise: the stub
 /// sweeps for at most this long (P-41: the live probe's one retry of a
@@ -159,7 +173,7 @@ close $ew;
 my $st=-1; my $why='exit'; my $poll=0;
 while(1){ my $w=waitpid($pid,1); if($w==$pid){$st=$?;last} my $rin='';vec($rin,fileno($c),1)=1; my $n=select(my $ro=$rin,undef,undef,0.02); if($n>0){$why='stop';last} if($np>0 && ++$poll>=12){$poll=0; my $mc=0; for my $q (2..99999){$mc++ if kill(0,$q)} if($mc-1>$np){$why='procs';last}} }
 my ($k,$res)=(0,'unconverged');
-my $t0=time; PASS: for my $p (1..1000){ my $hit=kill(0,$pp); my $en=$!+0; my $z=0; while($hit && $z<20){select(undef,undef,undef,0.05); $z++; $hit=kill(0,$pp); $en=$!+0} if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS} my $n=0; for my $q (2..99999){next if $q==$$; $n++ if kill('KILL',$q)} 1 while waitpid(-1,1)>0; $k+=$n; if($n==0){$res='confirmed';last PASS} last PASS if time-$t0>=$sw; my $w=0.005*$p; $w=0.05 if $w>0.05; select(undef,undef,undef,$w) }
+my $t0=time; PASS: for my $p (1..1000){ my $hit=kill(0,$pp); my $en=$!+0; if($hit ? getppid()==$pp : ($en!=1 && $en!=3)){$res='canary';last PASS} my $n=0; for my $q (2..99999){next if $q==$$; $n++ if kill('KILL',$q)} 1 while waitpid(-1,1)>0; $k+=$n; if($n==0){$res='confirmed';last PASS} last PASS if time-$t0>=$sw; my $w=0.005*$p; $w=0.05 if $w>0.05; select(undef,undef,undef,$w) }
 my $ef=''; if($res eq 'confirmed'){sysread($er,$ef,1)}
 my $ex = $ef eq 'E' ? 'failed' : $ef eq 'L' ? 'limit' : 'ok';
 if($st==-1){$st=-2}
@@ -266,7 +280,15 @@ pub(crate) fn spawn(
     sweep: Duration,
     cleanup_dir: Option<PathBuf>,
 ) -> std::io::Result<Running> {
-    launch(profile, v, sweep, cleanup_dir, v.limits.output_bytes, None)
+    launch(
+        profile,
+        v,
+        sweep,
+        cleanup_dir,
+        v.limits.output_bytes,
+        None,
+        Stub::Domain,
+    )
 }
 
 /// Start `v` under the profile as a live call: output is readable from
@@ -291,7 +313,37 @@ pub(crate) fn spawn_live(
             "live lifetime must be nonzero and within MAX_WALL",
         ));
     }
-    launch(profile, v, sweep, cleanup_dir, live.ring_bytes, Some(live))
+    launch(
+        profile,
+        v,
+        sweep,
+        cleanup_dir,
+        live.ring_bytes,
+        Some(live),
+        Stub::Domain,
+    )
+}
+
+/// Start the file-op helper instance (P-36d, §7.1): the file-op stub, no
+/// frame written (requests start at once over the control pipe), the stdout
+/// ring sized to the codec's response bound so a full reply is never
+/// dropped by the ring, and no live lifetime (the caller drives the helper
+/// and ends it by dropping it or by its own deadline).
+pub(crate) fn spawn_fileop(
+    profile: &Path,
+    v: &Validated,
+    sweep: Duration,
+    cleanup_dir: Option<PathBuf>,
+) -> std::io::Result<Running> {
+    launch(
+        profile,
+        v,
+        sweep,
+        cleanup_dir,
+        crate::fileop::proto::MAX_RESPONSE_BYTES as u64,
+        None,
+        Stub::FileOp,
+    )
 }
 
 /// The one launch path (§6.3): every confined child comes from here, live
@@ -304,12 +356,17 @@ fn launch(
     cleanup_dir: Option<PathBuf>,
     ring_bytes: u64,
     live: Option<&LiveOpts>,
+    stub: Stub,
 ) -> std::io::Result<Running> {
     let started = Instant::now();
+    let stub_text = match stub {
+        Stub::Domain => STUB,
+        Stub::FileOp => FILEOP_STUB,
+    };
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-f")
         .arg(profile)
-        .args(["/usr/bin/perl", "-e", STUB])
+        .args(["/usr/bin/perl", "-e", stub_text])
         .env_clear()
         .current_dir(&v.cwd)
         .stdin(Stdio::piped())
@@ -359,8 +416,10 @@ fn launch(
             return Err(e);
         }
     };
-    // A stub that already died gives EPIPE here; the wait reports it.
-    {
+    // Only the domain stub takes a frame (limits, argv, env). The file-op
+    // stub reads `rh-fileop/1` requests straight away; a frame would be
+    // read as a malformed request and refuse the instance (§7.1).
+    if matches!(stub, Stub::Domain) {
         let mut pipe = lock_stdin(&stdin);
         if let Some(pipe) = pipe.as_mut() {
             let _ = pipe.write_all(&frame(v, sweep)).and_then(|()| pipe.flush());
@@ -462,6 +521,25 @@ impl Running {
     /// scales, so a retried probe's longer sweep is not cut short).
     fn grace(&self) -> Duration {
         self.sweep + SWEEP_GRACE_MARGIN
+    }
+
+    /// The stub's process id, while the instance runs (P-36d: the file-op
+    /// helper's identity; the instance forks nothing, so the pid is stable
+    /// across requests). `None` once the call has been reaped.
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
+    /// Write `bytes` to the stub's control pipe — the file-op helper's
+    /// request channel (§7.3). Fails once the pipe is closed (a stop, a
+    /// deadline, or a dead stub), which the caller treats as a lost
+    /// instance.
+    pub(crate) fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut pipe = lock_stdin(&self.stdin);
+        match pipe.as_mut() {
+            Some(pipe) => pipe.write_all(bytes).and_then(|()| pipe.flush()),
+            None => Err(std::io::Error::other("the stub's control pipe is closed")),
+        }
     }
 
     /// Wait for the call to end (program exit or deadline), let the stub
@@ -807,12 +885,17 @@ mod tests {
         let check = STUB.find("end=start").unwrap();
         assert!(check < STUB.find("open(my $c").unwrap());
         assert!(check < STUB.find("fork()").unwrap());
-        // Per pass: only EPERM (1) or ESRCH (3) lets a sweep pass run, and
-        // a bare success is re-checked through the reap window (a just
-        // SIGKILLed harness is a zombie that kill(0) still succeeds on)
-        // before it canaries.
-        assert!(STUB.contains("while($hit && $z<20)"));
-        assert!(STUB.contains("if($hit || ($en!=1 && $en!=3)){$res='canary';last PASS}"));
+        // Per pass: only EPERM (1) or ESRCH (3) lets a sweep pass run —
+        // or a signal macOS accepted from an already-reparented stub,
+        // whose `kill(0, zombie)` quirk would otherwise forfeit the crash
+        // sweep to the reaper race every time. A parent `getppid()` still
+        // reports cannot be dead, so an accepted signal means the filter
+        // is off and the stub must still refuse to sweep.
+        assert!(STUB
+            .contains("if($hit ? getppid()==$pp : ($en!=1 && $en!=3)){$res='canary';last PASS}"));
+        // The start canary is untouched: before the frame, the parent must
+        // be alive and refused.
+        assert!(STUB.contains("if($pp<=1 || kill(0,$pp) || ($!+0)!=1)"));
     }
 
     #[test]

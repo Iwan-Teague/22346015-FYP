@@ -46,10 +46,13 @@ mod capture;
 // The confined spawn (macOS).
 #[cfg(target_os = "macos")]
 mod confine_spawn;
+// The file-op helper's stub text (P-36d, §7.1), pinned like `confine_spawn`.
 pub mod conformance;
 pub mod egress;
 pub mod environment;
 pub mod fileop;
+#[cfg(target_os = "macos")]
+mod fileop_stub;
 pub mod linux;
 pub mod locality;
 pub mod profile;

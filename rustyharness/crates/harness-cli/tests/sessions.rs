@@ -130,6 +130,17 @@ fn fixture(name: &str) -> Fx {
     }
 }
 
+/// Like [`fixture`], but the task may delegate a helper run.
+fn delegating_fixture(name: &str) -> Fx {
+    let fx = fixture(name);
+    std::fs::write(
+        &fx.task,
+        r#"{"task":"What does a.txt say?","grants":["harness.fs.read","harness.fs.list","harness.task.delegate"]}"#,
+    )
+    .unwrap();
+    fx
+}
+
 /// What a CLI invocation produced.
 struct Output {
     code: i32,
@@ -194,6 +205,34 @@ fn run_id(o: &Output) -> String {
     let err = o.err();
     let at = err.find("run ").unwrap() + 4;
     err[at..at + 32].to_owned()
+}
+
+/// One parent run that delegates a helper (which reads and submits), then
+/// submits itself; the helper shares the parent's model server, so the
+/// replies are served across the two runs in call order.
+fn delegate_once(fx: &Fx, name: &str) -> (String, String) {
+    let m = mock(vec![
+        act(
+            "harness.task.delegate",
+            r#"{"task":"read a.txt and report"}"#,
+        ),
+        act("harness.fs.read", r#"{"path":"a.txt"}"#),
+        act("harness.task.submit", r#"{"note":"helper done"}"#),
+        act("harness.task.submit", r#"{"note":"parent done"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(fx, &ep), &fx.marker);
+    assert_eq!(o.code, 5, "{name}: stderr: {}", o.err());
+    let parent = run_id(&o);
+    let mut children: Vec<String> = std::fs::read_dir(run_dir_of(fx, &parent).parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| *n != parent)
+        .collect();
+    assert_eq!(children.len(), 1, "{name}: one helper expected");
+    let child = children.pop().unwrap();
+    (parent, child)
 }
 
 /// One finished run (a read, then a submit; exit 5, nothing checked),
@@ -309,6 +348,142 @@ fn sessions_marks_tampered_journal_unreadable() {
     );
     assert_eq!(o.code, 0, "{}", o.err());
     assert!(o.err().contains("unreadable"), "{}", o.err());
+}
+
+#[test]
+fn sessions_hides_child_runs_by_default() {
+    let fx = delegating_fixture("hide-children");
+    let (parent, child) = delegate_once(&fx, "hidden");
+    let o = cli(
+        &["sessions", "--state-root", fx.state.to_str().unwrap()],
+        &fx.marker,
+    );
+    assert_eq!(o.code, 0, "{}", o.err());
+    let err = o.err();
+    assert!(err.contains("1 run(s) in "), "{err}");
+    assert!(err.contains("1 helper run(s) hidden; pass --all"), "{err}");
+    let out = o.out();
+    let rows: Vec<&str> = out.lines().collect();
+    assert_eq!(rows.len(), 1, "{out}");
+    assert!(rows[0].starts_with(&parent), "{out}");
+    assert!(!out.contains(&child), "the helper is not listed: {out}");
+}
+
+#[test]
+fn sessions_all_shows_child_with_parent_link() {
+    let fx = delegating_fixture("all-children");
+    let (parent, child) = delegate_once(&fx, "shown");
+    // The step recorded in the child's header is the truth the line quotes.
+    let v =
+        harness_journal::JournalReader::open(&run_dir_of(&fx, &child).join("attempt-1")).unwrap();
+    let step = v.records[0].body["parent"]["step"].as_u64().unwrap();
+
+    let o = cli(
+        &[
+            "sessions",
+            "--all",
+            "--state-root",
+            fx.state.to_str().unwrap(),
+        ],
+        &fx.marker,
+    );
+    assert_eq!(o.code, 0, "{}", o.err());
+    assert!(o.err().contains("2 run(s) in "), "{}", o.err());
+    let out = o.out();
+    let rows: Vec<&str> = out.lines().collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    let child_row = rows.iter().find(|r| r.starts_with(&child)).unwrap();
+    assert!(
+        child_row.contains(&format!("child of {parent}@{step}")),
+        "{out}"
+    );
+    // A plain run carries no link.
+    let parent_row = rows.iter().find(|r| r.starts_with(&parent)).unwrap();
+    assert!(!parent_row.contains("child of "), "{out}");
+
+    // Asking for the helper by name shows it, with the same link.
+    let o = cli(
+        &[
+            "sessions",
+            "show",
+            "--run",
+            &child,
+            "--state-root",
+            fx.state.to_str().unwrap(),
+        ],
+        &fx.marker,
+    );
+    assert_eq!(o.code, 0, "{}", o.err());
+    assert!(
+        o.out().contains(&format!("child of {parent}@{step}")),
+        "{}",
+        o.out()
+    );
+}
+
+/// The parent's replay names each helper it audited, and a clean helper
+/// leaves the replay's verdict alone (P-38g).
+#[test]
+fn cli_replay_audits_children_and_reports_them() {
+    let fx = delegating_fixture("replay-children");
+    let (parent, child) = delegate_once(&fx, "audited");
+    let o = cli(
+        &[
+            "replay",
+            "--run",
+            &parent,
+            "--state-root",
+            fx.state.to_str().unwrap(),
+        ],
+        &fx.marker,
+    );
+    assert_eq!(o.code, 5, "{}", o.err());
+    assert!(o.err().contains(REPLAY_MATCHED), "{}", o.err());
+    // One line per helper: id, anchored (the parent's recorded chain head
+    // anchors it), divergence.
+    assert!(
+        o.err()
+            .contains(&format!("child run {child}: anchored, no divergence")),
+        "{}",
+        o.err()
+    );
+}
+
+/// A helper whose journal was broken after the fact fails the parent's
+/// replay, by name (P-38g).
+#[test]
+fn cli_replay_fails_when_child_tampered() {
+    let fx = delegating_fixture("replay-tampered");
+    let (parent, child) = delegate_once(&fx, "tampered");
+    let j = journal_of(&fx, &child);
+    let mut bytes = std::fs::read(&j).unwrap();
+    let at = bytes.len() - 5;
+    bytes[at] = if bytes[at] == b'x' { b'y' } else { b'x' };
+    std::fs::write(&j, &bytes).unwrap();
+
+    let o = cli(
+        &[
+            "replay",
+            "--run",
+            &parent,
+            "--state-root",
+            fx.state.to_str().unwrap(),
+        ],
+        &fx.marker,
+    );
+    assert_eq!(o.code, 5, "{}", o.err());
+    assert!(o.err().contains("DIVERGED"), "{}", o.err());
+    assert!(
+        o.err().contains(&format!("helper run {child}")),
+        "{}",
+        o.err()
+    );
+    assert_eq!(
+        report(&o)["outcome"]["Indeterminate"]["why"],
+        "UnreadableEvidence",
+        "{}",
+        o.out()
+    );
 }
 
 #[test]
@@ -571,4 +746,89 @@ fn gc_is_idempotent() {
     let o = cli(&args, &fx.marker);
     assert_eq!(o.code, 0, "{}", o.err());
     assert!(o.err().contains("nothing to remove"), "{}", o.err());
+}
+
+// ---- the helper's ask, labelled with where it came from (P-38g) ----------------
+
+/// An embedder-style approver that records each request's display text
+/// (what the terminal prompt would print) and answers yes.
+struct RecordingApprover(RefCell<Vec<String>>);
+
+impl harness_run::Approver for RecordingApprover {
+    fn kind(&self) -> harness_run::ApproverKind {
+        harness_run::ApproverKind::Embedded
+    }
+
+    fn ask(
+        &self,
+        req: &harness_policy::approval::ApprovalRequest,
+        _deadline: std::time::Instant,
+    ) -> harness_run::ApprovalAnswer {
+        self.0.borrow_mut().push(format!("{req}"));
+        harness_run::ApprovalAnswer::Yes
+    }
+}
+
+/// [`cli`], but the run's asks go to a given approver.
+fn cli_as(args: &[&str], marker: &Path, approver: &dyn harness_run::Approver) -> Output {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = {
+        let cx = harness_cli::Cx {
+            probe: &Local,
+            gate_ok_file: Some(marker.to_path_buf()),
+            out: RefCell::new(&mut out),
+            err: RefCell::new(&mut err),
+            approver: harness_cli::ApproverSource::Given(approver),
+            input: harness_cli::InputSource::Given(&[]),
+            backend: harness_cli::BackendSource::BuiltIn,
+            confinement: &harness_sandbox::SystemConfinement,
+        };
+        harness_cli::main_with(&cx, args)
+    };
+    Output {
+        code: i32::from(code),
+        stdout: out,
+        stderr: err,
+    }
+}
+
+// P-38c routing, seen from the CLI: a helper's ask reaches the run's own
+// approver, and the prompt text opens with where the ask came from.
+#[test]
+fn approval_prompt_shows_helper_origin() {
+    let fx = delegating_fixture("approval-helper-origin");
+    let policy = fx.task.parent().unwrap().join("policy.json");
+    std::fs::write(&policy, r#"{"ask":["harness.fs.read"]}"#).unwrap();
+    let m = mock(vec![
+        act(
+            "harness.task.delegate",
+            r#"{"task":"read a.txt and report"}"#,
+        ),
+        act("harness.fs.read", r#"{"path":"a.txt"}"#),
+        act("harness.task.submit", r#"{"note":"helper done"}"#),
+        act("harness.task.submit", r#"{"note":"parent done"}"#),
+    ]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let mut args = run_args(&fx, &ep);
+    args.push("--policy");
+    args.push(policy.to_str().unwrap());
+    let approver = RecordingApprover(RefCell::new(Vec::new()));
+    let o = cli_as(&args, &fx.marker, &approver);
+    assert_eq!(o.code, 5, "stderr: {}", o.err());
+    let asks = approver.0.borrow();
+    assert_eq!(
+        asks.len(),
+        1,
+        "the helper's one ask reaches the run's approver: {asks:?}"
+    );
+    let shown = &asks[0];
+    assert!(
+        shown.starts_with("asked by a helper (run "),
+        "prompt: {shown}"
+    );
+    assert!(
+        shown.contains("started by run "),
+        "the prompt names the delegating run: {shown}"
+    );
+    assert!(shown.contains("harness.fs.read"), "prompt: {shown}");
 }

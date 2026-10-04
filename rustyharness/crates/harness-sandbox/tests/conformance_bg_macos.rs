@@ -385,8 +385,10 @@ fn ft_bg_parent_sigkill_sweeps_the_domain() {
 
 /// `bg-parent-death` with the harness left unreaped: a SIGKILLed harness
 /// is a zombie until its parent waits on it, and on macOS `kill(0, zombie)`
-/// still succeeds — so the stub must ride the reap window out (re-checking
-/// its per-pass success) and sweep anyway, instead of canarying the moment
+/// still succeeds — so the stub must not read that success as a live
+/// parent: it checks `getppid()` (a reparented stub's parent cannot come
+/// back, so the accepted signal cannot have reached the harness) and
+/// sweeps anyway, instead of canarying the moment
 /// the harness dies and orphaning the domain. The zombie is held for 400ms,
 /// well past the stub's first per-pass checks, then reaped.
 #[test]

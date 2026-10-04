@@ -467,6 +467,10 @@ fn audit_inner(
         a.profile,
         approver_present,
         exec_header.is_some(),
+        // A child audit's policy arrives with the protected-path floor
+        // already applied (the live child planned with it, and the header
+        // digests it); the plan must not apply it a second time (P-38g).
+        expect.is_none(),
     )
     .map_err(AuditRefused::Plan)?;
     let hdr = header(&HeaderInputs {
@@ -1072,13 +1076,19 @@ fn audit_child(
             UNREADABLE,
         );
     }
-    let Ok(policy) = plan::protected_policy(a.policy) else {
-        return report(
-            f.child.clone(),
-            Some(diverge(r.seq, r.step, "the child's policy does not plan")),
-            false,
-            UNREADABLE,
-        );
+    // The child plans like the live child did: with the protected policy
+    // (the ask floor applied), and no second application of the floor
+    // (P-38g: a double application refuses by name).
+    let policy = match plan::protected_policy(a.policy) {
+        Ok(p) => p,
+        Err(_) => {
+            return report(
+                f.child.clone(),
+                Some(diverge(r.seq, r.step, "the child's policy does not plan")),
+                false,
+                UNREADABLE,
+            )
+        }
     };
     let spec = TaskSpec {
         task: child_task_text(brief, &nonce),

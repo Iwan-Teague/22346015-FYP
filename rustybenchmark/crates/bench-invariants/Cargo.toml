@@ -1,0 +1,13 @@
+[package]
+name = "bench-invariants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A meta-crate: no product code, only the single source of truth for the
+# published statistics and a CI gate asserting the docs match it.
+[dependencies]
+
+[lints]
+workspace = true

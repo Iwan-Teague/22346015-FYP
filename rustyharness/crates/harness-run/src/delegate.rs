@@ -590,6 +590,7 @@ pub(crate) fn run_child(
         // A child loop has no `user`, so the repo map is never built
         // (fail closed); `live()` keeps that inert.
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: None,
         user: None,
         // A child never delegates again (design §11): the depth limit is
         // structural — the branch would stop on a missing context before
@@ -1892,6 +1893,7 @@ mod tests {
             research: false,
             instructions: None,
             repo_feed: RepoMapFeed::live(),
+            file_ops_stop: None,
             delegate: Some(ctx),
         });
         let end = lp.drive(&mut w);
@@ -2246,6 +2248,7 @@ mod tests {
             research: false,
             instructions: None,
             repo_feed: RepoMapFeed::live(),
+            file_ops_stop: None,
             delegate: Some(ctx),
         });
         let end = lp.drive(&mut w);

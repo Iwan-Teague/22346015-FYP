@@ -435,7 +435,7 @@ impl PortsHeader {
 /// without any read as before. `endpoint_class` (P-31) is a
 /// hosted profile's declaration (Q-3): absent for a local model, so every
 /// journal written before P-31 reads as before.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 25] = [
+pub(crate) const HEADER_INPUT_KEYS: [&str; 26] = [
     "task",
     "grants",
     "workspace_public",
@@ -451,6 +451,7 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 25] = [
     "limits",
     "exec",
     "ports",
+    "file_ops",
     "presubmit",
     "post_edit",
     "mode",
@@ -462,6 +463,22 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 25] = [
     "instructions",
     "endpoint_class",
 ];
+
+/// The stub build the confined file helper runs (P-36f): SHA-256 over the
+/// pinned `FILEOP_STUB` source, the same digest the header's `file_ops`
+/// field records and a replay compares. Outside macOS no helper exists and
+/// this path is unreachable (an exec grant refuses before the header); the
+/// empty digest stands in so the function total.
+pub(crate) fn fileop_stub_sha256() -> Digest {
+    #[cfg(target_os = "macos")]
+    {
+        sha256(harness_sandbox::seatbelt::FILEOP_STUB.as_bytes())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        sha256(b"")
+    }
+}
 
 /// The header's `limits` object, field by field: the one encoding the
 /// header writes and an audit or a resume compares.
@@ -658,7 +675,18 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, super::RunRefused> 
                 ]),
             )
             .field("exec_programs_sha256", Trusted::Digest(e.programs_sha256))
-            .field("exec_timeout_ms", Trusted::U64(e.timeout_ms));
+            .field("exec_timeout_ms", Trusted::U64(e.timeout_ms))
+            // P-36f: an execute-class run's file tools are the confined
+            // helper's, so the header names the mode and the stub build the
+            // run's file work ran under (§7.5). No key without an exec
+            // grant — an in-process run's header reads as before.
+            .field(
+                "file_ops",
+                Trusted::Obj(vec![
+                    ("mode", Trusted::Text("confined-helper")),
+                    ("stub", Trusted::Digest(fileop_stub_sha256())),
+                ]),
+            );
     }
     // The task's port grant (P-36g §6.1): the ports, their LAN subset, the
     // model's reserved ports and the probe's digest; no key without a port

@@ -141,6 +141,17 @@ pub(crate) fn expected_inputs(
         o.insert("spec".into(), Value::from(e.digest().to_string()));
         o.insert("programs".into(), Value::from(e.programs.len() as u64));
         m.insert("exec".into(), Value::Object(o));
+        // P-36f: an execute-class run's file work ran through the confined
+        // helper, so the expected header carries the mode and the pinned
+        // stub's digest, exactly as the header writes them. No key without
+        // an exec grant, so in-process journals compare as before.
+        let mut o = Map::new();
+        o.insert("mode".into(), Value::from("confined-helper"));
+        o.insert(
+            "stub".into(),
+            Value::from(crate::driver::header::fileop_stub_sha256().to_string()),
+        );
+        m.insert("file_ops".into(), Value::Object(o));
     }
     // The port grant (P-36g §6.1), as the header writes it: the granted
     // ports, their LAN subset, the model's reserved ports and the probe's
@@ -294,6 +305,7 @@ fn header_mismatch(key: &str) -> &'static str {
             "the port grants (loopback, lan, reserved or the probe's ports) differ from the \
              recorded header"
         }
+        "file_ops" => "another harness build wrote this journal (its file-op mode or stub differs)",
         "presubmit" => "the pre-submit checks given differ from the recorded header",
         "post_edit" => "the post-edit checks given differ from the recorded header",
         "protected" => {

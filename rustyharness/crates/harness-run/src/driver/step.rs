@@ -158,6 +158,13 @@ pub(crate) struct Loop<'a> {
     /// it from the touched files; an audit and a resume's catch-up re-feed
     /// the recorded one (the workspace is not read in a replay).
     pub(crate) repo_feed: super::repomap::RepoMapFeed,
+    /// The confined file helper's stop flag (P-36f): set after the
+    /// helper's third loss of the attempt, and the loop then stops with
+    /// [`harness_core::StopCause::SandboxLost`] — continuing would do the
+    /// next file work outside the helper's kernel-enforced view (INV-42).
+    /// `None` when the run used no helper (and in a replay, which never
+    /// touches the workspace).
+    pub(crate) file_ops_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// A submitted plan awaiting the user's `/build` (P-28): the validated
@@ -328,6 +335,7 @@ pub(crate) struct LoopInit<'a> {
     pub(crate) instructions: Option<&'a crate::session::Instructions>,
     pub(crate) repo_feed: super::repomap::RepoMapFeed,
     pub(crate) delegate: Option<crate::delegate::ChildCtx<'a>>,
+    pub(crate) file_ops_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<'a> Loop<'a> {
@@ -366,6 +374,7 @@ impl<'a> Loop<'a> {
             instructions,
             repo_feed,
             delegate,
+            file_ops_stop,
         } = init;
         Loop {
             session,
@@ -401,6 +410,7 @@ impl<'a> Loop<'a> {
             instructions,
             repo_feed,
             delegate,
+            file_ops_stop,
             plan_pending: None,
             plan_approved: None,
             ledger_commands: Vec::new(),
@@ -2243,6 +2253,18 @@ impl<'a> Loop<'a> {
         }
         if let Some(cause) = exec_stop {
             return Err(cause);
+        }
+        // P-36f: the file helper's third loss stops the run. The failing
+        // call's error result is already durable (the restart it caused is
+        // visible in the journal as that error, no new record kind);
+        // continuing would do the next file work outside the helper's
+        // view (INV-42), so the run ends as a sandbox loss instead.
+        if self
+            .file_ops_stop
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err(StopCause::SandboxLost);
         }
         // A command that changed the workspace is progress (§2.6).
         if exec_changed {

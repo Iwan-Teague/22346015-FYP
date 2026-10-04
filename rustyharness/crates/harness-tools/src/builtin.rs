@@ -770,6 +770,11 @@ pub(crate) fn cut(line: &str, max: usize) -> String {
 fn io_out(e: io::Error) -> Out {
     if e.kind() == io::ErrorKind::NotFound {
         err(code::NOT_FOUND, "no such file or directory")
+    } else if e.kind() == io::ErrorKind::TimedOut {
+        // A file call that ran past its per-call deadline ends in the
+        // timeout status (§7.5; the in-process deadline raises the same
+        // kind).
+        timeout()
     } else {
         err(code::IO, "the file system refused the operation")
     }
@@ -1005,14 +1010,14 @@ fn facts_with(
 
 /// One entry of a [`WorkspaceTree`]: what the facts walk digests for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TreeEntry {
+pub(crate) struct TreeEntry {
     /// The relative path, `/`-separated, in its lossy UTF-8 form.
-    rel: String,
+    pub(crate) rel: String,
     /// `d` directory, `f` file (content digested), `F` file over the cap
     /// (size only), `l` symlink (never followed), `o` anything else.
-    kind: u8,
+    pub(crate) kind: u8,
     /// A file's SHA-256 in hex, `len:<n>` for kind `F`, empty otherwise.
-    content: String,
+    pub(crate) content: String,
 }
 
 /// The workspace as the facts walk measured it: every entry in walk order
@@ -1025,7 +1030,7 @@ struct TreeEntry {
 /// the two (design §2.10): a workspace changed any other way is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceTree {
-    entries: Vec<TreeEntry>,
+    pub(crate) entries: Vec<TreeEntry>,
     files: u64,
     oversize: u64,
     tree: Digest,
@@ -1038,7 +1043,9 @@ fn walk_order(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 impl WorkspaceTree {
-    fn from_entries(entries: Vec<TreeEntry>, files: u64, oversize: u64) -> Self {
+    /// Build a tree from entries already in walk order (the confined
+    /// helper's `tree` op lands here, P-36f).
+    pub(crate) fn from_entries(entries: Vec<TreeEntry>, files: u64, oversize: u64) -> Self {
         let mut t = Self {
             entries,
             files,

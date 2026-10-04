@@ -219,6 +219,7 @@ fn drive(
         post_edit: None,
         restore: Default::default(),
         repo_feed: RepoMapFeed::live(),
+        file_ops_stop: None,
         workspace_root: None,
         user: None,
         delegate: None,

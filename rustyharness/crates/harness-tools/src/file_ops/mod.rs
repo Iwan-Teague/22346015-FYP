@@ -5,6 +5,11 @@
 
 mod in_process;
 
+#[cfg(target_os = "macos")]
+mod confined;
+
+#[cfg(target_os = "macos")]
+pub use confined::Confined;
 pub use in_process::InProcess;
 
 use std::io;

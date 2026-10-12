@@ -15,3 +15,6 @@ target/
 # Per-run workspace copies (rebuilt from fixture + journal) and raw local wire dumps.
 /devkit/*/work/
 /devkit/*/dumps-local/
+
+# local sensitive-check patterns (see hooks/README.md)
+hooks/sensitive.local

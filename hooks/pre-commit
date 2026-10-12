@@ -1,0 +1,39 @@
+#!/bin/sh
+# Sensitive-content check, runs on every commit (enable: git config core.hooksPath hooks).
+# Scans STAGED ADDED lines for personal paths / session logs / credentials and
+# any extra regexes in sensitive.local (one per line, git-ignored, same dir).
+# Always asks before committing. Bypass: --no-verify.
+
+added=$(git diff --cached --unified=0 --diff-filter=ACMR | grep -E '^\+[^+]' || true)
+
+hits=$(printf '%s\n' "$added" | grep -E -i \
+  -e '/Users/[a-z][a-z0-9_]+' \
+  -e 'claude-501' \
+  -e '\.jsonl' \
+  -e '(api[_-]?key|secret|passcode|password|auth[_-]?token)[[:space:]]*[:=]' \
+  || true)
+# known-fake users used by fixtures/docs, not sensitive
+hits=$(printf '%s\n' "$hits" | grep -v -E '/Users/(me|x|jdoe42)' || true)
+
+localp="$(dirname "$0")/sensitive.local"
+if [ -f "$localp" ]; then
+  extra=$(printf '%s\n' "$added" | grep -E -i -f "$localp" || true)
+  if [ -n "$extra" ]; then
+    hits="$hits
+$extra"
+  fi
+fi
+
+if [ -n "$hits" ]; then
+  echo "=== pre-commit sensitive scan: possible hits ==="
+  printf '%s\n' "$hits" | grep -v '^$' | head -40
+else
+  echo "=== pre-commit sensitive scan: no pattern hits ==="
+fi
+
+printf 'Is there anything sensitive in this folder? Commit anyway? (y/N) '
+read -r ans < /dev/tty 2>/dev/null || ans=""
+case "$ans" in
+  y|Y) exit 0 ;;
+  *) echo "commit aborted (use --no-verify to skip this check)"; exit 1 ;;
+esac

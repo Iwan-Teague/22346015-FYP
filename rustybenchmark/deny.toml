@@ -1,0 +1,52 @@
+# cargo-deny configuration — rustybenchmark (AQ-73 baseline supply-chain scaffold).
+# Gate in CI: `cargo deny check advisories bans sources`.
+# NOTE: `licenses` is intentionally NOT gated in CI yet — the PolyForm/MPL
+# allow-list ruling is pending owner decision OI-05 (wave10 audit README.md B4).
+# The allow list below records the MEASURED licence set of the current graph
+# (cargo-deny 0.20.2, `cargo deny list`, all features) and is a fact-record,
+# not a policy decision.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT",
+    "MIT-0",
+    # First-party bench-* workspace crates inherit this licence via
+    # [workspace.package]; included so a local `cargo deny check --licenses`
+    # reflects reality. Ruling itself is OI-05, not this file.
+    "PolyForm-Noncommercial-1.0.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 1.0
+# Unlicensed crates are denied by default (licenses v2); any crate whose
+# licence does not match the allow list fails a local licenses check.
+
+[bans]
+multiple-versions = "warn"
+# Ratcheting note: "deny" is the goal, but every member manifest in this
+# workspace currently uses two-component caret requirements (e.g. "0.2"),
+# which cargo-deny classifies as wildcards (measured: 11 hits at HEAD).
+# Held at "warn" so the scaffold does not fail CI on day one; tighten to
+# "deny" as manifests are migrated to three-component requirements.
+wildcards = "warn"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []

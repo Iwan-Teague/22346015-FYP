@@ -1,0 +1,25 @@
+[package]
+name = "bench-submit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The OFFLINE half of the submission / privacy pipeline (docs/11, docs/12, roadmap P6):
+# journal + hw profile -> redacted, schema-validated, canonically serialised, content-hashed
+# upload bundle; the consent gate; and `verify-bundle`. No network, no server, no signing key,
+# no encryption — those need decisions recorded in docs/OPEN-QUESTIONS.md (Q32).
+#
+# Dependencies are all already in the workspace graph 
+
+[dependencies]
+bench-core = { path = "../bench-core" }
+bench-hw = { path = "../bench-hw" }
+bench-stats = { path = "../bench-stats" }
+blake3 = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

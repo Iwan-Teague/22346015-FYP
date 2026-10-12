@@ -1,0 +1,25 @@
+[package]
+name = "bench-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Phase A of docs/05: the static host inventory, plus the privacy-bucketed public
+# view of it (docs/11). Probes are plain OS tools (`sysctl`, `vm_stat`, `pmset`,
+# `/proc`), each parsed by a pure function, so the whole inventory is unit-tested
+# against captured fixtures and nothing here needs a vendor SDK or `unsafe`.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Phase B calibration talks to the model endpoint through bench-model (the only place the harness
+# does). bench-model does not depend on bench-hw, so there is no cycle.
+bench-model = { path = "../bench-model" }
+
+[dev-dependencies]
+bench-model = { path = "../bench-model", features = ["mock"] }
+
+[lints]
+workspace = true
